@@ -1,0 +1,69 @@
+---
+title: "IHEC RNA-seq"
+output: html_notebook
+---
+
+```{r}
+library(data.table)
+# data.table::setDTthreads(20)
+```
+
+```{r}
+isoform_files <- list.files('/nfs/data/IHEC/RNAseq', full.names = T)
+keep_cols <- c('transcript_id', 'gene_id', 'TPM', 'FPKM')
+isoform_quants <- data.table::rbindlist(sapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, simplify = FALSE, select = keep_cols), idcol = 'sample')
+```
+
+## PCA on TPM
+```{r, fig.height=7, fig.width=12}
+library(ggplot2)
+library(ggfortify)
+# bring tpms to wide format
+tpm_wide <- data.table::dcast(isoform_quants, sample ~ transcript_id, value.var = 'TPM')
+tpm_wide[, sample:=as.factor(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", sample))]
+# load metadata
+metadata <- data.table::fread('IHEC_metadata_harmonization.v0.5.csv')
+metadata[, EpiRR_merging := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+tpm_wide <- data.table::merge.data.table(tpm_wide, metadata, all.x = TRUE, by.x = 'sample', by.y='EpiRR_merging')
+# keep only tpm columns
+transcript_cols <- names(tpm_wide)[startsWith(names(tpm_wide), 'ENST')]
+tpm_matrix <- as.matrix(tpm_wide[, ..transcript_cols])
+# filter out transcripts where all samples are smaller than 1
+tpm_matrix <- tpm_matrix[, colSums(tpm_matrix < 1) < nrow(tpm_matrix), drop = FALSE]
+# perform PCA
+pca_tpm <- prcomp(tpm_matrix, center = TRUE, scale = TRUE)
+# summary(pca_tpm)
+# add annotation
+tpm_wide[, annotation := cell_type]
+tpm_wide[biomaterial_type == 'primary tissue', annotation := tissue_type]
+tpm_wide[biomaterial_type == 'cell line', annotation := line]
+ggplot2::autoplot(pca_tpm, data=tpm_wide, colour='annotation', shape = 'project') + labs(title = 'PCA inluding outliers')
+```
+
+```{r, fig.height=7, fig.width=12}
+# remove two outliers
+tpm_wide_filtered <- tpm_wide[cell_type != 'sperm cell']
+tpm_matrix_filtered <- as.matrix(tpm_wide_filtered[, ..transcript_cols])
+# filter again in case outliers dominated the expressionof certain transcripts
+tpm_matrix_filtered <- tpm_matrix_filtered[, colSums(tpm_matrix_filtered < 1) < nrow(tpm_matrix_filtered), drop = FALSE]
+# perform PCA
+pca_tpm_filtered <- prcomp(tpm_matrix_filtered, center = TRUE, scale = TRUE)
+# summary(pca_tpm)
+ggplot2::autoplot(pca_tpm_filtered, data=tpm_wide_filtered, colour='annotation', shape = 'project') + labs(title = 'PCA excluding outliers')
+```
+
+## UMAP on TPM
+```{r, fig.height=7, fig.width=12}
+library(umap)
+umap_tpm <- umap::umap(tpm_matrix_filtered)
+
+df <- data.frame(x = umap_tpm$layout[,1],
+                 y = umap_tpm$layout[,2],
+                 annotation = tpm_wide_filtered$annotation,
+                 project = tpm_wide_filtered$project)
+
+ggplot(df, aes(x, y, color = annotation, shape = project)) +
+  geom_point() +
+  labs(x = "UMAP1", y = "UMAP2", title = 'UMAP excluding outliers')
+```
+
