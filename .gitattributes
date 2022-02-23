@@ -1,0 +1,10 @@
+suppa_analysis/all_isoform.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/tpm_expressions.tsv filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_MX.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_RI.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_SE.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_A3.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_A5.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_AF.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/event_AL.psi filter=lfs diff=lfs merge=lfs -text
+suppa_analysis/events/*.psi filter=lfs diff=lfs merge=lfs -text

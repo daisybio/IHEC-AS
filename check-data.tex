@@ -1,0 +1,379 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+%
+\documentclass[
+]{article}
+\title{IHEC RNA-seq and Alternative Splicing}
+\author{}
+\date{\vspace{-2.5em}}
+
+\usepackage{amsmath,amssymb}
+\usepackage{lmodern}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math}
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+\hypersetup{
+  pdftitle={IHEC RNA-seq and Alternative Splicing},
+  hidelinks,
+  pdfcreator={LaTeX via pandoc}}
+\urlstyle{same} % disable monospaced font for URLs
+\usepackage[margin=1in]{geometry}
+\usepackage{color}
+\usepackage{fancyvrb}
+\newcommand{\VerbBar}{|}
+\newcommand{\VERB}{\Verb[commandchars=\\\{\}]}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\}}
+% Add ',fontsize=\small' for more characters per line
+\usepackage{framed}
+\definecolor{shadecolor}{RGB}{248,248,248}
+\newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+\newcommand{\AlertTok}[1]{\textcolor[rgb]{0.94,0.16,0.16}{#1}}
+\newcommand{\AnnotationTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textbf{\textit{#1}}}}
+\newcommand{\AttributeTok}[1]{\textcolor[rgb]{0.77,0.63,0.00}{#1}}
+\newcommand{\BaseNTok}[1]{\textcolor[rgb]{0.00,0.00,0.81}{#1}}
+\newcommand{\BuiltInTok}[1]{#1}
+\newcommand{\CharTok}[1]{\textcolor[rgb]{0.31,0.60,0.02}{#1}}
+\newcommand{\CommentTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textit{#1}}}
+\newcommand{\CommentVarTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textbf{\textit{#1}}}}
+\newcommand{\ConstantTok}[1]{\textcolor[rgb]{0.00,0.00,0.00}{#1}}
+\newcommand{\ControlFlowTok}[1]{\textcolor[rgb]{0.13,0.29,0.53}{\textbf{#1}}}
+\newcommand{\DataTypeTok}[1]{\textcolor[rgb]{0.13,0.29,0.53}{#1}}
+\newcommand{\DecValTok}[1]{\textcolor[rgb]{0.00,0.00,0.81}{#1}}
+\newcommand{\DocumentationTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textbf{\textit{#1}}}}
+\newcommand{\ErrorTok}[1]{\textcolor[rgb]{0.64,0.00,0.00}{\textbf{#1}}}
+\newcommand{\ExtensionTok}[1]{#1}
+\newcommand{\FloatTok}[1]{\textcolor[rgb]{0.00,0.00,0.81}{#1}}
+\newcommand{\FunctionTok}[1]{\textcolor[rgb]{0.00,0.00,0.00}{#1}}
+\newcommand{\ImportTok}[1]{#1}
+\newcommand{\InformationTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textbf{\textit{#1}}}}
+\newcommand{\KeywordTok}[1]{\textcolor[rgb]{0.13,0.29,0.53}{\textbf{#1}}}
+\newcommand{\NormalTok}[1]{#1}
+\newcommand{\OperatorTok}[1]{\textcolor[rgb]{0.81,0.36,0.00}{\textbf{#1}}}
+\newcommand{\OtherTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{#1}}
+\newcommand{\PreprocessorTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textit{#1}}}
+\newcommand{\RegionMarkerTok}[1]{#1}
+\newcommand{\SpecialCharTok}[1]{\textcolor[rgb]{0.00,0.00,0.00}{#1}}
+\newcommand{\SpecialStringTok}[1]{\textcolor[rgb]{0.31,0.60,0.02}{#1}}
+\newcommand{\StringTok}[1]{\textcolor[rgb]{0.31,0.60,0.02}{#1}}
+\newcommand{\VariableTok}[1]{\textcolor[rgb]{0.00,0.00,0.00}{#1}}
+\newcommand{\VerbatimStringTok}[1]{\textcolor[rgb]{0.31,0.60,0.02}{#1}}
+\newcommand{\WarningTok}[1]{\textcolor[rgb]{0.56,0.35,0.01}{\textbf{\textit{#1}}}}
+\usepackage{graphicx}
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
+\makeatother
+% Scale images if necessary, so that they will not overflow the page
+% margins by default, and it is still possible to overwrite the defaults
+% using explicit options in \includegraphics[width, height, ...]{}
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+% Set default figure placement to htbp
+\makeatletter
+\def\fps@figure{htbp}
+\makeatother
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+\usepackage{xcolor}
+\ifLuaTeX
+  \usepackage{selnolig}  % disable illegal ligatures
+\fi
+
+\begin{document}
+\maketitle
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\FunctionTok{library}\NormalTok{(data.table)}
+\CommentTok{\# data.table::setDTthreads(20)}
+\FunctionTok{library}\NormalTok{(ggplot2)}
+\FunctionTok{library}\NormalTok{(ggfortify)}
+\FunctionTok{library}\NormalTok{(ggrepel)}
+
+\NormalTok{colVar }\OtherTok{\textless{}{-}} \ControlFlowTok{function}\NormalTok{(x, }\AttributeTok{na.rm=}\ConstantTok{TRUE}\NormalTok{) \{}
+  \FunctionTok{colMeans}\NormalTok{(x}\SpecialCharTok{*}\NormalTok{x, }\AttributeTok{na.rm=}\NormalTok{na.rm) }\SpecialCharTok{{-}}\NormalTok{ (}\FunctionTok{colMeans}\NormalTok{(x, }\AttributeTok{na.rm=}\NormalTok{na.rm))}\SpecialCharTok{\^{}}\DecValTok{2}
+\NormalTok{\}}
+
+\NormalTok{pca\_plots }\OtherTok{\textless{}{-}} \ControlFlowTok{function}\NormalTok{(matrix, metadata, }\AttributeTok{title=}\ConstantTok{NULL}\NormalTok{, }\AttributeTok{color\_by=}\StringTok{\textquotesingle{}annotation\textquotesingle{}}\NormalTok{, }\AttributeTok{shape\_by=}\StringTok{\textquotesingle{}project\textquotesingle{}}\NormalTok{, }\AttributeTok{label=}\StringTok{\textquotesingle{}annotation\textquotesingle{}}\NormalTok{) \{}
+  \CommentTok{\# set NA to 0 }
+\NormalTok{  matrix[}\FunctionTok{is.na}\NormalTok{(matrix)] }\OtherTok{\textless{}{-}} \DecValTok{0}
+  
+  \CommentTok{\# filter out cols without variance}
+\NormalTok{  matrix }\OtherTok{\textless{}{-}}\NormalTok{ matrix[, }\FunctionTok{colVar}\NormalTok{(matrix) }\SpecialCharTok{!=} \DecValTok{0}\NormalTok{, drop }\OtherTok{=} \ConstantTok{FALSE}\NormalTok{]}
+  
+  \CommentTok{\# perform PCA}
+\NormalTok{  pca }\OtherTok{\textless{}{-}} \FunctionTok{prcomp}\NormalTok{(matrix, }\AttributeTok{center =} \ConstantTok{TRUE}\NormalTok{, }\AttributeTok{scale =} \ConstantTok{TRUE}\NormalTok{)}
+  
+  \CommentTok{\# compute explained variance of PCs}
+\NormalTok{  var\_explained\_tpm }\OtherTok{=} \DecValTok{100} \SpecialCharTok{*}\NormalTok{ pca}\SpecialCharTok{$}\NormalTok{sdev}\SpecialCharTok{\^{}}\DecValTok{2} \SpecialCharTok{/} \FunctionTok{sum}\NormalTok{(pca}\SpecialCharTok{$}\NormalTok{sdev}\SpecialCharTok{\^{}}\DecValTok{2}\NormalTok{)}
+  
+  \FunctionTok{return}\NormalTok{(}\FunctionTok{list}\NormalTok{(}\AttributeTok{dimred=}\NormalTok{ggplot2}\SpecialCharTok{::}\FunctionTok{autoplot}\NormalTok{(pca, }\AttributeTok{data=}\NormalTok{metadata, }\AttributeTok{colour=}\NormalTok{color\_by, }\AttributeTok{shape =}\NormalTok{ shape\_by) }\SpecialCharTok{+} \FunctionTok{labs}\NormalTok{(}\AttributeTok{title =} \FunctionTok{paste}\NormalTok{(}\StringTok{\textquotesingle{}PCA:\textquotesingle{}}\NormalTok{, title)) }\SpecialCharTok{+} \FunctionTok{geom\_text\_repel}\NormalTok{(}\FunctionTok{aes}\NormalTok{(}\AttributeTok{label=}\FunctionTok{get}\NormalTok{(label)), }\AttributeTok{min.segment.length =} \DecValTok{0}\NormalTok{, }\AttributeTok{max.overlaps =} \DecValTok{5}\NormalTok{),}
+              \AttributeTok{scree=}\FunctionTok{qplot}\NormalTok{(}\FunctionTok{seq.int}\NormalTok{(var\_explained\_tpm), var\_explained\_tpm) }\SpecialCharTok{+} 
+                \FunctionTok{geom\_line}\NormalTok{() }\SpecialCharTok{+} 
+                \FunctionTok{xlab}\NormalTok{(}\StringTok{"Principal Component"}\NormalTok{) }\SpecialCharTok{+} 
+                \FunctionTok{ylab}\NormalTok{(}\StringTok{"Percent Variance Explained"}\NormalTok{) }\SpecialCharTok{+}
+                \FunctionTok{ggtitle}\NormalTok{(}\FunctionTok{paste}\NormalTok{(}\StringTok{"Variance explained:"}\NormalTok{, title))))}
+\NormalTok{\}}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{isoform\_files }\OtherTok{\textless{}{-}} \FunctionTok{list.files}\NormalTok{(}\StringTok{\textquotesingle{}/nfs/data/IHEC/RNAseq\textquotesingle{}}\NormalTok{, }\AttributeTok{full.names =}\NormalTok{ T)}
+\NormalTok{keep\_cols }\OtherTok{\textless{}{-}} \FunctionTok{c}\NormalTok{(}\StringTok{\textquotesingle{}transcript\_id\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}gene\_id\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}TPM\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}FPKM\textquotesingle{}}\NormalTok{)}
+\NormalTok{isoform\_quants }\OtherTok{\textless{}{-}}\NormalTok{ data.table}\SpecialCharTok{::}\FunctionTok{rbindlist}\NormalTok{(}\FunctionTok{sapply}\NormalTok{(isoform\_files, data.table}\SpecialCharTok{::}\NormalTok{fread, }\AttributeTok{stringsAsFactor=}\ConstantTok{TRUE}\NormalTok{, }\AttributeTok{simplify =} \ConstantTok{FALSE}\NormalTok{, }\AttributeTok{select =}\NormalTok{ keep\_cols), }\AttributeTok{idcol =} \StringTok{\textquotesingle{}sample\textquotesingle{}}\NormalTok{)}
+
+\CommentTok{\# bring tpms to wide format}
+\NormalTok{tpm\_wide }\OtherTok{\textless{}{-}}\NormalTok{ data.table}\SpecialCharTok{::}\FunctionTok{dcast}\NormalTok{(isoform\_quants, sample }\SpecialCharTok{\textasciitilde{}}\NormalTok{ transcript\_id, }\AttributeTok{value.var =} \StringTok{\textquotesingle{}TPM\textquotesingle{}}\NormalTok{)}
+\NormalTok{tpm\_wide[, sample}\SpecialCharTok{:}\ErrorTok{=}\FunctionTok{as.factor}\NormalTok{(}\FunctionTok{gsub}\NormalTok{(}\StringTok{"\^{}.*?(IHECRE[0{-}9]\{8\}).*$"}\NormalTok{, }\StringTok{"}\SpecialCharTok{\textbackslash{}\textbackslash{}}\StringTok{1"}\NormalTok{, sample))]}
+
+\CommentTok{\# load metadata}
+\NormalTok{metadata }\OtherTok{\textless{}{-}}\NormalTok{ data.table}\SpecialCharTok{::}\FunctionTok{fread}\NormalTok{(}\StringTok{\textquotesingle{}IHEC\_metadata\_harmonization.v0.5.csv\textquotesingle{}}\NormalTok{)}
+\NormalTok{metadata[, EpiRR\_merging }\SpecialCharTok{:}\ErrorTok{=}\NormalTok{ data.table}\SpecialCharTok{::}\FunctionTok{tstrsplit}\NormalTok{(EpiRR, }\StringTok{\textquotesingle{}.\textquotesingle{}}\NormalTok{, }\AttributeTok{fixed =} \ConstantTok{TRUE}\NormalTok{)[}\DecValTok{1}\NormalTok{]]}
+\NormalTok{tpm\_wide }\OtherTok{\textless{}{-}}\NormalTok{ data.table}\SpecialCharTok{::}\FunctionTok{merge.data.table}\NormalTok{(tpm\_wide, metadata, }\AttributeTok{all.x =} \ConstantTok{TRUE}\NormalTok{, }\AttributeTok{by.x =} \StringTok{\textquotesingle{}sample\textquotesingle{}}\NormalTok{, }\AttributeTok{by.y=}\StringTok{\textquotesingle{}EpiRR\_merging\textquotesingle{}}\NormalTok{)}
+\NormalTok{tpm\_wide[, annotation }\SpecialCharTok{:}\ErrorTok{=}\NormalTok{ cell\_type]}
+\NormalTok{tpm\_wide[biomaterial\_type }\SpecialCharTok{==} \StringTok{\textquotesingle{}primary tissue\textquotesingle{}}\NormalTok{, annotation }\SpecialCharTok{:}\ErrorTok{=}\NormalTok{ tissue\_type]}
+\NormalTok{tpm\_wide[biomaterial\_type }\SpecialCharTok{==} \StringTok{\textquotesingle{}cell line\textquotesingle{}}\NormalTok{, annotation }\SpecialCharTok{:}\ErrorTok{=}\NormalTok{ line]}
+
+\CommentTok{\# keep only tpm columns}
+\NormalTok{transcript\_cols }\OtherTok{\textless{}{-}} \FunctionTok{names}\NormalTok{(tpm\_wide)[}\FunctionTok{startsWith}\NormalTok{(}\FunctionTok{names}\NormalTok{(tpm\_wide), }\StringTok{\textquotesingle{}ENST\textquotesingle{}}\NormalTok{)]}
+\NormalTok{tpm\_matrix }\OtherTok{\textless{}{-}} \FunctionTok{as.matrix}\NormalTok{(tpm\_wide[, ..transcript\_cols])}
+
+\CommentTok{\# write files for SUPPA2}
+\FunctionTok{rownames}\NormalTok{(tpm\_matrix) }\OtherTok{\textless{}{-}}\NormalTok{ tpm\_wide[, sample]}
+\NormalTok{suppa\_expr\_filename }\OtherTok{\textless{}{-}} \StringTok{\textquotesingle{}suppa\_analysis/tpm\_expressions.tsv\textquotesingle{}}
+\ControlFlowTok{if}\NormalTok{ (}\SpecialCharTok{!}\FunctionTok{file.exists}\NormalTok{(suppa\_expr\_filename)) \{}
+  \FunctionTok{write.table}\NormalTok{(}\FunctionTok{t}\NormalTok{(tpm\_matrix), }\AttributeTok{file=}\NormalTok{suppa\_expr\_filename, }\AttributeTok{sep=}\StringTok{"}\SpecialCharTok{\textbackslash{}t}\StringTok{"}\NormalTok{, }\AttributeTok{quote =} \ConstantTok{FALSE}\NormalTok{)}
+\NormalTok{\}}
+\end{Highlighting}
+\end{Shaded}
+
+\hypertarget{pca-on-tpm}{%
+\subsection{PCA on TPM}\label{pca-on-tpm}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\CommentTok{\# filter out transcripts where all samples are smaller than 1}
+\CommentTok{\# tpm\_matrix \textless{}{-} tpm\_matrix[, colSums(tpm\_matrix \textless{} 1) \textless{} nrow(tpm\_matrix), drop = FALSE]}
+
+\FunctionTok{pca\_plots}\NormalTok{(tpm\_matrix, tpm\_wide, }\StringTok{\textquotesingle{}TPM w/ outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 126 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-3-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-3-2.pdf}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\CommentTok{\# remove two outliers}
+\NormalTok{tpm\_wide\_filtered }\OtherTok{\textless{}{-}}\NormalTok{ tpm\_wide[cell\_type }\SpecialCharTok{!=} \StringTok{\textquotesingle{}sperm cell\textquotesingle{}}\NormalTok{]}
+\NormalTok{tpm\_matrix\_filtered }\OtherTok{\textless{}{-}} \FunctionTok{as.matrix}\NormalTok{(tpm\_wide\_filtered[, ..transcript\_cols])}
+
+\CommentTok{\# filter again in case outliers dominated the expression of certain transcripts}
+\CommentTok{\# tpm\_matrix\_filtered \textless{}{-} tpm\_matrix\_filtered[, colSums(tpm\_matrix\_filtered \textless{} 1) \textless{} nrow(tpm\_matrix\_filtered), drop = FALSE]}
+
+\FunctionTok{pca\_plots}\NormalTok{(tpm\_matrix\_filtered, tpm\_wide\_filtered, }\StringTok{\textquotesingle{}TPM w/o outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 110 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-4-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-4-2.pdf}
+
+\hypertarget{umap-on-tpm}{%
+\subsection{UMAP on TPM}\label{umap-on-tpm}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\FunctionTok{library}\NormalTok{(umap)}
+\NormalTok{umap\_tpm }\OtherTok{\textless{}{-}}\NormalTok{ umap}\SpecialCharTok{::}\FunctionTok{umap}\NormalTok{(tpm\_matrix\_filtered)}
+
+\NormalTok{df }\OtherTok{\textless{}{-}} \FunctionTok{data.frame}\NormalTok{(}\AttributeTok{x =}\NormalTok{ umap\_tpm}\SpecialCharTok{$}\NormalTok{layout[,}\DecValTok{1}\NormalTok{],}
+                 \AttributeTok{y =}\NormalTok{ umap\_tpm}\SpecialCharTok{$}\NormalTok{layout[,}\DecValTok{2}\NormalTok{],}
+                 \AttributeTok{annotation =}\NormalTok{ tpm\_wide\_filtered}\SpecialCharTok{$}\NormalTok{annotation,}
+                 \AttributeTok{project =}\NormalTok{ tpm\_wide\_filtered}\SpecialCharTok{$}\NormalTok{project)}
+
+\FunctionTok{ggplot}\NormalTok{(df, }\FunctionTok{aes}\NormalTok{(x, y, }\AttributeTok{color =}\NormalTok{ annotation, }\AttributeTok{shape =}\NormalTok{ project, }\AttributeTok{label=}\NormalTok{annotation)) }\SpecialCharTok{+}
+  \FunctionTok{geom\_point}\NormalTok{() }\SpecialCharTok{+}
+  \FunctionTok{geom\_text\_repel}\NormalTok{( }\AttributeTok{min.segment.length =} \DecValTok{0}\NormalTok{, }\AttributeTok{max.overlaps =} \DecValTok{5}\NormalTok{) }\SpecialCharTok{+}
+  \FunctionTok{labs}\NormalTok{(}\AttributeTok{x =} \StringTok{"UMAP1"}\NormalTok{, }\AttributeTok{y =} \StringTok{"UMAP2"}\NormalTok{, }\AttributeTok{title =} \StringTok{\textquotesingle{}UMAP: TPM w/o outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## Warning: ggrepel: 123 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-5-1.pdf}
+
+\hypertarget{pca-on-isoform-usage}{%
+\subsection{PCA on Isoform Usage}\label{pca-on-isoform-usage}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{isoform\_usages }\OtherTok{\textless{}{-}} \FunctionTok{t}\NormalTok{(}\FunctionTok{as.matrix}\NormalTok{(}\FunctionTok{read.table}\NormalTok{(}\StringTok{\textquotesingle{}suppa\_analysis/all\_isoform.psi\textquotesingle{}}\NormalTok{, }\AttributeTok{header=}\ConstantTok{TRUE}\NormalTok{, }\AttributeTok{sep=}\StringTok{"}\SpecialCharTok{\textbackslash{}t}\StringTok{"}\NormalTok{)))}
+
+\FunctionTok{pca\_plots}\NormalTok{(isoform\_usages, tpm\_wide, }\StringTok{\textquotesingle{}IU w/ outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 132 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-6-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-6-2.pdf}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{isoform\_usages\_filtered }\OtherTok{\textless{}{-}}\NormalTok{ isoform\_usages[tpm\_wide\_filtered[, sample],]}
+
+\FunctionTok{pca\_plots}\NormalTok{(isoform\_usages\_filtered, tpm\_wide\_filtered, }\StringTok{\textquotesingle{}IU w/o outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 122 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-7-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-7-2.pdf}
+
+\hypertarget{pca-on-as-events-psi-values}{%
+\subsection{PCA on AS events (PSI
+values)}\label{pca-on-as-events-psi-values}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{psi\_files }\OtherTok{\textless{}{-}} \FunctionTok{list.files}\NormalTok{(}\StringTok{\textquotesingle{}suppa\_analysis/events\textquotesingle{}}\NormalTok{, }\AttributeTok{pattern =} \StringTok{\textquotesingle{}}\SpecialCharTok{\textbackslash{}\textbackslash{}}\StringTok{.psi$\textquotesingle{}}\NormalTok{, }\AttributeTok{full.names =} \ConstantTok{TRUE}\NormalTok{)}
+\NormalTok{psi\_table }\OtherTok{\textless{}{-}} \FunctionTok{do.call}\NormalTok{(cbind, }\FunctionTok{lapply}\NormalTok{(psi\_files, }\ControlFlowTok{function}\NormalTok{(f) }\FunctionTok{t}\NormalTok{(}\FunctionTok{as.matrix}\NormalTok{(}\FunctionTok{read.table}\NormalTok{(f, }\AttributeTok{header=}\ConstantTok{TRUE}\NormalTok{, }\AttributeTok{sep=}\StringTok{"}\SpecialCharTok{\textbackslash{}t}\StringTok{"}\NormalTok{)))))}
+
+\FunctionTok{pca\_plots}\NormalTok{(psi\_table, tpm\_wide, }\StringTok{\textquotesingle{}PSI w/ outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 132 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-8-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-8-2.pdf}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{psi\_table\_filtered }\OtherTok{\textless{}{-}}\NormalTok{ psi\_table[tpm\_wide\_filtered[, sample],]}
+
+\FunctionTok{pca\_plots}\NormalTok{(psi\_table\_filtered, tpm\_wide\_filtered, }\StringTok{\textquotesingle{}PSI w/o outliers\textquotesingle{}}\NormalTok{)}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{verbatim}
+## $dimred
+\end{verbatim}
+
+\begin{verbatim}
+## Warning: ggrepel: 116 unlabeled data points (too many overlaps). Consider
+## increasing max.overlaps
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-9-1.pdf}
+
+\begin{verbatim}
+## 
+## $scree
+\end{verbatim}
+
+\includegraphics{check-data_files/figure-latex/unnamed-chunk-9-2.pdf}
+
+\end{document}
