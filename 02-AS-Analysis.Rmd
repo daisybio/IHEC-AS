@@ -1,0 +1,55 @@
+---
+title: "AS Analysis"
+output: html_notebook
+---
+
+## download
+```{bash, eval = FALSE}
+cd suppa_analysis
+wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
+gunzip gencode.v29.annotation.gtf.gz
+```
+
+## install suppa and generate events
+```{bash, eval=FALSE, engine.opts="-l"}
+mkdir -p suppa_analysis
+cd suppa_analysis
+conda activate ihec-as
+conda install -y -c bioconda suppa==2.3
+```
+
+
+## psi per isoform
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+suppa.py generateEvents -i gencode.v29.annotation.gtf -o gencode.v29.isoform -f ioi --pool-genes
+suppa.py psiPerIsoform -g gencode.v29.annotation.gtf -e tpm_expressions.tsv -o all -m INFO
+```
+
+## psi per event
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+mkdir -p events/TPM1
+suppa.py generateEvents -i gencode.v29.annotation.gtf -o events/gencode.v29.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i events/gencode.v29.events_${event}_strict.ioe -e tpm_expressions.tsv -o events/event_${event} -m INFO
+    suppa.py psiPerEvent -i events/gencode.v29.events_${event}_strict.ioe -e tpm_expressions.tsv -o events/TPM1/event_${event} -m INFO -f 1
+done
+```
+
+
+
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+mkdir -p events/unpooled/TPM1
+suppa.py generateEvents -i gencode.v29.annotation.gtf -o events/unpooled/gencode.v29.events -f ioe -e SE SS MX RI FL
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i events/gencode.v29.events_${event}_strict.ioe -e tpm_expressions.tsv -o events/unpooled/event_${event} -m INFO
+    suppa.py psiPerEvent -i events/gencode.v29.events_${event}_strict.ioe -e tpm_expressions.tsv -o events/unpooled/TPM1/event_${event} -m INFO -f 1
+done
+```

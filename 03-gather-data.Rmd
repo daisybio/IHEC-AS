@@ -1,0 +1,132 @@
+---
+title: "Match Data"
+output: 
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(data.table)
+library(pbmcapply)
+library(rtracklayer)
+options(mc.cores = parallel::detectCores()/2)
+data_dir <- '/nfs/data/IHEC/RNAseq'
+rna_data_dir <- file.path(data_dir, 'RNA-Seq')
+chip_data_dir <- file.path(data_dir, 'ChIP-Seq')
+wgbs_data_dir <- file.path(data_dir, 'WGBS')
+```
+
+## get RNA files
+
+```{r, eval=FALSE}
+
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+mounted_rna_files <- list.files('~/ihec-incoming/RNA-Seq', '*\\.isoforms\\.results$', full.names = TRUE, recursive = T)
+local_rna_files <- file.path(rna_data_dir, basename(mounted_rna_files))
+
+# if (!all(file.exists(local_rna_files)))
+# pbmcapply::pbmcmapply(function(f, t) {
+#   if (!file.exists(t))
+#     file.copy(f, t)
+#   else setNames(f, 'already there')}, mounted_rna_files, local_rna_files)
+```
+
+### check RNA files
+
+```{r}
+# check the rna-seq metadata file first
+rna_samples <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
+rna_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+
+# now check the files that are actually available
+isoform_files_available <- list.files(rna_data_dir, pattern = '\\.isoforms\\.results$')
+isoform_epirr_available <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files_available)
+
+if (length(setdiff(rna_samples[, epirr_id_wo_version], isoform_epirr_available)) > 0) {
+  print(paste('in metadata file but no isoform file:', paste(rna_samples[!epirr_id_wo_version %in% isoform_epirr_available, epirr_id_wo_version], collapse = ', ')))
+  print(paste('isoform file but not in metadata file:', paste(isoform_files_available[!isoform_epirr_available %in% rna_samples[, epirr_id_wo_version]], collapse = ', ')))
+}
+```
+
+## get ChIP files
+
+```{r}
+histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
+histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+
+histone_samples_available <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(chip_data_dir, '\\.signal\\.bigwig$'))))
+
+if (length(setdiff(histone_samples[, epirr_id_wo_version], histone_samples_available)) > 0) {
+  print(paste('in metadata file but no signal file:', paste(histone_samples[!epirr_id_wo_version %in% histone_samples_available, epirr_id_wo_version], collapse = ', ')))
+  print(paste('signal file but not in metadata file:', paste(histone_samples_available[!histone_samples_available %in% histone_samples[, epirr_id_wo_version]], collapse = ', ')))
+}
+
+rna_samples_w_chip <- rna_samples[epirr_id_wo_version %in% histone_samples_available]
+rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+```
+
+
+```{r, eval=FALSE}
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+files_to_download <- paste0('.*(', paste(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.signal.bigwig$')
+mounted_chip_files <- list.files('~/ihec-incoming/ChIP-Seq', files_to_download, full.names = TRUE, recursive = TRUE)
+local_chip_files <- file.path(chip_data_dir, basename(mounted_chip_files))
+print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
+
+chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_chip_files[!file.exists(local_chip_files)], fixed = T))
+
+n_chunks <- 10
+chunked_chip_get_commands <- split(chip_get_commands, cut(seq_along(chip_get_commands), n_chunks, labels = FALSE))
+lapply(seq(n_chunks), function(chunk_id){
+  fileConn <- file(file.path(chip_data_dir, sprintf("chip_%02d.txt", chunk_id)))
+  writeLines(chunked_chip_get_commands[[chunk_id]], fileConn)
+  close(fileConn)
+})
+
+```
+
+## get WGBS files
+
+```{r}
+wgbs_samples <- fread(file.path(data_dir, 'ihec_metadata_wgbs.csv'))
+wgbs_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+
+
+wgbs_samples_available <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(wgbs_data_dir, '\\.gembs_(pos|neg)\\.bw$'))))
+
+if (length(setdiff(wgbs_samples[, epirr_id_wo_version], wgbs_samples_available)) > 0) {
+  print(paste('in metadata file but no signal file:', paste(wgbs_samples[!epirr_id_wo_version %in% wgbs_samples_available, epirr_id_wo_version], collapse = ', ')))
+  print(paste('signal file but not in metadata file:', paste(wgbs_samples_available[!wgbs_samples_available %in% wgbs_samples[, epirr_id_wo_version]], collapse = ', ')))
+}
+
+rna_samples_w_wgbs <- rna_samples[epirr_id_wo_version %in% wgbs_samples_available]
+rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+```
+
+
+```{r, eval=FALSE}
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+files_to_download <- paste0('.*(', paste(wgbs_rna_samples[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.gembs_(neg|pos).bw$')
+
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+mounted_wgbs_files <- list.files('~/ihec-incoming/WGBS', files_to_download, full.names = TRUE, recursive = T)
+local_wgbs_files <- file.path(wgbs_data_dir, basename(mounted_wgbs_files))
+print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
+
+wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_wgbs_files[!file.exists(local_wgbs_files)], fixed = T))
+
+n_chunks <- 10
+chunked_get_commands <- split(wgbs_get_commands, cut(seq_along(wgbs_get_commands), n_chunks, labels = FALSE))
+lapply(seq(n_chunks), function(chunk_id){
+  fileConn <- file(file.path(wgbs_data_dir, sprintf("wgbs_%02d.txt", chunk_id)))
+  writeLines(chunked_get_commands[[chunk_id]], fileConn)
+  close(fileConn)
+})
+
+# if (!all(file.exists(local_wgbs_files)))
+# pbmcapply::pbmcmapply(mc.cores = 1, function(f, t) {
+#   if (!file.exists(t))
+#     system(paste('cp', f, t)) 
+#   else setNames(f, 'already there')}, mounted_wgbs_files, local_wgbs_files)
+```
+
