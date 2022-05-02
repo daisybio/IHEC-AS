@@ -14,21 +14,27 @@ data_dir <- '/nfs/data/IHEC/RNAseq'
 rna_data_dir <- file.path(data_dir, 'RNA-Seq')
 chip_data_dir <- file.path(data_dir, 'ChIP-Seq')
 wgbs_data_dir <- file.path(data_dir, 'WGBS')
+write_chunked_files <- function(commands, n_chunks, name, folder) {
+  chunked_commands <- ifelse(n_chunks == 1, list(commands), split(commands, cut(seq_along(commands), n_chunks, labels = FALSE)))
+  lapply(seq(n_chunks), function(chunk_id){
+    fileConn <- file(file.path(folder, sprintf("%s_%02d.txt", name, chunk_id)))
+    writeLines(chunked_commands[[chunk_id]], fileConn)
+    close(fileConn)
+  })
+}
 ```
 
 ## get RNA files
 
-```{r, eval=FALSE}
+```{r}
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 mounted_rna_files <- list.files('~/ihec-incoming/RNA-Seq', '*\\.isoforms\\.results$', full.names = TRUE, recursive = T)
 local_rna_files <- file.path(rna_data_dir, basename(mounted_rna_files))
+print(100*round(sum(file.exists(local_rna_files))/length(local_rna_files), 5))
 
-# if (!all(file.exists(local_rna_files)))
-# pbmcapply::pbmcmapply(function(f, t) {
-#   if (!file.exists(t))
-#     file.copy(f, t)
-#   else setNames(f, 'already there')}, mounted_rna_files, local_rna_files)
+rna_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_rna_files[!file.exists(local_rna_files)], fixed = T))
+write_chunked_files(rna_get_commands, 1, 'rna', rna_data_dir)
 ```
 
 ### check RNA files
@@ -66,22 +72,16 @@ rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[rna_seq_type != 'total
 ```
 
 
-```{r, eval=FALSE}
+```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-files_to_download <- paste0('.*(', paste(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.signal.bigwig$')
+files_to_download <- paste0('.*(', paste(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.(fc.signal.bigwig|pval0.01.500K.bfilt.narrowPeak.gz)$')
 mounted_chip_files <- list.files('~/ihec-incoming/ChIP-Seq', files_to_download, full.names = TRUE, recursive = TRUE)
 local_chip_files <- file.path(chip_data_dir, basename(mounted_chip_files))
 print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
 
 chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_chip_files[!file.exists(local_chip_files)], fixed = T))
 
-n_chunks <- 10
-chunked_chip_get_commands <- split(chip_get_commands, cut(seq_along(chip_get_commands), n_chunks, labels = FALSE))
-lapply(seq(n_chunks), function(chunk_id){
-  fileConn <- file(file.path(chip_data_dir, sprintf("chip_%02d.txt", chunk_id)))
-  writeLines(chunked_chip_get_commands[[chunk_id]], fileConn)
-  close(fileConn)
-})
+write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
 
 ```
 
@@ -104,9 +104,9 @@ rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total
 ```
 
 
-```{r, eval=FALSE}
+```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-files_to_download <- paste0('.*(', paste(wgbs_rna_samples[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.gembs_(neg|pos).bw$')
+files_to_download <- paste0('.*(', paste(rna_samples_w_wgbs[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.gembs_(neg|pos).bw$')
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 mounted_wgbs_files <- list.files('~/ihec-incoming/WGBS', files_to_download, full.names = TRUE, recursive = T)
@@ -115,18 +115,6 @@ print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
 
 wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_wgbs_files[!file.exists(local_wgbs_files)], fixed = T))
 
-n_chunks <- 10
-chunked_get_commands <- split(wgbs_get_commands, cut(seq_along(wgbs_get_commands), n_chunks, labels = FALSE))
-lapply(seq(n_chunks), function(chunk_id){
-  fileConn <- file(file.path(wgbs_data_dir, sprintf("wgbs_%02d.txt", chunk_id)))
-  writeLines(chunked_get_commands[[chunk_id]], fileConn)
-  close(fileConn)
-})
-
-# if (!all(file.exists(local_wgbs_files)))
-# pbmcapply::pbmcmapply(mc.cores = 1, function(f, t) {
-#   if (!file.exists(t))
-#     system(paste('cp', f, t)) 
-#   else setNames(f, 'already there')}, mounted_wgbs_files, local_wgbs_files)
+write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
 ```
 
