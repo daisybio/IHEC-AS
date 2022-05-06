@@ -6,22 +6,20 @@ output:
 ---
 
 ```{r}
-library(data.table)
-library(pbmcapply)
-library(rtracklayer)
-options(mc.cores = parallel::detectCores()/2)
-data_dir <- '/nfs/data/IHEC/RNAseq'
-rna_data_dir <- file.path(data_dir, 'RNA-Seq')
-chip_data_dir <- file.path(data_dir, 'ChIP-Seq')
-wgbs_data_dir <- file.path(data_dir, 'WGBS')
 write_chunked_files <- function(commands, n_chunks, name, folder) {
-  chunked_commands <- ifelse(n_chunks == 1, list(commands), split(commands, cut(seq_along(commands), n_chunks, labels = FALSE)))
+  if (n_chunks == 1)
+    chunked_commands <- list(commands)
+  else 
+    chunked_commands <- split(commands, cut(seq_along(commands), n_chunks, labels = FALSE))
   lapply(seq(n_chunks), function(chunk_id){
     fileConn <- file(file.path(folder, sprintf("%s_%02d.txt", name, chunk_id)))
     writeLines(chunked_commands[[chunk_id]], fileConn)
     close(fileConn)
   })
 }
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+system("find ~/ihec-incoming -name '*' > all_files.txt")
+all_files <- readLines(file.path(data_dir, 'all_files.txt'))
 ```
 
 ## get RNA files
@@ -29,7 +27,7 @@ write_chunked_files <- function(commands, n_chunks, name, folder) {
 ```{r}
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-mounted_rna_files <- list.files('~/ihec-incoming/RNA-Seq', '*\\.isoforms\\.results$', full.names = TRUE, recursive = T)
+mounted_rna_files <- all_files[grep('/nfs/home/students/ga89koc/ihec-incoming/RNA-Seq/.*\\.isoforms\\.results$', all_files)]
 local_rna_files <- file.path(rna_data_dir, basename(mounted_rna_files))
 print(100*round(sum(file.exists(local_rna_files))/length(local_rna_files), 5))
 
@@ -60,28 +58,29 @@ if (length(setdiff(rna_samples[, epirr_id_wo_version], isoform_epirr_available))
 histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
 histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
 
-histone_samples_available <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(chip_data_dir, '\\.signal\\.bigwig$'))))
+histone_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(chip_data_dir))))
 
-if (length(setdiff(histone_samples[, epirr_id_wo_version], histone_samples_available)) > 0) {
-  print(paste('in metadata file but no signal file:', paste(histone_samples[!epirr_id_wo_version %in% histone_samples_available, epirr_id_wo_version], collapse = ', ')))
-  print(paste('signal file but not in metadata file:', paste(histone_samples_available[!histone_samples_available %in% histone_samples[, epirr_id_wo_version]], collapse = ', ')))
-}
+# if (length(setdiff(histone_samples[, epirr_id_wo_version], histone_samples_available)) > 0) {
+#   print(paste('in metadata file but no signal file:', paste(histone_samples[!epirr_id_wo_version %in% histone_samples_available, epirr_id_wo_version], collapse = ', ')))
+#   print(paste('signal file but not in metadata file:', paste(histone_samples_available[!histone_samples_available %in% histone_samples[, epirr_id_wo_version]], collapse = ', ')))
+# }
 
-rna_samples_w_chip <- rna_samples[epirr_id_wo_version %in% histone_samples_available]
+rna_samples_w_chip <- rna_samples[epirr_id_wo_version %in% histone_samples[, epirr_id_wo_version]]
 rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
 ```
 
 
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-files_to_download <- paste0('.*(', paste(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.(fc.signal.bigwig|pval0.01.500K.bfilt.narrowPeak.gz)$')
-mounted_chip_files <- list.files('~/ihec-incoming/ChIP-Seq', files_to_download, full.names = TRUE, recursive = TRUE)
+files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/ChIP-Seq/.*(', paste(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$')
+
+mounted_chip_files <-  all_files[grep(files_to_download, all_files)]
 local_chip_files <- file.path(chip_data_dir, basename(mounted_chip_files))
 print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
 
 chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_chip_files[!file.exists(local_chip_files)], fixed = T))
 
-write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
+write_chunked_files(chip_get_commands, 5, 'chip', chip_data_dir)
 
 ```
 
@@ -92,29 +91,30 @@ wgbs_samples <- fread(file.path(data_dir, 'ihec_metadata_wgbs.csv'))
 wgbs_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
 
 
-wgbs_samples_available <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(wgbs_data_dir, '\\.gembs_(pos|neg)\\.bw$'))))
+wgbs_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(wgbs_data_dir, '\\.gembs_(pos|neg)\\.bw$'))))
 
-if (length(setdiff(wgbs_samples[, epirr_id_wo_version], wgbs_samples_available)) > 0) {
-  print(paste('in metadata file but no signal file:', paste(wgbs_samples[!epirr_id_wo_version %in% wgbs_samples_available, epirr_id_wo_version], collapse = ', ')))
-  print(paste('signal file but not in metadata file:', paste(wgbs_samples_available[!wgbs_samples_available %in% wgbs_samples[, epirr_id_wo_version]], collapse = ', ')))
-}
+# if (length(setdiff(wgbs_samples[, epirr_id_wo_version], wgbs_samples_available)) > 0) {
+#   print(paste('in metadata file but no signal file:', paste(wgbs_samples[!epirr_id_wo_version %in% wgbs_samples_available, epirr_id_wo_version], collapse = ', ')))
+#   print(paste('signal file but not in metadata file:', paste(wgbs_samples_available[!wgbs_samples_available %in% wgbs_samples[, epirr_id_wo_version]], collapse = ', ')))
+# }
 
-rna_samples_w_wgbs <- rna_samples[epirr_id_wo_version %in% wgbs_samples_available]
+rna_samples_w_wgbs <- rna_samples[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version]]
 rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
 ```
 
 
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-files_to_download <- paste0('.*(', paste(rna_samples_w_wgbs[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.gembs_(neg|pos).bw$')
+files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/.*(', paste(rna_samples_w_wgbs[, sort(unique(epirr_id_wo_version))], collapse = '|'), ').*.gembs_(neg|pos).bw$')
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-mounted_wgbs_files <- list.files('~/ihec-incoming/WGBS', files_to_download, full.names = TRUE, recursive = T)
+mounted_wgbs_files <- all_files[grep(files_to_download, all_files)]
 local_wgbs_files <- file.path(wgbs_data_dir, basename(mounted_wgbs_files))
 print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
 
 wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', mounted_wgbs_files[!file.exists(local_wgbs_files)], fixed = T))
 
-write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
+write_chunked_files(wgbs_get_commands, 5, 'wgbs', wgbs_data_dir)
 ```
+
 

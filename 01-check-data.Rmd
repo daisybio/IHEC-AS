@@ -80,11 +80,11 @@ metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor O
 Load Isoform Quantifications:
 
 ```{r}
-rna_metadata <- fread('/nfs/data/IHEC/RNAseq/ihec_metadata_rna.csv')
+rna_metadata <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
 rna_metadata[, EpiRR_no_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
 multiple_RNAs <- rna_metadata[, if(.N == 2) .(uuid, rna_seq_type), by=EpiRR_no_version]
 
-isoform_files <- list.files('/nfs/data/IHEC/RNAseq/RNA-Seq', pattern = '\\.isoforms\\.results$', full.names = T)
+isoform_files <- list.files(rna_data_dir, pattern = '\\.isoforms\\.results$', full.names = T)
 isoform_files <- isoform_files[!grepl(multiple_RNAs[rna_seq_type == 'total-RNA-Seq', paste(uuid, collapse = '|')], isoform_files)]
 keep_cols <- c('transcript_id', 'gene_id', 'TPM', 'FPKM')
 isoform_quants <- data.table::rbindlist(sapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, simplify = FALSE, select = keep_cols), idcol = 'EpiRR')

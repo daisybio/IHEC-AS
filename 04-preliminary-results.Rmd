@@ -41,9 +41,10 @@ rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total
 
 
 ```{r}
+psi_input_dir <- "suppa_analysis/events/filtered_annotation/TPM1"
 event_res <- sapply(as_events, function(event) {
 	# load psi values
-  event_dt <- fread(paste0('suppa_analysis/events/TPM1/event_', event, '.psi'))
+  event_dt <- fread(paste0(psi_input_dir, '/event_', event, '.psi'))
   setnames(event_dt, 'V1', 'event')
   # get all the samples that are also in the metadata and filter
   samples_to_consider <- intersect(names(event_dt), rna_samples[, epirr_id_wo_version])
@@ -77,8 +78,7 @@ event_res <- sapply(as_events, function(event) {
   self_hits <- findOverlaps(all_gr)
   non_overlapping <- self_hits@from[which(!(duplicated(self_hits@from) | duplicated(self_hits@from, fromLast = TRUE)))]
   single_genes_only <- event_dt[-event_dt[, grep('_and_', gene_id, fixed = TRUE)], ID]
-  single_genes_non_overlapping <- intersect(non_overlapping, single_genes_only)
-  list(event_dt = event_dt[, c('ID', 'gene_id', 'seqnames', 'strand', ..samples_to_consider)], event_gr = event_gr, upstream_gr = upstream_gr, downstream_gr = downstream_gr, single_genes_non_overlapping = single_genes_non_overlapping)
+  list(event_dt = event_dt[, c('ID', 'gene_id', 'seqnames', 'strand', ..samples_to_consider)], event_gr = event_gr, upstream_gr = upstream_gr, downstream_gr = downstream_gr, single_genes_only = single_genes_only, non_overlapping = non_overlapping)
 }, simplify = FALSE)
 ```
 
@@ -90,7 +90,7 @@ var_events <- sapply(names(event_res), function(event) {
   this_event <- event_res[[event]]
   event_mat <- as.matrix(this_event[['event_dt']][, ..samples_with_epi])
   event_mat[is.nan(event_mat)] <- NA
-  events_to_consider <- intersect(this_event[['single_genes_non_overlapping']], which(apply(event_mat, 1, function(r) sum(is.na(r)) < (length(r) - 1))))
+  events_to_consider <- intersect(this_event[['non_overlapping']], which(apply(event_mat, 1, function(r) sum(is.na(r)) < (length(r) - 1))))
   
   # check event psi variation
   event_psi_sd <- apply(event_mat, 1, sd, na.rm = TRUE)
@@ -115,12 +115,14 @@ event_dt <- data.table()
 event_gr <- GRanges()
 upstream_gr <- GRanges()
 downstream_gr <- GRanges()
-single_genes_non_overlapping <- integer()
+single_genes_only <- integer()
+non_overlapping <- integer()
 for (event_name in names(event_res)) {
   this_dt <- event_res[[event_name]]$event_dt
   this_max_ID <- this_dt[, max(ID)]
   var_events[[event_name]] <- sapply(var_events[[event_name]], function(ids) ids + max_ID, simplify = FALSE)
-  single_genes_non_overlapping <- c(single_genes_non_overlapping, event_res[[event_name]]$single_genes_non_overlapping + max_ID)
+  single_genes_only <- c(single_genes_only, event_res[[event_name]]$single_genes_only + max_ID)
+  non_overlapping <- c(non_overlapping, event_res[[event_name]]$non_overlapping + max_ID)
   event_gr <- c(event_gr, event_res[[event_name]]$event_gr)
   upstream_gr <- c(upstream_gr, event_res[[event_name]]$upstream_gr)
   downstream_gr <- c(downstream_gr, event_res[[event_name]]$downstream_gr)
@@ -133,14 +135,15 @@ stopifnot(event_dt[, max(ID)] == nrow(event_dt))
 ```
 
 ```{r}
-if (file.exists('aggregated_regions.rds')) {
-  aggregated_data <- readRDS('aggregated_regions.rds')
+aggregated_file_path <- file.path(psi_input_dir, 'aggregated_regions.rds')
+if (file.exists(aggregated_file_path)) {
+  aggregated_data <- readRDS(aggregated_file_path)
 } else {
   source('aggregating_helper.R')
   samples_to_consider <- names(event_dt)[startsWith(names(event_dt), "IHECRE") ]
   aggregated_data <- aggregate_multiple_samples(samples_to_consider, event_dt, event_gr, upstream_gr, downstream_gr)
   names(aggregated_data) <- samples_to_consider
-  saveRDS(aggregated_data, 'aggregated_regions.rds')
+  saveRDS(aggregated_data, aggregated_file_path)
 }
 
 # at some point rename event_name and other_region with ifelse(event_name == 'SE', 'intron', 'exon')
@@ -176,7 +179,7 @@ metadata[biomaterial_type == 'cell line', annotation := line]
 metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
 ```
 
-```{r, fig.width=10, fig.height=8}
+```{r, fig.width=16, fig.height=10}
 library(pheatmap)
 library(ggplot2)
 for (entry in aggregated_data) {
@@ -196,14 +199,29 @@ aggregated_dt[event_dt, on = .(ID), event := event_name]
 for (event_name in event_dt[, unique(event_name)]) 
 print(ggplot(aggregated_dt[event == event_name & IHEC %in% aggregated_dt[, sample(unique(IHEC), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + theme_bw() + facet_wrap(. ~ IHEC) + labs(title = event_name))
 
+max_cor_cols <- keep_cols(aggregated_dt, aggregation)
+aggregated_dt_intermediate <- aggregated_dt[, ..max_cor_cols]
+
 unlisted_vars <- unlist(unname(var_events), recursive = FALSE)
 cor_dt <- rbindlist(sapply(unique(names(unlisted_vars)), function(var){
   var_ids <- unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE)
   aggregated_dt[ID %in% var_ids, lapply(.SD[, -c('ID', 'PSI')], function(y) suppressWarnings(cor(y, PSI, use = 'na', method = cor_method))), by = .(event, IHEC)]
 }, simplify = FALSE), idcol = 'variance quartile')
 
-max_cor_cols <- keep_cols(cor_dt, aggregation)
-cor_dt_intermediate <- cor_dt[, ..max_cor_cols]
+
+for (event_name in event_dt[, unique(event_name)]) {
+  var_events_type <- var_events[[event_type]]
+  for (var_threshold in names(var_events_type)) {
+    cor_dt_event_var <- cor_dt_intermediate[event == event_name & `variance quartile` == var_threshold]
+    cor_mat <- as.matrix(cor_dt_event_var[, -c('IHEC', 'event', 'variance quartile')])
+    rownames(cor_mat) <- cor_dt_event_var[, IHEC]
+    breaks <- seq(-.2, .2, by = .01)
+    annotation_df <- metadata[EpiRR_no_version %in% samples_with_epi, data.frame(annotation = annotation, row.names = EpiRR_no_version)]
+    pheatmap(t(cor_mat[samples_with_epi, ])[, rownames(annotation_df)[order(annotation_df$annotation)]], color = colorRampPalette(c("red", "white", "blue"))(length(breaks)), breaks = breaks,
+             annotation_col = annotation_df, cluster_cols = FALSE, main = paste(event_name, ': PSI Variance Quantile:', var_threshold))
+  }
+}
+
 colnames(cor_dt_intermediate) <- gsub('_max', '', colnames(cor_dt_intermediate), fixed = TRUE)
 melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'variance quartile', 'event'), variable.name = 'feature', value.name = 'correlation w/ PSI')
 melt_cor_dt[event == 'SE', feature := gsub('other_region', 'intron', feature, fixed=TRUE)]
@@ -213,12 +231,32 @@ melt_cor_dt[event == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TR
 melt_cor_dt[, median_cor:=median(`correlation w/ PSI`, na.rm = TRUE), by = c('feature', 'event', 'variance quartile')]
 melt_cor_dt[, relevant:=any(abs(median_cor > .05)), by = c('event', 'feature', 'variance quartile')]
 
-subset_cor_dt <- melt_cor_dt[`variance quartile` %in% c('0', '0.9')]
+subset_cor_dt <- melt_cor_dt[`variance quartile` %in% c('0', '0.8')]
 subset_cor_dt[, relevant := any(relevant), by = .(feature, event)]
 
 breaks <- seq(-.2, .2, by = .01)
 print(ggplot(subset_cor_dt[relevant == TRUE], aes(x = `correlation w/ PSI`, y = reorder(feature, -`correlation w/ PSI`, FUN = median, na.rm = TRUE), color = `variance quartile`)) + theme_bw() + geom_boxplot(aes(fill = median_cor)) + scale_fill_gradientn(colours = colorRampPalette(c("red", "white", "blue"))(length(breaks)), breaks = seq(-.2, .2, by = .1), limits = c(-.2, .2)) + scale_colour_manual(values = c('dark grey', 'black')) + ylab('feature') + facet_grid(event ~ ., scales="free_y"))
 ```
+
+
+```{r}
+library(kohonen)
+for (event_name in aggregated_dt_intermediate[, unique(event)]) {
+  
+  # x <- as.matrix(aggregated_dt_intermediate[event == event_name & ID %in% non_overlapping, -c('IHEC', 'ID', 'PSI', 'event')])
+  # y <- aggregated_dt_intermediate[event == event_name & ID %in% non_overlapping, PSI]
+  # som <- xyf(x, y, mode = 'pbatch', cores = ncores)
+  
+  feature_data <- aggregated_dt_intermediate[event == event_name & ID %in% non_overlapping, -c('IHEC', 'ID', 'event')]
+  response <- 'PSI'
+  explanatory <- names(feature_data)[names(feature_data) != response]
+  feature_data[, (names(feature_data)) := lapply(names(feature_data), function(x) scale(get(x)))]
+  linear_model <- lm(formula(paste(response, '~', paste(explanatory, collapse = ' + '))), feature_data)
+  summary(linear_model)
+}
+aggregated_dt_intermediate
+```
+
 
 
 ```{r, fig.width = 18, fig.height = 8, eval=FALSE}
@@ -255,7 +293,7 @@ for (var_threshold in names(var_events)) {
 }
 ```
 
-```{r}
+```{r, eval = FALSE}
 se_max_cols <- keep_cols(se_dt, aggregation)
 feature_data <- se_dt[, ..se_max_cols][, -c('IHEC', 'ID')]
 response <- 'PSI'

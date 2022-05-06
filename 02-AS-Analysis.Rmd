@@ -40,6 +40,20 @@ do
 done
 ```
 
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+dir_path=events/filtered_annotation
+mkdir -p ${dir_path}/TPM1
+grep -e "level [12]" gencode.v29.annotation.gtf | grep "transcript_type \"protein_coding\";" > ${dir_path}/gencode.v29.filtered_annotation.gtf
+suppa.py generateEvents -i ${dir_path}/gencode.v29.filtered_annotation.gtf -o ${dir_path}/gencode.v29.filtered_annotation.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.filtered_annotation.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.filtered_annotation.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/TPM1/event_${event} -m INFO -f 1
+done
+```
+
 
 
 ```{bash, engine.opts="-l"}
