@@ -1,7 +1,8 @@
-aggregate_hits <- function(hits, signal_gr, peak = FALSE){
+aggregate_hits <- function(merge_dt, name, hits, signal_gr, peak = FALSE){
   if (peak){
     # merge_dt[, paste(region_name, 'presence', sep = '_') := ID %in% from(hits)]
-    res_dt <- data.table(ID=from(hits))[, .(value=.N, aggregation=factor('peak_count')), by=ID]
+    tmp_dt <- data.table(ID=from(hits))[, .(peak_count=.N), by=ID]
+    merge_dt[tmp_dt, on=.(ID), (paste(name, 'peak_count', sep = ';')):=peak_count]
     
     # region_gr is an already aggregated data table if peak is true and enhancers are aggregated
     # if (endsWith(region_name, 'enhancer')) {
@@ -14,33 +15,15 @@ aggregate_hits <- function(hits, signal_gr, peak = FALSE){
     # merge_dt[get(paste(region_name, 'presence', sep = '_')) == FALSE, paste(region_name, 'percentage', sep = '_') := 0]
     # invisible(merge_dt)
   } else {
-    tmp_dt <- data.table(ID = hits@from, score = signal_gr[hits@to]$score)
-    res_dt <- rbindlist(sapply(aggregation_functions, function(fun) tmp_dt[, .(value=fun(score)), by=ID], simplify = FALSE), idcol='aggregation', use.names = TRUE)
-    res_dt[, aggregation:=as.factor(aggregation)]
+    tmp_dt <- data.table(ID = hits@from, score = signal_gr[hits@to]$score)[, sapply(aggregation_functions, function(agg_method){agg_method(score)}, simplify = FALSE), by = ID]
+    merge_dt[tmp_dt, on=.(ID), (paste(name, names(aggregation_functions), sep = ';')):=mget(names(aggregation_functions))]
+    # res_dt <- rbindlist(sapply(aggregation_functions, function(fun) tmp_dt[, .(value=fun(score)), by=ID], simplify = FALSE), idcol='aggregation', use.names = TRUE)
+    # res_dt[, aggregation:=as.factor(aggregation)]
   }
-  res_dt
+  invisible(merge_dt)
 }
 
-aggregate_with_flank <- function(signal_gr, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = FALSE) {
-  # enhancer regions
-  # first find enhancers that are at most 5kb from the alternative region
-  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000)
-  # get the hits of the enhancers that were near alternative regions
-  cCRE_signal_hits <- findOverlaps(cCRE_gr[to(cCRE_hits)], signal_gr)
-  # get the id of the alternative region
-  from_cCRE <- from(cCRE_hits)[cCRE_signal_hits@from]
-  # get the id in the signal file
-  to_cCRE <- to(cCRE_signal_hits)
-  event_cCRE_hits <- data.table(
-    from= from_cCRE,
-    to=to_cCRE,
-    cCRE=factor(cCREs[to(cCRE_hits)[cCRE_signal_hits@from], accession])
-  )
-  cCRE_dt_list <- split(event_cCRE_hits, by = 'cCRE', keep_by=FALSE)
-  cCRE_hits_list <- sapply(cCRE_dt_list, function(dt) dt[, Hits(from, to, nLnode = max(from), nRnode = max(to))], simplify = FALSE)
-  
-  # cCRE_acc2idx <- cCREs[, seq(.N)]
-  # names(cCRE_acc2idx) <- cCREs[, accession]
+aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = FALSE) {
   
   region_grs <- list(
     # promoter_gr, # promoter regions
@@ -54,13 +37,34 @@ aggregate_with_flank <- function(signal_gr, event_gr, cCREs, cCRE_gr, upstream_g
   hits_list <- sapply(region_grs, findOverlaps, signal_gr, simplify = FALSE)
   # names(hits_list) <- c('upstream_other_region', 'upstream_tile', 'event_name', 'downstream_tile', 'downstream_other_region')
   
-  # TODO: check how long this takes
   # hits_list <- c(hits_list, cCRE_hits_list)
   
+  # # enhancer regions
+  # # first find enhancers that are at most 5kb from the alternative region
+  # cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000)
+  # # get the hits of the enhancers that were near alternative regions
+  # cCRE_signal_hits <- findOverlaps(cCRE_gr[to(cCRE_hits)], signal_gr)
+  # # get the id of the alternative region
+  # from_cCRE <- from(cCRE_hits)[cCRE_signal_hits@from]
+  # # get the id in the signal file
+  # to_cCRE <- to(cCRE_signal_hits)
+  # event_cCRE_hits <- data.table(
+  #   from= from_cCRE,
+  #   to=to_cCRE,
+  #   cCRE=factor(cCREs[to(cCRE_hits)[cCRE_signal_hits@from], accession])
+  # )
+  # cCRE_dt_list <- split(event_cCRE_hits, by = 'cCRE', keep_by=FALSE)
+  # cCRE_hits_list <- sapply(cCRE_dt_list, function(dt) dt[, Hits(from, to, nLnode = max(from), nRnode = max(to))], simplify = FALSE)
+  
+  # cCRE_acc2idx <- cCREs[, seq(.N)]
+  # names(cCRE_acc2idx) <- cCREs[, accession]
+  #TODO: cCRE rethinking
   # if (length(cCRE_signal_hits) == 0 || length(cCRE_hits) == 0) hits_enhancer <- Hits()
   # else hits_enhancer <- Hits(from_cCRE, to_cCRE, max(from_cCRE), max(to_cCRE))
   # hits_list <- c(list(hits_enhancer), hits_list)
-  # names(hits_list)[1] <- paste(mark, 'enhancer', sep = '_')
+  # names(hits_list)[1] <- 'enhancer'
+  
+  names(hits_list) <- paste(name, names(hits_list), sep = ';')
   
   # if (peak) {
   #   overlap_enhancers <- pintersect(enhancer_gr[cCRE_hits@to][cCRE_signal_hits@from], signal_gr[cCRE_signal_hits@to])
@@ -72,15 +76,17 @@ aggregate_with_flank <- function(signal_gr, event_gr, cCREs, cCRE_gr, upstream_g
   #   region_grs <- c(list(overlap_dt), region_grs)
   # } else region_grs <- c(list(enhancer_gr[cCRE_hits@to]), region_grs)
   
-  res_dt <- rbindlist(mapply(aggregate_hits, hits = hits_list, #region_gr = region_grs, 
-                             MoreArgs = list(signal_gr = signal_gr, peak = peak), SIMPLIFY = FALSE), idcol = 'region', use.names = TRUE)
-  res_dt[, region:=as.factor(region)]
-  res_dt
+  invisible(mapply(aggregate_hits, name=names(hits_list), hits = hits_list, #region_gr = region_grs, 
+         MoreArgs = list(merge_dt=merge_dt, signal_gr = signal_gr, peak = peak)))
+  # res_dt <- rbindlist(mapply(aggregate_hits, hits = hits_list, #region_gr = region_grs, 
+  #                            MoreArgs = list(signal_gr = signal_gr, peak = peak), SIMPLIFY = FALSE), idcol = 'region', use.names = TRUE)
+  # res_dt[, region:=as.factor(region)]
+  # res_dt
 }
 
 
 ### Main aggregation function ----
-aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, upstream_gr, downstream_gr, sep = '_'){
+aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, upstream_gr, downstream_gr){
   
   # annotation <- import('suppa_analysis/gencode.v29.annotation.gtf')
   # used_genes <- annotation[annotation$gene_id %in% event_dt[, gene_id] & annotation$type == 'gene', ]
@@ -129,106 +135,110 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
                         event_gr, 
                         downstream_gr, 
                         promoters(event_gr, upstream = flank_size, downstream = flank_size))
-
+  
   # ihec <- samples_to_consider[1]
   # profvis::profvis(
   #
-  ihec_list <- pbmcapply::pbmclapply(samples_to_consider, function(ihec) 
+  ihec_list <- #pbmcapply::pbmc
+    lapply(samples_to_consider, function(ihec) 
     {
-    
-    # first gather gene expression
-    # separator_gene_ids <- '_and_'
-    # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec))] #, gene_id)]
-    # signal_psi_dt <- signal_psi_dt[, .(gene_id = unlist(tstrsplit(gene_id, separator_gene_ids, fixed=TRUE))), by=.(ID, PSI)]
-    # signal_psi_dt[unique(gene_quants[EpiRR_no_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
-    # signal_psi_dt <- signal_psi_dt[, .(gene_id=paste(gene_id, collapse=separator_gene_ids), gene_expression=sum(gene_expression, na.rm = TRUE)), by=.(ID, PSI)]
-    
-    # signal_psi_dt[, gene_id := NULL]
-    # setkey(signal_psi_dt, ID)
-    
-    mark_names <- c()
-    signal_gr_list <- list()
-    peak_list <- c()
-    
-    # add wgbs
-    wgbs_files <- list.files(wgbs_data_dir, ihec)
-    if (length(wgbs_files) == 2) {
-      wgbs <- Reduce(c, lapply(c('pos', 'neg'), function(strand) {
-        wgbs_file <-
-          list.files(
-            wgbs_data_dir,
-            pattern = paste0('.*', ihec, '.*.gembs_', strand, '.bw$'),
-            full.names = TRUE
-          )
-        wgbs_strand <- rtracklayer::import(wgbs_file, which = regions_to_cover)
-        strand(wgbs_strand) <- ifelse(strand == 'pos', '+', '-')
-        return(wgbs_strand)
-      }))
-      mark_names <- c(mark_names, 'wgbs')
-      signal_gr_list <- c(signal_gr_list, wgbs)
-      peak_list <- c(peak_list, FALSE)
       
-      # aggregate_with_flank(signal_psi_dt, wgbs, 'wgbs', event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size)
-    } else if (length(wgbs_files) > 2)
-      warning(paste(ihec, 'had > 2 files:', paste(wgbs_files, collapse = ', ')))
-    else if (length(wgbs_files) < 0) {
-      warning(paste(ihec, 'had < 2 files'))
-    }
-    # add histone marks
-    histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
-    histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-    for (this_uuid in histone_samples[epirr_id_wo_version == ihec, uuid]) {
-      file_ext <- c(peak = '\\.pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz$', 
-                    signal = '\\.fc\\.signal\\.bigwig$')
-      for (file_type in names(file_ext)) {
-        histone_file <-
-          list.files(
-            chip_data_dir,
-            pattern = paste0('.*', ihec, '.*', this_uuid, file_ext[file_type]),
-            full.names = TRUE
-          )
-        if (length(histone_file) > 1)
-          warning(paste(ihec, 'had > 1 files for uuid', this_uuid, ':', paste(histone_file, collapse = ', ')))
-        else if (length(histone_file) == 0) {
-          warning(paste(ihec, 'had 0 files for uuid', this_uuid))
-        } else {
-          hPTM <- rtracklayer::import(histone_file, which = regions_to_cover)
-          
-          mark_names <- c(mark_names, histone_samples[uuid == this_uuid, antibody])
-          signal_gr_list <- c(signal_gr_list, hPTM)
-          peak_list <- c(peak_list, file_type == 'peak')
-          
-          # aggregate_with_flank(signal_psi_dt, hPTM, , event_gr,  cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak')
+      merge_dt <- event_dt[, .(ID)]
+      # first gather gene expression
+      # separator_gene_ids <- '_and_'
+      # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec))] #, gene_id)]
+      # signal_psi_dt <- signal_psi_dt[, .(gene_id = unlist(tstrsplit(gene_id, separator_gene_ids, fixed=TRUE))), by=.(ID, PSI)]
+      # signal_psi_dt[unique(gene_quants[EpiRR_no_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
+      # signal_psi_dt <- signal_psi_dt[, .(gene_id=paste(gene_id, collapse=separator_gene_ids), gene_expression=sum(gene_expression, na.rm = TRUE)), by=.(ID, PSI)]
+      
+      # signal_psi_dt[, gene_id := NULL]
+      # setkey(signal_psi_dt, ID)
+      
+      # mark_names <- c()
+      # signal_gr_list <- list()
+      # peak_list <- c()
+      
+      # add wgbs
+      wgbs_files <- list.files(wgbs_data_dir, ihec)
+      if (length(wgbs_files) == 2) {
+        wgbs <- Reduce(c, lapply(c('pos', 'neg'), function(strand) {
+          wgbs_file <-
+            list.files(
+              wgbs_data_dir,
+              pattern = paste0('.*', ihec, '.*.gembs_', strand, '.bw$'),
+              full.names = TRUE
+            )
+          wgbs_strand <- rtracklayer::import(wgbs_file, which = regions_to_cover)
+          strand(wgbs_strand) <- ifelse(strand == 'pos', '+', '-')
+          return(wgbs_strand)
+        }))
+        # mark_names <- c(mark_names, 'wgbs')
+        # signal_gr_list <- c(signal_gr_list, wgbs)
+        # peak_list <- c(peak_list, FALSE)
+        
+        aggregate_with_flank(merge_dt, 'wgbs', wgbs, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size)
+      } else if (length(wgbs_files) > 2)
+        warning(paste(ihec, 'had > 2 files:', paste(wgbs_files, collapse = ', ')))
+      else if (length(wgbs_files) < 0) {
+        warning(paste(ihec, 'had < 2 files'))
+      }
+      # add histone marks
+      histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
+      histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+      for (this_uuid in histone_samples[epirr_id_wo_version == ihec, uuid]) {
+        file_ext <- c(peak = '\\.pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz$', 
+                      signal = '\\.fc\\.signal\\.bigwig$')
+        for (file_type in names(file_ext)) {
+          histone_file <-
+            list.files(
+              chip_data_dir,
+              pattern = paste0('.*', ihec, '.*', this_uuid, file_ext[file_type]),
+              full.names = TRUE
+            )
+          if (length(histone_file) > 1)
+            warning(paste(ihec, 'had > 1 files for uuid', this_uuid, ':', paste(histone_file, collapse = ', ')))
+          else if (length(histone_file) == 0) {
+            warning(paste(ihec, 'had 0 files for uuid', this_uuid))
+          } else {
+            hPTM <- rtracklayer::import(histone_file, which = regions_to_cover)
+            
+            # mark_names <- c(mark_names, histone_samples[uuid == this_uuid, antibody])
+            # signal_gr_list <- c(signal_gr_list, hPTM)
+            # peak_list <- c(peak_list, file_type == 'peak')
+            
+            aggregate_with_flank(merge_dt, histone_samples[uuid == this_uuid, antibody], hPTM, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak')
+          }
         }
       }
-    }
-    
-    mark_list <-
-      mapply(
-        aggregate_with_flank,
-        signal_gr_list,
-        peak = peak_list,
-        MoreArgs = list(
-          event_gr = event_gr,
-          cCREs = cCREs,
-          cCRE_gr = cCRE_gr,
-          upstream_gr = upstream_gr,
-          downstream_gr = downstream_gr,
-          flank_size = flank_size
-        ),
-        SIMPLIFY = FALSE
-      )
-    names(mark_list) <- mark_names
-    res_dt <- rbindlist(mark_list, idcol = 'mark', use.names = TRUE)
-    res_dt[, mark:=as.factor(mark)]
-    
-    # return(res_dt)
-    
-  })
+      
+      # browser()
+      # mark_list <-
+      #   mapply(
+      #     aggregate_with_flank,
+      #     signal_gr_list,
+      #     peak = peak_list,
+      #     MoreArgs = list(
+      #       event_gr = event_gr,
+      #       cCREs = cCREs,
+      #       cCRE_gr = cCRE_gr,
+      #       upstream_gr = upstream_gr,
+      #       downstream_gr = downstream_gr,
+      #       flank_size = flank_size
+      #     ),
+      #     SIMPLIFY = FALSE
+      #   )
+      # names(mark_list) <- mark_names
+      # res_dt <- rbindlist(mark_list, idcol = 'mark', use.names = TRUE)
+      # res_dt[, mark:=as.factor(mark)]
+      
+      # return(res_dt)
+      merge_dt
+    })
   # 
-  # names(ihec_list) <- samples_to_consider
+  names(ihec_list) <- samples_to_consider
   # res_dt <- rbindlist(ihec_list, idcol = 'ihec', use.names = TRUE)
   # res_dt[, ihec:= as.factor(ihec)]
   # return(res_dt)
+  ihec_list
   
 }
