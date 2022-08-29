@@ -1,0 +1,122 @@
+---
+title: "total vs messenger"
+output: pdf_document
+---
+
+```{r}
+rna_samples <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
+rna_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+uuids_total_mrna <- rna_samples[, if('mRNA-Seq' %in% rna_seq_type & 'total-RNA-Seq' %in% rna_seq_type).SD[rna_seq_type %in% c('total-RNA-Seq', 'mRNA-Seq'), .(uuid=uuid)], by=epirr_id_wo_version][, uuid]
+isoform_files <- list.files(rna_data_dir, pattern = paste0('(', paste(uuids_total_mrna, collapse = '|'), ')\\.isoforms\\.results$'), full.names = TRUE)
+cols_to_keep <- c('transcript_id', 'gene_id', 'TPM')
+isoform_dt <- rbindlist(sapply(isoform_files, fread, stringsAsFactor=TRUE, simplify = FALSE, select = cols_to_keep), idcol = 'file')
+file2uuid <- gsub("^.*\\.(.*?)\\.isoforms\\.results$", "\\1", isoform_files)
+names(file2uuid) <- isoform_files
+isoform_dt[, file := as.factor(file2uuid[isoform_dt[, file]])]
+
+# bring tpms to wide format
+isoform_dt <- data.table::dcast(isoform_dt, transcript_id ~ file, value.var = 'TPM')
+
+# remove id column
+tpm_matrix <- as.matrix(isoform_dt[, -'transcript_id'])
+
+# write files for SUPPA2
+rownames(tpm_matrix) <- isoform_dt[, transcript_id]
+as_dir <- 'suppa_analysis/tot_vs_m'
+suppa_tot_vs_m_filename <- file.path(as_dir, 'tpm_expressions.tsv')
+if (!file.exists(suppa_tot_vs_m_filename)) {
+  dir.create(dirname(suppa_tot_vs_m_filename), showWarnings = FALSE)
+  write.table(tpm_matrix, file=suppa_tot_vs_m_filename, sep="\t", quote = FALSE)
+}
+```
+
+```{bash, engine.opts="-l", eval=FALSE}
+cd suppa_analysis
+conda activate ihec-as
+dir_path=tot_vs_m
+mkdir -p ${dir_path}
+grep "transcript_type \"protein_coding\"" gencode.v29.annotation.gtf > ${dir_path}/gencode.v29.filtered_annotation.gtf
+suppa.py generateEvents -i ${dir_path}/gencode.v29.filtered_annotation.gtf -o ${dir_path}/gencode.v29.filtered_annotation.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+   suppa.py psiPerEvent -i ${dir_path}/gencode.v29.filtered_annotation.events_${event}_strict.ioe -e ${dir_path}/tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO -f 1
+done
+``` 
+
+```{r, fig.width=10}
+psi_files <- list.files(as_dir, pattern = '^event_..\\.psi$', full.names = TRUE)
+psi_dt <- rbindlist(sapply(psi_files, fread, stringsAsFactor=TRUE, simplify = FALSE), idcol = 'file')
+psi_dt[, file:=as.factor(file)]
+setnames(psi_dt, 'V1', 'event')
+psi_dt_melt <- melt(psi_dt, id.vars = c('file', 'event'), variable.name = 'uuid', value.name = 'PSI')
+mapping_dt <- rna_samples[uuid %in% uuids_total_mrna, .(uuid, epirr_id_wo_version, rna_seq_type)]
+uuid2epirr <- mapping_dt[, epirr_id_wo_version]
+names(uuid2epirr) <- mapping_dt[, uuid]
+psi_dt_melt[, epirr:=as.factor(uuid2epirr[uuid])]
+uuid2seq_type <- mapping_dt[, rna_seq_type]
+names(uuid2seq_type) <- mapping_dt[, uuid]
+psi_dt_melt[, seq_type:=as.factor(uuid2seq_type[uuid])]
+psi_dt_melt[is.nan(PSI), PSI:=NA]
+psi_dt_cast <- dcast(psi_dt_melt, event + epirr ~ seq_type, value.var = 'PSI')
+psi_dt_cast <- na.omit(psi_dt_cast)
+```
+
+
+```{r, fig.width=10}
+psi_cor_dt <- psi_dt_cast[, .(pearson_correlation=suppressWarnings(cor(`mRNA-Seq`, `total-RNA-Seq`, use = 'pairwise.complete.obs')), 
+                              #t.test_pval=t.test(`mRNA-Seq`, `total-RNA-Seq`, paired=TRUE)$p.value, 
+                              abs_mean_diff=mean(abs(`mRNA-Seq` -`total-RNA-Seq`), na.rm=TRUE),
+                              mean_diff=mean(`mRNA-Seq` -`total-RNA-Seq`, na.rm=TRUE),
+                              rand_abs_mean_diff=mean(abs(sample(`mRNA-Seq`) - sample(`total-RNA-Seq`)), na.rm=TRUE),
+                              rand_mean_diff=mean(sample(`mRNA-Seq`) - sample(`total-RNA-Seq`), na.rm=TRUE),
+                              sd_diff=sd(`mRNA-Seq` -`total-RNA-Seq`, na.rm=TRUE),
+                              full_oservations=sum(!is.na(`mRNA-Seq`) & !is.na(`total-RNA-Seq`))), 
+                          by=.(event)][, event_name:=gsub('.*?;(..):.*$', '\\1', event)]
+
+tests <- c('t.test'=t.test)#, 'wilcoxon'=wilcox.test)
+for (test in names(tests)) {
+  print(test)
+  if (test == 'wilcoxon')
+    test_dt <- psi_dt_cast[event %in% psi_cor_dt[sd_diff != 0, event], suppressWarnings(tests[[test]](`mRNA-Seq`, `total-RNA-Seq`, paired=TRUE))[c(1, 3)], by=event]
+  else if (test == 't.test')
+    test_dt <- psi_dt_cast[event %in% psi_cor_dt[sd_diff != 0, event], tests[[test]](`mRNA-Seq`, `total-RNA-Seq`, paired=TRUE), by=event]
+  test_dt[, p.adj := p.adjust(p.value, method = 'BH')]
+  colNames <- names(test_dt)[names(test_dt)!='event']
+  psi_cor_dt[test_dt, (paste(test, colNames, sep = '_')) := mget(paste0("i.", colNames))]
+}
+ggplot(psi_cor_dt, aes(x = pearson_correlation, y = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='correlation between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = mean_diff, y = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = abs_mean_diff, y = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean absolute diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = mean_diff, color = event_name)) + stat_ecdf() + labs(title='per event ecdf of mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = abs_mean_diff, y = mean_diff)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. abs mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = rand_mean_diff, y = mean_diff, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. shuffled mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = rand_abs_mean_diff, y = abs_mean_diff, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event abs mean diff vs. shuffled abs mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = mean_diff, y = t.test_p.value, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. p.value from t-test between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+ggplot(psi_cor_dt, aes(x = mean_diff, y = t.test_p.adj, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. adjusted p.value from t-test between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+```
+
+```{r, eval = FALSE}
+# do it sample specific
+# psi_cor_sample <- psi_dt_cast[, .(pearson_correlation=suppressWarnings(cor(`mRNA-Seq`, `total-RNA-Seq`, use = 'pairwise.complete.obs')), 
+#                               #t.test_pval=t.test(`mRNA-Seq`, `total-RNA-Seq`, paired=TRUE)$p.value, 
+#                               abs_mean_diff=mean(abs(`mRNA-Seq` -`total-RNA-Seq`), na.rm=TRUE),
+#                               mean_diff=mean(`mRNA-Seq` -`total-RNA-Seq`, na.rm=TRUE),
+#                               rand_abs_mean_diff=mean(abs(sample(`mRNA-Seq`) - sample(`total-RNA-Seq`)), na.rm=TRUE),
+#                               rand_mean_diff=mean(sample(`mRNA-Seq`) - sample(`total-RNA-Seq`), na.rm=TRUE),
+#                               sd_diff=sd(`mRNA-Seq` -`total-RNA-Seq`, na.rm=TRUE),
+#                               full_oservations=sum(!is.na(`mRNA-Seq`) & !is.na(`total-RNA-Seq`))), 
+#                           by=.(event)][, event_name:=gsub('.*?;(..):.*$', '\\1', event)]
+# t_test_dt <- psi_dt_cast[event %in% psi_cor_dt[sd_diff != 0, event], t.test(`mRNA-Seq`, `total-RNA-Seq`, paired=TRUE), by= event]
+# t_test_dt[, p.adj := p.adjust(p.value, method = 'BH')]
+# colNames <- names(t_test_dt)[names(t_test_dt)!='event']
+# psi_cor_dt[t_test_dt, (colNames) := mget(paste0("i.", colNames))]
+# ggplot(psi_cor_dt, aes(x = pearson_correlation, y = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='correlation between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = mean_diff, y = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = mean_diff, color = event_name)) + stat_ecdf() + labs(title='per event ecdf of mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = abs_mean_diff, y = mean_diff)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. abs mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = rand_mean_diff, y = mean_diff, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. shuffled mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = rand_abs_mean_diff, y = abs_mean_diff, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event abs mean diff vs. shuffled abs mean diff between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = mean_diff, y = p.value, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. p.value from t-test between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+# ggplot(psi_cor_dt, aes(x = mean_diff, y = p.adj, color = full_oservations)) + geom_point(size = .5) + facet_wrap(~event_name) + labs(title='per event mean diff vs. adjusted p.value from t-test between PSI values from mRNA-Seq and total-RNA-Seq on 76 pairs')
+```
+

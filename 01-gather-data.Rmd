@@ -1,0 +1,280 @@
+---
+title: "Match Data"
+output: 
+  pdf_document: default
+  html_notebook: default
+---
+
+
+```{bash, eval=FALSE}
+cd /nfs/data/IHEC/RNAseq
+echo "get ihec_metadata*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
+echo "get ihec_readme.pdf" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
+sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
+find ~/ihec-incoming -name '*' > all_files.txt
+fusermount -u ~/ihec-incoming
+```
+
+```{r}
+write_chunked_files <- function(commands, n_chunks, name, folder) {
+  if (length(commands) == 1)
+    n_chunks <- 1
+  if (n_chunks == 1)
+    chunked_commands <- list(commands)
+  else 
+    chunked_commands <- split(commands, cut(seq_along(commands), n_chunks, labels = FALSE))
+  lapply(seq(n_chunks), function(chunk_id){
+    fileConn <- file(file.path(folder, sprintf("%s_%02d.txt", name, chunk_id)))
+    writeLines(chunked_commands[[chunk_id]], fileConn)
+    close(fileConn)
+  })
+}
+```
+
+
+
+```{r}
+all_files <- readLines(file.path(data_dir, 'all_files.txt'))
+```
+
+## check RNA files
+
+```{r}
+# check the rna-seq metadata file first
+rna_samples <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
+rna_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+# rna_samples <- rna_samples[rna_seq_type == 'mRNA-Seq']
+
+# now check the files that are actually available
+isoform_files_downloaded <- list.files(rna_data_dir, pattern = '\\.isoforms\\.results$')
+isoform_epirr_downloaded <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files_downloaded)
+
+if (!identical(rna_samples[, sort(epirr_id_wo_version)], sort(isoform_epirr_downloaded))) {
+  print(paste('in metadata file but no isoform file:', paste(rna_samples[!epirr_id_wo_version %in% isoform_epirr_downloaded, epirr_id_wo_version], collapse = ', ')))
+  print(paste('isoform file but not in metadata file:', paste(isoform_files_downloaded[!isoform_epirr_downloaded %in% rna_samples[, epirr_id_wo_version]], collapse = ', ')))
+}
+```
+
+## check ChIP and WGBS files
+
+```{r}
+histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
+histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+
+histone_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(chip_data_dir))))
+
+# if (length(setdiff(histone_samples[, epirr_id_wo_version], histone_samples_available)) > 0) {
+#   print(paste('in metadata file but no signal file:', paste(histone_samples[!epirr_id_wo_version %in% histone_samples_available, epirr_id_wo_version], collapse = ', ')))
+#   print(paste('signal file but not in metadata file:', paste(histone_samples_available[!histone_samples_available %in% histone_samples[, epirr_id_wo_version]], collapse = ', ')))
+# }
+
+rna_samples_w_chip <- rna_samples[epirr_id_wo_version %in% histone_samples[, epirr_id_wo_version]]
+rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+```
+
+```{r}
+wgbs_samples <- fread(file.path(data_dir, 'ihec_metadata_wgbs.csv'))
+wgbs_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+
+wgbs_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(wgbs_data_dir, '\\.gembs_(pos|neg)\\.bw$'))))
+
+# if (length(setdiff(wgbs_samples[, epirr_id_wo_version], wgbs_samples_available)) > 0) {
+#   print(paste('in metadata file but no signal file:', paste(wgbs_samples[!epirr_id_wo_version %in% wgbs_samples_available, epirr_id_wo_version], collapse = ', ')))
+#   print(paste('signal file but not in metadata file:', paste(wgbs_samples_available[!wgbs_samples_available %in% wgbs_samples[, epirr_id_wo_version]], collapse = ', ')))
+# }
+
+rna_samples_w_wgbs <- rna_samples[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version]]
+rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+```
+
+
+
+
+### get RNA files
+
+```{r}
+epirr_ids_to_download <- intersect(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], rna_samples_w_wgbs[, sort(unique(epirr_id_wo_version))])
+uuids_to_download <- rna_samples[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, rna_seq_type)]
+uuids_to_download <- uuids_to_download[, if(.N>1) .SD[rna_seq_type == 'mRNA-Seq'] else .SD, by=epirr_id_wo_version]
+
+# also download files for comparison between total and mRNA-seq
+uuids_total_mrna <- rna_samples[, if('mRNA-Seq' %in% rna_seq_type & 'total-RNA-Seq' %in% rna_seq_type).SD[rna_seq_type %in% c('total-RNA-Seq', 'mRNA-Seq'), .(uuid=uuid)], by=epirr_id_wo_version][, uuid]
+
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+sftp_rna_files <- all_files[grep(paste0('/nfs/home/students/ga89koc/ihec-incoming/RNA-Seq/.*(', paste(c(uuids_to_download[, uuid], uuids_total_mrna), collapse = '|'), ')\\.isoforms\\.results$'), all_files)]
+local_rna_files <- file.path(rna_data_dir, basename(sftp_rna_files))
+print(100*round(sum(file.exists(local_rna_files))/length(local_rna_files), 5))
+
+downloaded_rna_files <- list.files(rna_data_dir, 'isoforms\\.results$', full.names = TRUE)
+# file.remove(downloaded_rna_files[!downloaded_rna_files %in% local_rna_files])
+
+rna_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_rna_files[!file.exists(local_rna_files)], fixed = T))
+
+write_chunked_files(rna_get_commands, 1, 'rna', rna_data_dir)
+```
+
+## download ChIP and WGBS files
+
+```{r}
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+chip_files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/ChIP-Seq/.*(', paste(epirr_ids_to_download, collapse = '|'), ').*\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$')
+
+sftp_chip_files <-  all_files[grep(chip_files_to_download, all_files)]
+local_chip_files <- file.path(chip_data_dir, basename(sftp_chip_files))
+print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
+
+downloaded_chip_files <- list.files(chip_data_dir, '\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$', full.names = TRUE)
+# file.remove(downloaded_chip_files[!downloaded_chip_files %in% local_chip_files])
+
+chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_chip_files[!file.exists(local_chip_files)], fixed = T))
+
+write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
+
+```
+
+
+```{r}
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+wgbs_files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/WGBS/.*(', paste(epirr_ids_to_download, collapse = '|'), ').*.gembs_(neg|pos).bw$')
+
+# make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+sftp_wgbs_files <- all_files[grep(wgbs_files_to_download, all_files)]
+local_wgbs_files <- file.path(wgbs_data_dir, basename(sftp_wgbs_files))
+print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
+
+downloaded_wgbs_files <- list.files(wgbs_data_dir, full.names = TRUE)
+# file.remove(downloaded_wgbs_files[!downloaded_wgbs_files %in% local_wgbs_files])
+
+
+wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_wgbs_files[!file.exists(local_wgbs_files)], fixed = T))
+
+write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
+```
+
+```{r}
+sample_list <-
+  list(histone_samples[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, antibody)],
+       wgbs_samples[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, antibody = 'wgbs')],
+       rna_samples[uuid %in% uuids_to_download[, uuid], .(epirr_id_wo_version, uuid, antibody = rna_seq_type)])
+ggplot(rbindlist(sample_list), aes(x = epirr_id_wo_version, y = reorder(antibody, antibody, length))) + geom_tile()
+```
+
+
+```{r}
+library(data.table)
+# data.table::setDTthreads(20)
+library(ggplot2)
+library(ggfortify)
+library(ggrepel)
+
+colVar <- function(x, na.rm = TRUE) {
+  colMeans(x * x, na.rm = na.rm) - (colMeans(x, na.rm = na.rm)) ^ 2
+}
+
+pca_plots <-
+  function(matrix,
+           metadata,
+           title = '',
+           color_by = 'annotation',
+           shape_by = 'project',
+           label = 'annotation',
+           na.omit = FALSE) {
+    if (na.omit){
+      matrix <- matrix[, colSums(is.na(matrix)) == 0, drop=FALSE]
+    } else {
+      # set NA to 0
+      matrix[is.na(matrix)] <- 0
+    }
+    
+    # filter out cols without variance
+    matrix <- matrix[, colVar(matrix) != 0, drop = FALSE]
+    
+    # perform PCA
+    pca <- prcomp(matrix, center = TRUE, scale = TRUE)
+    
+    # compute explained variance of PCs
+    var_explained_tpm = 100 * pca$sdev ^ 2 / sum(pca$sdev ^ 2)
+    
+    return(
+      list(
+        pca = pca,
+        dimred = ggplot2::autoplot(
+          pca,
+          data = metadata,
+          colour = color_by,
+          shape = shape_by
+        ) + labs(title = paste('PCA:', title)) + geom_text_repel(
+          aes(label = get(label)),
+          min.segment.length = 0,
+          max.overlaps = 5
+        ),
+        scree = qplot(seq.int(var_explained_tpm), var_explained_tpm) +
+          geom_line() +
+          xlab("Principal Component") +
+          ylab("Percent Variance Explained") +
+          ggtitle(paste("Variance explained:", title))
+      )
+    )
+  }
+```
+
+Load Metadata:
+
+```{r}
+# load metadata
+metadata <- data.table::fread('IHEC_metadata_harmonization.v0.7.csv')
+metadata[, EpiRR_no_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+metadata[, annotation := cell_type]
+metadata[biomaterial_type == 'primary tissue', annotation := tissue_type]
+metadata[biomaterial_type == 'cell line', annotation := line]
+metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
+```
+
+Load Isoform Quantifications:
+
+```{r}
+# rna_metadata <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
+# rna_metadata[, EpiRR_no_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+# multiple_RNAs <- rna_metadata[, if(.N > 1) .(uuid, rna_seq_type), by=EpiRR_no_version]
+
+isoform_files <- list.files(rna_data_dir, pattern = paste0(paste(uuids_to_download[, uuid], collapse = '|'),'\\.isoforms\\.results$'), full.names = T)
+cols_to_keep <- c('transcript_id', 'gene_id', 'TPM')
+isoform_quants <- data.table::rbindlist(sapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, simplify = FALSE, fill = TRUE, select = cols_to_keep), idcol = 'EpiRR')
+file2id <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files)
+names(file2id) <- isoform_files
+isoform_quants[, EpiRR_no_version := as.factor(file2id[isoform_quants[, EpiRR]])]
+isoform_quants[, EpiRR:=NULL]
+
+suppressWarnings(dir.create('suppa_analysis/'))
+
+gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = c('EpiRR_no_version', 'gene_id')]
+gene_expr_file <- 'suppa_analysis/gene_expressions.rds'
+# if (!file.exists(gene_expr_file)) {
+  saveRDS(gene_quants, gene_expr_file)
+# }
+
+# bring tpms to wide format
+tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ EpiRR_no_version, value.var = 'TPM', fill = 0)
+
+
+# remove id column
+# tpm_matrix <- as.matrix(tpm_dt[, -'EpiRR_no_version'])
+
+# write files for SUPPA2
+# rownames(tpm_matrix) <- tpm_dt[, EpiRR_no_version]
+# tpm_matrix[is.na(tpm_matrix)] <- 0
+suppa_expr_filename <- 'suppa_analysis/tpm_expressions.tsv'
+# if (!file.exists(suppa_expr_filename)) {
+  fileConn<-file(suppa_expr_filename)
+  writeLines(paste(names(tpm_dt)[-1], collapse = '\t'), fileConn)
+  close(fileConn)
+  fwrite(tpm_dt, suppa_expr_filename, sep='\t', append = TRUE)
+  # write.table(t(tpm_matrix), file=suppa_expr_filename, sep="\t", quote = FALSE)
+# }
+
+# filter metadata
+metadata <- metadata[EpiRR_no_version %in% names(tpm_dt)[-1]]
+# remove the two outliers
+metadata_filtered <- metadata[cell_type != 'sperm']
+save.image('pca.rda')
+```
