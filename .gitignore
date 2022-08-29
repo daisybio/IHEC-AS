@@ -3,3 +3,17 @@
 .RData
 .Ruserdata
 suppa_analysis
+*.nb.html
+IHEC-IA-AS*.txt
+ML-build*.txt
+GET-TF*.txt
+*.rds
+*.rda
+*.csv
+*.csv.gz
+data/
+cll_collab/
+wgbs_check/
+old/
+isoform_psi_plots.Rmd
+nonzero_cCRE_accessions.txt
