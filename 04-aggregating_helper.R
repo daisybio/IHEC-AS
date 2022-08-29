@@ -23,7 +23,7 @@ aggregate_hits <- function(merge_dt, name, hits, signal_gr, peak = FALSE){
   invisible(merge_dt)
 }
 
-aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = FALSE) {
+aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = FALSE, make_cCREs = FALSE) {
   
   region_grs <- list(
     # promoter_gr, # promoter regions
@@ -34,20 +34,20 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCR
     downstream_other_region = downstream_gr # the whole region downstream
   )
   
-  hits_list <- sapply(region_grs, findOverlaps, signal_gr, simplify = FALSE)
+  hits_list <- sapply(region_grs, findOverlaps, subject = signal_gr, simplify = FALSE)
   # names(hits_list) <- c('upstream_other_region', 'upstream_tile', 'event_name', 'downstream_tile', 'downstream_other_region')
   
   # hits_list <- c(hits_list, cCRE_hits_list)
   
-  # # enhancer regions
-  # # first find enhancers that are at most 5kb from the alternative region
-  # cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000)
-  # # get the hits of the enhancers that were near alternative regions
-  # cCRE_signal_hits <- findOverlaps(cCRE_gr[to(cCRE_hits)], signal_gr)
-  # # get the id of the alternative region
-  # from_cCRE <- from(cCRE_hits)[cCRE_signal_hits@from]
-  # # get the id in the signal file
-  # to_cCRE <- to(cCRE_signal_hits)
+  # enhancer regions
+  # first find enhancers that are at most 5kb from the alternative region
+  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000)
+  # get the hits of the enhancers that were near alternative regions
+  cCRE_signal_hits <- findOverlaps(cCRE_gr[to(cCRE_hits)], signal_gr)
+  # get the id of the alternative region
+  from_cCRE <- from(cCRE_hits)[cCRE_signal_hits@from]
+  # get the id in the signal file
+  to_cCRE <- to(cCRE_signal_hits)
   # event_cCRE_hits <- data.table(
   #   from= from_cCRE,
   #   to=to_cCRE,
@@ -59,9 +59,13 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCR
   # cCRE_acc2idx <- cCREs[, seq(.N)]
   # names(cCRE_acc2idx) <- cCREs[, accession]
   #TODO: cCRE rethinking
+  
+  from_split <- split(from_cCRE, cCREs[to(cCRE_hits)[cCRE_signal_hits@from], cCRE_type])
+  to_split <- split(to_cCRE, cCREs[to(cCRE_hits)[cCRE_signal_hits@from], cCRE_type])
+  hits_enhancer <- mapply(function(from, to) {Hits(from, to, max(from), max(to))}, from_split, to_split, SIMPLIFY = FALSE)
   # if (length(cCRE_signal_hits) == 0 || length(cCRE_hits) == 0) hits_enhancer <- Hits()
   # else hits_enhancer <- Hits(from_cCRE, to_cCRE, max(from_cCRE), max(to_cCRE))
-  # hits_list <- c(list(hits_enhancer), hits_list)
+  hits_list <- c(hits_enhancer, hits_list)
   # names(hits_list)[1] <- 'enhancer'
   
   names(hits_list) <- paste(name, names(hits_list), sep = ';')
@@ -75,6 +79,9 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCR
   #                                , percentage := overlap_width/enhancer_width]
   #   region_grs <- c(list(overlap_dt), region_grs)
   # } else region_grs <- c(list(enhancer_gr[cCRE_hits@to]), region_grs)
+  # aggregate cCREs separately
+  if (make_cCREs)
+  aggregate_hits(merge_dt = cCRE_dt, name = name, hits = findOverlaps(cCRE_gr, signal_gr), signal_gr = signal_gr, peak = FALSE)
   
   invisible(mapply(aggregate_hits, name=names(hits_list), hits = hits_list, #region_gr = region_grs, 
          MoreArgs = list(merge_dt=merge_dt, signal_gr = signal_gr, peak = peak)))
@@ -82,11 +89,12 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCREs, cCR
   #                            MoreArgs = list(signal_gr = signal_gr, peak = peak), SIMPLIFY = FALSE), idcol = 'region', use.names = TRUE)
   # res_dt[, region:=as.factor(region)]
   # res_dt
+  cCRE_dt
 }
 
 
 ### Main aggregation function ----
-aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, upstream_gr, downstream_gr){
+aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, upstream_gr, downstream_gr, make_cCREs = FALSE){
   
   # annotation <- import('suppa_analysis/gencode.v29.annotation.gtf')
   # used_genes <- annotation[annotation$gene_id %in% event_dt[, gene_id] & annotation$type == 'gene', ]
@@ -139,11 +147,11 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
   # ihec <- samples_to_consider[1]
   # profvis::profvis(
   #
-  ihec_list <- #pbmcapply::pbmc
-    lapply(samples_to_consider, function(ihec) 
+  ihec_list <- pbmcapply::pbmclapply(samples_to_consider, function(ihec) 
     {
       
       merge_dt <- event_dt[, .(ID)]
+      cCRE_dt <- data.table(ID = seq.int(nrow(cCREs)))
       # first gather gene expression
       # separator_gene_ids <- '_and_'
       # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec))] #, gene_id)]
@@ -176,7 +184,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
         # signal_gr_list <- c(signal_gr_list, wgbs)
         # peak_list <- c(peak_list, FALSE)
         
-        aggregate_with_flank(merge_dt, 'wgbs', wgbs, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size)
+        aggregate_with_flank(merge_dt, 'wgbs', wgbs, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, make_cCREs = make_cCREs)
       } else if (length(wgbs_files) > 2)
         warning(paste(ihec, 'had > 2 files:', paste(wgbs_files, collapse = ', ')))
       else if (length(wgbs_files) < 0) {
@@ -206,7 +214,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
             # signal_gr_list <- c(signal_gr_list, hPTM)
             # peak_list <- c(peak_list, file_type == 'peak')
             
-            aggregate_with_flank(merge_dt, histone_samples[uuid == this_uuid, antibody], hPTM, event_gr, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak')
+            aggregate_with_flank(merge_dt, histone_samples[uuid == this_uuid, antibody], hPTM, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak',  make_cCREs = make_cCREs)
           }
         }
       }
@@ -228,13 +236,20 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
       #     SIMPLIFY = FALSE
       #   )
       # names(mark_list) <- mark_names
-      # res_dt <- rbindlist(mark_list, idcol = 'mark', use.names = TRUE)
+      # res_dt <- rbindlist(mark_list, idcol = 'mark', use.names = TRUE)NULL
       # res_dt[, mark:=as.factor(mark)]
       
       # return(res_dt)
-      merge_dt
+      fwrite(merge_dt, file.path(psi_input_dir, 'sample_dts', paste0(ihec, '-merge_dt.csv.gz')))
+      if (make_cCREs)
+      fwrite(cCRE_dt[apply(cCRE_dt, 1, function(row) sum(is.na(row)) < length(cCRE_dt) - 1)], file.path(psi_input_dir, 'sample_dts', paste0(ihec, '-cCRE_dt.csv.gz')))
+      
+      # merge_dt
+      # list(merge_dt = merge_dt, cCRE_dt = cCRE_dt)
+      TRUE
     })
   # 
+  
   names(ihec_list) <- samples_to_consider
   # res_dt <- rbindlist(ihec_list, idcol = 'ihec', use.names = TRUE)
   # res_dt[, ihec:= as.factor(ihec)]

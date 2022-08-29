@@ -1,0 +1,30 @@
+---
+title: "05-find-constitutive-exons"
+output: pdf_document
+---
+
+```{r}
+library(data.table)
+library(rtracklayer)
+```
+
+```{r}
+annotation <- as.data.table(rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf'))
+event_files <- list.files('suppa_analysis/events', '.*\\.ioe$', full.names = TRUE)
+file2event <- gsub('^.*events_(.*)_strict\\.ioe$', '\\1', event_files)
+names(file2event) <- event_files
+as_events <- rbindlist(sapply(event_files, fread, simplify = FALSE), idcol = 'event_type')
+as_events[, event_type := file2event[event_type]]
+annotation_gene_ids <- unique(annotation[, gene_id])
+genes_with_event <- as_events[, unique(unlist(tstrsplit(gene_id, '_and_', fixed = TRUE)))]
+genes_with_event <- genes_with_event[!is.na(genes_with_event)]
+genes_with_event <- unique(gsub('^(.*)_locus.*$', '\\1', genes_with_event))
+genes_wo_event <- annotation_gene_ids[!annotation_gene_ids %in% genes_with_event]
+stopifnot(length(genes_with_event[!genes_with_event %in% annotation_gene_ids]) == 0 && length(annotation_gene_ids) == (length(genes_with_event) + length(genes_wo_event)))
+
+constitutive_candidates <- annotation[gene_id %in% genes_wo_event & type == 'exon', .(gene_id = unique(gene_id), exon_count = max(exon_number)), by = transcript_id]
+single_transcript_genes <- constitutive_candidates[, if(.N == 1) .SD, by = gene_id]
+min_nr_exons <- 4
+single_transcript_genes[exon_count >= min_nr_exons, gene_id]
+```
+

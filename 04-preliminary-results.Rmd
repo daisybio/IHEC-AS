@@ -115,7 +115,6 @@ event_res <- sapply(as_events, function(event_type) {
 library(ggvenn)
 
 all_gr <- Reduce(c, lapply(event_res, function(event){event$all_gr}))
-to_analyze <- c('SE', 'RI')
 
 # merge event_dts and gr objects. adjust IDs
 max_ID <- 0L
@@ -189,7 +188,7 @@ var_events <- sapply(to_analyze, function(event) {
   names(var_events) <- quants
   
   
-  print(pheatmap(event_mat, show_colnames = FALSE, main = event, cluster_rows = FALSE, cluster_cols = FALSE))
+  print(pheatmap(event_mat, show_colnames = FALSE, show_rownames = FALSE, main = event, cluster_rows = FALSE, cluster_cols = FALSE))
   rmv <- apply(event_mat, 1, function(r) sum(is.na(r)) > length(r)/2)
   print(pheatmap(event_mat[intersect(var_events[['0.5']], names(rmv)[!rmv]), ], show_colnames = FALSE, main = paste(event, '0.5 var threshold')))
   var_events
@@ -205,23 +204,13 @@ ggplot(melt(event_dt[ID %in% keep_rows], id.vars = c('ID', 'gene_id', 'seqnames'
 ```
 
 ```{r}
-aggregated_file_path <- file.path(psi_input_dir, 'aggregated_regions.rds')
+aggregated_file_path <- file.path(psi_input_dir, 'aggregated_reference.rds')
 save.image('aggregating.rda')
 ```
 
+
 ```{r}
-if (!file.exists(aggregated_file_path)) {
-  source('04-preliminary-results-aggregation.R') # or run with sbatch 04-preliminary-results-aggregation.sh
-}
-aggregated_data <- readRDS(aggregated_file_path)
-
-# at some point rename event_name and other_region with ifelse(event_name == 'SE', 'intron', 'exon')
-
-# aggregated_data <- aggregated_data[sample_cols]
-```
-
-```{r, eval=FALSE}
-annotation <- import('suppa_analysis/gencode.v29.protein_coding.gtf')
+annotation <- import('suppa_analysis/gencode.v29.annotation.gtf')
 used_genes <- annotation[annotation$gene_id %in% event_dt[, gene_id] & annotation$type == 'gene', ]
 event_dt[data.table(gene_id = used_genes$gene_id, gene_start = start(used_genes), gene_end = end(used_genes)), on = 'gene_id', c('gene_start', 'gene_end') := .(gene_start, gene_end)]
 
@@ -232,123 +221,299 @@ event_dt[strand == '-', distance_TES:=start(event_gr[ID]) - gene_start]
 event_dt[strand != '-', distance_TES:=gene_end - end(event_gr[ID])]
 
 # add stats about enhancers
-signal_psi_dt[, count_enhancer := as.integer(table(c(signal_psi_dt[, ID], from(enhancer_hits)))) - 1L]
+# signal_psi_dt[, count_enhancer := as.integer(table(c(signal_psi_dt[, ID], from(enhancer_hits)))) - 1L]
     
-signal_psi_dt[data.table(ID = from(distances_enhancers), distance = mcols(distances_enhancers)$distance), on = .(ID), distance_enhancer := distance]
+# signal_psi_dt[data.table(ID = from(distances_enhancers), distance = mcols(distances_enhancers)$distance), on = .(ID), distance_enhancer := distance]
 
 # load gene quantifications
-gene_quants <- fread('suppa_analysis/gene_expressions.tsv')
+gene_quants <- readRDS('suppa_analysis/gene_expressions.rds')
 
 # separator_gene_ids <- '_and_'
-signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec), gene_id)]
+# signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec), gene_id)]
 # signal_psi_dt <- signal_psi_dt[, .(gene_id = unlist(tstrsplit(gene_id, separator_gene_ids, fixed=TRUE))), by=.(ID, PSI)]
 # signal_psi_dt[unique(gene_quants[EpiRR_no_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
 # signal_psi_dt <- signal_psi_dt[, .(gene_id=paste(gene_id, collapse=separator_gene_ids), gene_expression=sum(gene_expression, na.rm = TRUE)), by=.(ID, PSI)]
 
     
 # add region_lengths
-signal_psi_dt[, paste('width', 'upstream', 'other_region', sep = sep) := width(upstream_gr)]
-signal_psi_dt[, paste('width', 'event_name', sep = sep) := width(event_gr)]
-signal_psi_dt[, paste('width', 'downstream', 'other_region', sep = sep) := width(downstream_gr)]
+event_dt[, paste('width', 'upstream_other_region', sep = ';') := width(upstream_gr)]
+event_dt[, paste('width', 'event_name', sep = ';') := width(event_gr)]
+event_dt[, paste('width', 'downstream_other_region', sep = ';') := width(downstream_gr)]
 
 # add distance to TSS and TES here
-signal_psi_dt[, distance_TSS := distance_TSS]
-signal_psi_dt[width(promoter_gr) == 1, distance_TSS := NA] # no distance for multi-gene-exons
-signal_psi_dt[, distance_TES := distance_TES]
-signal_psi_dt[width(tes_gr) == 1, distance_TES := NA] # no distance for multi-gene-exons
+# signal_psi_dt[, distance_TSS := distance_TSS]
+# signal_psi_dt[width(promoter_gr) == 1, distance_TSS := NA] # no distance for multi-gene-exons
+# signal_psi_dt[, distance_TES := distance_TES]
+# signal_psi_dt[width(tes_gr) == 1, distance_TES := NA] # no distance for multi-gene-exons
+
 ```
 
 ```{r}
-metadata <- data.table::fread('IHEC_metadata_harmonization.v0.7.csv')
+metadata <- data.table::fread('IHEC_metadata_harmonization.v0.9.extended.csv')
 metadata[, EpiRR_no_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
-metadata[, annotation := cell_type]
-metadata[biomaterial_type == 'primary tissue', annotation := tissue_type]
-metadata[biomaterial_type == 'cell line', annotation := line]
-metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
+metadata[, annotation := sample_ontology_term_high_order_manual]
+# metadata[biomaterial_type == 'primary tissue', annotation := tissue_type]
+# metadata[biomaterial_type == 'cell line', annotation := line]
+# metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
 ```
 
+
 ```{r}
-aggregation <- 'max'
-cor_method <- 'pearson'
+# if (!file.exists(aggregated_file_path)) {
+#   source('04-preliminary-results-aggregation.R') # or run with sbatch 04-preliminary-results-aggregation.sh
+# }
+# 
+# aggregated_data <- readRDS(aggregated_file_path)
+
+# at some point rename event_name and other_region with ifelse(event_name == 'SE', 'intron', 'exon')
+
+# aggregated_data <- aggregated_data[sample_cols]
 ```
 
 ```{r, fig.width=16, fig.height=10}
-library(pheatmap)
-library(ggplot2)
-for (entry in aggregated_data) {
-  if (any(duplicated(sub('^reH', 'H', names(entry))))) {
-    drop_cols <- names(entry)[startsWith(names(entry), 're') & (duplicated(sub('^reH', 'H', names(entry))) | duplicated(sub('^reH', 'H', names(entry)), last = TRUE))]
-    entry[, (drop_cols):=NULL]
-  } else {
-    setnames(entry, names(entry), sub('^reH', 'H', names(entry)))
-  }
-  rare_antibodies <- names(entry)[grep('H3K9/14ac|H2A\\.Zac', names(entry))]
-  entry[, (rare_antibodies):=NULL]
-  setnames(entry, names(entry), gsub(' ', '_', names(entry), fixed = TRUE))
-}
-aggregated_dt <- rbindlist(aggregated_data, idcol = 'IHEC', fill = TRUE)
-aggregated_dt <- aggregated_dt[!is.nan(PSI)]
-aggregated_dt <- aggregated_dt[ID %in% single_genes_non_overlapping]
-aggregated_dt[, gene_expression:=log2(gene_expression + 1)]
-aggregated_dt[event_dt, on = .(ID), event := event_name]
-aggregated_dt[metadata, on=c(IHEC='EpiRR_no_version'), annotation:=annotation]
-if (!file.exists('aggregated_dt.rds'))
-saveRDS(aggregated_dt, 'aggregated_dt.rds')
+agg_data_files <- list.files(file.path(psi_input_dir, 'sample_dts'), pattern = 'merge_dt.csv.gz', full.names = TRUE)
+histone_marks <- c('H3K4me1', 'H3K27me3', 'H3K36me3', 'H3K27ac', 'H3K4me3', 'H3K9me3')
+cCRE_regions <- c('CTCF-only', 'dELS', 'pELS', 'PLS', 'DNase-H3K4me3')
+cCRE_regions <- c(cCRE_regions, paste(cCRE_regions, 'CTCF-bound', sep = ','))
+genomic_regions <- c('upstream_other_region', 'event_name', 'downstream_other_region')
+all_regions <- c(cCRE_regions, genomic_regions)
+histone_cols <- paste(CJ(histone_marks, all_regions)[, paste(histone_marks, all_regions, sep=';')], 'max', sep = ';')
+wgbs_cols <- paste('wgbs', all_regions, 'mean', sep = ';')
+cols_to_read <- c('ID', histone_cols, wgbs_cols)
+file2IHEC <- tstrsplit(basename(agg_data_files), '-', fixed=TRUE, keep = 1)[[1]]
+names(file2IHEC) <- agg_data_files
+aggregated_dt <- rbindlist(suppressWarnings(sapply(agg_data_files, fread, select = cols_to_read)), idcol = 'IHEC', fill = TRUE)
+aggregated_dt[, IHEC:= as.factor(file2IHEC[IHEC])]
+# for (entry in aggregated_data) {
+#   if (any(duplicated(sub('^reH', 'H', names(entry))))) {
+#     drop_cols <- names(entry)[startsWith(names(entry), 're') & (duplicated(sub('^reH', 'H', names(entry))) | duplicated(sub('^reH', 'H', names(entry)), last = TRUE))]
+#     entry[, (drop_cols):=NULL]
+#   }
+#   setnames(entry, names(entry), sub('^reH', 'H', names(entry)))
+#   rare_antibodies <- names(entry)[grep('H3K9/14ac|H2A\\.Zac', names(entry))]
+#   entry[, (rare_antibodies):=NULL]
+#   # setnames(entry, names(entry), gsub(' ', '_', names(entry), fixed = TRUE))
+# }
+# aggregated_dt <- rbindlist(aggregated_data, idcol = 'IHEC', fill = TRUE)
+# rm(aggregated_data)
+# aggregated_dt[, IHEC:=as.factor(IHEC)]
+aggregated_dt <- aggregated_dt[ID %in% keep_rows]
+# aggregated_dt <- aggregated_dt[!is.nan(PSI)]
+gc()
+
+# if (!file.exists('aggregated_dt.rds'))
+# saveRDS(aggregated_dt, 'aggregated_dt.rds')
+fwrite(aggregated_dt, 'aggregated_dt.csv.gz')
 ```
 
-```{r}
+```{r, eval=FALSE}
+wgbs_cols <- names(aggregated_dt)[startsWith(names(aggregated_dt), 'wgbs;') & endsWith(names(aggregated_dt), ';mean') & !endsWith(names(aggregated_dt), 'tile;mean')]
+hPTM_cols <- names(aggregated_dt)[!startsWith(names(aggregated_dt), 'wgbs;') & endsWith(names(aggregated_dt), ';max') & !endsWith(names(aggregated_dt), 'tile;max')]
+cols_to_delete <- names(aggregated_dt)[!names(aggregated_dt) %in% c(wgbs_cols, hPTM_cols, 'IHEC', 'ID')]
+aggregated_dt[, (cols_to_delete):=NULL]
+```
+
+```{r, eval = FALSE}
 enhancers_counts <- dcast(aggregated_dt, ID + event ~ IHEC, value.var = 'count_enhancer')
 stopifnot(all(apply(enhancers_counts[, ..sample_cols], 1, FUN = function(row) length(unique(row[!is.na(row)])) == 1)))
 ggplot(enhancers_counts, aes(x = IHECRE00000001)) + facet_wrap(. ~ event) + stat_ecdf()
 ```
 
 ```{r, fig.width=16, fig.height=10}
-for (event_name in event_dt[, unique(event_name)]) 
-print(ggplot(aggregated_dt[event == event_name & IHEC %in% aggregated_dt[, sample(unique(IHEC), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + theme_bw() + facet_wrap(. ~ IHEC) + labs(title = event_name))
+melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = 'ID', variable.name = 'IHEC', value.name = 'PSI')
+aggregated_dt[melted_psi[ID %in% keep_rows & !is.na(PSI)], on=.(ID, IHEC), PSI:=PSI]
+aggregated_dt <- aggregated_dt[!is.na(PSI)]
+
+cols_to_add <- c('gene_id', 'distance_TSS', 'distance_TES', 'width;upstream_other_region', 'width;event_name', 'width;downstream_other_region', 'event_name')
+aggregated_dt[event_dt, on=.(ID), (cols_to_add):=mget(cols_to_add)]
+aggregated_dt[gene_quants, on=.(gene_id), gene_expression:=gene_tpm]
+aggregated_dt[, gene_expression:=log2(gene_expression + 1)]
+aggregated_dt[, gene_id:=NULL]
+
+# if (!file.exists('aggregated_dt_filtered.rds'))
+# saveRDS(aggregated_dt, 'aggregated_dt_filtered.rds')
+fwrite(aggregated_dt, 'aggregated_dt_filtered.csv.gz')
+
+# aggregated_dt[metadata, on=c(IHEC='EpiRR_no_version'), annotation:=annotation]
+# cols_to_add <- c(cols_to_add, 'PSI')
+
+
+for (this_event in to_analyze) 
+print(ggplot(aggregated_dt[event_name == this_event & IHEC %in% aggregated_dt[, sample(unique(IHEC), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + theme_bw() + facet_wrap(. ~ IHEC) + labs(title = this_event))
 ```
 
 ```{r, fig.width=16, fig.height=10}
 unlisted_vars <- unlist(unname(var_events), recursive = FALSE)
-cor_dt <- rbindlist(sapply(unique(names(unlisted_vars)), function(var){
-  var_ids <- unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE)
-  aggregated_dt[ID %in% var_ids, lapply(.SD[, -c('ID', 'PSI')], function(y) suppressWarnings(cor(y, PSI, use = 'na', method = cor_method))), by = .(event, IHEC)]
-}, simplify = FALSE), idcol = 'variance quartile')
 
-max_cor_cols <- keep_cols(cor_dt, aggregation)
+minimum_events <- 25
 
-for (event_name in event_dt[, unique(event_name)]) {
-  var_events_type <- var_events[[event_name]]
+cor_dt <-
+  rbindlist(setNames(pbmclapply(unique(
+    names(unlisted_vars)
+  ), function(var) {
+    print(var)
+    var_ids <-
+      as.integer(unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE))
+    rbindlist(sapply(cor_methods, function(cor_method)
+      aggregated_dt[ID %in% var_ids, lapply(.SD, function(y) {
+        rmv <- is.na(y) | is.na(PSI)
+        res <- NA
+        if ((length(rmv) - sum(rmv)) >= 25)
+          res <-
+          suppressWarnings(stats::cor(PSI, y, use = 'pairwise', method = cor_method))
+        return(as.numeric(res))
+      }), by = .(event_name, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'event_name')]]
+      , simplify = FALSE),
+      idcol = 'cor_method')
+  }), unique(names(unlisted_vars))), idcol = 'variance_quartile')
+cor_dt[, variance_quartile := as.factor(variance_quartile)]
+cor_dt[, cor_method := as.factor(cor_method)]
+cor_dt[, partial := FALSE]
+
+
+pcor_dt <-
+  rbindlist(setNames(pbmclapply(unique(
+    names(unlisted_vars)
+  ), function(var) {
+    print(var)
+    var_ids <-
+      as.integer(unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE))
+    rbindlist(sapply(cor_methods, function(cor_method)
+      aggregated_dt[ID %in% var_ids, lapply(.SD, function(y) {
+        rmv <- is.na(y) | is.na(PSI) | is.na(gene_expression)
+        res <- NA
+        if ((length(rmv) - sum(rmv)) >= 25)
+          res <- tryCatch(
+            suppressWarnings(ppcor::pcor.test(PSI[!rmv], y[!rmv], gene_expression[!rmv], method = cor_method)$estimate),
+            error = function(e) {
+              if (identical(y, gene_expression) &
+                  startsWith(e$message, prefix = 'system is computationally singular'))
+                return(suppressWarnings(stats::cor(y, PSI, use = 'pairwise', method = cor_method)))
+              return(e)
+            }
+          )
+        return(as.numeric(res))
+      }), by = .(event_name, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'event_name')]]
+      , simplify = FALSE),
+      idcol = 'cor_method')
+  }), unique(names(unlisted_vars))), idcol = 'variance_quartile')
+pcor_dt[, variance_quartile := as.factor(variance_quartile)]
+pcor_dt[, cor_method := as.factor(cor_method)]
+pcor_dt[, partial := TRUE]
+
+
+all_cor <- rbind(cor_dt, pcor_dt)
+
+for (this_event in to_analyze) {
+  var_events_type <- var_events[[this_event]]
   for (var_threshold in names(var_events_type)) {
-    cor_dt_event_var <- cor_dt[event == event_name & `variance quartile` == var_threshold, ..max_cor_cols]
-    cor_mat <- as.matrix(cor_dt_event_var[, -c('IHEC', 'event', 'variance quartile')])
-    rownames(cor_mat) <- cor_dt_event_var[, IHEC]
-    breaks <- seq(-.2, .2, by = .01)
-    annotation_df <- metadata[EpiRR_no_version %in% sample_cols, data.frame(annotation = annotation, row.names = EpiRR_no_version)]
-    tryCatch({
-      pheatmap(t(cor_mat[sample_cols, ])[, rownames(annotation_df)[order(annotation_df$annotation)]], color = colorRampPalette(c("red", "white", "blue"))(length(breaks)), breaks = breaks, annotation_col = annotation_df, cluster_cols = FALSE, cluster_rows=FALSE, main = paste(event_name, ': PSI Variance Quantile:', var_threshold))
-    }, error = function(e){
-      print(paste(event_name, var_threshold, e$message))
-    })
-      
+    for (this_cor_method in cor_methods) {
+      for (this_partial in c(TRUE, FALSE)) {
+        cor_dt_event_var <-
+          all_cor[event_name == this_event &
+                    variance_quartile == var_threshold &
+                    cor_method == this_cor_method &
+                    partial == this_partial]
+        cor_mat <-
+          as.matrix(cor_dt_event_var[,-c('IHEC',
+                                         'event_name',
+                                         'variance_quartile',
+                                         'partial',
+                                         'cor_method')])
+        rownames(cor_mat) <- cor_dt_event_var[, IHEC]
+        breaks <- seq(-.4, .4, by = .05)
+        annotation_df <-
+          metadata[EpiRR_no_version %in% sample_cols, data.frame(annotation = annotation, row.names = EpiRR_no_version)]
+        tryCatch({
+          pheatmap(
+            t(cor_mat[sample_cols,])[, rownames(annotation_df)[order(annotation_df$annotation)]],
+            color = colorRampPalette(c("red", "white", "blue"))(length(breaks)),
+            breaks = breaks,
+            annotation_col = annotation_df,
+            cluster_cols = FALSE,
+            cluster_rows = FALSE,
+            main = paste(
+              this_event,
+              ':',
+              this_cor_method,
+              ', PSI Variance Quantile:',
+              var_threshold,
+              ', partial',
+              this_partial
+            ),
+            na_col = 'grey',
+            show_colnames = FALSE
+          )
+        }, error = function(e) {
+          print(paste(this_event, var_threshold, e$message))
+        })
+      }
+    }
   }
 }
-
-cor_dt_intermediate <- cor_dt[, ..max_cor_cols]
-colnames(cor_dt_intermediate) <- gsub('_max', '', colnames(cor_dt_intermediate), fixed = TRUE)
-melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'variance quartile', 'event'), variable.name = 'feature', value.name = 'correlation w/ PSI')
-melt_cor_dt[event == 'SE', feature := gsub('other_region', 'intron', feature, fixed=TRUE)]
-melt_cor_dt[event == 'RI', feature := gsub('other_region', 'exon', feature, fixed=TRUE)]
-melt_cor_dt[event == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
-melt_cor_dt[event == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
-melt_cor_dt[, median_cor:=median(`correlation w/ PSI`, na.rm = TRUE), by = c('feature', 'event', 'variance quartile')]
-melt_cor_dt[, relevant:=any(abs(median_cor > .05)), by = c('event', 'feature', 'variance quartile')]
-
-subset_cor_dt <- melt_cor_dt[`variance quartile` %in% c('0', '0.8')]
-subset_cor_dt[, relevant := any(relevant), by = .(feature, event)]
-
-breaks <- seq(-.2, .2, by = .01)
-print(ggplot(subset_cor_dt[relevant == TRUE], aes(x = `correlation w/ PSI`, y = reorder(feature, -`correlation w/ PSI`, FUN = median, na.rm = TRUE), color = `variance quartile`)) + theme_bw() + geom_boxplot(aes(fill = median_cor)) + scale_fill_gradientn(colours = colorRampPalette(c("red", "white", "blue"))(length(breaks)), breaks = seq(-.2, .2, by = .1), limits = c(-.2, .2)) + scale_colour_manual(values = c('dark grey', 'black')) + ylab('feature') + facet_grid(event ~ ., scales="free_y"))
 ```
+
+
+```{r, fig.width=8, fig.height=6}
+cor_dt_intermediate <- copy(all_cor)
+colnames(cor_dt_intermediate) <- gsub(';max', '', colnames(cor_dt_intermediate), fixed = TRUE)
+colnames(cor_dt_intermediate) <- gsub(';mean', '', colnames(cor_dt_intermediate), fixed = TRUE)
+melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'event_name', 'variance_quartile', 'partial', 'cor_method'), variable.name = 'feature', value.name = 'correlation w/ PSI')
+melt_cor_dt[event_name == 'SE', feature := gsub('other_region', 'intron', feature, fixed=TRUE)]
+melt_cor_dt[event_name == 'RI', feature := gsub('other_region', 'exon', feature, fixed=TRUE)]
+melt_cor_dt[event_name == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
+melt_cor_dt[event_name == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
+melt_cor_dt[, feature:=sub(';', ' in ', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=gsub('_', ' ', feature, fixed = TRUE)]
+aggregate_median_by <- c('feature', 'event_name', 'variance_quartile', 'partial', 'cor_method')
+melt_cor_dt[, median_cor:=median(`correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
+melt_cor_dt[, relevant:=any(abs(median_cor) > .1), by = aggregate_median_by]
+
+# subset_cor_dt <- melt_cor_dt[variance_quartile %in% c('0', '0.5')]
+# subset_cor_dt[, relevant := any(relevant), by = .(feature, event_name)]
+
+for (color_by in c('partial', 'cor_method')) {
+  find_relevant_by <- aggregate_median_by[aggregate_median_by != color_by]
+  melt_cor_dt[, plot_relevant:=any(relevant), by = mget(find_relevant_by)]
+  breaks <- seq(-.5, .5, by = .1)
+  not_color_by <- TRUE
+  if (color_by == 'partial')
+    not_color_by <- melt_cor_dt[, cor_method == 'spearman']
+  else if (color_by == 'cor_method')
+    not_color_by <- melt_cor_dt[, partial == 'TRUE']
+  p <- ggplot(melt_cor_dt[plot_relevant == TRUE & variance_quartile == '0' & not_color_by], 
+               aes(x = `correlation w/ PSI`, 
+                   y =  tidytext::reorder_within(feature, -median_cor, event_name), 
+                   color = get(color_by))) + 
+          theme_bw() +
+          geom_boxplot(aes(fill = median_cor)) + 
+          scale_fill_gradientn(colours = colorRampPalette(c("red", "white", "blue"))(length(breaks)), breaks = breaks, limits = c(min(breaks), max(breaks))) +
+          scale_colour_manual(values = c('dark grey', 'black'), name = color_by) +
+          labs(y = 'aggregated signal in or statistic of region') + #, title = 'Distribution of (partial) pearson correlation of epigenetic signals and the PSI (percent spliced ) across all events and samples') +
+          tidytext::scale_y_reordered() + 
+          facet_wrap(. ~ event_name, scales="free")
+  print(p)
+}
+```
+
+
+```{r, fig.width=10, fig.height=10}
+dcast(all_cor, formula = variance_quartile + cor_method + IHEC + event_name ~ partial, value.var = 'gene_expression')[`FALSE` - `TRUE` > 1e-10]
+test_dt <- aggregated_dt[event_name == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000277']
+test_dt[, cor(PSI, gene_expression, use = 'pairwise', 'spearman')]
+test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(gene_expression, PSI, gene_expression, 'spearman')]
+test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(PSI, gene_expression, gene_expression, 'spearman')]
+```
+
+```{r, fig.width=10, fig.height=10}
+library(patchwork)
+p <- ggplot(aggregated_dt[event_name == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = event_name)) + facet_wrap(. ~ IHEC) +  geom_point() +
+  ggpubr::stat_cor(colour = "black")+ ggpubr::stat_cor(method='spearman', cor.coef.name = 'rho', label.y.npc = 'bottom', colour = "black")
+p1 <- ggplot(aggregated_dt[event_name == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = event_name)) + facet_wrap(. ~ IHEC) +  geom_point() + scale_x_log10() + 
+  ggpubr::stat_cor(colour = "black")+ ggpubr::stat_cor(method='spearman', cor.coef.name = 'rho', label.y.npc = 'bottom', colour = "black")
+p + p1
+```
+
 
 ```{r, fig.width = 12, fig.height = 12, eval=FALSE}
 library(corrplot)
