@@ -11,7 +11,7 @@ cd /nfs/data/IHEC/RNAseq
 echo "get ihec_metadata*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
 echo "get ihec_readme.pdf" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
 sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
-find ~/ihec-incoming -name '*' > all_files.txt
+find ~/ihec-incoming -printf "%p\t%CY-%Cm-%Cd %CH:%CM:%CS %CZ\n" > all_files.txt
 fusermount -u ~/ihec-incoming
 ```
 
@@ -29,12 +29,39 @@ write_chunked_files <- function(commands, n_chunks, name, folder) {
     close(fileConn)
   })
 }
+
+determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_chunks = 1, remove = FALSE) {
+  
+  print(prefix)
+  
+  # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+  sftp_files <- all_files[grep(files_to_download, all_files[, filename]), .(filename, date)]
+  local_files <- file.path(dir_to_write, basename(sftp_files[, filename]))
+  
+  still_to_download <- sftp_files[!(file.exists(local_files) & file.info(local_files)$ctime > sftp_files[, date]), filename]
+  
+  print(100*round(length(still_to_download)/length(local_files), 5))
+  
+  downloaded_files <- list.files(dir_to_write, full.names = TRUE)
+  
+  to_remove <- downloaded_files[!downloaded_files %in% local_files]
+  if (remove) {
+    file.remove(to_remove)
+  } else {
+    print(to_remove)
+  }
+  
+  get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', still_to_download, fixed = T))
+  
+  write_chunked_files(get_commands, n_chunks, prefix, dir_to_write)
+}
 ```
 
 
 
 ```{r}
-all_files <- readLines(file.path(data_dir, 'all_files.txt'))
+all_files <- fread(file.path(data_dir, 'all_files.txt'), header = FALSE)
+setnames(all_files, c('V1', 'V2'), c('filename', 'date'))
 ```
 
 ## check RNA files
@@ -100,17 +127,21 @@ uuids_to_download <- uuids_to_download[, if(.N>1) .SD[rna_seq_type == 'mRNA-Seq'
 # also download files for comparison between total and mRNA-seq
 uuids_total_mrna <- rna_samples[, if('mRNA-Seq' %in% rna_seq_type & 'total-RNA-Seq' %in% rna_seq_type).SD[rna_seq_type %in% c('total-RNA-Seq', 'mRNA-Seq'), .(uuid=uuid)], by=epirr_id_wo_version][, uuid]
 
+rna_files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/RNA-Seq/.*(', paste(c(uuids_to_download[, uuid], uuids_total_mrna), collapse = '|'), ')\\.isoforms\\.results$')
+
+determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna', dir_to_write = rna_data_dir, n_chunks = 1)
+
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-sftp_rna_files <- all_files[grep(paste0('/nfs/home/students/ga89koc/ihec-incoming/RNA-Seq/.*(', paste(c(uuids_to_download[, uuid], uuids_total_mrna), collapse = '|'), ')\\.isoforms\\.results$'), all_files)]
-local_rna_files <- file.path(rna_data_dir, basename(sftp_rna_files))
-print(100*round(sum(file.exists(local_rna_files))/length(local_rna_files), 5))
-
-downloaded_rna_files <- list.files(rna_data_dir, 'isoforms\\.results$', full.names = TRUE)
-# file.remove(downloaded_rna_files[!downloaded_rna_files %in% local_rna_files])
-
-rna_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_rna_files[!file.exists(local_rna_files)], fixed = T))
-
-write_chunked_files(rna_get_commands, 1, 'rna', rna_data_dir)
+# sftp_rna_files <- all_files[grep(rna_files_to_download, all_files[, filename]), .(filename, date)]
+# local_rna_files <- file.path(rna_data_dir, basename(sftp_rna_files[, filename]))
+# print(100*round(sum(file.exists(local_rna_files))/length(local_rna_files), 5))
+# 
+# downloaded_rna_files <- list.files(rna_data_dir, 'isoforms\\.results$', full.names = TRUE)
+# # file.remove(downloaded_rna_files[!downloaded_rna_files %in% local_rna_files])
+# 
+# rna_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_rna_files[!(file.exists(local_rna_files) & file.info(local_rna_files)$ctime > sftp_rna_files[, date]), filename], fixed = T))
+# 
+# write_chunked_files(rna_get_commands, 1, 'rna', rna_data_dir)
 ```
 
 ## download ChIP and WGBS files
@@ -119,16 +150,19 @@ write_chunked_files(rna_get_commands, 1, 'rna', rna_data_dir)
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 chip_files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/ChIP-Seq/.*(', paste(epirr_ids_to_download, collapse = '|'), ').*\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$')
 
-sftp_chip_files <-  all_files[grep(chip_files_to_download, all_files)]
-local_chip_files <- file.path(chip_data_dir, basename(sftp_chip_files))
-print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
-
-downloaded_chip_files <- list.files(chip_data_dir, '\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$', full.names = TRUE)
-# file.remove(downloaded_chip_files[!downloaded_chip_files %in% local_chip_files])
-
-chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_chip_files[!file.exists(local_chip_files)], fixed = T))
-
-write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
+determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 1)
+# 
+# 
+# sftp_chip_files <-  all_files[grep(chip_files_to_download, all_files[, filename]), .(filename, date)]
+# local_chip_files <- file.path(chip_data_dir, basename(sftp_chip_files[, filename]))
+# print(100*round(sum(file.exists(local_chip_files))/length(local_chip_files), 5))
+# 
+# downloaded_chip_files <- list.files(chip_data_dir, '\\.(fc\\.signal\\.bigwig|pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz)$', full.names = TRUE)
+# # file.remove(downloaded_chip_files[!downloaded_chip_files %in% local_chip_files])
+# 
+# chip_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_chip_files[!(file.exists(local_chip_files) & file.info(local_chip_files)$ctime > sftp_chip_files[, date]), filename], fixed = T))
+# 
+# write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
 
 ```
 
@@ -137,18 +171,20 @@ write_chunked_files(chip_get_commands, 1, 'chip', chip_data_dir)
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 wgbs_files_to_download <- paste0('/nfs/home/students/ga89koc/ihec-incoming/WGBS/.*(', paste(epirr_ids_to_download, collapse = '|'), ').*.gembs_(neg|pos).bw$')
 
+determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1)
+
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-sftp_wgbs_files <- all_files[grep(wgbs_files_to_download, all_files)]
-local_wgbs_files <- file.path(wgbs_data_dir, basename(sftp_wgbs_files))
-print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
-
-downloaded_wgbs_files <- list.files(wgbs_data_dir, full.names = TRUE)
-# file.remove(downloaded_wgbs_files[!downloaded_wgbs_files %in% local_wgbs_files])
-
-
-wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_wgbs_files[!file.exists(local_wgbs_files)], fixed = T))
-
-write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
+# sftp_wgbs_files <- all_files[grep(wgbs_files_to_download, all_files[, filename]), .(filename, date)]
+# local_wgbs_files <- file.path(wgbs_data_dir, basename(sftp_wgbs_files[, filename]))
+# print(100*round(sum(file.exists(local_wgbs_files))/length(local_wgbs_files), 5))
+# 
+# downloaded_wgbs_files <- list.files(wgbs_data_dir, full.names = TRUE)
+# # file.remove(downloaded_wgbs_files[!downloaded_wgbs_files %in% local_wgbs_files])
+# 
+# 
+# wgbs_get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', sftp_wgbs_files[!(file.exists(local_wgbs_files) & file.info(local_wgbs_files)$ctime > sftp_wgbs_files[, date]), filename], fixed = T))
+# 
+# write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
 ```
 
 ```{r}
