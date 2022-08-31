@@ -23,7 +23,7 @@ coef_dt <- rbindlist(sapply(event_models, function(cvfits){
   if (inherits(cvfits, 'simpleError'))
     return(NULL)
   coefs <- coef(summary(cvfits$cvfit$OLS))
-  if (ncol(coefs) != 4) browser()
+  if (ncol(coefs) != 4) stop('something did not work')
   data.table(feature = rownames(coefs), coefs = coefs[, 1], pvalue = coefs[, 4])
   # rbindlist(sapply(names(cvfits), function(alpha) {
   #   cvfit <- cvfits[[alpha]]
@@ -35,8 +35,9 @@ coef_dt <- rbindlist(sapply(event_models, function(cvfits){
   #   data.table(feature = rownames(coefs), coefs = coefs[, 1])
   # }, simplify = FALSE), idcol = 'alpha')
 }, simplify = FALSE), idcol='ID')
-coef_dt[, padj_ID:=p.adjust(pvalue, 'BH'), by=ID]
+# coef_dt[, padj_ID:=p.adjust(pvalue, 'BH'), by=ID]
 coef_dt[, padj:=p.adjust(pvalue, 'BH')]
+coef_dt[, padj_BF:=p.adjust(pvalue, 'bonferroni')]
 coef_dt[, ID:=as.integer(ID)]
 coef_dt[event_dt, on=.(ID), event_name:=event_name]
 # coef_dt[, coef_rank:=rank(-coefs), by=.(ID)]
@@ -89,7 +90,7 @@ tf_dt[, percentage:=n/total]
 # tfs_by_accession <- tf_dt[, list(tfs = list(name)), by=.(accession)]
 # coef_dt[alpha == '1' & coefs != 0 & feature != '(Intercept)' & ID %in% coef_dt[!is.na(cCRE_type), ID]]
 # coef_dt[tfs_by_accession, on=c(cCRE_accession='accession'), tfs:=tfs]
-cols_to_tf <- c('coefs', 'event_name', 'cCRE_type', 'mark')
+cols_to_tf <- c('coefs', 'event_name', 'cCRE_type', 'mark', 'padj', 'padj_BF')
 tf_dt[coef_dt[padj < .05], on=c(accession='cCRE_accession'), (cols_to_tf):=mget(cols_to_tf)]
 
 ggplot(tf_dt[n> 1 & cCRE_type == 'dELS' & event_name == 'SE'], aes(x = name, y = coefs)) + geom_boxplot() + facet_wrap(~ mark, ncol = 1, scales = 'free_y') + theme_bw() + theme(axis.text.x = element_text(
@@ -97,6 +98,22 @@ ggplot(tf_dt[n> 1 & cCRE_type == 'dELS' & event_name == 'SE'], aes(x = name, y =
     hjust = 1,
     vjust = .5
   ))
+```
+
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(GO.db)
+protein_id <- 'SYMBOL'
+# first get splicing factors
+go_id_splicing <- AnnotationDbi::select(GO.db, keys = c("mRNA splicing, via spliceosome"), columns = c("GOID"), keytype = c("TERM"))$GOID
+splicing_factors <- unique(AnnotationDbi::select(org.Hs.eg.db, keys=go_id_splicing, columns = protein_id, keytype = "GOALL")[[protein_id]])
+# here we manually produced data/splicing_factor_mapping.tab
+
+# now get tfs
+go_id_transcription_factor <- AnnotationDbi::select(GO.db, keys = c("DNA-binding transcription factor activity"), columns = c("GOID"), keytype = c("TERM"))$GOID
+transcription_factors <- unique(AnnotationDbi::select(org.Hs.eg.db, keys=go_id_transcription_factor, columns = protein_id, keytype = "GOALL")[[protein_id]])
+# here we manually produced data/transcription_factor_mapping.tab
 ```
 
 ```{r, fig.width=10, eval=FALSE}
