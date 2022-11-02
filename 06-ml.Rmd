@@ -7,6 +7,7 @@ output: pdf_document
 library(ggplot2)
 library(glmnet)
 glmnet.control(itrace = 1)
+all_models <- sapply(to_analyze, function(event) readRDS(paste(event, 'models.rds', sep = '_')))
 ```
 
 
@@ -26,9 +27,9 @@ source('06-ml.R')
 
 # check models
 
-```{r, fig.width=15, fig.height=10}
-rank_dt <- rbindlist(sapply(to_analyze, function(event){
-  models <- readRDS(paste(event, 'models.rds', sep = '_'))
+```{r, fig.width=16, fig.height=11}
+rank_dt <- rbindlist(sapply(to_analyze, function(this_event){
+  models <- all_models[, this_event]
   as_dt <- rbindlist(sapply(names(models), function(cvfit_name) {
     cvfits <- models[[cvfit_name]]$cvfit
     rbindlist(sapply(names(cvfits), function(alpha) {
@@ -36,8 +37,8 @@ rank_dt <- rbindlist(sapply(to_analyze, function(event){
       if (alpha == 'OLS') {
         coefs <- as.matrix(coef(cvfit))
       } else {
-        coefs <- coef(cvfit, s = "lambda.1se")
-        plot(cvfit, main=paste(event, cvfit_name, alpha))
+        coefs <- coef(cvfit, s = my_lambda)
+        # plot(cvfit, main=paste(this_event, cvfit_name, alpha))
       }
       data.table(feature = rownames(coefs), coefs = coefs[, 1])
     }, simplify = FALSE), idcol = 'alpha')
@@ -45,25 +46,75 @@ rank_dt <- rbindlist(sapply(to_analyze, function(event){
   # as_dt <- melt(dcast(as_dt, model + alpha ~ feature, value.var = 'coefs'), id.vars = c('model', 'alpha'), variable.name = 'feature', value.name = 'coefs')
   # as_dt[, model:=sub('no_enhancer', 'noEnhancer', model, fixed = TRUE)]
   # as_dt[, model:=sub('enhancer_stripped', 'enhancerStripped', model, fixed = TRUE)]
-  as_dt[, c('dataset', 'explanatory', 'response'):=tstrsplit(model, '_', fixed=TRUE)]
-  as_dt[, coef_rank:=rank(-coefs, na.last = 'keep'), by=model]
-}, simplify = FALSE), idcol = 'event')
-rank_dt[event == 'SE', feature:=sub('event_name', 'SE', feature, fixed = TRUE)]
-rank_dt[event == 'SE', feature:=sub('other_region', 'intron', feature, fixed = TRUE)]
-# ggplot(rank_dt[event == 'SE'], aes(x = coef_rank, y = reorder(feature, coef_rank, mean), shape = response, color = dataset)) + geom_jitter() + facet_wrap(~ event)
-rank_dt[event == 'RI', feature:=sub('event_name', 'RI', feature, fixed = TRUE)]
-rank_dt[event == 'RI', feature:=sub('other_region', 'exon', feature, fixed = TRUE)]
-# ggplot(rank_dt[event == 'RI'], aes(x = coef_rank, y = reorder(feature, coef_rank, mean), shape = response, color = dataset)) + geom_jitter() + facet_wrap(~ event)
+  as_dt[, model:=gsub('nocCRE', 'wo/ cCRE', model, fixed = TRUE)]
+  as_dt[, c('PSI Variance', 'dat_expl_resp'):=tstrsplit(model, '.', fixed=TRUE)]
+  as_dt[, `PSI Variance`:=tstrsplit(`PSI Variance`, '_', fixed=TRUE, keep = 1)]
+  as_dt[, c('dataset', 'explanatory', 'response'):=tstrsplit(dat_expl_resp, '_', fixed=TRUE)]
+  # as_dt[, coef_rank:=rank(-coefs, na.last = 'keep'), by=model]
+}, simplify = FALSE), idcol = 'Event Type')
+split_features(rank_dt, 'feature')
+rank_dt[, region:=sub('upstream', 'Upstream', region, fixed = TRUE)]
+rank_dt[, region:=sub('downstream', 'Downstream', region, fixed = TRUE)]
+rank_dt[, region:=gsub('[_,]', '\n', region)]
+rank_dt[, region := factor(
+  region,
+  levels =
+    c(
+      unique(region)[startsWith(unique(region), 'Upstream')],
+      unique(region)[startsWith(unique(region), 'RI')],
+      unique(region)[startsWith(unique(region), 'SE')],
+      unique(region)[startsWith(unique(region), 'Downstream')],
+      unique(region)[startsWith(unique(region), 'Gene')],
+      unique(region)[startsWith(unique(region), 'PLS')],
+      unique(region)[startsWith(unique(region), 'DNase-H3K4me3')],
+      unique(region)[startsWith(unique(region), 'pELS')],
+      unique(region)[startsWith(unique(region), 'dELS')],
+      unique(region)[startsWith(unique(region), 'CTCF-only')]
+    )
+)]
+rank_dt[, mark:=sub('gene_expression', 'Gene_Expression', mark)]
+rank_dt[, mark:=gsub('[_,]', '\n', mark)]
+rank_dt[, mark:=sub('wgbs', 'DNAm', mark)]
+rank_dt[, mark:=sub('width', 'Width', mark)]
+rank_dt[, mark:=sub('distance', 'Distance', mark)]
+rank_dt[, mark := factor(
+  mark,
+  levels =
+    c('(Intercept)', 'ID', 'Gene\nExpression', 'Distance\nTSS', 'Distance\nTES', 'Width', 'DNAm', 'H3K36me3', 'H3K4me1', 'H3K4me3', 'H3K27me3', 'H3K27ac', 'H3K9me3')
+)]
+
+rank_dt[, 'Samples, Features':= paste(dataset, explanatory, sep = ', ')]
+```
+
+
+```{r, fig.width=16, fig.height=11}
+my_colors <- rev(c("#CC79A7", "#009E73", "#999999"))
+
+for (this_event in to_analyze) {
+  print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width'], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
+        + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
+  ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
+  print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & (region == 'Gene-Wide' | mark ==  'Width')], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_wrap(~ region + mark, nrow = 2) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
+        + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
+  ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 9, height = 6)
+  print(ggplot(rank_dt[feature != '(Intercept)' & this_event==`Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width'], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(region ~ mark) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#just_text(angle = 45, hjust=1))
+    + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
+  ggsave(filename = file.path(plot_dir, paste0('coef_region_', this_event, '.pdf')), width =9, height = 15)
+  
+  # print((ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & explanatory == 'all' & dataset == 'all'], aes(x = reorder(mark, mark, function(x) -length(x)))) + geom_bar() + labs(title=this_event)) +
+  #         (ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & explanatory == 'all' & dataset == 'all'], aes(x = reorder(region, region, function(x) -length(x)))) + geom_bar()))
+}
+
 ```
 
 # make roc_curves for total models:
-```{r}
+```{r, fig.height=5, fig.width=11.7}
 library(pROC)
 library(patchwork)
-roc_list <- sapply(to_analyze, function(event){
-  models <- readRDS(paste(event, 'models.rds', sep = '_'))
-  as_list <- sapply(names(models)[endsWith(names(models), 'binary')], function(cvfit_name) {
-      print(paste(event, cvfit_name))
+cm_list <- sapply(to_analyze, function(this_event){
+  models <- all_models[, this_event]
+  as_list <- sapply(names(models)[endsWith(names(models), 'binomial')], function(cvfit_name) {
+      print(paste(this_event, cvfit_name))
       cvfits <- models[[cvfit_name]]$cvfit
       test_data <- models[[cvfit_name]]$test_data
       explanatory <- models[[cvfit_name]]$explanatory
@@ -73,128 +124,48 @@ roc_list <- sapply(to_analyze, function(event){
         {
           predicted <-
             predict(cvfit, newdata = test_data[, ..explanatory])
+          predicted_label <- predict(cvfit, newdata = test_data[, ..explanatory], type = 'response')
+          predicted_label[predicted_label < .5] <- 0
+          predicted_label[predicted_label >= .5] <- 1
         }
         else
         {
           predicted <-
-            predict(cvfit, newx = as.matrix(test_data[, ..explanatory]), s = "lambda.1se")[, 1]
+            predict(cvfit, newx = as.matrix(test_data[, ..explanatory]), s = my_lambda)[, 1]
+          predicted_label <- predict(cvfit, newx = as.matrix(test_data[, ..explanatory]), s = my_lambda, type = 'class')[, 1]
         }
-        trues <- test_data[, binary]
-        roc(trues, predicted)
+        trues <- as.factor(test_data[, binary])
+      list(roc=roc(trues, predicted, levels=base::levels(as.factor(trues)),direction='<'), cm = caret::confusionMatrix(as.factor(predicted_label), trues, positive='1'))
       }, simplify = FALSE)
   }, simplify = FALSE)
-  ggroc(unlist(as_list, recursive = FALSE)) + labs(title=event, color='data_explanatory_response_alpha')
+  flat_as_list <- unlist(unlist(as_list, recursive = FALSE), recursive = FALSE)
+  names(flat_as_list) <- gsub('nocCRE', 'wo/ cCRE', names(flat_as_list), fixed = TRUE)
+  for (alpha in names(models[[1]]$cvfit)) {
+    roc_list <- flat_as_list[endsWith(names(flat_as_list), paste0(alpha, '.roc'))]
+    roc_list <- roc_list[order(names(roc_list))]
+    auc_list <- sapply(names(roc_list), function(x){
+      var <- tstrsplit(x, '_', fixed = TRUE, keep = 1)[[1]]
+      paste0(var, ': ', round(roc_list[[x]][["auc"]], 2))
+    })
+    plot_list <- lapply(unique(tstrsplit(names(roc_list), '.', fixed=TRUE, keep=1)[[1]]), function(var) {
+      tmp_roc_list <- roc_list[startsWith(names(roc_list), var)]
+      
+      names(tmp_roc_list) <- gsub(paste0('_binomial\\.', alpha, '\\.roc$'), '', gsub(paste0('^',var,'\\.'), '', names(tmp_roc_list)))
+      p <- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
+                color = "darkgrey", linetype = "dashed") +
+            labs(title=tstrsplit(var, '_', fixed = TRUE, keep = 1)[[1]], color='Samples, Features (variance: AUC)', x = 'Specificity', y = 'Sensitivity') + 
+            scale_color_discrete(labels=sapply(names(tmp_roc_list), function(x) paste0(sub('_', ', ', x, fixed = TRUE), ' (', paste(auc_list[grep(x, names(auc_list), fixed = TRUE)], collapse = ', '), ')'))) + 
+            theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
+      p
+    })
+  print(Reduce(`+`, plot_list)+ plot_layout(guides = "collect") & theme(legend.position = 'bottom'))# + plot_layout(guides = "collect") & theme(legend.position = 'bottom'))
+  ggsave(filename = file.path(plot_dir, paste0('roc_', this_event, '_', alpha, '.pdf')), width = 11.7, height = 5)
+    # print(ggroc(roc_list) + 
+          # labs(title=paste(this_event, alpha), color='data_explanatory_response_alpha') + scale_color_discrete(labels=paste(names(roc_list), sapply(roc_list, function(x) paste0('(', round(x[["auc"]], 2),')')))) + theme_bw())
+  }
+  
+  flat_as_list[endsWith(names(flat_as_list), '.cm')]
 }, simplify = FALSE)
-roc_list
+
 ```
  
- # build event-specific models
-```{r, eval=FALSE}
-event_specific_ids <- aggregated_dt[count_enhancer > 0, if(.N >= 300) .(N=.N), by=ID]
-explanatory <- names(aggregated_dt)[!names(aggregated_dt) %in% c('IHEC', 'ID', 'event', response) & keep_cols(aggregated_dt, aggregation) & !grepl('tile', names(aggregated_dt), fixed = TRUE) & !endsWith(names(aggregated_dt), 'percentage') & !endsWith(names(aggregated_dt), 'count') & !endsWith(names(aggregated_dt), 'presence')]
-glmnet.control(itrace = 0)
-event_models <- pbmcapply::pbmclapply(event_specific_ids[, ID], function(id) {
-  tryCatch({
-    cvfit <- run_glmnet(data = aggregated_dt[, -c('IHEC', 'ID', 'event')], 
-                        explanatory = explanatory, 
-                        response = response,
-                        filter_rows = aggregated_dt[, ID == id])
-    cvfit}, error = function(e){e}
-  )
-})
-names(event_models) <- event_specific_ids[, ID]
-```
- 
-```{r, fig.width=20, fig.height=10}
-load('aggregating.rda')
-cCREs <- data.table::fread('data/GRCh38-cCREs.bed')
-names(cCREs) <- c('seqnames', 'start', 'end', 'some_id', 'accession', 'cCRE_type')
-
-event_models <- readRDS('event_models.rds')
-nsamples_dt <- rbindlist(sapply(event_models, function(event) list(nsamples=event$nsamples), simplify = FALSE), idcol='ID')
-ids_with_big_nsamples <- nsamples_dt[nsamples >= 200, as.integer(ID)]
-coef_dt <- rbindlist(sapply(event_models, function(cvfits){
-  cvfits <- cvfits$cvfit
-  rbindlist(sapply(names(cvfits), function(alpha) {
-    cvfit <- cvfits[[alpha]]
-    if (alpha == 'OLS') {
-      coefs <- as.matrix(coef(cvfit))
-    } else {
-      coefs <- coef(cvfit, s = "lambda.1se")
-    }
-    data.table(feature = rownames(coefs), coefs = coefs[, 1])
-  }, simplify = FALSE), idcol = 'alpha')
-}, simplify = FALSE), idcol='ID')
-coef_dt[, ID:=as.integer(ID)]
-coef_dt[event_dt, on=.(ID), event_name:=event_name]
-coef_dt[, coef_rank:=rank(-coefs), by=.(ID, alpha)]
-coef_dt[, feature:=gsub('`', '', feature, fixed = TRUE)]
-coef_dt[, cCRE_id := as.integer(gsub('^.+_(\\d+)$', '\\1', feature))]
-coef_dt[, c('cCRE_type', 'cCRE_accession'):=cCREs[cCRE_id, .(cCRE_type, accession)]]
-coef_dt[, mark:=tstrsplit(feature, ';', fixed = TRUE, keep = 1)]
-coef_dt[!is.na(cCRE_type), feature := paste(tstrsplit(feature, '_', fixed = TRUE, keep = 1)[[1]], cCRE_type, sep = ';')]
-ggplot(coef_dt[coefs!=0 & feature != '(Intercept)' & ID %in% coef_dt[!is.na(cCRE_type), ID]], aes(y = coefs, x = tidytext::reorder_within(feature, -coefs, event_name, median), color = event_name))  + geom_boxplot() + #geom_jitter() + 
-  labs(x='feature', title = 'nonzero coeffficients for each event with an enhancer in 5kb window') + theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = .5)) + tidytext::scale_x_reordered() + facet_wrap(~ event_name + alpha, scales='free', nrow = 2)
-ggplot(coef_dt[alpha == 'OLS' & coefs != 0 & !is.na(cCRE_id)#feature != '(Intercept)' & ID %in% coef_dt[!is.na(cCRE_type), ID]
-               ], aes(x = coefs, color=mark)) + geom_density() + theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = .5)) + facet_wrap( ~ event_name + cCRE_type, nrow = 2, scales='free_y')
-ggplot(coef_dt[alpha == 'OLS' & coefs != 0 & !is.na(cCRE_id)], aes(y = coefs, x = tidytext::reorder_within(mark, -coefs, event_name, median), color = event_name))  + geom_boxplot() + #geom_jitter() + 
-  labs(x='feature', title = 'nonzero coeffficients for each event with an enhancer in 5kb window') + theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = .5)) + tidytext::scale_x_reordered() + facet_wrap( ~ event_name + cCRE_type, nrow = 2, scales='free_y')
-```
-
-
-```{r}
-library(httr)
-nonzero_cCRE_accessions <-
-  coef_dt[alpha == 'OLS' &
-            coefs != 0 & !is.na(cCRE_id), unique(cCREs[cCRE_id, accession])]
-job::job({
-  tf_dt <- rbindlist(sapply(nonzero_cCRE_accessions, function(this_accession) {
-    print(this_accession)
-    r <-
-      RETRY(verb = 'POST',
-        url = 'https://screen-beta-api.wenglab.org/dataws/re_detail/tfIntersection',
-        body = sprintf(
-          '{"assembly": "GRCh38", "accession": "%s"}',
-          this_accession
-        ),
-        content_type_json(),
-        pause_min = 301
-      )
-    if (http_error(r)){
-      warn_for_status(r)
-      return(data.table(name='ERROR', n = 0L, total = 0L))
-    } else {
-      rbindlist(content(r, "parsed", "application/json")[[this_accession]]$tf)
-    }
-  }), idcol = 'accession')
-})
-```
-
-```{r}
-tfs_by_accession <- tf_dt[, list(tfs = list(name)), by=.(accession)]
-coef_dt[alpha == '1' & coefs != 0 & feature != '(Intercept)' & ID %in% coef_dt[!is.na(cCRE_type), ID]]
-coef_dt[tfs_by_accession, on=c(cCRE_accession='accession'), tfs:=tfs]
-```
-
-```{r, fig.width=10}
-#, fig.width=15, fig.height=10}
-#, fig.height=35, fig.width=14}
-non_zero_enhancers_wo_gene_expr <- coef_dt[ID %in% ids_non_zero_enhancers & !ID %in% gene_expr_ids & coefs != 0 & feature != '(Intercept)']
-print(paste(non_zero_enhancers_wo_gene_expr[, uniqueN(ID)], 'events left'))
-
-all_features <- coef_dt[, unique(feature)]
-enhancer_ids <- grep('enhancer', all_features, fixed = TRUE)
-ggplot(non_zero_enhancers_wo_gene_expr, aes(y = coefs, x = factor(feature, levels = c(all_features[enhancer_ids], all_features[-enhancer_ids])), color = event_name))  + geom_boxplot() + geom_jitter()+ labs(x='feature', title = 'nonzero coeffficients for each event with an enhancer in 5kb window and > 300 samples') + theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = .5)) #+ facet_wrap(~ ID, scales='free_x')
-```
-
-```{r}
-all.equal(event_dt[ID %in% non_zero_enhancers_wo_gene_expr[, unique(ID)]], event_dt[non_zero_enhancers_wo_gene_expr[, sort(unique(ID))]])
-event_dt[non_zero_enhancers_wo_gene_expr[, sort(unique(ID))], 'gene_id']
-event_gr[non_zero_enhancers_wo_gene_expr[, sort(unique(ID))]]
-enhancers <- rtracklayer::import('data/F5.hg38.enhancers.bed')
-enhancer_hits <- findOverlaps(event_gr, enhancers, maxgap = 5000, ignore.strand=TRUE)
-enhancers[to(enhancer_hits[from(enhancer_hits) %in% non_zero_enhancers_wo_gene_expr[, unique(ID)]])]
-enhancer_hits[from(enhancer_hits) == 719]
-head(enhancers)
-```
-

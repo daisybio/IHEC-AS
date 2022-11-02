@@ -24,7 +24,6 @@ pca_plots(tpm_matrix[metadata_filtered[, EpiRR_no_version]], metadata_filtered, 
 ## UMAP on TPM
 
 ```{r, fig.height=7, fig.width=12}
-library(umap)
 umap_tpm <- umap::umap(tpm_matrix[metadata_filtered[, EpiRR_no_version]])
 
 df <- data.frame(x = umap_tpm$layout[,1],
@@ -107,7 +106,6 @@ pca_plots(psi_table_tpm[metadata_filtered[, EpiRR_no_version],], metadata_filter
 ```
 
 ```{r, fig.height=7, fig.width=12, eval=TRUE}
-library(pheatmap)
 pheatmap(psi_table_filtered)
 ```
 

@@ -35,7 +35,7 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCRE_dt, c
   )
   
   hits_list <- sapply(region_grs, findOverlaps, subject = signal_gr, simplify = FALSE)
-  # names(hits_list) <- c('upstream_other_region', 'upstream_tile', 'event_name', 'downstream_tile', 'downstream_other_region')
+  
   
   # hits_list <- c(hits_list, cCRE_hits_list)
   
@@ -194,7 +194,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
       histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
       histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
       for (this_uuid in histone_samples[epirr_id_wo_version == ihec, uuid]) {
-        file_ext <- c(peak = '\\.pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz$', 
+        file_ext <- c(#peak = '\\.pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz$', 
                       signal = '\\.fc\\.signal\\.bigwig$')
         for (file_type in names(file_ext)) {
           histone_file <-

@@ -1,0 +1,244 @@
+---
+title: "Correlation analysis"
+output: pdf_document
+---
+
+```{r, fig.width=16, fig.height=10}
+# if (!file.exists('aggregated_dt_filtered.rds'))
+# saveRDS(aggregated_dt, 'aggregated_dt_filtered.rds')
+load('aggregating.rda')
+aggregated_dt <- fread('aggregated_dt_filtered.csv.gz', stringsAsFactors=TRUE)
+```
+
+
+```{r, fig.width=16, fig.height=10}
+vars_to_investigate <- c('0', '0.5', '<0.5')
+unlisted_vars <- unlist(unname(var_events), recursive = FALSE)
+unlisted_vars$'<0.5' <- setdiff(as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)),
+                                as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0.5'], use.names = FALSE)))
+unlisted_vars <- unlisted_vars[names(unlisted_vars) %in% vars_to_investigate]
+
+minimum_events <- 25
+
+cor_dt <-
+  rbindlist(setNames(pbmclapply(unique(
+    names(unlisted_vars)
+  ), function(var) {
+    print(var)
+    var_ids <-
+      as.integer(unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE))
+    rbindlist(sapply(cor_methods, function(cor_method)
+      aggregated_dt[ID %in% var_ids, lapply(.SD, function(y) {
+        rmv <- is.na(y) | is.na(PSI)
+        res <- NA
+        if ((length(rmv) - sum(rmv)) >= minimum_events)
+          res <-
+          suppressWarnings(stats::cor(PSI, y, use = 'pairwise', method = cor_method))
+        return(as.numeric(res))
+      }), by = .(`Event Type`, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'Event Type')]]
+      , simplify = FALSE),
+      idcol = 'Correlation Coefficient')
+  }), unique(names(unlisted_vars))), idcol = 'PSI Variance')
+cor_dt[, `PSI Variance` := as.factor(`PSI Variance`)]
+cor_dt[, `Correlation Coefficient` := as.factor(`Correlation Coefficient`)]
+cor_dt[, `Partial Correlation` := FALSE]
+
+
+pcor_dt <-
+  rbindlist(setNames(pbmclapply(unique(
+    names(unlisted_vars)
+  ), function(var) {
+    print(var)
+    var_ids <-
+      as.integer(unlist(unlisted_vars[names(unlisted_vars) == var], use.names = FALSE))
+    rbindlist(sapply(cor_methods, function(cor_method)
+      aggregated_dt[ID %in% var_ids, lapply(.SD, function(y) {
+        rmv <- is.na(y) | is.na(PSI) | is.na(gene_expression)
+        res <- NA
+        if ((length(rmv) - sum(rmv)) >= minimum_events)
+          res <- tryCatch(
+            suppressWarnings(ppcor::pcor.test(PSI[!rmv], y[!rmv], gene_expression[!rmv], method = cor_method)$estimate),
+            error = function(e) {
+              if (identical(y, gene_expression) &
+                  startsWith(e$message, prefix = 'system is computationally singular'))
+                return(suppressWarnings(stats::cor(y, PSI, use = 'pairwise', method = cor_method)))
+              return(e)
+            }
+          )
+        return(as.numeric(res))
+      }), by = .(`Event Type`, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'Event Type')]]
+      , simplify = FALSE),
+      idcol = 'Correlation Coefficient')
+  }), unique(names(unlisted_vars))), idcol = 'PSI Variance')
+pcor_dt[, `PSI Variance` := as.factor(`PSI Variance`)]
+pcor_dt[, `Correlation Coefficient` := as.factor(`Correlation Coefficient`)]
+pcor_dt[, `Partial Correlation` := TRUE]
+
+
+all_cor <- rbind(cor_dt, pcor_dt)
+all_cor[`PSI Variance` == '0', `PSI Variance`:='all']
+all_cor[`PSI Variance` == '0.5', `PSI Variance`:='high']
+all_cor[`PSI Variance` == '<0.5', `PSI Variance`:='low']
+all_cor[, `PSI Variance`:=factor(`PSI Variance`, levels = c('low', 'high', 'all'))]
+
+for (this_event in to_analyze) {
+  var_events_type <- var_events[[this_event]]
+  for (var_threshold in names(var_events_type)) {
+    for (this_cor_method in cor_methods) {
+      for (this_partial in c(TRUE, FALSE)) {
+        cor_dt_event_var <-
+          all_cor[`Event Type` == this_event &
+                    `PSI Variance` == var_threshold &
+                    `Correlation Coefficient` == this_cor_method &
+                    `Partial Correlation` == this_partial]
+        cor_mat <-
+          as.matrix(cor_dt_event_var[,-c('IHEC',
+                                         'Event Type',
+                                         'PSI Variance',
+                                         'Partial Correlation',
+                                         'Correlation Coefficient')])
+        rownames(cor_mat) <- cor_dt_event_var[, IHEC]
+        breaks <- seq(-.4, .4, by = .05)
+        annotation_df <-
+          metadata[EpiRR_no_version %in% sample_cols, data.frame(annotation = annotation, row.names = EpiRR_no_version)]
+        tryCatch({
+        #   pheatmap(
+        #     t(cor_mat[sample_cols,])[, rownames(annotation_df)[order(annotation_df$annotation)]],
+        #     color = colorRampPalette(c("red", "white", "blue"))(length(breaks)),
+        #     breaks = breaks,
+        #     annotation_col = annotation_df,
+        #     cluster_cols = FALSE,
+        #     cluster_rows = FALSE,
+        #     main = paste(
+        #       this_event,
+        #       ':',
+        #       this_cor_method,
+        #       ', PSI Variance Quantile:',
+        #       var_threshold,
+        #       ', partial',
+        #       this_partial
+        #     ),
+        #     na_col = 'grey',
+        #     show_colnames = FALSE
+        # )
+        }, error = function(e) {
+          print(paste(this_event, var_threshold, e$message))
+        })
+      }
+    }
+  }
+}
+```
+
+```{r, fig.width=12, fig.height=8}
+cor_dt_intermediate <- copy(all_cor)
+# below_0.5 <- aggregated_dt[ID %in% setdiff(as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)),
+#         as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0.5'], use.names = FALSE))), lapply(.SD, function(y) {
+#         rmv <- is.na(y) | is.na(PSI) | is.na(gene_expression)
+#         res <- NA
+#         if ((length(rmv) - sum(rmv)) >= minimum_events)
+#           res <- tryCatch(
+#             suppressWarnings(ppcor::pcor.test(PSI[!rmv], y[!rmv], gene_expression[!rmv], method = 'pearson')$estimate),
+#             error = function(e) {
+#               if (identical(y, gene_expression) &
+#                   startsWith(e$message, prefix = 'system is computationally singular'))
+#                 return(suppressWarnings(stats::cor(y, PSI, use = 'pairwise', method = 'pearson')))
+#               return(e)
+#             }
+#           )
+#         return(as.numeric(res))
+#       }), by = .(`Event Type`, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'Event Type')]]
+# below_0.5[, c('PSI Variance', 'Partial Correlation', 'Correlation Coefficient'):=list('<0.5', TRUE, 'pearson')]
+# cor_dt_intermediate <- rbind(cor_dt_intermediate, below_0.5)
+colnames(cor_dt_intermediate) <- gsub(';max', '', colnames(cor_dt_intermediate), fixed = TRUE)
+colnames(cor_dt_intermediate) <- gsub(';mean', '', colnames(cor_dt_intermediate), fixed = TRUE)
+melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'Event Type', 'PSI Variance', 'Partial Correlation', 'Correlation Coefficient'), variable.name = 'feature', value.name = 'Correlation w/ PSI')
+melt_cor_dt[`Event Type` == 'SE', feature := gsub('other_region', 'intron', feature, fixed=TRUE)]
+melt_cor_dt[`Event Type` == 'RI', feature := gsub('other_region', 'exon', feature, fixed=TRUE)]
+melt_cor_dt[`Event Type` == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
+melt_cor_dt[`Event Type` == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
+melt_cor_dt[, feature:=sub('wgbs', 'DNAm', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub(';', ' in ', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=gsub('_', ' ', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('distance', 'Distance to', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('width in', 'Width of', feature, fixed = TRUE)]
+aggregate_median_by <- c('feature', 'Event Type', 'PSI Variance', 'Partial Correlation', 'Correlation Coefficient')
+melt_cor_dt[, median_cor:=median(`Correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
+melt_cor_dt[, relevant:=any(abs(median_cor) > .1), by = aggregate_median_by]
+```
+
+
+```{r, fig.width=8, fig.height=8}
+my_colors <- c("#CC79A7", "#009E73", "#999999")
+
+for (color_by in c('Correlation Coefficient', 'Partial Correlation', 'PSI Variance')) {
+  find_relevant_by <- aggregate_median_by[aggregate_median_by != color_by]
+  melt_cor_dt[, plot_relevant:=NULL]
+  melt_cor_dt[, plot_relevant:=any(relevant), by = mget(find_relevant_by)]
+  breaks <- seq(-.5, .5, by = .1)
+  not_color_by <- TRUE
+  if (color_by == 'Partial Correlation')
+    not_color_by <- melt_cor_dt[, `Correlation Coefficient` == 'pearson' & `PSI Variance` == 'all']
+  else if (color_by == 'Correlation Coefficient')
+    not_color_by <- melt_cor_dt[, `Partial Correlation` == 'TRUE'  & `PSI Variance` == 'all']
+  else if (color_by == 'PSI Variance'){
+    not_color_by <- melt_cor_dt[, `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson']
+  }
+  
+  color_levels <- melt_cor_dt[not_color_by, uniqueN(get(color_by))]
+  tmp_cor_dt <- melt_cor_dt[not_color_by & !is.na(`Correlation w/ PSI`), if(uniqueN(get(color_by)) == color_levels) .SD, by=.(`Event Type`, feature)]
+  if (color_by == 'PSI Variance') {
+    median_dt <- dcast(tmp_cor_dt[, .(median_cor=unique(median_cor)), by=.(`Event Type`, feature, `PSI Variance`)], `Event Type` + feature ~ `PSI Variance`, value.var = 'median_cor')
+    median_dt[, diff_col:=abs(low-high)]
+    sorted_idx <- median_dt[, order(-diff_col)]
+    p <- ggplot(merge(tmp_cor_dt, median_dt[sorted_idx, .(feature=feature[1:10], diff_col=diff_col[1:10]), by=.(`Event Type`)]), 
+             aes(x = `Correlation w/ PSI`, 
+                 y =  tidytext::reorder_within(feature, -diff_col, `Event Type`), 
+                 fill = get(color_by))) + 
+        theme_bw() +
+        geom_boxplot(aes(color = median_cor)) + 
+        scale_color_gradientn(colours = colorRampPalette(c("red", "lightgrey", "blue"))(length(breaks)), breaks = breaks, limits = c(min(breaks), max(breaks))) + 
+        labs(y = 'Aggregated Signal or Statistic', color = 'Median Correlation') + #, title = 'Distribution of (partial) pearson correlation of epigenetic signals and the PSI (percent spliced ) across all events and samples') +
+        tidytext::scale_y_reordered() + 
+        facet_wrap(. ~ `Event Type`, scales="free", nrow=2) + 
+scale_fill_manual(values = my_colors[1:color_levels], name = color_by)
+    ggsave(filename = file.path(plot_dir, paste0('max diff ', color_by, '.pdf')), p, width = 8, height = 8)
+    print(p)
+  }
+p <- ggplot(merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature=unique(feature)[1:10]), by=.(`Event Type`)]), 
+             aes(x = `Correlation w/ PSI`, 
+                 y =  tidytext::reorder_within(feature, -median_cor, `Event Type`), 
+                 fill = get(color_by))) + 
+        theme_bw() +
+        geom_boxplot(aes(color = median_cor)) + 
+        scale_color_gradientn(colours = colorRampPalette(c("red", "lightgrey", "blue"))(length(breaks)), breaks = breaks, limits = c(min(breaks), max(breaks))) + 
+        labs(y = 'Aggregated Signal or Statistic', color = 'Median Correlation') + #, title = 'Distribution of (partial) pearson correlation of epigenetic signals and the PSI (percent spliced ) across all events and samples') +
+        tidytext::scale_y_reordered() + 
+        facet_wrap(. ~ `Event Type`, scales="free", nrow=2) + 
+scale_fill_manual(values = my_colors[1:color_levels], name = color_by)
+ggsave(filename = file.path(plot_dir, paste0('top10 ', color_by, '.pdf')), p, width = 8, height = 8)
+  print(p)
+}
+```
+
+```{r}
+ggplot(melt_cor_dt[feature == 'DNAm in PLS' & `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson'], aes(y=`Correlation w/ PSI`, x=`PSI Variance`)) + geom_dotplot(binaxis='y', stackdir='center', dotsize=.2) + geom_boxplot(width=0.1) + theme_bw() + facet_wrap(. ~ `Event Type`, nrow = 2)
+```
+
+```{r, fig.width=10, fig.height=10}
+stopifnot(nrow(dcast(all_cor, formula = `PSI Variance` + `Correlation Coefficient` + IHEC + `Event Type` ~ `Partial Correlation`, value.var = 'gene_expression')[`FALSE` - `TRUE` > 1e-10]) == 0)
+test_dt <- aggregated_dt[`Event Type` == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == sample(IHEC, 1)]
+stopifnot(test_dt[, cor(PSI, gene_expression, use = 'pairwise', 'pearson')] !=
+test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(PSI, gene_expression, gene_expression, 'pearson')]$estimate)
+test_dt[, cor(PSI, gene_expression, use = 'pairwise', 'pearson')]
+test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(PSI, gene_expression, gene_expression, 'pearson')]$estimate
+test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(gene_expression, PSI, gene_expression, 'pearson')]$estimate
+```
+
+```{r, fig.width=10, fig.height=10}
+p <- ggplot(aggregated_dt[`Event Type` == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = `Event Type`)) + facet_wrap(. ~ IHEC) +  geom_point() +
+  ggpubr::stat_cor(colour = "black")+ ggpubr::stat_cor(method='spearman', cor.coef.name = 'rho', label.y.npc = 'bottom', colour = "black")
+p1 <- ggplot(aggregated_dt[`Event Type` == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = `Event Type`)) + facet_wrap(. ~ IHEC) +  geom_point() + scale_x_log10() + 
+  ggpubr::stat_cor(colour = "black")+ ggpubr::stat_cor(method='spearman', cor.coef.name = 'rho', label.y.npc = 'bottom', colour = "black")
+p + p1
+```
