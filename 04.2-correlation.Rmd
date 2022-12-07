@@ -8,6 +8,7 @@ output: pdf_document
 # saveRDS(aggregated_dt, 'aggregated_dt_filtered.rds')
 load('aggregating.rda')
 aggregated_dt <- fread('aggregated_dt_filtered.csv.gz', stringsAsFactors=TRUE)
+aggregated_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
 ```
 
 
@@ -19,7 +20,22 @@ unlisted_vars$'<0.5' <- setdiff(as.integer(unlist(unlisted_vars[names(unlisted_v
 unlisted_vars <- unlisted_vars[names(unlisted_vars) %in% vars_to_investigate]
 
 minimum_events <- 25
+```
 
+```{r, eval=FALSE}
+library(gprofiler2)
+gostres <- gost(query = event_dt[as.integer(unlisted_vars$`0.5`), tstrsplit(as.character(unique(gene_id)), '.', fixed=TRUE, keep = 1)[[1]]],
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = FALSE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = .05, correction_method = "fdr", 
+                domain_scope = "custom", custom_bg = event_dt[, tstrsplit(as.character(unique(gene_id)), '.', fixed=TRUE, keep = 1)[[1]]],
+                numeric_ns = "", sources = c('GO'), as_short_link = FALSE)
+gostplot(gostres, capped = TRUE, interactive = FALSE)
+```
+
+
+```{r, fig.width=16, fig.height=10}
 cor_dt <-
   rbindlist(setNames(pbmclapply(unique(
     names(unlisted_vars)
@@ -79,7 +95,7 @@ all_cor <- rbind(cor_dt, pcor_dt)
 all_cor[`PSI Variance` == '0', `PSI Variance`:='all']
 all_cor[`PSI Variance` == '0.5', `PSI Variance`:='high']
 all_cor[`PSI Variance` == '<0.5', `PSI Variance`:='low']
-all_cor[, `PSI Variance`:=factor(`PSI Variance`, levels = c('low', 'high', 'all'))]
+all_cor[, `PSI Variance`:=factor(`PSI Variance`, levels = c('low', 'all', 'high'))]
 
 for (this_event in to_analyze) {
   var_events_type <- var_events[[this_event]]
@@ -153,15 +169,20 @@ cor_dt_intermediate <- copy(all_cor)
 colnames(cor_dt_intermediate) <- gsub(';max', '', colnames(cor_dt_intermediate), fixed = TRUE)
 colnames(cor_dt_intermediate) <- gsub(';mean', '', colnames(cor_dt_intermediate), fixed = TRUE)
 melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'Event Type', 'PSI Variance', 'Partial Correlation', 'Correlation Coefficient'), variable.name = 'feature', value.name = 'Correlation w/ PSI')
-melt_cor_dt[`Event Type` == 'SE', feature := gsub('other_region', 'intron', feature, fixed=TRUE)]
-melt_cor_dt[`Event Type` == 'RI', feature := gsub('other_region', 'exon', feature, fixed=TRUE)]
+melt_cor_dt[`Event Type` == 'SE', feature := gsub('other_region', 'Intron', feature, fixed=TRUE)]
+melt_cor_dt[`Event Type` == 'RI', feature := gsub('other_region', 'Exon', feature, fixed=TRUE)]
 melt_cor_dt[`Event Type` == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
 melt_cor_dt[`Event Type` == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
 melt_cor_dt[, feature:=sub('wgbs', 'DNAm', feature, fixed = TRUE)]
-melt_cor_dt[, feature:=sub(';', ' in ', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub(';', '\n', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub(',', '\n', feature, fixed = TRUE)]
 melt_cor_dt[, feature:=gsub('_', ' ', feature, fixed = TRUE)]
-melt_cor_dt[, feature:=sub('distance', 'Distance to', feature, fixed = TRUE)]
-melt_cor_dt[, feature:=sub('width in', 'Width of', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('distance ', 'Distance\n', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('upstream Intron', 'Intron\nUpstream', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('upstream Exon', 'Exon\nUpstream', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('downstream Intron', 'Intron\nDownstream', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('downstream Exon', 'Exon\nDownstream', feature, fixed = TRUE)]
+melt_cor_dt[, feature:=sub('width', 'Width', feature, fixed = TRUE)]
 aggregate_median_by <- c('feature', 'Event Type', 'PSI Variance', 'Partial Correlation', 'Correlation Coefficient')
 melt_cor_dt[, median_cor:=median(`Correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
 melt_cor_dt[, relevant:=any(abs(median_cor) > .1), by = aggregate_median_by]
@@ -169,7 +190,23 @@ melt_cor_dt[, relevant:=any(abs(median_cor) > .1), by = aggregate_median_by]
 
 
 ```{r, fig.width=8, fig.height=8}
-my_colors <- c("#CC79A7", "#009E73", "#999999")
+my_colors <- c("#CC79A7", "#999999", "#009E73")
+
+tmp_cor_dt <- melt_cor_dt[`PSI Variance` == 'all' & `Correlation Coefficient` == 'pearson' & `Partial Correlation` == 'TRUE']
+tmp_cor_dt[order(-abs(median_cor)), .(feature=unique(feature)[1:10]), by=.(`Event Type`)]
+ggplot(merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature=unique(feature)[1:10]), by=.(`Event Type`)]), 
+       aes(y = `Correlation w/ PSI`, 
+           x =  tidytext::reorder_within(feature, -median_cor, `Event Type`),
+       fill = '#999999')) + 
+    theme_bw() + geom_hline(yintercept = 0, color = "darkgrey", linetype = "dashed") + 
+    geom_boxplot() + 
+    labs(x = 'Aggregated Signal or Statistic') +
+    tidytext::scale_x_reordered() + 
+    facet_wrap(. ~ `Event Type`, scales="free", nrow=2) +
+    scale_fill_manual(values = '#999999') +
+    theme(legend.position = 'none')
+ggsave(filename = file.path(plot_dir, 'top10_overall.pdf'), width = 9, height = 7)
+
 
 for (color_by in c('Correlation Coefficient', 'Partial Correlation', 'PSI Variance')) {
   find_relevant_by <- aggregate_median_by[aggregate_median_by != color_by]
@@ -177,11 +214,11 @@ for (color_by in c('Correlation Coefficient', 'Partial Correlation', 'PSI Varian
   melt_cor_dt[, plot_relevant:=any(relevant), by = mget(find_relevant_by)]
   breaks <- seq(-.5, .5, by = .1)
   not_color_by <- TRUE
-  if (color_by == 'Partial Correlation')
+  if (color_by == 'Partial Correlation') {
     not_color_by <- melt_cor_dt[, `Correlation Coefficient` == 'pearson' & `PSI Variance` == 'all']
-  else if (color_by == 'Correlation Coefficient')
+  } else if (color_by == 'Correlation Coefficient') {
     not_color_by <- melt_cor_dt[, `Partial Correlation` == 'TRUE'  & `PSI Variance` == 'all']
-  else if (color_by == 'PSI Variance'){
+  } else if (color_by == 'PSI Variance') {
     not_color_by <- melt_cor_dt[, `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson']
   }
   
@@ -191,38 +228,38 @@ for (color_by in c('Correlation Coefficient', 'Partial Correlation', 'PSI Varian
     median_dt <- dcast(tmp_cor_dt[, .(median_cor=unique(median_cor)), by=.(`Event Type`, feature, `PSI Variance`)], `Event Type` + feature ~ `PSI Variance`, value.var = 'median_cor')
     median_dt[, diff_col:=abs(low-high)]
     sorted_idx <- median_dt[, order(-diff_col)]
-    p <- ggplot(merge(tmp_cor_dt, median_dt[sorted_idx, .(feature=feature[1:10], diff_col=diff_col[1:10]), by=.(`Event Type`)]), 
-             aes(x = `Correlation w/ PSI`, 
-                 y =  tidytext::reorder_within(feature, -diff_col, `Event Type`), 
-                 fill = get(color_by))) + 
-        theme_bw() +
-        geom_boxplot(aes(color = median_cor)) + 
-        scale_color_gradientn(colours = colorRampPalette(c("red", "lightgrey", "blue"))(length(breaks)), breaks = breaks, limits = c(min(breaks), max(breaks))) + 
-        labs(y = 'Aggregated Signal or Statistic', color = 'Median Correlation') + #, title = 'Distribution of (partial) pearson correlation of epigenetic signals and the PSI (percent spliced ) across all events and samples') +
-        tidytext::scale_y_reordered() + 
-        facet_wrap(. ~ `Event Type`, scales="free", nrow=2) + 
-scale_fill_manual(values = my_colors[1:color_levels], name = color_by)
-    ggsave(filename = file.path(plot_dir, paste0('max diff ', color_by, '.pdf')), p, width = 8, height = 8)
+    p <- ggplot(merge(tmp_cor_dt, median_dt[sorted_idx, .(feature=feature[1:10], diff_col=diff_col[1:10], all_median=all[1:10]), by=.(`Event Type`)]), 
+       aes(y = `Correlation w/ PSI`, 
+           x =  tidytext::reorder_within(feature, -all_median, `Event Type`), 
+           fill = get(color_by))) + 
+    theme_bw() + geom_hline(yintercept = 0, color = "darkgrey", linetype = "dashed") + 
+    geom_boxplot() + 
+    labs(x = 'Aggregated Signal or Statistic') +
+    tidytext::scale_x_reordered() + 
+    facet_wrap(. ~ `Event Type`, scales="free", nrow=2) + 
+    scale_fill_manual(values = my_colors[1:color_levels], name = color_by)
+    ggsave(filename = file.path(plot_dir, paste0('max diff ', color_by, '.pdf')), p, width = 10, height = 7)
     print(p)
   }
 p <- ggplot(merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature=unique(feature)[1:10]), by=.(`Event Type`)]), 
-             aes(x = `Correlation w/ PSI`, 
-                 y =  tidytext::reorder_within(feature, -median_cor, `Event Type`), 
+             aes(y = `Correlation w/ PSI`, 
+                 x =  tidytext::reorder_within(feature, -median_cor, `Event Type`), 
                  fill = get(color_by))) + 
-        theme_bw() +
-        geom_boxplot(aes(color = median_cor)) + 
-        scale_color_gradientn(colours = colorRampPalette(c("red", "lightgrey", "blue"))(length(breaks)), breaks = breaks, limits = c(min(breaks), max(breaks))) + 
-        labs(y = 'Aggregated Signal or Statistic', color = 'Median Correlation') + #, title = 'Distribution of (partial) pearson correlation of epigenetic signals and the PSI (percent spliced ) across all events and samples') +
-        tidytext::scale_y_reordered() + 
-        facet_wrap(. ~ `Event Type`, scales="free", nrow=2) + 
-scale_fill_manual(values = my_colors[1:color_levels], name = color_by)
-ggsave(filename = file.path(plot_dir, paste0('top10 ', color_by, '.pdf')), p, width = 8, height = 8)
+        theme_bw() + geom_hline(yintercept = 0, color = "darkgrey", linetype = "dashed") + 
+    geom_boxplot() + 
+    labs(x = 'Aggregated Signal or Statistic') +
+    tidytext::scale_x_reordered() + 
+    facet_wrap(. ~ `Event Type`, scales="free", nrow=2) +
+    scale_fill_manual(values = my_colors, name = color_by)
+if (color_levels == 2)
+  p <- p + scale_fill_manual(values = my_colors[c(1,3)], name = color_by)
+ggsave(filename = file.path(plot_dir, paste0('top10 ', color_by, '.pdf')), p, width = 10, height = 7)
   print(p)
 }
 ```
 
 ```{r}
-ggplot(melt_cor_dt[feature == 'DNAm in PLS' & `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson'], aes(y=`Correlation w/ PSI`, x=`PSI Variance`)) + geom_dotplot(binaxis='y', stackdir='center', dotsize=.2) + geom_boxplot(width=0.1) + theme_bw() + facet_wrap(. ~ `Event Type`, nrow = 2)
+ggplot(melt_cor_dt[feature == 'DNAm\nPLS' & `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson'], aes(y=`Correlation w/ PSI`, x=`PSI Variance`)) + geom_dotplot(binaxis='y', stackdir='center', dotsize=.2) + geom_boxplot(width=0.1) + theme_bw() + facet_wrap(. ~ `Event Type`, nrow = 2)
 ```
 
 ```{r, fig.width=10, fig.height=10}

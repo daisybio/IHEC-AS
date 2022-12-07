@@ -63,6 +63,7 @@ ggsave(filename = file.path(plot_dir, 'cCRE_distr.pdf'), width = 7, height = 5)
 
 n_cCREs_long <- data.table(ID=from(hits_used), cCRE_type=cCREs[from(hits_used), cCRE_type])[, .(n_cCRE=.N), by=.(ID, cCRE_type)]
 n_cCREs_long[event_dt, on=.(ID), `Event Type`:=`Event Type`]
+n_cCREs_long[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
 n_cCREs_long[,cCRE_type:=sub(pattern = ',', replacement = '\n', cCRE_type, fixed = TRUE)]
 ggplot(n_cCREs_long, aes(x = n_cCRE, fill = cCRE_type)) + geom_histogram(binwidth = 1, color = 'white') + facet_wrap(~ `Event Type`, scales='free') + theme_bw() + labs(x='#cCRE in Event Neighborhood', y='Count') + scale_fill_discrete(name = "cCRE Type")
 ggsave(filename = file.path(plot_dir, 'cCRE_counts.pdf'), width = 8, height = 4)
@@ -82,6 +83,7 @@ aggregated_dt <- aggregated_dt[!is.na(PSI)]
 
 cols_to_add <- c('gene_id', 'distance_TSS', 'distance_TES', 'width;upstream_other_region', 'width;event_name', 'width;downstream_other_region', 'Event Type')
 aggregated_dt[event_dt, on=.(ID), (cols_to_add):=mget(cols_to_add)]
+aggregated_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
 aggregated_dt[gene_quants, on=c(gene_id='gene_id', IHEC='EpiRR_no_version'), gene_expression:=gene_tpm]
 aggregated_dt[, gene_expression:=log2(gene_expression)]
 aggregated_dt[, gene_id:=NULL]
@@ -92,11 +94,11 @@ aggregated_dt[, gene_id:=NULL]
 percentiles <- c(1/3, .5, 2/3)
 sample_quartiles <- aggregated_dt[, split(quantile(PSI, probs = percentiles, names= FALSE), as.character(round(percentiles, 2))), by = .(`Event Type`, IHEC)]
 melted_sample_quartiles <- melt(sample_quartiles, id.vars = c('Event Type', 'IHEC'), variable.name='Percentage', value.name = 'quantile')
-print(ggplot(melted_sample_quartiles, aes(x = quantile, fill = Percentage)) + geom_histogram(binwidth = 0.01, color='white') + theme_bw() + facet_wrap(~`Event Type`, scales='free_y')) + labs(x='PSI Quantile', y='Count')
-ggsave(filename = file.path(plot_dir, 'percentage_dist.pdf'), width = 8, height = 3)
+print(ggplot(melted_sample_quartiles, aes(x = quantile, fill = Percentage)) + geom_histogram(binwidth = 0.01) + theme_bw() + theme(legend.position = 'bottom') + facet_wrap(~`Event Type`, scales='free_y') + labs(x='PSI Quantile', y='Count'))
+ggsave(filename = file.path(plot_dir, 'percentage_dist.pdf'), width = 6, height = 3)
 event_quartiles <- aggregated_dt[, .(Mean=mean(PSI), `SD`=sd(PSI), `NA Percentage`= 1- length(IHEC)/aggregated_dt[, uniqueN(IHEC)]), by = .(`Event Type`, ID)]
 print(ggplot(event_quartiles, aes(x = Mean, y = SD, color = `Event Type`)) + geom_point() + geom_hline(data=event_quartiles[, .(median_sd=median(SD, na.rm = TRUE)), by = `Event Type`], aes(yintercept = median_sd, color = `Event Type`)) + theme_bw())
-ggsave(filename = file.path(plot_dir, 'PSI_mean_sd.pdf'), width = 8, height = 4)
+ggsave(filename = file.path(plot_dir, 'PSI_mean_sd.pdf'), width = 8, height = 5)
 
 print(ggplot(event_quartiles, aes(x = `NA Percentage`, y = SD, color = `Event Type`)) + geom_point() + geom_smooth(aes(color = `Event Type`), method='lm') + ggpubr::stat_cor(aes(color = `Event Type`)) + theme_bw())
 ggsave(filename = file.path(plot_dir, 'PSI_sd_na.pdf'), width = 8, height = 4)
@@ -109,6 +111,8 @@ for (this_event in to_analyze) {
 ```
 
 ```{r, fig.width=16, fig.height=10}
+safe_colorblind_palette <- c("#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499", 
+                             "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
 id_vars <- c('IHEC', 'ID', 'Event Type')
 features <- setdiff(names(aggregated_dt), id_vars)
 marks <- unique(tstrsplit(features, ';', fixed=TRUE, keep = 1)[[1]])
@@ -118,24 +122,70 @@ ggsave(filename = file.path(plot_dir, 'feature_dists',  'sds.pdf'), width = 5, h
 # ggplot(agg_melt, aes(x = value, color = feature)) + geom_density() + facet_wrap(. ~ `Event Type`, nrow=2) + geom_text_repel(
 #     aes(label = sd(value)))
 
-for (mark in marks){
-agg_melt <- melt(aggregated_dt, id.vars = c('IHEC', 'ID', 'Event Type'), measure.vars = features[startsWith(features, mark)])
-if (any(agg_melt[, grepl(';', variable, fixed = TRUE)])) {
-  agg_melt[, c('mark', 'region'):=tstrsplit(variable, ';', fixed=TRUE, keep = 2)]
-} else {
-  agg_melt[, region:='event_name']
-  agg_melt[, mark := variable]
-}
-  p <- ggplot(agg_melt, aes(x = value, color = region)) + geom_density() + facet_wrap(.~`Event Type`, nrow=2) + theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1))
-  if (mark == 'wgbs') p <- p + labs(title = 'DNAm', x = 'log2(Mean Methylation)')
-  else if (mark == 'distance_TSS') p <- p + labs(title = 'Distance to TSS', x = 'log2(bp)')
-  else if (mark == 'distance_TES') p <- p + labs(title = 'Distance to TES', x = 'log2(bp)')
-  else if (mark == 'width') p <- p + labs(title = 'Width', x = 'log2(bp)')
-  else if (mark == 'gene_expression') p <- p + labs(title = 'Gene Expression', x = 'log2(TPM)')
-  else if (mark == 'Inclusion Level') p <- p + labs(x = 'PSI')
-  else p <- p + labs(title = mark, x = 'log2(FC)')
+for (mark in marks) {
+  agg_melt <-
+    melt(
+      aggregated_dt,
+      id.vars = c('IHEC', 'ID', 'Event Type'),
+      measure.vars = features[startsWith(features, mark)]
+    )
+  if (any(agg_melt[, grepl(';', variable, fixed = TRUE)])) {
+    agg_melt[, c('mark', 'region') := tstrsplit(variable, ';', fixed = TRUE, keep = 2)]
+    agg_melt[region == 'event_name', region := 'Alternative Region']
+    agg_melt[region == 'downstream_other_region', region := 'Downstream Region']
+    agg_melt[region == 'upstream_other_region', region := 'Upstream Region']
+    agg_melt[, region := factor(
+      region,
+      levels =
+        c(
+          unique(region)[startsWith(unique(region), 'Upstream')],
+          unique(region)[startsWith(unique(region), 'Alternative')],
+          unique(region)[startsWith(unique(region), 'Downstream')],
+          unique(region)[startsWith(unique(region), 'PLS')],
+          unique(region)[startsWith(unique(region), 'DNase-H3K4me3')],
+          unique(region)[startsWith(unique(region), 'pELS')],
+          unique(region)[startsWith(unique(region), 'dELS')],
+          unique(region)[startsWith(unique(region), 'CTCF-only')]
+        )
+    )]
+  } else {
+    agg_melt[, region := 'Gene-Wide']
+    agg_melt[, mark := variable]
+  }
+  # max_dt <- agg_melt[, {
+  #   dens <- density(value, na.rm=TRUE)
+  #   .(xMax=(dens)$x[which.max(density(value, na.rm=TRUE)$y)], yMax=max((dens)$y, na.rm=TRUE))
+  #   }, by=.(`Event Type`, region)]
+  this_colors <- safe_colorblind_palette[seq_len(agg_melt[, uniqueN(region)])]
+  p <-
+    ggplot(agg_melt, aes(x = value, color = region, label = region)) +
+    geom_density() + 
+    facet_wrap(. ~ `Event Type`, nrow = 2, scales = 'free_y') + 
+    theme_bw() + 
+    labs(color = 'Region') + 
+    scale_color_manual(values = this_colors) + 
+    guides(color = guide_legend(override.aes = list(fill = this_colors))) # + geom_text_repel(data=max_dt, aes(xMax, yMax, color=region, label=region), min.segment.length = 0, force=75)
+    if (mark == 'wgbs') {
+      p <- p + labs(title = 'DNAm', x = 'log2(Mean Methylation)')
+    } else if (mark == 'distance_TSS') {
+      p <- p + labs(title = 'Distance to TSS', x = 'log2(bp)')
+    } else if (mark == 'distance_TES') {
+      p <- p + labs(title = 'Distance to TES', x = 'log2(bp)')
+    } else if (mark == 'width') {
+      p <- p + labs(title = 'Width', x = 'log2(bp)')
+    } else if (mark == 'gene_expression') {
+      p <- p + labs(title = 'Gene Expression', x = 'log2(TPM)')
+    } else if (mark == 'Inclusion Level') {
+      p <- p + labs(x = 'PSI')
+    } else {
+      p <- p + labs(title = mark, x = 'log2(FC)')
+    }
   print(p)
-  ggsave(filename = file.path(plot_dir, 'feature_dists',  paste0(mark, '.pdf')), width = 8, height = 4)
+  ggsave(
+    filename = file.path(plot_dir, 'feature_dists',  paste0(mark, '.pdf')),
+    width = 8,
+    height = 4
+  )
 }
 ```
 

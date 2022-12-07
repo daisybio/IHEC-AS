@@ -119,6 +119,7 @@ for (this_event in to_analyze) {
   # max_ID <- max_ID + this_max_ID
 }
 event_dt[, ID:=seq.int(.N)]
+event_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
 
 other_event_overlaps <- findOverlaps(event_gr, all_gr)
 non_overlapping_other <- other_event_overlaps@from[which(!(duplicated(other_event_overlaps@from) | duplicated(other_event_overlaps@from, fromLast = TRUE)))]

@@ -83,26 +83,74 @@ rank_dt[, mark := factor(
     c('(Intercept)', 'ID', 'Gene\nExpression', 'Distance\nTSS', 'Distance\nTES', 'Width', 'DNAm', 'H3K36me3', 'H3K4me1', 'H3K4me3', 'H3K27me3', 'H3K27ac', 'H3K9me3')
 )]
 
-rank_dt[, 'Samples, Features':= paste(dataset, explanatory, sep = ', ')]
+rank_dt[, 'Samples, Features':= as.factor(paste(dataset, explanatory, sep = ', '))]
+rank_dt[, `PSI Variance`:=factor(`PSI Variance`, levels = c('low', 'all', 'high'))]
 ```
 
 
 ```{r, fig.width=16, fig.height=11}
-my_colors <- rev(c("#CC79A7", "#009E73", "#999999"))
+# my_colors <- rev(c("#CC79A7", "#009E73", "#999999"))
 
 for (this_event in to_analyze) {
-  print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width'], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
-        + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
-  ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
-  print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & (region == 'Gene-Wide' | mark ==  'Width')], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_wrap(~ region + mark, nrow = 2) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
-        + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
-  ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 9, height = 6)
-  print(ggplot(rank_dt[feature != '(Intercept)' & this_event==`Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width'], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(region ~ mark) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#just_text(angle = 45, hjust=1))
-    + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
-  ggsave(filename = file.path(plot_dir, paste0('coef_region_', this_event, '.pdf')), width =9, height = 15)
+  # pheatmap(as.matrix(dcast(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], formula = `Samples, Features` + region ~ `Mark, PSI Variance`, value.var = 'coefs', fill = 0L)[, -c(1, 2)]), cluster_cols = FALSE, cluster_rows = FALSE)
+  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
+  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
+  # ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
+  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & !grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
+  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
+  #   ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
+  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & (region == 'Gene-Wide' | mark ==  'Width')], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_wrap(~ region + mark, nrow = 2) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
+  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
+  # ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 9, height = 6)
+  print(
+    ggplot(
+      rank_dt[feature != '(Intercept)' &
+                this_event == `Event Type` &
+                alpha == 'OLS' & (region == 'Gene-Wide' | mark ==  'Width')], 
+    aes(
+        y = `Samples, Features`,
+        x = `PSI Variance`,
+        fill = coefs
+    )
+    ) + facet_wrap( ~ region + mark, nrow = 2) + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev) + theme(legend.position = 'bottom')
+    #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
+  )
+  ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 5, height = 6)
+  print(
+    ggplot(
+    rank_dt[feature != '(Intercept)' &
+                this_event == `Event Type` &
+                alpha == 'OLS' &
+                region != 'Gene-Wide' &
+                mark != 'Width' &
+                grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)],
+    aes(
+        y = `Samples, Features`,
+        x = `PSI Variance`,
+        fill = coefs
+    )
+    ) + facet_grid(region ~ mark, scales = 'free_y') + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev)
+  #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
+  )
+  ggsave(filename = file.path(plot_dir, paste0('coef_cCRE_', this_event, '.pdf')), width =9, height = 10.5)
+  print(
+    ggplot(
+    rank_dt[feature != '(Intercept)' &
+                this_event == `Event Type` &
+                alpha == 'OLS' &
+                region != 'Gene-Wide' &
+                mark != 'Width' &
+                !grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)],
+    aes(
+        y = `Samples, Features`,
+        x = `PSI Variance`,
+        fill = coefs
+    )
+    ) + facet_grid(region ~ mark) + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev)
+    #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
+  )
+  ggsave(filename = file.path(plot_dir, paste0('coef_exon_intron', this_event, '.pdf')), width =9, height = 7)
   
-  # print((ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & explanatory == 'all' & dataset == 'all'], aes(x = reorder(mark, mark, function(x) -length(x)))) + geom_bar() + labs(title=this_event)) +
-  #         (ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & explanatory == 'all' & dataset == 'all'], aes(x = reorder(region, region, function(x) -length(x)))) + geom_bar()))
 }
 
 ```
@@ -111,6 +159,8 @@ for (this_event in to_analyze) {
 ```{r, fig.height=5, fig.width=11.7}
 library(pROC)
 library(patchwork)
+all_plots <- list()
+all_aucs <- list()
 cm_list <- sapply(to_analyze, function(this_event){
   models <- all_models[, this_event]
   as_list <- sapply(names(models)[endsWith(names(models), 'binomial')], function(cvfit_name) {
@@ -149,8 +199,16 @@ cm_list <- sapply(to_analyze, function(this_event){
     })
     plot_list <- lapply(unique(tstrsplit(names(roc_list), '.', fixed=TRUE, keep=1)[[1]]), function(var) {
       tmp_roc_list <- roc_list[startsWith(names(roc_list), var)]
-      
+      if (var == 'all_var') all_aucs[[this_event]] <<- sub('all', this_event, auc_list[names(tmp_roc_list)])
       names(tmp_roc_list) <- gsub(paste0('_binomial\\.', alpha, '\\.roc$'), '', gsub(paste0('^',var,'\\.'), '', names(tmp_roc_list)))
+      
+      if (var == 'all_var') {
+        all_plots[[this_event]] <<- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
+                color = "darkgrey", linetype = "dashed") +
+            labs(title=this_event, color='Samples, Features (Event Type: AUC)', x = 'Specificity', y = 'Sensitivity') +
+            theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
+      }
+      
       p <- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
                 color = "darkgrey", linetype = "dashed") +
             labs(title=tstrsplit(var, '_', fixed = TRUE, keep = 1)[[1]], color='Samples, Features (variance: AUC)', x = 'Specificity', y = 'Sensitivity') + 
@@ -158,7 +216,7 @@ cm_list <- sapply(to_analyze, function(this_event){
             theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
       p
     })
-  print(Reduce(`+`, plot_list)+ plot_layout(guides = "collect") & theme(legend.position = 'bottom'))# + plot_layout(guides = "collect") & theme(legend.position = 'bottom'))
+  print(Reduce(`+`, plot_list) + plot_layout(guides = "collect") & theme(legend.position = 'bottom'))# + plot_layout(guides = "collect") & theme(legend.position = 'bottom'))
   ggsave(filename = file.path(plot_dir, paste0('roc_', this_event, '_', alpha, '.pdf')), width = 11.7, height = 5)
     # print(ggroc(roc_list) + 
           # labs(title=paste(this_event, alpha), color='data_explanatory_response_alpha') + scale_color_discrete(labels=paste(names(roc_list), sapply(roc_list, function(x) paste0('(', round(x[["auc"]], 2),')')))) + theme_bw())
@@ -168,4 +226,18 @@ cm_list <- sapply(to_analyze, function(this_event){
 }, simplify = FALSE)
 
 ```
+```{r}
+((all_plots$SE + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')'))) + (all_plots$RI + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'roc_both.pdf'), width = 9, height = 5.5)
+```
  
+```{r}
+size_table <- rbindlist(sapply(to_analyze, function(this_event) rbindlist(lapply(all_models[, this_event], function(model){data.table('Train Size' = model$nsamples, 'Test Size' = nrow(model$test_data))}), idcol='model'), simplify = FALSE), idcol = 'event_name')
+size_table[, var := tstrsplit(model, '_', fixed=TRUE, keep=1)]
+size_table[, data := tstrsplit(model, '.', fixed=TRUE, keep=2)]
+size_table[, data := tstrsplit(data, '_', fixed=TRUE, keep=1)]
+size_table <- unique(size_table, by=c('event_name', 'Train Size', 'Test Size', 'var', 'data'))
+size_table_cast <- dcast(size_table, var + data ~ event_name, value.var = c('Train Size', 'Test Size'))
+fwrite(size_table_cast[, c(1,2,4,6,3,5)], 'ml_data_sizes.txt')
+```
+

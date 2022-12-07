@@ -1,8 +1,10 @@
 ---
 title: "Match Data"
-output: 
-  pdf_document: default
+output:
+  html_document:
+    df_print: paged
   html_notebook: default
+  pdf_document: default
 ---
 
 
@@ -140,7 +142,7 @@ uuids_total_mrna <- rna_samples[, if('mRNA-Seq' %in% rna_seq_type & 'total-RNA-S
 
 rna_files_to_download <- all_files[uuid %in% c(uuids_to_download[, uuid], uuids_total_mrna) & endsWith(filename, '.isoforms.results')]
 
-determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna', dir_to_write = rna_data_dir, n_chunks = 1, remove = TRUE)
+determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna', dir_to_write = rna_data_dir, n_chunks = 1)#, remove = TRUE)
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 # sftp_rna_files <- all_files[grep(rna_files_to_download, all_files[, filename]), .(filename, date)]
@@ -162,7 +164,7 @@ determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna
 
 chip_files_to_download <- all_files[uuid %in% histones_w_all_marks[epirr_id_wo_version %in% epirr_ids_to_download, uuid] & endsWith(filename, '.fc.signal.bigwig')]
 
-determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 1, remove = TRUE)
+determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 1)#, remove = TRUE)
 # 
 # 
 # sftp_chip_files <-  all_files[grep(chip_files_to_download, all_files[, filename]), .(filename, date)]
@@ -183,7 +185,14 @@ determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'c
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 wgbs_files_to_download <- all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% epirr_ids_to_download, uuid] & endsWith(filename, '.bw')]
 
-determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1, remove = TRUE)
+determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1)#, remove = TRUE)
+
+# for alex:
+# meta <- fread('IHEC_metadata_harmonization.v1.0.extended.csv')
+# meta[, epirr_id_wo_version := tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+# all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% meta[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_wo_version], uuid]]
+
+# determine_files_to_write(all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% meta[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_wo_version], uuid] & endsWith(filename, 'cpg.bed.gz')], prefix = 'alex_wgbs', dir_to_write = wgbs_data_dir, n_chunks = 4)
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 # sftp_wgbs_files <- all_files[grep(wgbs_files_to_download, all_files[, filename]), .(filename, date)]
@@ -214,69 +223,12 @@ sample_dt[, actually_downloaded:=unlist(pbmclapply(uuid, function(uid) any(grepl
 ggplot(sample_dt, aes(x = reorder(epirr_id_wo_version, actually_downloaded, sum), y = reorder(antibody, antibody, length), fill = actually_downloaded)) + geom_tile()
 ```
 
-
-```{r}
-colVar <- function(x, na.rm = TRUE) {
-  colMeans(x * x, na.rm = na.rm) - (colMeans(x, na.rm = na.rm)) ^ 2
-}
-
-pca_plots <-
-  function(matrix,
-           metadata,
-           title = '',
-           color_by = 'annotation',
-           shape_by = 'project',
-           label = 'annotation',
-           na.omit = FALSE) {
-    if (na.omit){
-      matrix <- matrix[, colSums(is.na(matrix)) == 0, drop=FALSE]
-    } else {
-      # set NA to 0
-      matrix[is.na(matrix)] <- 0
-    }
-    
-    # filter out cols without variance
-    matrix <- matrix[, colVar(matrix) != 0, drop = FALSE]
-    
-    # perform PCA
-    pca <- prcomp(matrix, center = TRUE, scale = TRUE)
-    
-    # compute explained variance of PCs
-    var_explained_tpm = 100 * pca$sdev ^ 2 / sum(pca$sdev ^ 2)
-    
-    return(
-      list(
-        pca = pca,
-        dimred = ggplot2::autoplot(
-          pca,
-          data = metadata,
-          colour = color_by,
-          shape = shape_by
-        ) + labs(title = paste('PCA:', title)) + geom_text_repel(
-          aes(label = get(label)),
-          min.segment.length = 0,
-          max.overlaps = 5
-        ),
-        scree = qplot(seq.int(var_explained_tpm), var_explained_tpm) +
-          geom_line() +
-          xlab("Principal Component") +
-          ylab("Percent Variance Explained") +
-          ggtitle(paste("Variance explained:", title))
-      )
-    )
-  }
-```
-
 Load Metadata:
 
 ```{r}
 # load metadata
-metadata <- data.table::fread('IHEC_metadata_harmonization.v0.7.csv')
+metadata <- data.table::fread('IHEC_metadata_harmonization.v1.0.extended.csv')
 metadata[, EpiRR_no_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
-metadata[, annotation := cell_type]
-metadata[biomaterial_type == 'primary tissue', annotation := tissue_type]
-metadata[biomaterial_type == 'cell line', annotation := line]
-metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
 ```
 
 Load Isoform Quantifications:
@@ -326,6 +278,6 @@ suppa_expr_filename <- 'suppa_analysis/tpm_expressions.tsv'
 # filter metadata
 metadata <- metadata[EpiRR_no_version %in% names(tpm_dt)[-1]]
 # remove the two outliers
-metadata_filtered <- metadata[cell_type != 'sperm']
+# metadata_filtered <- metadata[cell_type != 'sperm']
 save.image('pca.rda')
 ```

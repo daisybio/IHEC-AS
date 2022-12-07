@@ -22,7 +22,8 @@ options(mc.cores = ncores)
 message(sprintf('set mc.cores to: %d', options()$mc.cores))
 setOption("ignore.interactive", TRUE)
 
-Sys.setenv(RSTUDIO_PANDOC='/usr/lib/rstudio-server/bin/pandoc')
+if (!rmarkdown::pandoc_available())
+  Sys.setenv(RSTUDIO_PANDOC='/usr/lib/rstudio-server/bin/quarto/bin/tools')
 
 data_dir <- '/nfs/data/IHEC/RNAseq'
 data_dir2 <- '/nfs/data3/IHEC'

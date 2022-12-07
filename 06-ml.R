@@ -58,7 +58,8 @@ run_glmnet <- function(data, explanatory, response, filter_rows = TRUE, scale_ex
   foldid <- sample(seq.int(nfolds), size = nrow(this_data), replace = TRUE)
   cvfit <- lapply(alpha, function(a) cv.glmnet(as.matrix(this_data[, ..explanatory]), this_data[, get(response)], family = family, type.measure = type.measure, foldid = foldid, parallel = parallel, keep = FALSE, alpha = a))
   names(cvfit) <- alpha
-  nonzero_explanatory <- rownames(coef(cvfit[[max(alpha)]], s = my_lambda))[as.matrix(coef(cvfit$`1`, s = my_lambda)) != 0 & rownames(coef(cvfit$`1`, s = my_lambda)) != '(Intercept)']
+  browser()
+  nonzero_explanatory <- rownames(coef(cvfit[[max(alpha)]], s = my_lambda))[as.matrix(coef(cvfit[[max(alpha)]], s = my_lambda)) != 0 & rownames(coef(cvfit[[max(alpha)]], s = my_lambda)) != '(Intercept)']
   cvfit$OLS <- glm(formula = formula(paste(response, '~', paste0('`', nonzero_explanatory, '`', collapse = ' + '))), data = this_data, family = family, model = FALSE, y = FALSE)
   res_list <- list(cvfit=cvfit, nsamples=nrow(this_data))
   if (family == 'binomial') {
@@ -164,7 +165,9 @@ event_models <- pbmcapply::pbmclapply(ids_to_check, function(id) {
     cCREs_this <- all_cCREs[ID %in% cCREs_ids & IHEC %in% feature_data[, IHEC]]
     non_all_na_cols <- cCREs_this[, sapply(.SD, function(column) !all(is.na(column)))]
     cCREs_this <- cCREs_this[, ..non_all_na_cols]
-    cCREs_wide <- dcast(cCREs_this, formula = IHEC ~ ID, value.var = value_cols, fill = 0)
+    for (j in which(!names(cCREs_this) %in% c('IHEC', 'ID')))
+      set(cCREs_this,NULL,j,log2(min(cCREs_this[[j]][cCREs_this[[j]] != 0], na.rm = TRUE) + cCREs_this[[j]]))
+    cCREs_wide <- dcast(cCREs_this, formula = IHEC ~ ID, value.var = value_cols, fill = NA)
     cols_to_add <- names(cCREs_wide)[Reduce(`|`, lapply(value_cols, function(prefix) startsWith(names(cCREs_wide), prefix)))]
     feature_data[cCREs_wide, on=.(IHEC), (cols_to_add):=mget(cols_to_add)]
     # files_to_read <- list.files(file.path(psi_input_dir, 'sample_dts'), paste0('(', paste(feature_data[, IHEC], collapse = '|'), ')-cCRE_dt.csv.gz'), full.names = TRUE)
