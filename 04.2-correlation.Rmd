@@ -205,9 +205,11 @@ ggplot(merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature=unique(fe
     facet_wrap(. ~ `Event Type`, scales="free", nrow=2) +
     scale_fill_manual(values = '#999999') +
     theme(legend.position = 'none')
-ggsave(filename = file.path(plot_dir, 'top10_overall.pdf'), width = 9, height = 7)
+ggsave(filename = file.path(plot_dir, 'top10_overall.pdf'), width = 9, height = 5)
+```
 
 
+```{r, fig.width=8, fig.height=8}
 for (color_by in c('Correlation Coefficient', 'Partial Correlation', 'PSI Variance')) {
   find_relevant_by <- aggregate_median_by[aggregate_median_by != color_by]
   melt_cor_dt[, plot_relevant:=NULL]
