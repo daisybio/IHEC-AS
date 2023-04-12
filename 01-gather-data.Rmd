@@ -10,9 +10,9 @@ output:
 
 ```{bash, eval=FALSE}
 cd /nfs/data/IHEC/RNAseq
-echo "get ihec_metadata*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
-echo "get ihec_readme.pdf" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
-sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
+echo "get epiatlas_metadata*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
+echo "get IHEC*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
+#sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
 find ~/ihec-incoming -printf "%p\t%CY-%Cm-%Cd %CH:%CM:%CS %CZ\n" > all_files.txt
 fusermount -u ~/ihec-incoming
 ```
@@ -38,10 +38,10 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
   print(prefix)
   
   # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-  sftp_files <- files_to_download
-  local_files <- file.path(dir_to_write, basename(sftp_files[, filename]))
+  sftp_files <- rbindlist(list(files_to_download, files_to_download[, .(filename=paste0(filename, ".md5"), date=date)]))
   
-  still_to_download <- sftp_files[!(file.exists(local_files) & file.info(local_files)$ctime > sftp_files[, date]), filename]
+  local_files <- file.path(dir_to_write, basename(sftp_files[, filename]))
+  still_to_download <- sftp_files[!(file.exists(local_files) & as.Date(file.info(local_files)$ctime) > as.Date(sftp_files[, date], format="%m-%d-%Y")), filename]
   
   print(100*round(length(still_to_download)/length(local_files), 5))
   
@@ -56,7 +56,7 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
   }
   
   if (length(still_to_download) > 0) {
-    get_commands <- paste('get', sub('/nfs/home/students/ga89koc/ihec-incoming', '/IHEC/incoming', still_to_download, fixed = T))
+    get_commands <- paste('get', file.path("/IHEC", still_to_download))
     
     write_chunked_files(get_commands, n_chunks, prefix, dir_to_write)
   }
@@ -66,65 +66,30 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
 
 
 ```{r}
-all_files <- fread(file.path(data_dir, 'all_files.txt'), header = FALSE)
-filename_date <- c('filename', 'date')
-setnames(all_files, c('V1', 'V2'), filename_date)
-all_files[, uuid:=gsub(pattern = '.*([[:alnum:]]{8}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{12}).*', '\\1', filename)]
-```
-
-## check RNA files
-
-```{r}
-# check the rna-seq metadata file first
-rna_samples <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
-rna_samples <- rna_samples[uuid %in% all_files[, uuid]]
-rna_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-# rna_samples <- rna_samples[rna_seq_type == 'mRNA-Seq']
-
-# now check the files that are actually available
-isoform_files_downloaded <- list.files(rna_data_dir, pattern = '\\.isoforms\\.results$')
-isoform_epirr_downloaded <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files_downloaded)
-
-# if (!identical(rna_samples[, sort(epirr_id_wo_version)], sort(isoform_epirr_downloaded))) {
-#   print(paste('in metadata file but no isoform file:', paste(rna_samples[!epirr_id_wo_version %in% isoform_epirr_downloaded, epirr_id_wo_version], collapse = ', ')))
-#   print(paste('isoform file but not in metadata file:', paste(isoform_files_downloaded[!isoform_epirr_downloaded %in% rna_samples[, epirr_id_wo_version]], collapse = ', ')))
-# }
+all_files <- fread(file.path(data_dir, 'epiatlas_metadata.csv'))
+# all_files[, epirr_id_without_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+# filename_date <- c('filename', 'date')
+# setnames(all_files, c('V1', 'V2'), filename_date)
+# all_files[, uuid:=gsub(pattern = '.*([[:alnum:]]{8}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{12}).*', '\\1', filename)]
 ```
 
 ## check ChIP and WGBS files
 
 ```{r}
-histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
-histone_samples <- histone_samples[uuid %in% all_files[, uuid]]
-histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-
-histone_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(chip_data_dir))))
-
-# if (length(setdiff(histone_samples[, epirr_id_wo_version], histone_samples_available)) > 0) {
-#   print(paste('in metadata file but no signal file:', paste(histone_samples[!epirr_id_wo_version %in% histone_samples_available, epirr_id_wo_version], collapse = ', ')))
-#   print(paste('signal file but not in metadata file:', paste(histone_samples_available[!histone_samples_available %in% histone_samples[, epirr_id_wo_version]], collapse = ', ')))
-# }
 histone_marks <- c('H3K27ac', 'H3K27me3', 'H3K36me3', 'H3K4me1', 'H3K4me3', 'H3K9me3')
-histones_w_all_marks <- histone_samples[, if(all(histone_marks %in% antibody)) .SD[antibody %in% histone_marks], by=.(epirr_id_wo_version)]
+histones_w_all_marks <- all_files[assay_type == "ChIP-Seq", if(all(histone_marks %in% experiment_type)) .SD[experiment_type %in% histone_marks], by=.(epirr_id_without_version)]
 
-rna_samples_w_chip <- rna_samples[epirr_id_wo_version %in% histones_w_all_marks[, epirr_id_wo_version]]
-rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+# find rna samples with all histone marks
+rna_samples_w_chip <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% histones_w_all_marks[, epirr_id_without_version]]
+# for files with both total and mRNA-Seq used mRNA-Seq 
+rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[experiment_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_without_version]
 ```
 
 ```{r}
-wgbs_samples <- fread(file.path(data_dir, 'ihec_metadata_wgbs.csv'))
-wgbs_samples <- wgbs_samples[uuid %in% all_files[, uuid]]
-wgbs_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-
-wgbs_samples_downloaded <- sort(unique(gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", list.files(wgbs_data_dir, '\\.gembs_(pos|neg)\\.bw$'))))
-
-# if (length(setdiff(wgbs_samples[, epirr_id_wo_version], wgbs_samples_available)) > 0) {
-#   print(paste('in metadata file but no signal file:', paste(wgbs_samples[!epirr_id_wo_version %in% wgbs_samples_available, epirr_id_wo_version], collapse = ', ')))
-#   print(paste('signal file but not in metadata file:', paste(wgbs_samples_available[!wgbs_samples_available %in% wgbs_samples[, epirr_id_wo_version]], collapse = ', ')))
-# }
-
-rna_samples_w_wgbs <- rna_samples[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version]]
-rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_wo_version]
+# find rna samples with methylation data
+rna_samples_w_wgbs <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% all_files[assay_type == "WGBS", epirr_id_without_version]]
+# for files with both total and mRNA-Seq used mRNA-Seq 
+rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[experiment_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_without_version]
 ```
 
 
@@ -133,16 +98,21 @@ rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[rna_seq_type != 'total
 ### get RNA files
 
 ```{r}
-epirr_ids_to_download <- intersect(rna_samples_w_chip[, sort(unique(epirr_id_wo_version))], rna_samples_w_wgbs[, sort(unique(epirr_id_wo_version))])
-uuids_to_download <- rna_samples[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, rna_seq_type)]
-uuids_to_download <- uuids_to_download[, if(.N>1) .SD[rna_seq_type == 'mRNA-Seq'] else .SD, by=epirr_id_wo_version]
+epirr_ids_to_download <- intersect(rna_samples_w_chip[, sort(unique(epirr_id_without_version))], rna_samples_w_wgbs[, sort(unique(epirr_id_without_version))])
+uuids_to_download <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% epirr_ids_to_download, .(epirr_id_without_version, uuid, experiment_type)]
+uuids_to_download <- uuids_to_download[, if(.N>1) .SD[experiment_type == 'mRNA-Seq'] else .SD, by=epirr_id_without_version]
 
 # also download files for comparison between total and mRNA-seq
-uuids_total_mrna <- rna_samples[, if('mRNA-Seq' %in% rna_seq_type & 'total-RNA-Seq' %in% rna_seq_type).SD[rna_seq_type %in% c('total-RNA-Seq', 'mRNA-Seq'), .(uuid=uuid)], by=epirr_id_wo_version][, uuid]
+uuids_total_mrna <- all_files[assay_type == "RNA-Seq", if('mRNA-Seq' %in% experiment_type & 'total-RNA-Seq' %in% experiment_type).SD[experiment_type %in% c('total-RNA-Seq', 'mRNA-Seq'), .(uuid=uuid)], by=epirr_id_without_version][, uuid]
 
-rna_files_to_download <- all_files[uuid %in% c(uuids_to_download[, uuid], uuids_total_mrna) & endsWith(filename, '.isoforms.results')]
+isoform_files_to_download <- all_files[uuid %in% unique(c(uuids_to_download[, uuid], uuids_total_mrna)), .(filename=sub("*", "isoforms.results", data_file_path, fixed=TRUE), date=upload_date)]
+# download all, in order to create size normalized files
+isoform_files_to_download <- all_files[assay_type == "RNA-Seq", .(filename=sub("*", "isoforms.results", data_file_path, fixed=TRUE), date=upload_date)]
+# download all, in order to create size normalized files
+gene_files_to_download <- all_files[assay_type == "RNA-Seq", .(filename=sub("*", "genes.results", data_file_path, fixed=TRUE), date=upload_date)]
 
-determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna', dir_to_write = rna_data_dir, n_chunks = 1)#, remove = TRUE)
+
+determine_files_to_write(files_to_download = rbindlist(list(isoform_files_to_download, gene_files_to_download)), prefix = 'rna', dir_to_write = rna_data_dir, n_chunks = 1)#, remove = TRUE)
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 # sftp_rna_files <- all_files[grep(rna_files_to_download, all_files[, filename]), .(filename, date)]
@@ -162,7 +132,7 @@ determine_files_to_write(files_to_download = rna_files_to_download,prefix = 'rna
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 
-chip_files_to_download <- all_files[uuid %in% histones_w_all_marks[epirr_id_wo_version %in% epirr_ids_to_download, uuid] & endsWith(filename, '.fc.signal.bigwig')]
+chip_files_to_download <- histones_w_all_marks[epirr_id_without_version %in% epirr_ids_to_download, .(filename=sub("*", "fc.signal.bigwig", data_file_path, fixed=TRUE), date=upload_date)]
 
 determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 1)#, remove = TRUE)
 # 
@@ -183,16 +153,18 @@ determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'c
 
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-wgbs_files_to_download <- all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% epirr_ids_to_download, uuid] & endsWith(filename, '.bw')]
+wgbs_files_to_download <- all_files[assay_type == "WGBS" & uuid %in% all_files[epirr_id_without_version %in% epirr_ids_to_download, uuid]]
+wgbs_files_to_download <- rbindlist(list(wgbs_files_to_download[, .(filename=sub("*", "gembs_neg.bw", data_file_path, fixed=TRUE), date=upload_date)], 
+                                         wgbs_files_to_download[, .(filename=sub("*", "gembs_pos.bw", data_file_path, fixed=TRUE), date=upload_date)]))
 
 determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1)#, remove = TRUE)
 
 # for alex:
 # meta <- fread('IHEC_metadata_harmonization.v1.0.extended.csv')
-# meta[, epirr_id_wo_version := tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
-# all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% meta[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_wo_version], uuid]]
+# meta[, epirr_id_without_version := tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+# all_files[uuid %in% wgbs_samples[epirr_id_without_version %in% meta[epirr_id_without_version %in% wgbs_samples[, epirr_id_without_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_without_version], uuid]]
 
-# determine_files_to_write(all_files[uuid %in% wgbs_samples[epirr_id_wo_version %in% meta[epirr_id_wo_version %in% wgbs_samples[, epirr_id_wo_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_wo_version], uuid] & endsWith(filename, 'cpg.bed.gz')], prefix = 'alex_wgbs', dir_to_write = wgbs_data_dir, n_chunks = 4)
+# determine_files_to_write(all_files[uuid %in% wgbs_samples[epirr_id_without_version %in% meta[epirr_id_without_version %in% wgbs_samples[, epirr_id_without_version] & harmonized_sample_ontology_intermediate == 'monocyte' & harmonized_sample_disease_intermediate == 'None', epirr_id_without_version], uuid] & endsWith(filename, 'cpg.bed.gz')], prefix = 'alex_wgbs', dir_to_write = wgbs_data_dir, n_chunks = 4)
 
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
 # sftp_wgbs_files <- all_files[grep(wgbs_files_to_download, all_files[, filename]), .(filename, date)]
@@ -212,15 +184,17 @@ here we need to download the files from the sftp
 
 ```{r, fig.width = 10}
 sample_dt <-
-  rbindlist(list(histones_w_all_marks[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, antibody)],
-       wgbs_samples[epirr_id_wo_version %in% epirr_ids_to_download, .(epirr_id_wo_version, uuid, antibody = 'wgbs')],
-       rna_samples[uuid %in% uuids_to_download[, uuid], .(epirr_id_wo_version, uuid, antibody = rna_seq_type)]))
+rbindlist(list(histones_w_all_marks[epirr_id_without_version %in% epirr_ids_to_download],
+       all_files[assay_type == "WGBS" & uuid %in% all_files[epirr_id_without_version %in% epirr_ids_to_download, uuid]],
+       all_files[uuid %in% uuids_to_download[, uuid]]), use.names = TRUE)
 
 actually_downloaded_files <- unlist(sapply(c(rna_data_dir, chip_data_dir, wgbs_data_dir), list.files))
+actually_downloaded_files <- actually_downloaded_files[!endsWith(actually_downloaded_files, ".md5")]
 
 sample_dt[, actually_downloaded:=unlist(pbmclapply(uuid, function(uid) any(grepl(pattern = uid, x = actually_downloaded_files, fixed = TRUE))))]
+sample_dt[, experiment_type:=factor(experiment_type, levels = c("total-RNA-Seq", "mRNA-Seq", "PBAT", "standard", "H3K27ac", "H3K27me3", "H3K36me3", "H3K4me1", "H3K4me3", "H3K9me3"))]
 
-ggplot(sample_dt, aes(x = reorder(epirr_id_wo_version, actually_downloaded, sum), y = reorder(antibody, antibody, length), fill = actually_downloaded)) + geom_tile()
+ggplot(sample_dt, aes(x = reorder(epirr_id_without_version, actually_downloaded, sum), y = experiment_type, fill = actually_downloaded)) + geom_tile()
 ```
 
 Load Metadata:
@@ -238,7 +212,7 @@ Load Isoform Quantifications:
 # rna_metadata[, EpiRR_no_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
 # multiple_RNAs <- rna_metadata[, if(.N > 1) .(uuid, rna_seq_type), by=EpiRR_no_version]
 
-isoform_files <- list.files(rna_data_dir, pattern = paste0(paste(uuids_to_download[, uuid], collapse = '|'),'\\.isoforms\\.results$'), full.names = T)
+isoform_files <- list.files(rna_data_dir, pattern = paste0('(', paste(uuids_to_download[, uuid], collapse = '|'), ')','\\.isoforms\\.results$'), full.names = T)
 cols_to_keep <- c('transcript_id', 'gene_id', 'TPM')
 iso_quants_list <- pbmcapply::pbmclapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, fill = TRUE, select = cols_to_keep)
 names(iso_quants_list) <- isoform_files

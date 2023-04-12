@@ -89,7 +89,7 @@ for (this_event in to_analyze) {
   this_dt <- copy(event_res[[this_event]]$event_dt)
   this_event_gr <- event_res[[this_event]]$event_gr
   single_genes_only <- this_dt[!grepl('_', gene_id, fixed = TRUE), which = TRUE]
-  not_chrY <- this_dt[seqnames != 'chrY', which = TRUE]
+  not_gonosomes <- this_dt[!seqnames %in% c('chrY', 'chrX'), which = TRUE]
   # var_events[[this_event]] <- sapply(var_events[[this_event]], function(ids) ids + max_ID, simplify = FALSE)
   
   other_event_overlaps <- findOverlaps(this_event_gr, all_gr)
@@ -97,7 +97,7 @@ for (this_event in to_analyze) {
   self_event_overlaps <- findOverlaps(this_event_gr)
   non_overlapping_self <- self_event_overlaps@from[which(!(duplicated(self_event_overlaps@from) | duplicated(self_event_overlaps@from, fromLast = TRUE)))]  
   pdf(file=file.path(plot_dir, paste0(this_event, '_event_intersections.pdf')), width = 7, height = 5, onefile = FALSE) # or other device
-  upset <- upset(fromList(list('all'=this_dt[, seq.int(.N)],'no overlap other'=non_overlapping_other, 'no overlap self'=non_overlapping_self, 'single gene'=single_genes_only, 'not chrY' = not_chrY)), sets.bar.color = "#56B4E9", order.by = "freq")
+  upset <- upset(fromList(list('all'=this_dt[, seq.int(.N)],'no overlap other'=non_overlapping_other, 'no overlap self'=non_overlapping_self, 'single gene'=single_genes_only, 'not gonosomes' = not_gonosomes)), sets.bar.color = "#56B4E9", order.by = "freq")
   print(upset)
   grid.text(this_event, x = 0.65, y=0.95, gp=gpar(fontsize=20)) 
   dev.off()
@@ -125,9 +125,9 @@ other_event_overlaps <- findOverlaps(event_gr, all_gr)
 non_overlapping_other <- other_event_overlaps@from[which(!(duplicated(other_event_overlaps@from) | duplicated(other_event_overlaps@from, fromLast = TRUE)))]
 
 single_genes_only <- event_dt[!grepl('_', gene_id, fixed = TRUE), which = TRUE]
-not_chrY <- event_dt[seqnames != 'chrY', which = TRUE]
+not_gonosomes <- event_dt[!seqnames %in% c('chrY', 'chrX'), which = TRUE]
 
-keep_rows <- intersect(intersect(single_genes_only, non_overlapping_other), not_chrY)
+keep_rows <- intersect(intersect(single_genes_only, non_overlapping_other), not_gonosomes)
 
 stopifnot(identical(event_dt[, ID], seq(nrow(event_dt))))# && max_ID == event_dt[, max(ID)])
 cols_to_factor <- c('event_id', 'gene_id', 'seqnames', 'strand', 'Event Type')

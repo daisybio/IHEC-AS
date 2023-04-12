@@ -12,10 +12,6 @@ metadata[harmonized_sample_ontology_intermediate %in% names(which(table(harmoniz
 ```
 
 ```{r}
-colVar <- function(x, na.rm = TRUE) {
-  colMeans(x * x, na.rm = na.rm) - (colMeans(x, na.rm = na.rm)) ^ 2
-}
-
 pca_plots <-
   function(matrix,
            metadata,
@@ -31,7 +27,7 @@ pca_plots <-
     }
     
     # filter out cols without variance
-    matrix <- matrix[, colVar(matrix) != 0, drop = FALSE]
+    matrix <- matrix[, apply(matrix, 2, var, na.rm=TRUE) != 0, drop = FALSE]
     
     # perform PCA
     pca <- prcomp(matrix, center = TRUE, scale = TRUE)

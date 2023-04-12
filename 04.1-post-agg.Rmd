@@ -192,5 +192,6 @@ for (mark in marks) {
 ```{r, fig.width=16, fig.height=10}
 # if (!file.exists('aggregated_dt_filtered.rds'))
 # saveRDS(aggregated_dt, 'aggregated_dt_filtered.rds')
+# fwrite(event_dt[ID %in% keep_rows], "events.csv.gz")
 fwrite(aggregated_dt, 'aggregated_dt_filtered.csv.gz')
 ```
