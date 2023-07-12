@@ -231,6 +231,13 @@ metadata[, annotation := harmonized_sample_ontology_intermediate]
 # metadata[annotation == "CD34-positive, CD38-positive common myeloid progenitor OR CD34-positive, CD38-positive common lymphoid progenitor", annotation := "CD34-positive, CD38-positive common progenitor"]
 ```
 
+
+```{bash}
+mkdir -p data
+cd data 
+wget https://downloads.wenglab.org/Registry-V3/GRCh38-cCREs.bed
+```
+
 ```{r}
 # aggregated_file_path <- file.path(psi_input_dir, 'aggregated_reference.rds')
 save.image('aggregating.rda')

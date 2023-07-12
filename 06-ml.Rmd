@@ -199,14 +199,21 @@ cm_list <- sapply(to_analyze, function(this_event){
     })
     plot_list <- lapply(unique(tstrsplit(names(roc_list), '.', fixed=TRUE, keep=1)[[1]]), function(var) {
       tmp_roc_list <- roc_list[startsWith(names(roc_list), var)]
-      if (var == 'all_var') all_aucs[[this_event]] <<- sub('all', this_event, auc_list[names(tmp_roc_list)])
+      if (var == 'all_var') {
+        all_aucs[[this_event]] <<- sub('all', this_event, auc_list[names(tmp_roc_list)])
+        all_aucs[[paste(this_event, "simple", sep = "_")]] <<- sub('all', this_event, auc_list[paste0(var,'.', c("all_all", "wo/ cCRE_all"), '_binomial.', alpha, '.roc')])
+      }
       names(tmp_roc_list) <- gsub(paste0('_binomial\\.', alpha, '\\.roc$'), '', gsub(paste0('^',var,'\\.'), '', names(tmp_roc_list)))
       
       if (var == 'all_var') {
-        all_plots[[this_event]] <<- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
+      all_plots[[this_event]] <<- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
                 color = "darkgrey", linetype = "dashed") +
             labs(title=this_event, color='Samples, Features (Event Type: AUC)', x = 'Specificity', y = 'Sensitivity') +
             theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
+      all_plots[[paste(this_event, "simple", sep = "_")]] <<- ggroc(tmp_roc_list[c("all_all", "wo/ cCRE_all")]) + geom_abline(intercept = 1, slope = 1,
+                color = "darkgrey", linetype = "dashed") +
+            labs(title=this_event, color='Samples, Features (Event Type: AUC)', x = 'Specificity', y = 'Sensitivity') +
+            theme_bw() + theme(legend.position = 'bottom')
       }
       
       p <- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
@@ -229,6 +236,10 @@ cm_list <- sapply(to_analyze, function(this_event){
 ```{r}
 ((all_plots$SE + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')'))) + (all_plots$RI + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
 ggsave(filename = file.path(plot_dir, 'roc_both.pdf'), width = 9, height = 5.5)
+```
+```{r figure6}
+((all_plots$SE_simple + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE_simple)))), ' (', all_aucs$SE_simple, ' , ', all_aucs$RI_simple , ')'))) + (all_plots$RI_simple + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.OLS\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE_simple)))), ' (', all_aucs$SE_simple, ' , ', all_aucs$RI_simple, ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'roc_both_simple.pdf'), width = 9, height = 5.5)
 ```
  
 ```{r}

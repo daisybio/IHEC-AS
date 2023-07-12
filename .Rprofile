@@ -30,6 +30,7 @@ data_dir2 <- '/nfs/data3/IHEC'
 rna_data_dir <- file.path(data_dir, 'RNA-Seq')
 chip_data_dir <- file.path(data_dir2, 'ChIP-Seq')
 wgbs_data_dir <- file.path(data_dir, 'WGBS')
+sample_dt_dir <- 'sample_dts'
 
 as_events <- c('SE', 'RI', 'AL', 'AF', 'A3', 'A5', 'MX')
 to_analyze <- c('SE', 'RI')

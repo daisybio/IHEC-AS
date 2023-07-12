@@ -5,8 +5,8 @@ output: html_notebook
 
 ## download
 ```{bash, eval = FALSE}
-mkdir -p ~/hiwi/IHEC-AS/suppa_analysis
-cd ~/hiwi/IHEC-AS/suppa_analysis
+mkdir -p suppa_analysis
+cd suppa_analysis
 wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
 gunzip gencode.v29.annotation.gtf.gz
 grep "transcript_type \"protein_coding\"" gencode.v29.annotation.gtf > gencode.v29.protein_coding.gtf
@@ -14,7 +14,7 @@ grep "transcript_type \"protein_coding\"" gencode.v29.annotation.gtf > gencode.v
 
 ## install suppa
 ```{bash, eval=FALSE, engine.opts="-l"}
-cd ~/hiwi/IHEC-AS/suppa_analysis
+cd suppa_analysis
 conda activate ihec-as
 conda install -y -c bioconda suppa==2.3
 ```
@@ -32,7 +32,7 @@ suppa.py psiPerIsoform -g gencode.v29.protein_coding.gtf -e tpm_expressions.tsv 
 ## psi per event
 
 ```{bash, engine.opts="-l"}
-cd ~/hiwi/IHEC-AS/suppa_analysis
+cd suppa_analysis
 conda activate ihec-as
 dir_path=events/
 mkdir -p ${dir_path}

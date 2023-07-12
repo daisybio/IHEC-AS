@@ -144,6 +144,8 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
                         downstream_gr, 
                         promoters(event_gr, upstream = flank_size, downstream = flank_size))
   
+  histone_samples <- fread(file.path(data_dir, 'epiatlas_metadata.csv'))
+  
   # ihec <- samples_to_consider[1]
   # profvis::profvis(
   #
@@ -167,15 +169,15 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
       # peak_list <- c()
       
       # add wgbs
-      wgbs_files <- list.files(wgbs_data_dir, ihec)
+      wgbs_files <- 
+        list.files(
+          wgbs_data_dir,
+          pattern = paste0('.*', ihec, '.*.gembs_(pos|neg).bw$'),
+          full.names = TRUE
+        )
       if (length(wgbs_files) == 2) {
         wgbs <- Reduce(c, lapply(c('pos', 'neg'), function(strand) {
-          wgbs_file <-
-            list.files(
-              wgbs_data_dir,
-              pattern = paste0('.*', ihec, '.*.gembs_', strand, '.bw$'),
-              full.names = TRUE
-            )
+          wgbs_file <- wgbs_files[endsWith(wgbs_files, paste0(strand, '.bw'))]
           wgbs_strand <- rtracklayer::import(wgbs_file, which = regions_to_cover)
           strand(wgbs_strand) <- ifelse(strand == 'pos', '+', '-')
           return(wgbs_strand)
@@ -183,19 +185,16 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
         # mark_names <- c(mark_names, 'wgbs')
         # signal_gr_list <- c(signal_gr_list, wgbs)
         # peak_list <- c(peak_list, FALSE)
-        
         aggregate_with_flank(merge_dt, 'wgbs', wgbs, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, make_cCREs = make_cCREs)
       } else if (length(wgbs_files) > 2)
-        warning(paste(ihec, 'had > 2 files:', paste(wgbs_files, collapse = ', ')))
+        stop(paste(ihec, 'had > 2 files:', paste(wgbs_files, collapse = ', ')))
       else if (length(wgbs_files) < 0) {
-        warning(paste(ihec, 'had < 2 files'))
+        stop(paste(ihec, 'had < 2 files'))
       }
       # add histone marks
-      histone_samples <- fread(file.path(data_dir, 'ihec_metadata.csv'))
-      histone_samples[, epirr_id_wo_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-      for (this_uuid in histone_samples[epirr_id_wo_version == ihec, uuid]) {
+      for (this_uuid in histone_samples[epirr_id_without_version == ihec & assay_type == "ChIP-Seq", uuid]) {
         file_ext <- c(#peak = '\\.pval0\\.01\\.500K\\.bfilt\\.narrowPeak\\.gz$', 
-                      signal = '\\.fc\\.signal\\.bigwig$')
+                      signal = '\\.fc\\.signal\\.bw$')
         for (file_type in names(file_ext)) {
           histone_file <-
             list.files(
@@ -204,9 +203,9 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
               full.names = TRUE
             )
           if (length(histone_file) > 1)
-            warning(paste(ihec, 'had > 1 files for uuid', this_uuid, ':', paste(histone_file, collapse = ', ')))
+            stop(paste(ihec, 'had > 1 files for uuid', this_uuid, ':', paste(histone_file, collapse = ', ')))
           else if (length(histone_file) == 0) {
-            warning(paste(ihec, 'had 0 files for uuid', this_uuid))
+            stop(paste(ihec, 'had 0 files for uuid', this_uuid))
           } else {
             hPTM <- rtracklayer::import(histone_file, which = regions_to_cover)
             
@@ -214,7 +213,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
             # signal_gr_list <- c(signal_gr_list, hPTM)
             # peak_list <- c(peak_list, file_type == 'peak')
             
-            aggregate_with_flank(merge_dt, histone_samples[uuid == this_uuid, antibody], hPTM, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak',  make_cCREs = make_cCREs)
+            aggregate_with_flank(merge_dt, histone_samples[uuid == this_uuid, experiment_type], hPTM, event_gr, cCRE_dt, cCREs, cCRE_gr, upstream_gr, downstream_gr, flank_size, peak = file_type == 'peak',  make_cCREs = make_cCREs)
           }
         }
       }
@@ -240,9 +239,9 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
       # res_dt[, mark:=as.factor(mark)]
       
       # return(res_dt)
-      fwrite(merge_dt, file.path(psi_input_dir, 'sample_dts', paste0(ihec, '-merge_dt.csv.gz')))
+      fwrite(merge_dt, file.path(sample_dt_dir, paste0(ihec, '-merge_dt.csv.gz')))
       if (make_cCREs)
-      fwrite(cCRE_dt[apply(cCRE_dt, 1, function(row) sum(is.na(row)) < length(cCRE_dt) - 1)], file.path(psi_input_dir, 'sample_dts', paste0(ihec, '-cCRE_dt.csv.gz')))
+      fwrite(cCRE_dt[apply(cCRE_dt, 1, function(row) sum(is.na(row)) < length(cCRE_dt) - 1)], file.path(sample_dt_dir, paste0(ihec, '-cCRE_dt.csv.gz')))
       
       # merge_dt
       # list(merge_dt = merge_dt, cCRE_dt = cCRE_dt)

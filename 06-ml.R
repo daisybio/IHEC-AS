@@ -1,4 +1,4 @@
-setwd('~/hiwi/IHEC-AS/')
+# setwd('~/hiwi/IHEC-AS/')
 source('.Rprofile')
 
 library(glmnet)
@@ -148,7 +148,7 @@ foreach::registerDoSEQ()
 event_specific_ids <- aggregated_dt[ID %in% ids_with_cCREs, #if(.N > 300) 
                                     .(N=.N), by=ID]
 glmnet.control(itrace = 0)
-cCRE_files <- list.files(file.path(psi_input_dir, 'sample_dts'), '-cCRE_dt.csv.gz', full.names = TRUE)
+cCRE_files <- list.files(sample_dt_dir, '-cCRE_dt.csv.gz', full.names = TRUE)
 cCRE_files <- cCRE_files[!startsWith(basename(cCRE_files), 'old')]
 file2IHEC <- tstrsplit(basename(cCRE_files), '-', fixed=TRUE, keep = 1)[[1]]
 names(file2IHEC) <- cCRE_files

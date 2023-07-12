@@ -1,7 +1,8 @@
-setwd('~/hiwi/IHEC-AS/')
+# setwd('~/hiwi/IHEC-AS/')
 load('aggregating.rda')
 source('04-aggregating_helper.R')
-already_computed_files <- list.files(file.path(psi_input_dir, 'sample_dts'), pattern = 'merge_dt.csv.gz')
+dir.create(sample_dt_dir, recursive=TRUE)
+already_computed_files <- list.files(sample_dt_dir, pattern = 'merge_dt.csv.gz')
 if (length(already_computed_files) == 0) {
   samples_to_consider <- sample_cols
 } else {

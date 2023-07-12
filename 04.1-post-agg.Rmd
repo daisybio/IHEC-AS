@@ -6,7 +6,7 @@ output: pdf_document
 ```{r, fig.width=16, fig.height=10}
 load('aggregating.rda')
 
-agg_data_files <- list.files(file.path(psi_input_dir, 'sample_dts'), pattern = 'merge_dt.csv.gz', full.names = TRUE)
+agg_data_files <- list.files(sample_dt_dir, pattern = 'merge_dt.csv.gz', full.names = TRUE)
 agg_data_files <- agg_data_files[!startsWith(basename(agg_data_files), 'old')]
 histone_marks <- c('H3K4me1', 'H3K27me3', 'H3K36me3', 'H3K27ac', 'H3K4me3', 'H3K9me3')
 cCRE_regions <- c('CTCF-only', 'dELS', 'pELS', 'PLS', 'DNase-H3K4me3')

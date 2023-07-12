@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
-#SBATCH --job-name=IHEC-IA-AS
-#SBATCH --output=%x.%j.txt
-#SBATCH --mem-per-cpu=20G
+#SBATCH -c 20
+#SBATCH -J AGG
+#SBATCH --output=%x.%j.%N.txt
+#SBATCH --mem=380000
+#SBATCH -t 2-00:00:00 # days-hh:mm:ss
 
 Rscript 04-preliminary-results-aggregation.R

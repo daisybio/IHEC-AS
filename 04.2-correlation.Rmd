@@ -260,7 +260,7 @@ ggsave(filename = file.path(plot_dir, paste0('top10 ', color_by, '.pdf')), p, wi
 }
 ```
 
-```{r}
+```{r, eval=FALSE}
 ggplot(melt_cor_dt[feature == 'DNAm\nPLS' & `Partial Correlation` == 'TRUE' & `Correlation Coefficient` == 'pearson'], aes(y=`Correlation w/ PSI`, x=`PSI Variance`)) + geom_dotplot(binaxis='y', stackdir='center', dotsize=.2) + geom_boxplot(width=0.1) + theme_bw() + facet_wrap(. ~ `Event Type`, nrow = 2)
 ```
 
@@ -274,7 +274,7 @@ test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(PSI, gene_expre
 test_dt[!(is.na(PSI) | is.na(gene_expression)), ppcor::pcor.test(gene_expression, PSI, gene_expression, 'pearson')]$estimate
 ```
 
-```{r, fig.width=10, fig.height=10}
+```{r, fig.width=10, fig.height=10, eval=FALSE}
 p <- ggplot(aggregated_dt[`Event Type` == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = `Event Type`)) + facet_wrap(. ~ IHEC) +  geom_point() +
   ggpubr::stat_cor(colour = "black")+ ggpubr::stat_cor(method='spearman', cor.coef.name = 'rho', label.y.npc = 'bottom', colour = "black")
 p1 <- ggplot(aggregated_dt[`Event Type` == 'SE' & ID %in% as.integer(unlist(unlisted_vars[names(unlisted_vars) == '0'], use.names = FALSE)) & IHEC == 'IHECRE00000060'], aes(x = `width;event_name`, y = PSI, color = `Event Type`)) + facet_wrap(. ~ IHEC) +  geom_point() + scale_x_log10() + 

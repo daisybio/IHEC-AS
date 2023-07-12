@@ -12,9 +12,9 @@ output:
 cd /nfs/data/IHEC/RNAseq
 echo "get epiatlas_metadata*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
 echo "get IHEC*" | sftp DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/readme
-#sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
-find ~/ihec-incoming -printf "%p\t%CY-%Cm-%Cd %CH:%CM:%CS %CZ\n" > all_files.txt
-fusermount -u ~/ihec-incoming
+# sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/
+# find ~/ihec-incoming -printf "%p\t%CY-%Cm-%Cd %CH:%CM:%CS %CZ\n" > all_files.txt
+# fusermount -u ~/ihec-incoming
 ```
 
 ```{r}
@@ -198,6 +198,11 @@ ggplot(sample_dt, aes(x = reorder(epirr_id_without_version, actually_downloaded,
 ```
 
 Load Metadata:
+
+```{bash}
+wget https://raw.githubusercontent.com/IHEC/epimap-metadata-harmonization/2b85e717d2f8045f5b638f5e0f2626daa40b3bd0/openrefine/v1.0/IHEC_metadata_harmonization.v1.0.extended.csv
+```
+
 
 ```{r}
 # load metadata
