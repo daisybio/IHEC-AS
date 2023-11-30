@@ -1,9 +1,9 @@
 #!/bin/bash
-#
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --job-name=GET-TF
-#SBATCH --output=%x.%j.txt
-#SBATCH --mem-per-cpu=2G
+#SBATCH -J TF
+#SBATCH --output %x.%j.%N.txt
+#SBATCH -p exbio-cpu
+#SBATCH -c 1
+#SBATCH --mem 2G
+#SBATCH -t 4-00:00:00 # days-hh:mm:ss
 
-Rscript 07-event-specific-get-tf.R
+srun Rscript 07-event-specific-get-tf.R

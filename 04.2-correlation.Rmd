@@ -116,7 +116,7 @@ for (this_event in to_analyze) {
         rownames(cor_mat) <- cor_dt_event_var[, IHEC]
         breaks <- seq(-.4, .4, by = .05)
         annotation_df <-
-          metadata[EpiRR_no_version %in% sample_cols, data.frame(annotation = annotation, row.names = EpiRR_no_version)]
+          metadata[epirr_id_without_version %in% sample_cols, data.frame(annotation = annotation, row.names = epirr_id_without_version)]
         tryCatch({
         #   pheatmap(
         #     t(cor_mat[sample_cols,])[, rownames(annotation_df)[order(annotation_df$annotation)]],
@@ -166,14 +166,14 @@ cor_dt_intermediate <- copy(all_cor)
 #       }), by = .(`Event Type`, IHEC), .SDcols = names(aggregated_dt)[!names(aggregated_dt) %in% c('ID', 'PSI', 'IHEC', 'Event Type')]]
 # below_0.5[, c('PSI Variance', 'Partial Correlation', 'Correlation Coefficient'):=list('<0.5', TRUE, 'pearson')]
 # cor_dt_intermediate <- rbind(cor_dt_intermediate, below_0.5)
-colnames(cor_dt_intermediate) <- gsub(';max', '', colnames(cor_dt_intermediate), fixed = TRUE)
-colnames(cor_dt_intermediate) <- gsub(';mean', '', colnames(cor_dt_intermediate), fixed = TRUE)
+# colnames(cor_dt_intermediate) <- gsub(';max', '', colnames(cor_dt_intermediate), fixed = TRUE)
+# colnames(cor_dt_intermediate) <- gsub(';mean', '', colnames(cor_dt_intermediate), fixed = TRUE)
 melt_cor_dt <- melt(cor_dt_intermediate, id.vars = c('IHEC', 'Event Type', 'PSI Variance', 'Partial Correlation', 'Correlation Coefficient'), variable.name = 'feature', value.name = 'Correlation w/ PSI')
 melt_cor_dt[`Event Type` == 'SE', feature := gsub('other_region', 'Intron', feature, fixed=TRUE)]
 melt_cor_dt[`Event Type` == 'RI', feature := gsub('other_region', 'Exon', feature, fixed=TRUE)]
 melt_cor_dt[`Event Type` == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
 melt_cor_dt[`Event Type` == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
-melt_cor_dt[, feature:=sub('wgbs', 'DNAm', feature, fixed = TRUE)]
+# melt_cor_dt[, feature:=sub('wgbs', 'DNAm', feature, fixed = TRUE)]
 melt_cor_dt[, feature:=sub(';', '\n', feature, fixed = TRUE)]
 melt_cor_dt[, feature:=sub(',', '\n', feature, fixed = TRUE)]
 melt_cor_dt[, feature:=gsub('_', ' ', feature, fixed = TRUE)]

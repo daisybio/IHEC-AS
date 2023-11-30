@@ -5,8 +5,10 @@ library(pbapply)
 pboptions(type='timer')
 
 cCRE_accessions <- readLines('all_cCRE_accessions.txt')
-curr_tf_dt <- fread('tf_dt.csv')
-cCRE_accessions <- curr_tf_dt[name != 'ERROR', cCRE_accessions[!cCRE_accessions %in% accession]]
+if (file.exists('tf_dt.csv')){
+  curr_tf_dt <- fread('tf_dt.csv')
+  cCRE_accessions <- setdiff(cCRE_accessions, curr_tf_dt[name != 'ERROR', unique(accession)])
+}
 tf_dt <- rbindlist(pbapply::pbsapply(cCRE_accessions, function(this_accession) {
   r <-
     RETRY(verb = 'POST',

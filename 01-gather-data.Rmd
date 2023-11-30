@@ -38,7 +38,7 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
   print(prefix)
   
   # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-  sftp_files <- rbindlist(list(files_to_download, files_to_download[, .(filename=paste0(filename, ".md5"), date=date)]))
+  sftp_files <- rbindlist(list(files_to_download))#, files_to_download[, .(filename=paste0(filename, ".md5"), date=date)]))
   
   local_files <- file.path(dir_to_write, basename(sftp_files[, filename]))
   still_to_download <- sftp_files[!(file.exists(local_files) & as.Date(file.info(local_files)$ctime) > as.Date(sftp_files[, date], format="%m-%d-%Y")), filename]
@@ -52,7 +52,7 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
     print(paste('removing', length(to_remove), 'files'))
     file.remove(to_remove)
   } else {
-    print(to_remove)
+    print(paste('could remove', length(to_remove), 'files'))
   }
   
   if (length(still_to_download) > 0) {
@@ -60,6 +60,7 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
     
     write_chunked_files(get_commands, n_chunks, prefix, dir_to_write)
   }
+  invisible(NULL)
 }
 ```
 
@@ -67,17 +68,25 @@ determine_files_to_write <- function(files_to_download, prefix, dir_to_write, n_
 
 ```{r}
 all_files <- fread(file.path(data_dir, 'epiatlas_metadata.csv'))
+
 # all_files[, epirr_id_without_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
 # filename_date <- c('filename', 'date')
 # setnames(all_files, c('V1', 'V2'), filename_date)
 # all_files[, uuid:=gsub(pattern = '.*([[:alnum:]]{8}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{4}-[[:alnum:]]{12}).*', '\\1', filename)]
 ```
 
+```{r}
+rna_cols <- c('total-RNA-Seq', 'mRNA-Seq')
+wgbs_cols <- c('PBAT', 'standard')
+wide_files <- dcast(all_files, epirr_id_without_version ~ experiment_type, value.var = 'data_file_path')
+
+```
+
 ## check ChIP and WGBS files
 
 ```{r}
-histone_marks <- c('H3K27ac', 'H3K27me3', 'H3K36me3', 'H3K4me1', 'H3K4me3', 'H3K9me3')
-histones_w_all_marks <- all_files[assay_type == "ChIP-Seq", if(all(histone_marks %in% experiment_type)) .SD[experiment_type %in% histone_marks], by=.(epirr_id_without_version)]
+
+histones_w_all_marks <- all_files[assay_type == "ChIP-Seq", if(any(histone_marks %in% experiment_type)) .SD[experiment_type %in% histone_marks], by=.(epirr_id_without_version)]
 
 # find rna samples with all histone marks
 rna_samples_w_chip <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% histones_w_all_marks[, epirr_id_without_version]]
@@ -131,10 +140,16 @@ determine_files_to_write(files_to_download = rbindlist(list(isoform_files_to_dow
 
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
+# sftp://DATA-545_qmanz@sftp.bcgsc.ca/IHEC/incoming/ChIP-Seq_imputed/H3K36me3/impute_IHECRE00000001.4_H3K36me3.pval.bw
+histone_w_min_one_mark <- melt(dcast(histones_w_all_marks[epirr_id_without_version %in% epirr_ids_to_download], epirr_id ~ experiment_type, value.var = "data_file_path"), id.vars = "epirr_id", variable.name = 'experiment_type', value.name = 'data_file_path')
+histone_w_min_one_mark[is.na(data_file_path), data_file_path:=paste0('incoming/ChIP-Seq_imputed/', experiment_type, '/impute_', epirr_id, '_', experiment_type, '.pval.bw')]
+histone_w_min_one_mark[, filename:=sub("*", "pval.signal.bigwig", data_file_path, fixed=TRUE)]
+histone_w_min_one_mark[all_files, on='data_file_path', date:=upload_date]
+histone_w_min_one_mark[is.na(date), date:=as.Date("07/23/23", "%m/%d/%y")]
 
-chip_files_to_download <- histones_w_all_marks[epirr_id_without_version %in% epirr_ids_to_download, .(filename=sub("*", "fc.signal.bigwig", data_file_path, fixed=TRUE), date=upload_date)]
+chip_files_to_download <- histone_w_min_one_mark[, .(filename, date)] #histones_w_all_marks[epirr_id_without_version %in% epirr_ids_to_download, .(filename=sub("*", "pval.signal.bigwig", data_file_path, fixed=TRUE), date=upload_date)]
 
-determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 1)#, remove = TRUE)
+determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'chip', dir_to_write = chip_data_dir, n_chunks = 5)#, remove = TRUE)
 # 
 # 
 # sftp_chip_files <-  all_files[grep(chip_files_to_download, all_files[, filename]), .(filename, date)]
@@ -153,11 +168,15 @@ determine_files_to_write(files_to_download = chip_files_to_download, prefix = 'c
 
 ```{r}
 # make sure you ran "sshfs DATA-545_qmanz@sftp.bcgsc.ca:/IHEC/incoming/ /nfs/home/students/ga89koc/ihec-incoming/"
-wgbs_files_to_download <- all_files[assay_type == "WGBS" & uuid %in% all_files[epirr_id_without_version %in% epirr_ids_to_download, uuid]]
-wgbs_files_to_download <- rbindlist(list(wgbs_files_to_download[, .(filename=sub("*", "gembs_neg.bw", data_file_path, fixed=TRUE), date=upload_date)], 
-                                         wgbs_files_to_download[, .(filename=sub("*", "gembs_pos.bw", data_file_path, fixed=TRUE), date=upload_date)]))
+wgbs_files <- all_files[assay_type == "WGBS" & uuid %in% all_files[epirr_id_without_version %in% epirr_ids_to_download, uuid]]
+wgbs1 <- copy(wgbs_files)
+wgbs1[, filename:=sub("*", "gembs_neg.bw", data_file_path, fixed=TRUE)]
+wgbs2 <- copy(wgbs_files)
+wgbs2[, filename:=sub("*", "gembs_pos.bw", data_file_path, fixed=TRUE)]
+wgbs_files <- rbindlist(list(wgbs1, wgbs2))
+wgbs_files[, date:=upload_date]
 
-determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1)#, remove = TRUE)
+determine_files_to_write(files_to_download = wgbs_files[, .(filename, date)], prefix = 'wgbs', dir_to_write = wgbs_data_dir, n_chunks = 1)#, remove = TRUE)
 
 # for alex:
 # meta <- fread('IHEC_metadata_harmonization.v1.0.extended.csv')
@@ -180,6 +199,13 @@ determine_files_to_write(files_to_download = wgbs_files_to_download, prefix = 'w
 # write_chunked_files(wgbs_get_commands, 1, 'wgbs', wgbs_data_dir)
 ```
 
+```{r}
+shared_columns <- c("epirr_id", "experiment_type", "filename")
+wgbs_files[, experiment_type:='DNAm']
+file_table <- rbindlist(list(histone_w_min_one_mark[, ..shared_columns], wgbs_files[, ..shared_columns]))
+fwrite(file_table, 'file_table.csv.gz')
+```
+
 here we need to download the files from the sftp
 
 ```{r, fig.width = 10}
@@ -200,22 +226,22 @@ ggplot(sample_dt, aes(x = reorder(epirr_id_without_version, actually_downloaded,
 Load Metadata:
 
 ```{bash}
-wget https://raw.githubusercontent.com/IHEC/epimap-metadata-harmonization/2b85e717d2f8045f5b638f5e0f2626daa40b3bd0/openrefine/v1.0/IHEC_metadata_harmonization.v1.0.extended.csv
+wget https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/6f15184707c4b6230c5d7e12a56e6d625999a26e/openrefine/v1.1/IHEC_metadata_harmonization.v1.1.csv
 ```
 
 
 ```{r}
 # load metadata
-metadata <- data.table::fread('IHEC_metadata_harmonization.v1.0.extended.csv')
-metadata[, EpiRR_no_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+metadata <- data.table::fread(sample_metadata_file)
+# metadata[, epirr_id_without_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
 ```
 
 Load Isoform Quantifications:
 
 ```{r}
 # rna_metadata <- fread(file.path(data_dir, 'ihec_metadata_rna.csv'))
-# rna_metadata[, EpiRR_no_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
-# multiple_RNAs <- rna_metadata[, if(.N > 1) .(uuid, rna_seq_type), by=EpiRR_no_version]
+# rna_metadata[, epirr_id_without_version := tstrsplit(epirr_id, '.', fixed = TRUE)[1]]
+# multiple_RNAs <- rna_metadata[, if(.N > 1) .(uuid, rna_seq_type), by=epirr_id_without_version]
 
 isoform_files <- list.files(rna_data_dir, pattern = paste0('(', paste(uuids_to_download[, uuid], collapse = '|'), ')','\\.isoforms\\.results$'), full.names = T)
 cols_to_keep <- c('transcript_id', 'gene_id', 'TPM')
@@ -224,26 +250,26 @@ names(iso_quants_list) <- isoform_files
 isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'EpiRR')
 file2id <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files)
 names(file2id) <- isoform_files
-isoform_quants[, EpiRR_no_version := as.factor(file2id[isoform_quants[, EpiRR]])]
+isoform_quants[, epirr_id_without_version := as.factor(file2id[isoform_quants[, EpiRR]])]
 isoform_quants[, EpiRR:=NULL]
 
 suppressWarnings(dir.create('suppa_analysis/'))
 
-gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = c('EpiRR_no_version', 'gene_id')]
+gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = c('epirr_id_without_version', 'gene_id')]
 gene_expr_file <- 'suppa_analysis/gene_expressions.rds'
 # if (!file.exists(gene_expr_file)) {
   saveRDS(gene_quants, gene_expr_file)
 # }
 
 # bring tpms to wide format
-tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ EpiRR_no_version, value.var = 'TPM', fill = 0)
+tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ epirr_id_without_version, value.var = 'TPM', fill = 0)
 
 
 # remove id column
-# tpm_matrix <- as.matrix(tpm_dt[, -'EpiRR_no_version'])
+# tpm_matrix <- as.matrix(tpm_dt[, -'epirr_id_without_version'])
 
 # write files for SUPPA2
-# rownames(tpm_matrix) <- tpm_dt[, EpiRR_no_version]
+# rownames(tpm_matrix) <- tpm_dt[, epirr_id_without_version]
 # tpm_matrix[is.na(tpm_matrix)] <- 0
 suppa_expr_filename <- 'suppa_analysis/tpm_expressions.tsv'
 # if (!file.exists(suppa_expr_filename)) {
@@ -255,7 +281,7 @@ suppa_expr_filename <- 'suppa_analysis/tpm_expressions.tsv'
 # }
 
 # filter metadata
-metadata <- metadata[EpiRR_no_version %in% names(tpm_dt)[-1]]
+metadata <- metadata[epirr_id_without_version %in% names(tpm_dt)[-1]]
 # remove the two outliers
 # metadata_filtered <- metadata[cell_type != 'sperm']
 save.image('pca.rda')

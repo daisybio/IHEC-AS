@@ -187,6 +187,7 @@ ggplot(melt(event_dt[ID %in% keep_rows], id.vars = c('ID', 'gene_id', 'seqnames'
 ```{r}
 annotation <- rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf')
 used_genes <- annotation[annotation$gene_id %in% event_dt[, gene_id] & annotation$type == 'gene', ]
+rm(annotation)
 event_dt[data.table(gene_id = used_genes$gene_id, gene_start = start(used_genes), gene_end = end(used_genes)), on = 'gene_id', c('gene_start', 'gene_end') := .(gene_start, gene_end)]
 
 event_dt[strand == '-', distance_TSS:=log2(gene_end - end(event_gr[ID]))]
@@ -206,7 +207,7 @@ gene_quants <- readRDS('suppa_analysis/gene_expressions.rds')
 # separator_gene_ids <- '_and_'
 # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec), gene_id)]
 # signal_psi_dt <- signal_psi_dt[, .(gene_id = unlist(tstrsplit(gene_id, separator_gene_ids, fixed=TRUE))), by=.(ID, PSI)]
-# signal_psi_dt[unique(gene_quants[EpiRR_no_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
+# signal_psi_dt[unique(gene_quants[epirr_id_without_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
 # signal_psi_dt <- signal_psi_dt[, .(gene_id=paste(gene_id, collapse=separator_gene_ids), gene_expression=sum(gene_expression, na.rm = TRUE)), by=.(ID, PSI)]
 
     
@@ -223,8 +224,8 @@ event_dt[, paste('width', 'downstream_other_region', sep = ';') := log2(width(do
 ```
 
 ```{r}
-metadata <- data.table::fread('IHEC_metadata_harmonization.v1.0.extended.csv')
-metadata[, EpiRR_no_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
+metadata <- data.table::fread(sample_metadata_file)
+metadata[, epirr_id_without_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
 metadata[, annotation := harmonized_sample_ontology_intermediate]
 # metadata[biomaterial_type == 'primary tissue', annotation := tissue_type]
 # metadata[biomaterial_type == 'cell line', annotation := line]
@@ -235,8 +236,37 @@ metadata[, annotation := harmonized_sample_ontology_intermediate]
 ```{bash}
 mkdir -p data
 cd data 
-wget https://downloads.wenglab.org/Registry-V3/GRCh38-cCREs.bed
+# wget https://downloads.wenglab.org/Registry-V3/GRCh38-cCREs.bed
 ```
+
+```{r}
+# cCREs <- data.table::fread('data/GRCh38-cCREs.bed')
+# names(cCREs) <- c('seqnames', 'start', 'end', 'some_id', 'accession', 'cCRE_type')
+# cCRE_gr <- cCREs[, GRanges(seqnames = seqnames, IRanges(start = start, end = end), name = accession)]
+# cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = vicinity, ignore.strand=TRUE)
+# cCREs_in_vicinity_ids <- sort(unique(to(cCRE_hits)[from(cCRE_hits) %in% keep_rows]))
+
+activeChromHMM <- rtracklayer::import("StackedChromHMM_hg38_V1_EnhancerStates.bed.gz")
+activeChromHMM$chrom_state <- activeChromHMM$name
+activeChromHMM$name <- sprintf('chromhmm_%d', seq_along(activeChromHMM))
+chromhmm_hits <- findOverlaps(event_gr, activeChromHMM, maxgap = vicinity, ignore.strand=TRUE)
+chromhmm_in_vicinity <- sort(unique(to(chromhmm_hits)[from(chromhmm_hits) %in% keep_rows]))
+
+event_gr$name <- event_dt[, ID]
+upstream_gr$name <- sprintf('up_%d', event_dt[, ID])
+downstream_gr$name <- sprintf('down_%d', event_dt[, ID])
+```
+
+```{r}
+# write the bed files over which averaging should be done:
+aggregateOver <- c(event_gr[keep_rows],
+                   upstream_gr[keep_rows],
+                   downstream_gr[keep_rows],
+                   # cCRE_gr[cCREs_in_vicinity_ids],
+                   activeChromHMM[chromhmm_in_vicinity])
+rtracklayer::export(aggregateOver, 'aggregateOver.bed')
+```
+
 
 ```{r}
 # aggregated_file_path <- file.path(psi_input_dir, 'aggregated_reference.rds')

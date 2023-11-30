@@ -60,7 +60,7 @@ pca_plots <-
 tpm_matrix <- as.matrix(tpm_dt[, -'transcript_id'])
 rownames(tpm_matrix) <- tpm_dt[, transcript_id]
 tpm_matrix <- t(log2(tpm_matrix + 1))
-tpm_all <- pca_plots(tpm_matrix[metadata[, EpiRR_no_version], ], metadata, 'TPM')
+tpm_all <- pca_plots(tpm_matrix[metadata[, epirr_id_without_version], ], metadata, 'TPM')
 print(tpm_all$scree)
 
 labels <- metadata[, harmonized_sample_ontology_intermediate]
@@ -75,7 +75,7 @@ ggsave(filename = file.path(plot_dir, 'PCA_TPM.pdf'), width = 10, height = 7)
 
 ```{r, fig.height=7, fig.width=10}
 library(umap)
-umap_tpm <- umap::umap(tpm_matrix[metadata[, EpiRR_no_version], ])
+umap_tpm <- umap::umap(tpm_matrix[metadata[, epirr_id_without_version], ])
 
 df <- data.frame(x = umap_tpm$layout[,1],
                  y = umap_tpm$layout[,2],
@@ -107,7 +107,7 @@ ggsave(filename = file.path(plot_dir, 'UMAP_TPM.pdf'), width = 10, height = 7)
 <!-- ``` -->
 
 <!-- ```{r, fig.height=7, fig.width=12} -->
-<!-- pca_plots(isoform_usages[metadata_filtered[, EpiRR_no_version],], metadata_filtered, 'IU w/o outliers') -->
+<!-- pca_plots(isoform_usages[metadata_filtered[, epirr_id_without_version],], metadata_filtered, 'IU w/o outliers') -->
 <!-- ``` -->
 
 ## PCA on AS events (PSI values)
@@ -123,7 +123,7 @@ for(i in 1:ncol(psi_table)){
 ```
 
 ```{r, fig.height=7, fig.width=10}
-psi_all <- pca_plots(psi_table[metadata[, EpiRR_no_version], ], metadata, 'PSI')
+psi_all <- pca_plots(psi_table[metadata[, epirr_id_without_version], ], metadata, 'PSI')
 print(psi_all$scree)
 plot_pca_psi <- psi_all$dimred + guides(col= guide_legend(ncol = 1)) + geom_text_repel(aes(label = labels), min.segment.length = 0, max.overlaps = 5, force = 5)
 print(plot_pca_psi)
@@ -132,7 +132,7 @@ ggsave(filename = file.path(plot_dir, 'PCA_PSI.pdf'), width = 10, height = 7)
 
 ```{r, fig.height=7, fig.width=10}
 library(umap)
-umap_psi <- umap::umap(psi_table[metadata[, EpiRR_no_version], ])
+umap_psi <- umap::umap(psi_table[metadata[, epirr_id_without_version], ])
 
 df <- data.frame(x = umap_psi$layout[,1],
                  y = umap_psi$layout[,2],

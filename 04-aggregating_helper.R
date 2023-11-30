@@ -41,7 +41,7 @@ aggregate_with_flank <- function(merge_dt, name, signal_gr, event_gr, cCRE_dt, c
   
   # enhancer regions
   # first find enhancers that are at most 5kb from the alternative region
-  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000)
+  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = vicinity, ignore.strand = TRUE)
   # get the hits of the enhancers that were near alternative regions
   cCRE_signal_hits <- findOverlaps(cCRE_gr[to(cCRE_hits)], signal_gr)
   # get the id of the alternative region
@@ -129,7 +129,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
   names(cCREs) <- c('seqnames', 'start', 'end', 'some_id', 'accession', 'cCRE_type')
   cCRE_gr <- cCREs[, GRanges(seqnames = seqnames, IRanges(start = start, end = end))]
   # mcols(enhancers) <- NULL
-  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000, ignore.strand=TRUE)
+  cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = vicinity, ignore.strand=TRUE)
   # enhancers <- enhancers[unique(to(cCRE_hits))]
   # distances_enhancers <- distanceToNearest(event_gr, enhancers)
   # promoters_annotated <- rtracklayer::import('data/hg38_fair+new_CAGE_peaks_phase1and2.bed')
@@ -158,7 +158,7 @@ aggregate_multiple_samples <- function(samples_to_consider, event_dt, event_gr, 
       # separator_gene_ids <- '_and_'
       # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec))] #, gene_id)]
       # signal_psi_dt <- signal_psi_dt[, .(gene_id = unlist(tstrsplit(gene_id, separator_gene_ids, fixed=TRUE))), by=.(ID, PSI)]
-      # signal_psi_dt[unique(gene_quants[EpiRR_no_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
+      # signal_psi_dt[unique(gene_quants[epirr_id_without_version == ihec, .(gene_id, gene_tpm)]), on = .(gene_id), gene_expression := gene_tpm]
       # signal_psi_dt <- signal_psi_dt[, .(gene_id=paste(gene_id, collapse=separator_gene_ids), gene_expression=sum(gene_expression, na.rm = TRUE)), by=.(ID, PSI)]
       
       # signal_psi_dt[, gene_id := NULL]

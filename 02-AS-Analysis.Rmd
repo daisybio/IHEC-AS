@@ -22,7 +22,7 @@ conda install -y -c bioconda suppa==2.3
 
 ## psi per isoform
 ```{bash, engine.opts="-l"}
-cd ~/hiwi/IHEC-AS/suppa_analysis
+cd suppa_analysis
 conda activate ihec-as
 suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o gencode.v29.protein_coding -f ioi
 #suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o gencode.v29.protein_coding_pooled -f ioi --pool-genes

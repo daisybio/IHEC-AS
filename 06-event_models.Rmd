@@ -1,84 +1,77 @@
 ---
-title: "ML"
+title: "ML event models"
 output: pdf_document
 ---
 
-# overall model
-
-```{r, eval=FALSE}
-aggregated_dt <- readRDS('aggregated_dt.rds')
-aggregation <- 'max'
-response <- 'PSI'
-```
-
-
-```{r, eval=FALSE}
-if (!all(file.exists(paste(to_analyze, 'models.rds', sep = '_'))))
-source('06-ml.R')
-```
-
 # check models
+```{r}
+library(glmnet)
+library(ranger)
+library(caret)
+library(RSNNS)
+library(MLmetrics)
+```
 
-```{r, fig.width=16, fig.height=11, eval=FALSE}
-rank_dt <- rbindlist(sapply(to_analyze, function(this_event){
-  models <- all_models[, this_event]
-  as_dt <- rbindlist(sapply(names(models), function(cvfit_name) {
-    cvfits <- models[[cvfit_name]]$cvfit
-    rbindlist(sapply(names(cvfits), function(alpha) {
-      cvfit <- cvfits[[alpha]]
-      if (endsWith(alpha, 'OLS')) {
-        coefs <- as.matrix(coef(cvfit))
-      } else {
-        coefs <- coef(cvfit, s = my_lambda)
-        # plot(cvfit, main=paste(this_event, cvfit_name, alpha))
-      }
-      data.table(feature = rownames(coefs), coefs = coefs[, 1])
-    }, simplify = FALSE), idcol = 'alpha')
-  }, simplify = FALSE), idcol = 'model')
-  # as_dt <- melt(dcast(as_dt, model + alpha ~ feature, value.var = 'coefs'), id.vars = c('model', 'alpha'), variable.name = 'feature', value.name = 'coefs')
-  # as_dt[, model:=sub('no_enhancer', 'noEnhancer', model, fixed = TRUE)]
-  # as_dt[, model:=sub('enhancer_stripped', 'enhancerStripped', model, fixed = TRUE)]
-  as_dt[, model:=gsub('nocCRE', 'wo/ cCRE', model, fixed = TRUE)]
-  as_dt[, c('PSI Variance', 'dat_expl_resp'):=tstrsplit(model, '.', fixed=TRUE)]
-  as_dt[, `PSI Variance`:=tstrsplit(`PSI Variance`, '_', fixed=TRUE, keep = 1)]
-  as_dt[, c('dataset', 'explanatory', 'response'):=tstrsplit(dat_expl_resp, '_', fixed=TRUE)]
-  # as_dt[, coef_rank:=rank(-coefs, na.last = 'keep'), by=model]
-}, simplify = FALSE), idcol = 'Event Type')
-split_features(rank_dt, 'feature')
-rank_dt[, region:=sub('upstream', 'Upstream', region, fixed = TRUE)]
-rank_dt[, region:=sub('downstream', 'Downstream', region, fixed = TRUE)]
-rank_dt[, region:=gsub('[_,]', '\n', region)]
-rank_dt[, region := factor(
-  region,
-  levels =
-    c(
-      unique(region)[startsWith(unique(region), 'Upstream')],
-      unique(region)[startsWith(unique(region), 'RI')],
-      unique(region)[startsWith(unique(region), 'SE')],
-      unique(region)[startsWith(unique(region), 'Downstream')],
-      unique(region)[startsWith(unique(region), 'Gene')],
-      unique(region)[startsWith(unique(region), 'PLS')],
-      unique(region)[startsWith(unique(region), 'DNase-H3K4me3')],
-      unique(region)[startsWith(unique(region), 'pELS')],
-      unique(region)[startsWith(unique(region), 'dELS')],
-      unique(region)[startsWith(unique(region), 'CTCF-only')]
+```{r}
+event_files <- list.files('event_models', full.names = TRUE)
+event_list <- pbmclapply(event_files, readRDS)
+names(event_list) <- sub(".rds", '', basename(event_files), fixed = TRUE)
+# event_list[sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))]
+```
+
+
+```{r}
+events_with_OLS <- event_list[sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))]
+metric_table <- rbindlist(sapply(events_with_OLS, function(test){
+  rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+    ols <- test$cvfit[[paste0(random, '::OLS')]]
+    if (is.null(ols)) return(NULL)
+    metrics <- sapply(list(r2=MLmetrics::R2_Score, mse=MLmetrics::MSE, rmse=MLmetrics::RMSE, mae=MLmetrics::MAE), function(fun) fun(y_pred=predict(ols), y_true=ols$y))
+    list(metric = names(metrics), values = metrics)
+  }, simplify = FALSE), idcol = 'random')
+}, simplify = FALSE), idcol = 'event')
+setkey(metric_table, 'event')
+nsamples_dt <- rbindlist(sapply(event_list, function(x)  list(nsamples=x$nsamples), simplify = FALSE), idcol = 'event')
+setkey(nsamples_dt, 'event')
+# ggplot(metric_table, aes(x = values, color = random, fill=random)) + geom_histogram(position = 'dodge') + facet_wrap(~ metric, scales='free') + theme_bw()
+# ggplot(nsamples_dt[metric_table, on='event'], aes(x = values, y = nsamples, color = random)) + geom_point() + facet_wrap(~ metric, scales='free') + theme_bw()
+# ggplot(feature_data, aes(x=pred, y=PSI)) + geom_abline(slope = 1, intercept = 0) + geom_point() + theme_bw() + theme(legend.position = 'bottom') + labs(title = paste0(names(metrics), ': ', round(metrics, 2), collapse = ', '))
+```
+
+
+```{r}
+library(ggpubr)
+metric_nsample_dt <- nsamples_dt[metric_table, on='event']
+for (this_metric in metric_nsample_dt[, unique(metric)]) {
+  ggscatterhist(metric_nsample_dt[metric == this_metric], y = 'values', x = 'nsamples', color = 'random', margin.params = list(fill = 'random', color = 'random', size = 0.2), ggtheme = theme_bw(), title = this_metric)#margin.plot = 'boxplot',
+}
+```
+
+
+```{r}
+for (example_id in metric_nsample_dt[metric == 'r2' & values >= .95 & random == "FALSE" & nsamples >= 25, event]){
+  example_ols <- event_list[[example_id]]$cvfit$`FALSE::OLS`
+  # summary(example_ols)
+  print(
+    ggplot(
+      data.table(PSI = example_ols$y, fitted = predict(example_ols)),
+      aes(x = PSI, y = fitted)
+    ) + geom_abline(
+      intercept = 0,
+      slope = 1,
+      color = 'grey'
+    ) + geom_point() + theme_bw() + labs(
+      title = sprintf(
+        'Event: %s, nsamples: %d, nexplanatory: %d, r2: %.2f',
+        example_id,
+        nsamples_dt[example_id, nsamples],
+        length(coef(example_ols)) - 1,
+        metric_table[metric == 'r2' &
+                       random == "FALSE" & event == example_id, values]
+      )
     )
-)]
-rank_dt[, mark:=sub('gene_expression', 'Gene_Expression', mark)]
-rank_dt[, mark:=gsub('[_,]', '\n', mark)]
-rank_dt[, mark:=sub('wgbs', 'DNAm', mark)]
-rank_dt[, mark:=sub('width', 'Width', mark)]
-rank_dt[, mark:=sub('distance', 'Distance', mark)]
-rank_dt[, mark := factor(
-  mark,
-  levels =
-    c('(Intercept)', 'ID', 'Gene\nExpression', 'Distance\nTSS', 'Distance\nTES', 'Width', 'DNAm', 'H3K36me3', 'H3K4me1', 'H3K4me3', 'H3K27me3', 'H3K27ac', 'H3K9me3')
-)]
-
-rank_dt[, 'Samples, Features':= as.factor(paste(dataset, explanatory, sep = ', '))]
-rank_dt[, `PSI Variance`:=factor(`PSI Variance`, levels = c('low', 'all', 'high'))]
-rank_dt[, c("random", "alpha"):=tstrsplit(alpha, "::", fixed=TRUE)]
-rank_dt[, random := as.logical(random)]
+  )
+}
 ```
 
 
@@ -146,6 +139,7 @@ for (this_event in to_analyze) {
   ggsave(filename = file.path(plot_dir, paste0('coef_exon_intron', this_event, '.pdf')), width =9, height = 7)
   
 }
+
 ```
 
 # make roc_curves for total models:
@@ -178,28 +172,26 @@ cm_list <- sapply(to_analyze, function(this_event){
                function(test_data){
           sapply(names(cvfits), function(alpha){
             cvfit <- cvfits[[alpha]]
-            if (endsWith(alpha, 'OLS')) {
+            if (endsWith(alpha, 'OLS'))
+            {
               predicted <-
-                predict(cvfit, newdata = test_data[, ..explanatory], type = 'response')
+                predict(cvfit, newdata = test_data[, ..explanatory])
+              predicted_label <- ifelse(predict(cvfit, newdata = test_data[, ..explanatory], type = 'response') < .5, control_class, case_class)
+            } else if (endsWith(alpha, 'RF')) {
+              predicted <- predict(cvfit$finalModel, data = test_data[, ..explanatory])$predictions[, case_class]
               predicted_label <- ifelse(predicted < .5, control_class, case_class)
             } else {
               predicted <-
-                predict(cvfit, newdata = test_data[, ..explanatory], type = 'prob')[, case_class]
-              predicted_label <- predict(cvfit, newdata = test_data[, ..explanatory], type = 'raw')
+                predict(cvfit$finalModel, newx = as.matrix(test_data[, ..explanatory]), s = lambda.1sd(cvfit), type = 'response')[, 1]
+              predicted_label <- predict(cvfit$finalModel, newx = as.matrix(test_data[, ..explanatory]), s = lambda.1sd(cvfit), type = 'class')[, 1]
             }
           predicted_label <- ordered(predicted_label, levels = class_levels)
           roc <- PRROC::roc.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
-          if (length(unique(predicted)) > 1)
-            prc <- PRROC::pr.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
-          else {
-            prc <- PRROC::pr.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = FALSE)
-            prc$curve <- data.table(c(0, 1), prc$auc.integral, unique(predicted))
-          }
-            
+          prc <- PRROC::pr.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
           list(AUROC=roc$auc,
                AUPRC=prc$auc.integral,
                dt=setNames(rbind(data.table(roc$curve)[, type:=roc$type], data.table(prc$curve)[, type:=prc$type]), c('Recall', 'Precision', 'Threshold', 'Type')),
-               cm=caret::confusionMatrix(predicted_label, test_data[, binary], positive=case_class, mode = "everything"),
+               cm = caret::confusionMatrix(predicted_label, test_data[, binary], positive=case_class, mode = "everything"),
                MCC=ModelMetrics::mcc(test_data[, ifelse(binary == case_class, 1, 0)], predicted, 0.5),
                size_dt=data.table(nsamples=models$nsamples, ntest=test_data[, .N]),
                abline_dt=data.table(intercept=c(0, test_data[, sum(binary == case_class)/.N]), slope=c(1, 0), Type=c('ROC', 'PR')))
@@ -227,7 +219,7 @@ cm_list <- sapply(to_analyze, function(this_event){
     measure_dt[, (c('Random', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
     measure_dt[Random == 'FALSE', Random:="Real"]
     measure_dt[Random == 'TRUE', Random:="Random"]
-  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Random, alpha = Random)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='white')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
+  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Random)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='white')) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
     list(measure_dt=measure_dt, curve_dt=curve_dt, size_table=rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$size_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features'))
   # flat_as_list <- unlist(unlist(as_list, recursive = FALSE), recursive = FALSE)
   # names(flat_as_list) <- gsub('nocCRE', 'wo/ cCRE', names(flat_as_list), fixed = TRUE)

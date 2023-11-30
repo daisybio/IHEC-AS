@@ -5,7 +5,56 @@ output: pdf_document
 
 ```{r, fig.width=16, fig.height=10}
 load('aggregating.rda')
+file_table <- fread('file_table.csv.gz')
+file_table[, filename:=file.path('sample_dts', basename(filename))]
+file_table[, filename:=paste0(filename, '.tab.gz')]
+file_table <- file_table[experiment_type != "DNAm"]
+setkey(file_table, 'filename')
 
+wgbs_agg <- fread('sample_dts/WGBS_agg.csv.gz')
+wgbs_agg <- wgbs_agg[!startsWith(name, 'chromhmm')]
+wgbs_agg[, experiment_type:='DNAm']
+
+histone_dt <- rbindlist(
+  pbmcapply::pbmcmapply(
+    FUN = function(file) {
+      dt <-
+        fread(file)
+      names(dt) <-
+        c('name', 'size', 'covered', 'sum', 'mean0', 'mean', 'min', 'max')
+      dt[!startsWith(name, 'chromhmm')]
+    },
+    file = file_table[, filename],
+    USE.NAMES = TRUE,
+    SIMPLIFY = FALSE
+  ),
+  idcol = 'filename'
+)
+histone_dt[, ihec:=file_table[filename, epirr_id]]
+histone_dt[, experiment_type:=file_table[filename, experiment_type]]
+setnames(histone_dt, old = 'mean', new= 'score')
+
+common_ihec <- intersect(histone_dt[, unique(ihec)], wgbs_agg[, unique(ihec)])
+
+common_cols <- intersect(names(histone_dt), names(wgbs_agg))
+```
+
+
+```{r, fig.width=16, fig.height=10}
+aggregated_dt <- rbindlist(list(histone_dt[ihec %in% common_ihec, ..common_cols], wgbs_agg[ihec %in% common_ihec, ..common_cols]))
+aggregated_dt[, c("position", "ID"):=tstrsplit(name, "_", fixed=TRUE)]
+aggregated_dt[is.na(ID), c("position", "ID"):=list('event_name', position)]
+aggregated_dt[position=="up", position:="upstream_other_region"]
+aggregated_dt[position=="down", position:="downstream_other_region"]
+aggregated_dt[, ihec:=as.factor(ihec)]
+aggregated_dt[, ID:=as.integer(ID)]
+aggregated_dt <- dcast(aggregated_dt, ihec + ID ~ experiment_type + position, value.var = "score", sep = ";")
+setnames(aggregated_dt, old = 'ihec', new = 'IHEC')
+aggregated_dt[, IHEC:=gsub(pattern = "\\..*", "", IHEC)]
+```
+
+
+```{r, fig.width=16, fig.height=10, eval=FALSE}
 agg_data_files <- list.files(sample_dt_dir, pattern = 'merge_dt.csv.gz', full.names = TRUE)
 agg_data_files <- agg_data_files[!startsWith(basename(agg_data_files), 'old')]
 histone_marks <- c('H3K4me1', 'H3K27me3', 'H3K36me3', 'H3K27ac', 'H3K4me3', 'H3K9me3')
@@ -22,8 +71,12 @@ agg_file_list <- suppressWarnings(pbmcapply::pbmclapply(agg_data_files, fread, s
 names(agg_file_list) <- agg_data_files
 aggregated_dt <- rbindlist(agg_file_list, idcol = 'IHEC', fill = TRUE)
 aggregated_dt[, IHEC:= as.factor(file2IHEC[IHEC])]
-for (j in which(!names(aggregated_dt) %in% c('IHEC', 'ID')))
-  set(aggregated_dt,NULL,j,log2(min(aggregated_dt[[j]][aggregated_dt[[j]] != 0], na.rm = TRUE) + aggregated_dt[[j]]))
+```
+
+
+```{r, fig.width=16, fig.height=10}
+# for (j in which(!(names(aggregated_dt) %in% c('IHEC', 'ID') | startsWith(names(aggregated_dt), "DNAm"))))
+#   set(aggregated_dt,NULL,j,log2(min(aggregated_dt[[j]][aggregated_dt[[j]] != 0], na.rm = TRUE) + aggregated_dt[[j]]))
 # for (entry in aggregated_data) {
 #   if (any(duplicated(sub('^reH', 'H', names(entry))))) {
 #     drop_cols <- names(entry)[startsWith(names(entry), 're') & (duplicated(sub('^reH', 'H', names(entry))) | duplicated(sub('^reH', 'H', names(entry)), last = TRUE))]
@@ -38,21 +91,21 @@ for (j in which(!names(aggregated_dt) %in% c('IHEC', 'ID')))
 # rm(aggregated_data)
 # aggregated_dt[, IHEC:=as.factor(IHEC)]
 fwrite(aggregated_dt, 'aggregated_dt.csv.gz')
-aggregated_dt <- aggregated_dt[ID %in% keep_rows]
+# aggregated_dt <- aggregated_dt[ID %in% keep_rows]
 # aggregated_dt <- aggregated_dt[!is.nan(PSI)]
-rm(agg_file_list)
+# rm(agg_file_list)
 gc()
 
 # if (!file.exists('aggregated_dt.rds'))
 # saveRDS(aggregated_dt, 'aggregated_dt.rds')
 ```
 
-```{r, height=10, fig.width=8}
+```{r, height=10, fig.width=8, eval=FALSE}
 cCREs <- data.table::fread('data/GRCh38-cCREs.bed')
 names(cCREs) <- c('seqnames', 'start', 'end', 'some_id', 'accession', 'cCRE_type')
 cCREs[, ID:=.I]
 cCRE_gr <- cCREs[, GRanges(seqnames = seqnames, IRanges(start = start, end = end))]
-cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = 5000, ignore.strand=TRUE)
+cCRE_hits <- findOverlaps(event_gr, cCRE_gr, maxgap = vicinity, ignore.strand=TRUE)
 hits_used <- cCRE_hits[from(cCRE_hits) %in% keep_rows]
 cCREs[, 'neighborhood':='In SCREEN']
 cCREs[unique(from(hits_used)), 'neighborhood':='In Event Neighborhood']
@@ -77,7 +130,7 @@ new_n_cCRE_cols <- paste('#cCRE', n_cCRE_cols, sep =';')
 
 
 ```{r, fig.width=16, fig.height=10}
-melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = 'ID', variable.name = 'IHEC', value.name = 'PSI')
+melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = 'ID', variable.name = 'IHEC', value.name = 'PSI', variable.factor = FALSE)
 aggregated_dt[melted_psi[ID %in% keep_rows & !is.na(PSI)], on=.(ID, IHEC), PSI:=PSI]
 aggregated_dt <- aggregated_dt[!is.na(PSI)]
 
@@ -140,12 +193,12 @@ for (mark in marks) {
         c(
           unique(region)[startsWith(unique(region), 'Upstream')],
           unique(region)[startsWith(unique(region), 'Alternative')],
-          unique(region)[startsWith(unique(region), 'Downstream')],
-          unique(region)[startsWith(unique(region), 'PLS')],
-          unique(region)[startsWith(unique(region), 'DNase-H3K4me3')],
-          unique(region)[startsWith(unique(region), 'pELS')],
-          unique(region)[startsWith(unique(region), 'dELS')],
-          unique(region)[startsWith(unique(region), 'CTCF-only')]
+          unique(region)[startsWith(unique(region), 'Downstream')]
+          # unique(region)[startsWith(unique(region), 'PLS')],
+          # unique(region)[startsWith(unique(region), 'DNase-H3K4me3')],
+          # unique(region)[startsWith(unique(region), 'pELS')],
+          # unique(region)[startsWith(unique(region), 'dELS')],
+          # unique(region)[startsWith(unique(region), 'CTCF-only')]
         )
     )]
   } else {
@@ -165,7 +218,7 @@ for (mark in marks) {
     labs(color = 'Region') + 
     scale_color_manual(values = this_colors) + 
     guides(color = guide_legend(override.aes = list(fill = this_colors))) # + geom_text_repel(data=max_dt, aes(xMax, yMax, color=region, label=region), min.segment.length = 0, force=75)
-    if (mark == 'wgbs') {
+    if (mark == 'DNAm') {
       p <- p + labs(title = 'DNAm', x = 'log2(Mean Methylation)')
     } else if (mark == 'distance_TSS') {
       p <- p + labs(title = 'Distance to TSS', x = 'log2(bp)')
@@ -175,10 +228,10 @@ for (mark in marks) {
       p <- p + labs(title = 'Width', x = 'log2(bp)')
     } else if (mark == 'gene_expression') {
       p <- p + labs(title = 'Gene Expression', x = 'log2(TPM)')
-    } else if (mark == 'Inclusion Level') {
+    } else if (mark == 'PSI') {
       p <- p + labs(x = 'PSI')
     } else {
-      p <- p + labs(title = mark, x = 'log2(FC)')
+      p <- p + labs(title = mark, x = '-log10pval') + scale_x_log10()
     }
   print(p)
   ggsave(
