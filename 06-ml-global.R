@@ -1,10 +1,5 @@
 source('06-ml.R')
 
-require(doMC)
-registerDoMC(ncores)
-
-grouping_cols <- c('seqnames','harmonized_sample_ontology_intermediate')
-
 for (this_event in aggregated_dt[, levels(`Event Type`)]){
   print(this_event)
   feature_data <- aggregated_dt[this_event == `Event Type`, -'Event Type']
@@ -40,9 +35,11 @@ for (this_event in aggregated_dt[, levels(`Event Type`)]){
   explanatory <-
     c(
       replicate(length(family), list(all = explanatory_all)),
-      replicate(length(family), list(noEpigenetic = explanatory_all[Reduce(`&`, lapply(c(histone_marks, 'DNAm'), function(prefix) !startsWith(explanatory_all, prefix)))])),
+      replicate(length(family), list(noEpigenetic = explanatory_all[Reduce(`&`, lapply(c(histone_marks, 'DNAm', 'summed_enhancer', 'max_promoter'), function(prefix)
+        ! startsWith(explanatory_all, prefix)))])),
       # replicate(length(family), list(nocCRE = non_enhancer_cols)),
-      replicate(length(family), list(onlyEpigenetic = explanatory_all[Reduce(`|`, lapply(c(histone_marks, 'DNAm'), function(prefix) startsWith(explanatory_all, prefix)))]))
+      replicate(length(family), list(onlyEpigenetic = explanatory_all[Reduce(`|`, lapply(c(histone_marks, 'DNAm', 'summed_enhancer', 'max_promoter'), function(prefix)
+        startsWith(explanatory_all, prefix)))]))
       # replicate(length(family), list(all = explanatory_all)),
       # cCRE_type_explanatory
     )#, replicate(2, explanatory, simplify = FALSE))
@@ -54,7 +51,10 @@ for (this_event in aggregated_dt[, levels(`Event Type`)]){
   # run_glmnet(data = feature_data, explanatory = explanatory$all, response = response, filter_rows = filter_rows$high_var.nocCRE, family = family, parallel = parallel, nfolds = nfolds, alpha = alpha[[1]], grouping_cols = grouping_cols)
   result_names <- paste(this_event, names(filter_rows), names(explanatory), family, sep='_')
   res_list <- mapply(run_glmnet, SIMPLIFY = FALSE, USE.NAMES = TRUE, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=parallel, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols))
-  
+  # run_glmnet(model_name=result_names[[which(result_names == "SE_all_var.all_onlyEpigenetic_binomial")]], save_model=TRUE, filter_rows=filter_rows[[1]], explanatory=explanatory[[which(result_names == "SE_all_var.all_onlyEpigenetic_binomial")]], family=family, response=response, data=feature_data, parallel=parallel, nfolds=nfolds, alpha=alpha[[1]], grouping_cols=grouping_cols)
+  # res <- slurmR::Slurm_Map(run_glmnet, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=parallel, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols),
+             # mc.cores = ncores, njobs = length(result_names), sbatch_opt = list(time="01:00:00", mem="50G", c="40", p="exbio-cpu"), plan = "submit")
+  # clustermq::Q(run_glmnet, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=TRUE, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols), n_jobs = 3, log_worker=TRUE, memory="60G", template=list(cores=40))
   # names(res_list) <- 
   
   # saveRDS(res_list, paste0(this_event, '_models.rds'))

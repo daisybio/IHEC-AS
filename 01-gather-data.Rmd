@@ -79,7 +79,10 @@ all_files <- fread(file.path(data_dir, 'epiatlas_metadata.csv'))
 rna_cols <- c('total-RNA-Seq', 'mRNA-Seq')
 wgbs_cols <- c('PBAT', 'standard')
 wide_files <- dcast(all_files, epirr_id_without_version ~ experiment_type, value.var = 'data_file_path')
-
+wgbs_samples <- strsplit(readLines(file.path(wgbs_matrices_data_dir, 'chr1.meth10.csv.gz'), n = 1), split = ',', fixed = TRUE)[[1]]
+wgbs_samples <- wgbs_samples[startsWith(wgbs_samples, prefix = 'IHEC')]
+# remove . and numbers from wgbs_samples
+wgbs_samples <- gsub(pattern = '\\.\\d+$', replacement = '', x = wgbs_samples)
 ```
 
 ## check ChIP and WGBS files
@@ -96,7 +99,7 @@ rna_samples_w_chip <- rna_samples_w_chip[, if(.N > 1){.SD[experiment_type != 'to
 
 ```{r}
 # find rna samples with methylation data
-rna_samples_w_wgbs <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% all_files[assay_type == "WGBS", epirr_id_without_version]]
+rna_samples_w_wgbs <- all_files[assay_type == "RNA-Seq" & epirr_id_without_version %in% wgbs_samples]
 # for files with both total and mRNA-Seq used mRNA-Seq 
 rna_samples_w_wgbs <- rna_samples_w_wgbs[, if(.N > 1){.SD[experiment_type != 'total-RNA-Seq']}else{.SD}, by = epirr_id_without_version]
 ```
@@ -218,21 +221,44 @@ actually_downloaded_files <- unlist(sapply(c(rna_data_dir, chip_data_dir, wgbs_d
 actually_downloaded_files <- actually_downloaded_files[!endsWith(actually_downloaded_files, ".md5")]
 
 sample_dt[, actually_downloaded:=unlist(pbmclapply(uuid, function(uid) any(grepl(pattern = uid, x = actually_downloaded_files, fixed = TRUE))))]
+sample_dt[assay_type == 'WGBS', actually_downloaded :=TRUE] # manual because of matrices
 sample_dt[, experiment_type:=factor(experiment_type, levels = c("total-RNA-Seq", "mRNA-Seq", "PBAT", "standard", "H3K27ac", "H3K27me3", "H3K36me3", "H3K4me1", "H3K4me3", "H3K9me3"))]
-
+fwrite(sample_dt, 'sample_dt.csv.gz')
 ggplot(sample_dt, aes(x = reorder(epirr_id_without_version, actually_downloaded, sum), y = experiment_type, fill = actually_downloaded)) + geom_tile()
 ```
 
 Load Metadata:
 
-```{bash}
-wget https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/6f15184707c4b6230c5d7e12a56e6d625999a26e/openrefine/v1.1/IHEC_metadata_harmonization.v1.1.csv
+```{bash, eval=FALSE}
+wget https://github.com/IHEC/epiATLAS-metadata-harmonization/releases/download/v1.2/IHEC_metadata_harmonization.v1.2.csv
+wget https://github.com/IHEC/epiATLAS-metadata-harmonization/releases/download/v1.2/IHEC_metadata_harmonization.v1.2.extended.csv
+
+wget https://cb.csail.mit.edu/cb/tadmap/TADMap_scaffold_hs.bed
+
+mkdir -p suppa_analysis
+cd suppa_analysis
+wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
+gunzip gencode.v29.annotation.gtf.gz
+grep 'transcript_type \"protein_coding\"' gencode.v29.annotation.gtf > gencode.v29.protein_coding.gtf
+grep -E 'transcript_support_level "1";|transcript_support_level "2";' gencode.v29.annotation.gtf > gencode.v29.TSL12.gtf
+grep -E 'transcript_support_level "1";|transcript_support_level "2";' gencode.v29.protein_coding.gtf > gencode.v29.protein_codingTSL12.gtf
 ```
 
 
 ```{r}
 # load metadata
 metadata <- data.table::fread(sample_metadata_file)
+metadata <- merge(metadata, sample_dt[assay_type == 'RNA-Seq', .('mRNA'=experiment_type == 'mRNA-Seq'), by=epirr_id_without_version])
+ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
+    cols <- as.numeric(strsplit(x, ",")[[1]])
+    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+annotation <- rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf')
+tr_annotation <- annotation[annotation$type == 'transcript']
+tr_anno_dt <- data.table(transcript_id = as.factor(tr_annotation$transcript_id), transcript_type = as.factor(tr_annotation$transcript_type), transcript_support_level=as.factor(tr_annotation$transcript_support_level))
+tr_anno_dt[transcript_support_level == 'NA', transcript_support_level := NA]
+tr_anno_dt[, transcript_support_level := droplevels(transcript_support_level)]
 # metadata[, epirr_id_without_version := data.table::tstrsplit(EpiRR, '.', fixed = TRUE)[1]]
 ```
 
@@ -244,44 +270,100 @@ Load Isoform Quantifications:
 # multiple_RNAs <- rna_metadata[, if(.N > 1) .(uuid, rna_seq_type), by=epirr_id_without_version]
 
 isoform_files <- list.files(rna_data_dir, pattern = paste0('(', paste(uuids_to_download[, uuid], collapse = '|'), ')','\\.isoforms\\.results$'), full.names = T)
-cols_to_keep <- c('transcript_id', 'gene_id', 'TPM')
+cols_to_keep <- c('transcript_id', 'gene_id', 'effective_length', 'expected_count', 'TPM')
+
 iso_quants_list <- pbmcapply::pbmclapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, fill = TRUE, select = cols_to_keep)
-names(iso_quants_list) <- isoform_files
-isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'EpiRR')
-file2id <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", isoform_files)
-names(file2id) <- isoform_files
-isoform_quants[, epirr_id_without_version := as.factor(file2id[isoform_quants[, EpiRR]])]
-isoform_quants[, EpiRR:=NULL]
+names(iso_quants_list) <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", basename(isoform_files))
+isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'epirr_id_without_version')
+isoform_quants[, epirr_id_without_version := as.factor(epirr_id_without_version)]
+stopifnot(identical(tr_anno_dt[, sort(transcript_id)], 
+                    isoform_quants[, sort(unique(transcript_id))]))
 
-suppressWarnings(dir.create('suppa_analysis/'))
+isoform_quants[tr_anno_dt, on='transcript_id', c('transcript_type', 'transcript_support_level') := .(transcript_type, transcript_support_level)]
+isoform_quants[metadata, on='epirr_id_without_version', c('mRNA', 'harmonized_sample_ontology_term_high_order_fig1') := .(`mRNA`, as.factor(harmonized_sample_ontology_term_high_order_fig1))]
 
-gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = c('epirr_id_without_version', 'gene_id')]
-gene_expr_file <- 'suppa_analysis/gene_expressions.rds'
-# if (!file.exists(gene_expr_file)) {
+tpm_summary <- isoform_quants[, .(mean=mean(log2(TPM + 1)), median=median(log2(TPM + 1)), sd=sd(log2(TPM + 1)), min=min(log2(TPM + 1)), max=max(log2(TPM + 1))), by=.(transcript_support_level, transcript_type)]
+```
+
+```{r}
+transcript_types <- list(coding= isoform_quants[, transcript_type == 'protein_coding'], TSL=isoform_quants[, transcript_support_level %in% c('1', '2')], coding_TSL=isoform_quants[, transcript_type == 'protein_coding' & transcript_support_level %in% c('1', '2')])
+
+ggplot(isoform_quants[, .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA)], aes(x = TPM_sum, fill=mRNA)) + geom_histogram(binwidth = 1e4)
+
+invisible(lapply(names(transcript_types), function(x) {
+  rows <- transcript_types[[x]]
+    print(ggplot(isoform_quants[rows, .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA)], aes(x = TPM_sum, fill=mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = x))
+}))
+```
+
+```{r, eval=FALSE}
+ggplot(isoform_quants[transcript_type == 'protein_coding', .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA)], aes(x = TPM_sum, fill=mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'only protein_coding transcripts')
+ggplot(isoform_quants[transcript_type == 'protein_coding', .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'only protein_coding transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+ggplot(isoform_quants[transcript_support_level %in% c('1', '2'), .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'only TSL1/2 transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+ggplot(isoform_quants[transcript_support_level %in% c('1', '2') & transcript_type == 'protein_coding', .(TPM_sum = sum(TPM)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'protein_coding & TSL1/2 transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+```
+
+```{r}
+tsl12_anno <- annotation[annotation$transcript_support_level %in% c('1', '2')]
+
+stopifnot(identical(sort(unique(tsl12_anno$transcript_id)), isoform_quants[transcript_support_level %in% c('1', '2'), sort(unique(as.character(transcript_id)))]))
+stopifnot(identical(sort(unique(tsl12_anno$transcript_id)), tr_anno_dt[transcript_support_level %in% c('1', '2'), sort(as.character(transcript_id))]))
+```
+
+
+```{r}
+invisible(lapply(names(transcript_types), function(x) {
+  rows <- transcript_types[[x]]
+  isoform_quants[rows & effective_length > 0, paste('RPK', x, sep = '_') := 1000 * expected_count/effective_length, by=epirr_id_without_version]
+isoform_quants[, paste('TPM', x, sep = '_') := 1000000*get(paste('RPK', x, sep = '_'))/sum(get(paste('RPK', x, sep = '_')), na.rm = TRUE), by=epirr_id_without_version]
+isoform_quants[is.na(get(paste('TPM', x, sep = '_'))), paste('TPM', x, sep = '_') := 0]
+}))
+
+# 
+# isoform_quants[transcript_type == c('protein_coding') & effective_length > 0, RPK_coding := 1000 * expected_count/effective_length, by=epirr_id_without_version]
+# isoform_quants[, TPM_coding := 1000000*RPK_coding/sum(RPK_coding, na.rm = TRUE), by=epirr_id_without_version]
+# isoform_quants[is.na(TPM_coding), TPM_coding := 0]
+# 
+# isoform_quants[transcript_support_level %in% c('1', '2') & transcript_type == c('protein_coding') & effective_length > 0, RPK_coding_TSL := 1000 * expected_count/effective_length, by=epirr_id_without_version]
+# isoform_quants[, TPM_coding_TSL := 1000000*RPK_coding_TSL/sum(RPK_coding_TSL, na.rm = TRUE), by=epirr_id_without_version]
+# isoform_quants[is.na(TPM_coding_TSL), TPM_coding_TSL := 0]
+```
+
+```{r}
+invisible(lapply(names(transcript_types), function(x) {
+  rows <- transcript_types[[x]]
+    print(ggplot(isoform_quants[rows, .(TPM_sum = sum(get(paste('TPM', x, sep = '_')))), by=.(epirr_id_without_version, mRNA)], aes(x = TPM_sum, fill=mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = x))
+}))
+```
+
+
+```{r, eval=FALSE}
+ggplot(isoform_quants[transcript_type == 'protein_coding', .(TPM_sum = sum(TPM_TSL, na.rm = TRUE)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'only protein_coding transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+ggplot(isoform_quants[transcript_support_level %in% c('1', '2'), .(TPM_sum = sum(TPM_TSL, na.rm = TRUE)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'only TSL1/2 transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+ggplot(isoform_quants[transcript_support_level %in% c('1', '2') & transcript_type == 'protein_coding', .(TPM_sum = sum(TPM_TSL, na.rm = TRUE)), by=.(epirr_id_without_version, mRNA, harmonized_sample_ontology_term_high_order_fig1)], aes(x = TPM_sum, fill=harmonized_sample_ontology_term_high_order_fig1, color = mRNA)) + geom_histogram(binwidth = 1e4) + labs(title = 'protein_coding & TSL1/2 transcripts') + scale_fill_manual(values=sample_hex_colors) + scale_color_manual(values=c('white', 'black'))
+```
+
+
+```{r}
+lapply(names(transcript_types), function(x) {
+  rows <- transcript_types[[x]]
+  gene_quants <- isoform_quants[rows, .(gene_tpm = sum(get(paste('TPM', x, sep = '_')), na.rm = TRUE)), by = .(epirr_id_without_version, gene_id)]
+  gene_expr_file <- paste0('suppa_analysis/gene_expressions_', x, '.rds')
   saveRDS(gene_quants, gene_expr_file)
-# }
-
-# bring tpms to wide format
-tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ epirr_id_without_version, value.var = 'TPM', fill = 0)
-
-
-# remove id column
-# tpm_matrix <- as.matrix(tpm_dt[, -'epirr_id_without_version'])
-
-# write files for SUPPA2
-# rownames(tpm_matrix) <- tpm_dt[, epirr_id_without_version]
-# tpm_matrix[is.na(tpm_matrix)] <- 0
-suppa_expr_filename <- 'suppa_analysis/tpm_expressions.tsv'
-# if (!file.exists(suppa_expr_filename)) {
+  
+  # bring tpms to wide format
+  tpm_dt <- data.table::dcast(isoform_quants[rows], transcript_id ~ epirr_id_without_version, value.var = paste('TPM', x, sep = '_'), fill = 0)
+  
+  suppa_expr_filename <- paste0('suppa_analysis/tpm_expressions_', x, '.tsv')
   fileConn<-file(suppa_expr_filename)
   writeLines(paste(names(tpm_dt)[-1], collapse = '\t'), fileConn)
   close(fileConn)
   fwrite(tpm_dt, suppa_expr_filename, sep='\t', append = TRUE)
-  # write.table(t(tpm_matrix), file=suppa_expr_filename, sep="\t", quote = FALSE)
-# }
+})
+```
 
-# filter metadata
-metadata <- metadata[epirr_id_without_version %in% names(tpm_dt)[-1]]
+
+```{r}
 # remove the two outliers
 # metadata_filtered <- metadata[cell_type != 'sperm']
 save.image('pca.rda')

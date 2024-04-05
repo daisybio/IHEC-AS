@@ -12,7 +12,7 @@ aggregate_matrix <- function(file, seqname){
   # need to repeat ID rows times ihec entries
   melt_agg_from_hits <- rep(from(agg_hits), melt_mat[, nlevels(ihec)])
   # now need to multiply the target id with the corresponding entry
-  melt_agg_to_hits <- unlist(lapply(seq.int(melt_mat[, nlevels(ihec)]), function(ihec_i) to(agg_hits) + (rep(nrow(chr_matrix), length(agg_hits)) * ihec_i)))
+  melt_agg_to_hits <- unlist(lapply(seq.int(melt_mat[, nlevels(ihec)]), function(ihec_i) to(agg_hits) + (rep(nrow(chr_matrix), length(agg_hits)) * (ihec_i - 1))))
   # aggregate by ID and IHEC
   agg_dt <- data.table(ID = melt_agg_from_hits,
                        ihec = melt_mat[melt_agg_to_hits, ihec],
@@ -22,7 +22,7 @@ aggregate_matrix <- function(file, seqname){
   gc()
   return(agg_dt)
 }
-#chr1 <- aggregate_matrix(chr_files[1], chr_seqnames[1])
+# chr20 <- aggregate_matrix(chr_files[13], chr_seqnames[13])
 # library(clustermq)
 result <- pbmcapply::pbmcmapply(aggregate_matrix, file=chr_files, seqname=chr_seqnames, SIMPLIFY=FALSE)
 stopifnot(length(Reduce(intersect, lapply(result, function(x)x$name))) == 0)

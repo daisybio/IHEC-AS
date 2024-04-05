@@ -5,25 +5,33 @@ output:
   html_notebook: default
 ---
 
-```{r}
+```{r load}
 load('pca.rda')
-metadata[harmonized_sample_ontology_intermediate == 'CD34-negative, CD41-positive, CD42-positive megakaryocyte cell', harmonized_sample_ontology_intermediate := 'CD34-negative, CD41-positive\nCD42-positive megakaryocyte cell']
-metadata[harmonized_sample_ontology_intermediate %in% names(which(table(harmonized_sample_ontology_intermediate) < 5)), harmonized_sample_ontology_intermediate := 'other']
+# metadata[harmonized_sample_ontology_intermediate == 'CD34-negative, CD41-positive, CD42-positive megakaryocyte cell', harmonized_sample_ontology_intermediate := 'CD34-negative, CD41-positive\nCD42-positive megakaryocyte cell']
+# metadata[harmonized_sample_ontology_intermediate %in% names(which(table(harmonized_sample_ontology_intermediate) < 5)), harmonized_sample_ontology_intermediate := 'other']
 ```
 
-```{r}
+```{r function}
 pca_plots <-
   function(matrix,
            metadata,
            title = '',
-           color_by = 'harmonized_sample_ontology_intermediate',
+           color_by = 'harmonized_sample_ontology_term_high_order_fig1',
            shape_by = 'harmonized_biomaterial_type',
-           na.omit = FALSE) {
+           na.omit = FALSE,
+           na.impute = 'zero') {
+    require(ggfortify)
     if (na.omit){
       matrix <- matrix[, colSums(is.na(matrix)) == 0, drop=FALSE]
     } else {
-      # set NA to mean
+      if (na.impute == 'zero') {
+      # set NA to zero
       matrix[is.na(matrix)] <- 0
+      } else if (na.impute == 'mean') {
+        for (i in 1:ncol(matrix)) {
+        matrix[is.na(matrix[, i]), i] <- mean(matrix[, i], na.rm = TRUE)
+      }
+      }
     }
     
     # filter out cols without variance
@@ -31,21 +39,37 @@ pca_plots <-
     
     # perform PCA
     pca <- prcomp(matrix, center = TRUE, scale = TRUE)
-    
     # compute explained variance of PCs
-    var_explained_tpm = 100 * pca$sdev ^ 2 / sum(pca$sdev ^ 2)
-    
-    
+    var_explained <- 100 * summary(pca)[["importance"]][2, ]
+    cum_var_explained <- cumsum(var_explained) # Cumulative variance
+    pcs_to_use <- which(cum_var_explained >= 90)[1] # PCs to use
+    pc_scores <- pca$x[, 1:pcs_to_use]
+    sil_scores <- cluster::silhouette(as.integer(as.factor(metadata[, harmonized_sample_ontology_term_high_order_fig1])),
+                             dist(pc_scores))
+
+    metadata[, sil_score := sil_scores[, 'sil_width']]
+    metadata <- metadata[base::order(harmonized_sample_ontology_term_high_order_fig1, -sil_score)]
+    metadata[, epirr_id_without_version := factor(epirr_id_without_version, levels = unique(epirr_id_without_version))]
+
+
     return(
       list(
         pca = pca,
+        sil = sil_scores,
+        sil_plot = ggplot(metadata,
+                             aes(x = sil_score, y = harmonized_sample_ontology_term_high_order_fig1, 
+                                 color = harmonized_sample_ontology_term_high_order_fig1)) + 
+                          geom_boxplot() + 
+                          stat_summary(fun=mean, geom="point", shape=18, size = 3) +
+                          scale_color_manual(values = sample_hex_colors) +
+                          theme_bw() + labs(title = paste(title, 'Mean/median silhouette:', metadata[, round(mean(sil_score), 3)], metadata[, round(median(sil_score), 3)]), color = 'Sample Ontology'), 
         dimred = ggplot2::autoplot(
           pca,
           data = metadata,
           colour = color_by,
           shape = shape_by
-        ) + labs(title = title, color = 'Sample Ontology', shape = 'Biomaterial Type') + theme_bw(),
-        scree = qplot(seq.int(var_explained_tpm), var_explained_tpm) +
+        ) + labs(title = title, color = 'Sample Ontology', shape = 'Biomaterial Type') + scale_color_manual(values=sample_hex_colors[names(sample_hex_colors) %in% metadata[, harmonized_sample_ontology_term_high_order_fig1]]) + theme_bw(),
+        scree = qplot(seq.int(var_explained), var_explained) +
           geom_line() +
           xlab("Principal Component") +
           ylab("Percent Variance Explained") +
@@ -54,48 +78,59 @@ pca_plots <-
     )
   }
 ```
-## PCA on TPM
+## PCA on gene_level
 
-```{r, fig.height=7, fig.width=10}
-tpm_matrix <- as.matrix(tpm_dt[, -'transcript_id'])
-rownames(tpm_matrix) <- tpm_dt[, transcript_id]
-tpm_matrix <- t(log2(tpm_matrix + 1))
-tpm_all <- pca_plots(tpm_matrix[metadata[, epirr_id_without_version], ], metadata, 'TPM')
-print(tpm_all$scree)
-
-labels <- metadata[, harmonized_sample_ontology_intermediate]
-# labels[duplicated(labels, fromLast = TRUE)] <- '' # which(duplicated(labels, fromLast = TRUE))
-# labels[rows_to_label] <- metadata[, harmonized_sample_ontology_intermediate][rows_to_label]
-plot_pca_tpm <- tpm_all$dimred + guides(col= guide_legend(ncol = 1)) + geom_text_repel(aes(label = labels), min.segment.length = 0, max.overlaps = 5, force = 5)
-print(plot_pca_tpm)
-ggsave(filename = file.path(plot_dir, 'PCA_TPM.pdf'), width = 10, height = 7)
+```{r pca_tpm, fig.height=7, fig.width=10}
+final_plot_pca_tpm <- NULL
+final_tpm_matrix <- NULL
+lapply(names(transcript_types), function(types){
+  tpm_dt <- readRDS(paste0('suppa_analysis/gene_expressions_', types, '.rds'))
+  tpm_dt <- dcast(tpm_dt, gene_id ~ epirr_id_without_version)
+  tpm_matrix <- as.matrix(tpm_dt[, -1])
+  rownames(tpm_matrix) <- tpm_dt[[1]]
+  tpm_matrix <- t(log2(tpm_matrix + 1))
+  tpm_all <- pca_plots(tpm_matrix[metadata[, epirr_id_without_version], ], metadata, paste('TPM', types))
+  print(tpm_all$scree)
+  
+  print(tpm_all$sil_plot)
+  ggsave(filename = file.path(plot_dir, paste0(types, '_silhoutte_TPM.pdf')), width = 10, height = 7)
+  
+  labels <- metadata[, harmonized_sample_ontology_term_high_order_fig1]
+  # labels[duplicated(labels, fromLast = TRUE)] <- '' # which(duplicated(labels, fromLast = TRUE))
+  # labels[rows_to_label] <- metadata[, harmonized_sample_ontology_intermediate][rows_to_label]
+  plot_pca_tpm <- tpm_all$dimred + geom_text_repel(aes(label = labels), min.segment.length = 0, max.overlaps = 5, force = 5) + guides(col= guide_legend(ncol = 2), shape = guide_legend(ncol = 2))
+  if (types == 'TSL') {final_plot_pca_tpm <<- plot_pca_tpm
+  final_tpm_matrix <<- tpm_matrix}
+  print(plot_pca_tpm)
+  ggsave(filename = file.path(plot_dir, paste0(types, '_PCA_TPM.pdf')), width = 10, height = 7)
+})
 ```
 
 ## UMAP on TPM
 
-```{r, fig.height=7, fig.width=10}
+```{r umap_tpm, fig.height=7, fig.width=10}
 library(umap)
-umap_tpm <- umap::umap(tpm_matrix[metadata[, epirr_id_without_version], ])
+umap_tpm <- umap::umap(final_tpm_matrix[metadata[, epirr_id_without_version], ])
 
 df <- data.frame(x = umap_tpm$layout[,1],
                  y = umap_tpm$layout[,2],
-                 harmonized_sample_ontology_intermediate = metadata$harmonized_sample_ontology_intermediate,
+                 harmonized_sample_ontology_term_high_order_fig1 = metadata$harmonized_sample_ontology_term_high_order_fig1,
                  harmonized_biomaterial_type = metadata$harmonized_biomaterial_type,
                  label = '')
-rows_to_label <- c(250, 270, 300, 47, 333, 275, 351, 315, 166)
+# rows_to_label <- c(250, 270, 300, 47, 333, 275, 351, 315, 166)
 
 # df[duplicated(df$harmonized_sample_ontology_intermediate, fromLast = TRUE), 'label'] <- ''# which(duplicated(df$harmonized_sample_ontology_intermediate, fromLast = TRUE))#''
 # df$label <- metadata[, .I]
-df[rows_to_label, 'label'] <- metadata$harmonized_sample_ontology_intermediate[rows_to_label]
+df$label <- metadata$harmonized_sample_ontology_term_high_order_fig1#[rows_to_label]
 
 
-plot_umap_tpm <- ggplot(df, aes(x, y, color = harmonized_sample_ontology_intermediate, shape = harmonized_biomaterial_type, label=label)) +
+plot_umap_tpm <- ggplot(df, aes(x, y, color = harmonized_sample_ontology_term_high_order_fig1, shape = harmonized_biomaterial_type, label=label)) +
   geom_point() +
-  geom_text_repel(color = 'black', min.segment.length = 0, max.overlaps = 50, force = 5) +
+  geom_text_repel(color = 'black', min.segment.length = 0, max.overlaps = 25, force = 5) +
   labs(x = "UMAP1", y = "UMAP2", title = 'TPM', color = 'Sample Ontology', shape = 'Biomaterial Type') +
-  guides(col= guide_legend(ncol = 1)) + theme_bw()
+  scale_color_manual(values=sample_hex_colors) + theme_bw() + guides(col= guide_legend(ncol = 2), shape = guide_legend(ncol = 2))
 print(plot_umap_tpm)
-ggsave(filename = file.path(plot_dir, 'UMAP_TPM.pdf'), width = 10, height = 7)
+ggsave(filename = file.path(plot_dir, 'TSL12_UMAP_TPM.pdf'), width = 10, height = 7)
 ```
 
 <!-- ## PCA on Isoform Usage -->
@@ -112,55 +147,65 @@ ggsave(filename = file.path(plot_dir, 'UMAP_TPM.pdf'), width = 10, height = 7)
 
 ## PCA on AS events (PSI values)
 
-```{r}
-psi_files <- list.files('suppa_analysis/events', pattern = '\\.psi$', full.names = TRUE)
-psi_table <- do.call(cbind, lapply(psi_files, function(f) t(as.matrix(read.table(f, header=TRUE, sep="\t")))))
-psi_table <- psi_table[,colSums(is.na(psi_table))<nrow(psi_table)]
-stopifnot(all(startsWith(colnames(psi_table), 'ENSG')))
-for(i in 1:ncol(psi_table)){
-  psi_table[is.na(psi_table[,i]), i] <- mean(psi_table[,i], na.rm = TRUE)
-}
+```{r pca_psi, fig.height=7, fig.width=10}
+final_plot_pca_psi <- NULL
+final_psi_table <- NULL
+lapply(names(transcript_types), function(types){
+  psi_files <- list.files('suppa_analysis/events', pattern = paste0('^event_', types, '_.+\\.psi$'), full.names = TRUE)
+  psi_table <- do.call(cbind, lapply(psi_files, function(f) t(as.matrix(read.table(f, header=TRUE, sep="\t")))))
+  psi_table <- psi_table[,colSums(is.na(psi_table))<nrow(psi_table)]
+  stopifnot(all(startsWith(colnames(psi_table), 'ENSG')))
+  for(i in 1:ncol(psi_table)){
+    psi_table[is.na(psi_table[,i]), i] <- mean(psi_table[,i], na.rm = TRUE)
+  }
+  
+  psi_all <- pca_plots(psi_table[metadata[, epirr_id_without_version], ], metadata, paste('PSI', types))
+  print(psi_all$scree)
+  
+  print(psi_all$sil_plot)
+  ggsave(filename = file.path(plot_dir, paste0(types, '_silhoutte_PSI.pdf')), width = 10, height = 7)
+  
+  labels <- metadata[, harmonized_sample_ontology_term_high_order_fig1]
+  plot_pca_psi <- psi_all$dimred + geom_text_repel(aes(label = labels), min.segment.length = 0, max.overlaps = 6, force = 5) + guides(col= guide_legend(ncol = 2), shape = guide_legend(ncol = 2))
+  if (types == 'TSL')  {final_plot_pca_psi <<- plot_pca_psi
+  final_psi_table <<- psi_table}
+  print(plot_pca_psi)
+ggsave(filename = file.path(plot_dir, paste0(types, '_PCA_PSI.pdf')), width = 10, height = 7)
+})
+
 ```
 
-```{r, fig.height=7, fig.width=10}
-psi_all <- pca_plots(psi_table[metadata[, epirr_id_without_version], ], metadata, 'PSI')
-print(psi_all$scree)
-plot_pca_psi <- psi_all$dimred + guides(col= guide_legend(ncol = 1)) + geom_text_repel(aes(label = labels), min.segment.length = 0, max.overlaps = 5, force = 5)
-print(plot_pca_psi)
-ggsave(filename = file.path(plot_dir, 'PCA_PSI.pdf'), width = 10, height = 7)
-```
-
-```{r, fig.height=7, fig.width=10}
+```{r umap_psi, fig.height=7, fig.width=10}
 library(umap)
-umap_psi <- umap::umap(psi_table[metadata[, epirr_id_without_version], ])
+umap_psi <- umap::umap(final_psi_table[metadata[, epirr_id_without_version], ])
 
 df <- data.frame(x = umap_psi$layout[,1],
                  y = umap_psi$layout[,2],
                  harmonized_sample_ontology_intermediate = metadata$harmonized_sample_ontology_intermediate,
                  harmonized_biomaterial_type = metadata$harmonized_biomaterial_type,
                                   label = '')
-rows_to_label <- c(250, 270, 300, 47, 333, 275, 351, 315, 166)
+# rows_to_label <- c(250, 270, 300, 47, 333, 275, 351, 315, 166)
 
 # df[duplicated(df$harmonized_sample_ontology_intermediate, fromLast = TRUE), 'label'] <- ''# which(duplicated(df$harmonized_sample_ontology_intermediate, fromLast = TRUE))#''
 # df$label <- metadata[, .I]
-df[rows_to_label, 'label'] <- metadata$harmonized_sample_ontology_intermediate[rows_to_label]
+df$label <- metadata$harmonized_sample_ontology_intermediate#[rows_to_label]
 
 plot_umap_psi <- ggplot(df, aes(x, y, color = harmonized_sample_ontology_intermediate, shape = harmonized_biomaterial_type, label=label)) +
   geom_point() +
-  geom_text_repel(color = 'black', min.segment.length = 0, max.overlaps = 9999) +
+  geom_text_repel(color = 'black', min.segment.length = 0, max.overlaps = 25, force = 5) +
   labs(x = "UMAP1", y = "UMAP2", title = 'PSI', color = 'Sample Ontology', shape = 'Biomaterial Type') +
-  guides(col= guide_legend(ncol = 1)) + theme_bw()
+  scale_color_manual(values=sample_hex_colors) + theme_bw() + guides(col= guide_legend(ncol = 2), shape = guide_legend(ncol = 2))
 print(plot_umap_psi)
-ggsave(filename = file.path(plot_dir, 'UMAP_PSI.pdf'), width = 10, height = 7)
+ggsave(filename = file.path(plot_dir, 'TSL12_UMAP_PSI.pdf'), width = 10, height = 7)
 ```
 
-```{r fig.height=7, fig.width=17}
-print((plot_pca_tpm + plot_pca_psi) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')& guides(col= guide_legend(nrow = 4), shape = guide_legend(nrow = 4)))
-ggsave(filename = file.path(plot_dir, 'PCAs.pdf'), width = 14, height = 8)
+```{r both_pca, fig.height=7, fig.width=17}
+print((final_plot_pca_tpm + final_plot_pca_psi) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')& guides(col= guide_legend(nrow = 4), shape = guide_legend(nrow = 4)))
+ggsave(filename = file.path(plot_dir, 'TSL12_PCAs.pdf'), width = 14, height = 8)
 ```
 
-```{r fig.height=7, fig.width=17}
+```{r both_umap, fig.height=7, fig.width=17}
 print((plot_umap_tpm + plot_umap_psi) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')& guides(col= guide_legend(nrow = 4), shape = guide_legend(nrow = 4)))
-ggsave(filename = file.path(plot_dir, 'UMAPs.pdf'),  width = 14, height = 8)
+ggsave(filename = file.path(plot_dir, 'TSL12_UMAPs.pdf'),  width = 14, height = 8)
 ```
 

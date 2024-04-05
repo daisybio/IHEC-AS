@@ -150,9 +150,9 @@ for (this_event in to_analyze) {
 
 # make roc_curves for total models:
 ```{r, fig.height=6, fig.width=12}
-library(ggplot2)
-library(glmnet)
-library(ranger)
+# library(ggplot2)
+# library(glmnet)
+# library(ranger)
 library(PRROC)
 library(patchwork)
 all_plots <- list()
@@ -220,14 +220,20 @@ cm_list <- sapply(to_analyze, function(this_event){
           element[c('AUROC', 'AUPRC', 'MCC')],
           list(
             Kappa = element$cm$overall['Kappa'],
-            `Balanced Accuracy` = element$cm$byClass['Balanced Accuracy']
+            `Balanced\nAccuracy` = element$cm$byClass['Balanced Accuracy']
           )
         )), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
     measure_dt <- melt(measure_dt, id.vars = c('Features', 'Model', 'Test on'), variable.name = 'Measure', value.name = 'Value')
-    measure_dt[, (c('Random', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
-    measure_dt[Random == 'FALSE', Random:="Real"]
-    measure_dt[Random == 'TRUE', Random:="Random"]
-  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Random, alpha = Random)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='white')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
+    measure_dt[, (c('Labels', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
+    measure_dt[`Test on` == 'seqnames', `Test on`:='Unknown Chromosome']
+    measure_dt[`Test on` == 'harmonized_sample_ontology_term_high_order_fig1', `Test on`:='Unknown Tissue/Cell']
+    measure_dt[`Test on` == 'seqnames_AND_harmonized_sample_ontology_term_high_order_fig1', `Test on`:='Both Unknown']
+    measure_dt[Labels == 'FALSE', Labels:="Real"]
+    measure_dt[Labels == 'TRUE', Labels:="Random"]
+    measure_dt[Features == 'onlyEpigenetic', Features:="Epigenetic"]
+    measure_dt[Features == 'noEpigenetic', Features:="Intrinsic"]
+    measure_dt[Features == 'all', Features:="Epigenetic and Intrinsic"]
+  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
     list(measure_dt=measure_dt, curve_dt=curve_dt, size_table=rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$size_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features'))
   # flat_as_list <- unlist(unlist(as_list, recursive = FALSE), recursive = FALSE)
   # names(flat_as_list) <- gsub('nocCRE', 'wo/ cCRE', names(flat_as_list), fixed = TRUE)
@@ -273,14 +279,20 @@ cm_list <- sapply(to_analyze, function(this_event){
   # flat_as_list[endsWith(names(flat_as_list), '.cm')]
 }, simplify = FALSE)
 gc()
-
+saveRDS(cm_list, 'cm_list.rds')
 ```
+
 ```{r}
 for (this_event in to_analyze) {
   print(cm_list[[this_event]]$size_table[, .(Event=this_event, Models=paste(Features, Model, sep = '::', collapse = ', ')), by=.(nsamples, ntest)][])
 }
 ```
 
+```{r}
+mixed_metrics <- rbindlist(sapply(cm_list, function(x) x$measure_dt, simplify=FALSE), idcol = 'Event Type')
+ggplot(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown'], aes(y = Value, x = Features, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Event Type`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) + geom_text(aes(label = round(Value, 2), color='black'), position=position_dodge(width=0.9), vjust=-.5) + ylim(c(0,1.1))
+ggsave(filename = file.path(plot_dir, 'mixed_metrics.pdf'), width = 12, height = 6)
+```
 
 ```{r, eval=FALSE}
 ((all_plots$SE + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')'))) + (all_plots$RI + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')

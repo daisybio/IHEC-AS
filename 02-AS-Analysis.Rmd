@@ -3,15 +3,6 @@ title: "AS Analysis"
 output: html_notebook
 ---
 
-## download
-```{bash, eval = FALSE}
-mkdir -p suppa_analysis
-cd suppa_analysis
-wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
-gunzip gencode.v29.annotation.gtf.gz
-grep "transcript_type \"protein_coding\"" gencode.v29.annotation.gtf > gencode.v29.protein_coding.gtf
-```
-
 ## install suppa
 ```{bash, eval=FALSE, engine.opts="-l"}
 cd suppa_analysis
@@ -21,12 +12,12 @@ conda install -y -c bioconda suppa==2.3
 
 
 ## psi per isoform
-```{bash, engine.opts="-l"}
+```{bash, engine.opts="-l", eval=FALSE}
 cd suppa_analysis
 conda activate ihec-as
-suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o gencode.v29.protein_coding -f ioi
+suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o gencode.v29.protein_coding -f ioi --pool-genes
 #suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o gencode.v29.protein_coding_pooled -f ioi --pool-genes
-suppa.py psiPerIsoform -g gencode.v29.protein_coding.gtf -e tpm_expressions.tsv -o all -m INFO
+suppa.py psiPerIsoform -g gencode.v29.protein_coding.gtf -e tpm_expressions_coding.tsv -o all -m INFO
 ```
 
 ## psi per event
@@ -36,13 +27,36 @@ cd suppa_analysis
 conda activate ihec-as
 dir_path=events/
 mkdir -p ${dir_path}
-suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o ${dir_path}/gencode.v29.protein_coding.events -f ioe -e SE SS MX RI FL --pool-genes
+suppa.py generateEvents -i gencode.v29.TSL12.gtf -o ${dir_path}/gencode.v29.TSL12.events -f ioe -e SE SS MX RI FL --pool-genes
 for event in SE A5 A3 MX RI AF AL
 do 
-    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.protein_coding.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO -f 1
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.TSL12.events_${event}_strict.ioe -e tpm_expressions_TSL.tsv -o ${dir_path}/event_TSL_${event} -m INFO -f 1 --save_tpm_events
 done
 ```
 
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+dir_path=events/
+mkdir -p ${dir_path}
+suppa.py generateEvents -i gencode.v29.protein_coding.gtf -o ${dir_path}/gencode.v29.protein_coding.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.protein_coding.events_${event}_strict.ioe -e tpm_expressions_coding.tsv -o ${dir_path}/event_coding_${event} -m INFO -f 1 --save_tpm_events
+done
+```
+
+```{bash, engine.opts="-l"}
+cd suppa_analysis
+conda activate ihec-as
+dir_path=events/
+mkdir -p ${dir_path}
+suppa.py generateEvents -i gencode.v29.protein_codingTSL12.gtf -o ${dir_path}/gencode.v29.protein_codingTSL12.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.protein_codingTSL12.events_${event}_strict.ioe -e tpm_expressions_coding_TSL.tsv -o ${dir_path}/event_coding_TSL_${event} -m INFO -f 1 --save_tpm_events
+done
+```
 
 <!-- ```{bash, engine.opts="-l"} -->
 <!-- cd suppa_analysis -->

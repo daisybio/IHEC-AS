@@ -1,2 +1,4 @@
-logs/
-sample_dts/
+*logs*
+sample_dts*
+event_models*
+.cache/

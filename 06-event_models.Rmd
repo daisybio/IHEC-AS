@@ -8,291 +8,598 @@ output: pdf_document
 library(glmnet)
 library(ranger)
 library(caret)
-library(RSNNS)
 library(MLmetrics)
 ```
 
 ```{r}
-event_files <- list.files('event_models', full.names = TRUE)
-event_list <- pbmclapply(event_files, readRDS)
-names(event_list) <- sub(".rds", '', basename(event_files), fixed = TRUE)
-# event_list[sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))]
+aggregated_dt <-
+  fread('aggregated_dt_filtered.csv.gz', stringsAsFactors = TRUE)
+load('aggregating.rda')
+# annotation <- rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf')
+# 
+# metadata <- data.table::fread(sample_metadata_file)
+# metadata <- metadata[epirr_id_without_version %in% aggregated_dt[, unique(IHEC)]]
+# ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+# sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
+#     cols <- as.numeric(strsplit(x, ",")[[1]])
+#     rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+# })
 ```
 
 
 ```{r}
-events_with_OLS <- event_list[sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))]
-metric_table <- rbindlist(sapply(events_with_OLS, function(test){
+event_folder <- 
+                  "event_models"
+                  # "event_models_smaller"
+                  # "event_models_local"
+                
+# read only the event models where there is also an OLS model, i.e., there exists a robust version
+event_files <- list.files(event_folder, pattern = 'robust.rds$', full.names = TRUE)
+event_files_different_psi <- list.files(paste(event_folder, "rotated", sep = "_"), pattern = 'robust.rds$', full.names = TRUE)
+
+# # Get the file info for all files
+# files_info <- file.info(event_files)
+
+# # Filter files modified within the last half hour
+# one_hour_ago <- Sys.time() - .5*60*60
+# event_files <- rownames(subset(files_info, mtime > one_hour_ago))
+
+event_list <- pbmcapply::pbmclapply(event_files, readRDS)
+  # pbapply::pb
+names(event_list) <- sub(".rds", '', basename(event_files), fixed = TRUE)
+
+event_list_different_psi <- pbmcapply::pbmclapply(event_files_different_psi, readRDS)
+  # pbapply::pb
+names(event_list_different_psi) <- paste('rotated', sub(".rds", '', basename(event_files_different_psi), fixed = TRUE), sep = '_')
+
+event_list <- c(event_list, event_list_different_psi)
+```
+
+
+```{r}
+events_with_OLS <- sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))
+
+anova_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+  model <- event_list[[id]]
+  # feature_data <- fread(file.path('event_models', paste0("feature_table_", id, ".csv.gz")))
   rbindlist(sapply(c("FALSE", "TRUE"), function(random){
-    ols <- test$cvfit[[paste0(random, '::OLS')]]
+    ols <- model$cvfit[[paste0(random, '::OLS')]]
     if (is.null(ols)) return(NULL)
-    metrics <- sapply(list(r2=MLmetrics::R2_Score, mse=MLmetrics::MSE, rmse=MLmetrics::RMSE, mae=MLmetrics::MAE), function(fun) fun(y_pred=predict(ols), y_true=ols$y))
-    list(metric = names(metrics), values = metrics)
+    ols_ge <- model$cvfit[[paste0(random, '::OLS_GE')]]
+    ols_base <- model$cvfit[[paste0(random, '::OLS_BASE')]]
+    if(length(model$cvfit[[paste0(random, '::FEATURES')]]$full) >= (model$nsamples - 2))
+      return(NULL)
+    anova_base_res <- #tryCatch({
+      anova(ols_base, ols, test = 'Chi')
+    # }, error = function(e) {
+    #   browser()
+    #   matrix(nrow = 2, ncol = 5)
+    # })
+    anova_res <- #tryCatch({
+      anova(ols, ols_ge, test = 'Chi')
+    # }, error = function(e) {
+    #   browser()
+    #   matrix(nrow = 2, ncol = 5)
+    # })
+    orig_ge <- 'gene_expression' %in% model$cvfit[[paste0(random, '::FEATURES')]]$full
+    return(data.table(gene_expression_selected = orig_ge,
+                      anova_pval = anova_res[2, 5],
+                      anova_base_pval = anova_base_res[2, 5]))
   }, simplify = FALSE), idcol = 'random')
 }, simplify = FALSE), idcol = 'event')
-setkey(metric_table, 'event')
-nsamples_dt <- rbindlist(sapply(event_list, function(x)  list(nsamples=x$nsamples), simplify = FALSE), idcol = 'event')
-setkey(nsamples_dt, 'event')
-# ggplot(metric_table, aes(x = values, color = random, fill=random)) + geom_histogram(position = 'dodge') + facet_wrap(~ metric, scales='free') + theme_bw()
-# ggplot(nsamples_dt[metric_table, on='event'], aes(x = values, y = nsamples, color = random)) + geom_point() + facet_wrap(~ metric, scales='free') + theme_bw()
-# ggplot(feature_data, aes(x=pred, y=PSI)) + geom_abline(slope = 1, intercept = 0) + geom_point() + theme_bw() + theme(legend.position = 'bottom') + labs(title = paste0(names(metrics), ': ', round(metrics, 2), collapse = ', '))
+
+anova_table[is.na(anova_pval), expression_bias:='expression bias']
+
+anova_table[, robust := 'not robust']
+anova_table[endsWith(event, '_robust'), robust := 'robust']
+
+anova_table[, rotated := 'not rotated']
+anova_table[startsWith(event, 'rotated_'), rotated := 'rotated']
+
+# remove the _robust suffix and the rotated_ prefix
+anova_table[, ID:=as.integer(gsub('_robust|rotated_', '', event))]
+
+anova_table[event_dt, on=.(ID), 'Event Type':= `Event Type`]
+anova_table[random == TRUE, response := 'randomized response']
+anova_table[random == FALSE, response := 'real response']
+anova_table[random == FALSE & rotated == 'rotated', response := 'rotated response']
+anova_table <- anova_table[!(random == "TRUE" & rotated == 'rotated')]
+
+anova_table[, padj := p.adjust(anova_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated)]
+anova_table[, expression_bias := ifelse(padj <= .05, 
+                                        'expression bias',
+                                        'epigenetic only')]
+anova_table[gene_expression_selected == TRUE, expression_bias:='expression bias']
+anova_table[, padj_base := p.adjust(anova_base_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated)]
+anova_table[, intercept_only := ifelse(padj_base > .05, 
+                                        'intercept_only',
+                                        'complex model')]
+stopifnot(anova_table[, all('intercept only' != intercept_only, na.rm = TRUE)])
+
+# Test for checking that each model has one robust and one non-robust version
+# stopifnot(anova_table[, .(two=.N==2), by=.(ID, response, rotated)][, all(two)])
+```
+
+
+```{r, fig.width=14, fig.height=7}
+ggplot(anova_table, aes(x = expression_bias, fill=gene_expression_selected)) + geom_bar(position = 'dodge') + facet_wrap(~ `Event Type` + response + robust, scales = 'free', nrow = 2) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) +
+  #add text to each bar with the number of events
+  geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=1.3)
+```
+
+```{r}
+add_vector <- c('gene_expression_selected', 'expression_bias', 'ID', 'response', 'Event Type', 'robust')
+
+feature_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+  model <- event_list[[id]]
+  # feature_data <- fread(file.path('event_models', paste0("feature_table_", id, ".csv.gz")))
+  rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+    ols <- model$cvfit[[paste0(random, '::OLS')]]
+    if (is.null(ols)) return(NULL)
+    features <- model$cvfit[[paste0(random, '::FEATURES')]]
+    return(rbindlist(lapply(features, function(f) data.table(feature = f)), idcol = 'fold'))
+  }, simplify = FALSE), idcol = 'random')
+}, simplify = FALSE), idcol = 'event')
+feature_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+feature_table <- na.omit(feature_table, cols=add_vector)
+
+
+coef_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+  model <- event_list[[id]]
+  # feature_data <- fread(file.path('event_models', paste0("feature_table_", id, ".csv.gz")))
+  rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+    ols <- model$cvfit[[paste0(random, '::OLS')]]
+    if (is.null(ols)) return(NULL)
+    res_dt <- as.data.table(summary(ols)[["coefficients"]], keep.rownames = 'feature')
+    res_dt <- res_dt[, feature := gsub('`', '', feature, fixed = TRUE)]
+    return(res_dt)
+  }, simplify = FALSE), idcol = 'random')
+}, simplify = FALSE), idcol = 'event')
+coef_table[, let(c('mark', 'region'), tstrsplit(feature, ';', fixed=TRUE))]
+coef_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+coef_table <- na.omit(coef_table, cols=add_vector)
+# coef_table[feature_table[, if('full' %in% fold & uniqueN(fold) >= 3) .(robust = uniqueN(fold)), by=.(`Event Type`, ID, response, feature)], on=.(`Event Type`, ID, response, feature), robust:=robust]
+
+pred_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+  model <- event_list[[id]]
+  # feature_data <- fread(file.path('event_models', paste0("feature_table_", id, ".csv.gz")))
+  rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+    ols <- model$cvfit[[paste0(random, '::OLS')]]
+    if (is.null(ols)) return(NULL)
+    ols_ge <- model$cvfit[[paste0(random, '::OLS_GE')]]
+    logit <- model$cvfit[[paste0(random, '::LOGIT')]]
+    # test_data <- model$test_data
+    new_explanatory <- gsub('`', '', names(coef(ols))[-1], fixed = TRUE)
+    train_pred_ols <- predict(ols)
+    train_pred_ols_ge <- predict(ols_ge)
+    train_pred_logit <- predict(logit, type='response')
+    # train_pred_rf <- rf$pred
+    train_true <- ols$y
+    # test_pred_ols <- predict(ols, newdata=test_data[, ..new_explanatory])
+    # new_explanatory_ge <- c(new_explanatory, 'gene_expression')
+    # test_pred_ols_ge <- predict(ols_ge, newdata=test_data[, ..new_explanatory_ge])
+    # if (test_data[, .N] > 0)
+    #   test_pred_logit <- predict(logit, newdata=test_data[, ..new_explanatory], type='response')
+    # else
+    #   test_pred_logit <- numeric()
+    # # test_pred_rf <- predict(rf, newdata=test_data[, ..new_explanatory])
+    # test_true <- test_data[, PSI]
+    
+    data.table(
+      #   r2=c(MLmetrics::R2_Score(train_pred_ols, train_true), MLmetrics::R2_Score(train_pred_rf, train_true), MLmetrics::R2_Score(test_pred_ols, test_true), MLmetrics::R2_Score(test_pred_rf, test_true)),
+      #    mse=c(MLmetrics::MSE(train_pred_ols, train_true), MLmetrics::MSE(train_pred_rf, train_true), MLmetrics::MSE(test_pred_ols, test_true), MLmetrics::MSE(test_pred_rf, test_true)),
+      #    rmse=c(MLmetrics::RMSE(train_pred_ols, train_true), MLmetrics::RMSE(train_pred_rf, train_true), MLmetrics::RMSE(test_pred_ols, test_true), MLmetrics::RMSE(test_pred_rf, test_true)),
+      #    mae=c(MLmetrics::MAE(train_pred_ols, train_true), MLmetrics::MAE(train_pred_rf, train_true), MLmetrics::MAE(test_pred_ols, test_true), MLmetrics::MAE(test_pred_rf, test_true)),
+         pred = c(train_pred_ols, 
+                  train_pred_ols_ge, 
+                  train_pred_logit
+                  # test_pred_ols,
+                  # test_pred_ols_ge,
+                  # test_pred_logit
+                  ),
+         trues = c(train_true, 
+                   train_true, 
+                   train_true 
+                   # test_true,
+                   # test_true,
+                   # test_true
+                   ),
+         model = c(rep('ols', model$nsamples), 
+                   rep('ols_ge', model$nsamples), 
+                   rep('logit', model$nsamples)
+                   # rep('ols', test_data[, .N]),
+                   # rep('ols_ge', test_data[, .N]),
+                   # rep('logit', test_data[, .N])
+                   ),
+         dataset = c(rep('train', model$nsamples * 3) 
+                     #, rep('test', test_data[, .N] * 3)
+                     ),
+         gene_expression='gene_expression' %in% model$cvfit[[paste0(random, '::FEATURES')]],
+         n_var=length(new_explanatory),
+         nsamples=model$nsamples
+         #, ntest=test_data[, .N]
+         )
+  }, simplify = FALSE), idcol = 'random')
+}, simplify = FALSE), idcol = 'event')
+
+metric_table <- pred_table[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples)] #, ntest)]
+metric_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+metric_table <- na.omit(metric_table, cols=add_vector)
+
+# nsamples_dt <- rbindlist(sapply(event_list, function(x)  list(ntrain=x$nsamples, ntest=x$test_data[, .N]), simplify = FALSE), idcol = 'event')
+# setkey(nsamples_dt, 'event')
+
+# Test for checking bot the robust and not robust models have the same features
+# stopifnot(coef_table[, .(robust_subset=all(.SD[robust=='robust', feature] %in% .SD[robust=='not robust', feature])), by=.(ID, response)][, all(robust_subset)])
 ```
 
 
 ```{r}
-library(ggpubr)
-metric_nsample_dt <- nsamples_dt[metric_table, on='event']
-for (this_metric in metric_nsample_dt[, unique(metric)]) {
-  ggscatterhist(metric_nsample_dt[metric == this_metric], y = 'values', x = 'nsamples', color = 'random', margin.params = list(fill = 'random', color = 'random', size = 0.2), ggtheme = theme_bw(), title = this_metric)#margin.plot = 'boxplot',
+# no model built:
+aggregated_dt[!ID %in% anova_table[random == FALSE, unique(ID)], .(ID=uniqueN(ID)), by=`Event Type`]
+
+# no event quantified:
+event_dt[ID %in% setdiff(keep_rows, aggregated_dt[, unique(ID)])][, .N, by=`Event Type`]
+
+# events quantified:
+aggregated_dt[, .(ID=uniqueN(ID)), by=`Event Type`]
+```
+
+
+```{r, fig.width=12, fig.height=8}
+ten_plot_dt <- pred_table[event == '100_robust' & model == 'ols']
+ten_dt <- fread("event_models/feature_table_100.csv.gz")
+stopifnot(identical(ten_plot_dt$trues, ten_dt$PSI))
+ten_plot_dt[, sample_ontology := ten_dt$harmonized_sample_ontology_term_high_order_fig1]
+# ten_plot_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
+ggplot(ten_plot_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(ten_plot_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+# ggpubr::ggscatterhist(ten_plot_dt, x = 'trues', y = 'pred', color = 'sample_ontology') + geom_abline(intercept = 0, slope = 1)
+
+ten_dt[, harmonized_sample_ontology_term_high_order_fig1:=as.factor(harmonized_sample_ontology_term_high_order_fig1)]
+
+lm_ten <- lm(PSI ~ ., data = as.data.frame(cbind(ten_dt[, 'PSI'], makeX(ten_dt[, "harmonized_sample_ontology_term_high_order_fig1"]))))
+lm_ten_dt <- data.table(pred=predict(lm_ten), trues=ten_dt[, PSI], sample_ontology=ten_dt$harmonized_sample_ontology_term_high_order_fig1)
+# lm_ten_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
+ggplot(lm_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lm_ten_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+
+# ten_dt[, `H3K36me3;event_name`:=scale(`H3K36me3;event_name`)]
+ten_dt[, gene_expression:=scale(gene_expression)]
+lme_ten <- lme4::lmer(PSI ~ gene_expression + (gene_expression|harmonized_sample_ontology_term_high_order_fig1), data = ten_dt)
+lme_ten_dt <- data.table(pred=predict(lme_ten), trues=ten_dt[, PSI], sample_ontology=ten_dt$harmonized_sample_ontology_term_high_order_fig1)
+# lme_ten_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
+ggplot(lme_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lme_ten_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+```
+
+```{r, fig.width=14, fig.height=12, eval=FALSE}
+# make a boxplot comparing the number of features in each model using the coef
+ggplot(coef_table[, .(n_feature=uniqueN(feature) - 1), by = .(event, `Event Type`, expression_bias, response, robust)], 
+       aes(y = n_feature, x = robust)) + 
+     geom_boxplot() +
+     facet_grid(`Event Type` ~ response + expression_bias, scales = 'free_y') + 
+  scale_y_log10() +
+     theme_bw() + theme(strip.background = element_blank())
+ggsave(file.path(plot_dir, 'n_features.pdf'), width = 6, height = 3)
+
+# coef_table[, .(n_features = uniqueN(feature) - 1), by=.(ID, response, robust, expression_bias, `Event Type`)]
+ggplot(dcast(coef_table[, .(n_features = uniqueN(feature) - 1), by=.(ID, response, robust, expression_bias, `Event Type`)],
+             ID + response + expression_bias + `Event Type` ~ robust),
+       aes(x = `not robust`, y = robust)) + 
+    geom_abline(intercept = 0, slope = 1) + 
+    geom_point() + 
+    facet_wrap(`Event Type` ~ response + expression_bias, scales = 'free', nrow = 2) + 
+    theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+ggsave(file.path(plot_dir, 'n_features_scatter.pdf'), width = 10, height = 5)
+```
+
+# Comparison between logit, ols and ols_ge:
+
+```{r,fig.width=10, fig.height=12}
+for (metric in c('r', 'r2', 'mse', 'rmse', 'mae')){
+  p <- ggplot(metric_table, aes(y = get(metric), x = response, color=expression_bias)) + 
+      # show mean in geom_boxplot and add the mean as a point
+     geom_boxplot() +
+     stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+     facet_grid(`Event Type` + model ~ robust, scales ='free_y') + 
+     labs(title = metric, y = metric) + 
+     theme_bw() +
+     ggpubr::stat_compare_means(method = 'wilcox.test', vjust = .5)
+  ggsave(file.path(plot_dir, 'model_performances', paste(event_folder, metric, '.pdf', sep = '_')), width = 12, height = 10)
+  # if (metric == 'r2') p <- p + ylim(c(-1, 1))
+  print(p)
 }
 ```
 
+```{r}
+activeChromHMM_dt <- data.table(region = activeChromHMM$name,
+           chrom_state = activeChromHMM$chrom_state,
+           region_width = width(activeChromHMM),
+           region_ID = seq_along(activeChromHMM))
+coef_table[activeChromHMM_dt, on=.(region), c('chrom_state', 'region_width', 'region_ID') := .(chrom_state, region_width, region_ID)]
+stopifnot(identical(coef_table[!is.na(region_ID), region_width], coef_table[!is.na(region_ID), width(activeChromHMM[region_ID])]))
+coef_table[, chrom_state:=list(strsplit(chrom_state, split = ',', fixed = TRUE))]
+coef_table[, coefficient_sign:= ifelse(Estimate > 0, 'positive coefficient', 'negative coefficient')]
+coef_table[, region_type := 'not chromhmm region']
+```
 
 ```{r}
-for (example_id in metric_nsample_dt[metric == 'r2' & values >= .95 & random == "FALSE" & nsamples >= 25, event]){
-  example_ols <- event_list[[example_id]]$cvfit$`FALSE::OLS`
-  # summary(example_ols)
+ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+hex_colors <- sapply(unlist(ihec_ia_colors$experiment, recursive = FALSE), function(x) {
+    cols <- as.numeric(strsplit(x, ",")[[1]])
+    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+hex_colors <- c(hex_colors, DNAm=hex_colors[['WGBS']])
+
+
+coef_table[, plot_feature:=mark]
+coef_table[plot_feature %in% c('max_promoter', 'summed_enhancer'), plot_feature := 'H3K27ac']
+
+plot_colors <- setNames(rep("dark grey", coef_table[, uniqueN(plot_feature)]), coef_table[, unique(plot_feature)])
+for(name in names(hex_colors)) {
+  inds <- startsWith(names(plot_colors), name)
+  plot_colors[inds] <- hex_colors[name]
+}
+anova_table[, table(expression_bias, response, robust, `Event Type`)]
+
+ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
+  ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) + 
+  geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) #+
+  # ylim(0, 400)
+ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts.pdf', sep = '_')), width = 9, height = 7) 
+# ggsave(file.path(plot_dir, 'mark_counts.pdf'), width = 6, height = 3) 
+
+ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only' & robust == 'robust', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
+  ggplot2::facet_wrap(`Event Type` ~ ., scales = 'free_y') +
+  # ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
+  # geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) +
+  # ylim(0, 400)
+ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts_robust.pdf', sep = '_')), width = 6, height = 3) 
+
+# ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only' & robust == 'not robust', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
+#   ggplot2::facet_wrap(`Event Type` ~ ., scales = 'free_y') +
+#   # ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
+#   ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
+#   # geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) +
+#   # ylim(0, 400)
+# ggsave(file.path(plot_dir, 'mark_counts.pdf'), width = 6, height = 3) 
+
+# ggplot2::ggplot(coef_table[!is.na(robust) & plot_feature != '(Intercept)' & expression_bias == 'epigenetic only', .(plot_feature=unique(plot_feature)), by=.(ID, response, `Event Type`)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + ggplot2::facet_wrap(~ `Event Type`, ncol = 2, scales = 'free') + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white'))
+```
+
+```{r}
+# for the smaller ones:
+if (event_folder == "event_models_smaller") {
+  chromhmm_hits_smaller <- findOverlaps(event_gr, activeChromHMM, maxgap = vicinity/10, ignore.strand=TRUE)
+  background_region_ids <- to(chromhmm_hits_smaller)[from(chromhmm_hits_smaller) %in% anova_table[, ID]]
+  background_dt <- activeChromHMM_dt[background_region_ids]
+  background_dt[, ID := from(chromhmm_hits_smaller)[from(chromhmm_hits_smaller) %in% anova_table[, ID]]]
+} else {
+  # TODO: add a background distribution using these chromhmm regions, and then compare the distribution of the coefficients for the different models to the background distribution
+  background_region_ids <- to(chromhmm_hits)[from(chromhmm_hits) %in% anova_table[, ID]]
+  background_dt <- activeChromHMM_dt[background_region_ids]
+  background_dt[, ID := from(chromhmm_hits)[from(chromhmm_hits) %in% anova_table[, ID]]]
+}
+background_dt[, response := 'background']
+background_dt[, robust := 'robust']
+background_dt[event_dt, on=.(ID), `Event Type` := `Event Type`]
+stopifnot(identical(background_dt[, region_ID], background_region_ids))
+
+background_dt <- rbindlist(sapply(coef_table[!is.na(region_ID), unique(mark)], function(x) background_dt, simplify = FALSE), idcol='mark')
+
+region_dt <- rbind(coef_table[!is.na(region_ID) & expression_bias == 'epigenetic only'], background_dt, fill=TRUE)
+region_dt[, response:=factor(response, levels=c('background', 'real response', 'rotated response', 'randomized response'))]
+
+anno_hits <- findOverlaps(activeChromHMM[region_dt[, region_ID]], annotation)
+overlap_types <- data.table(region_ID = region_dt[, region_ID][from(anno_hits)], overlap_type=annotation[to(anno_hits)]$type)[, .(types=list(overlap_type)), by=region_ID]
+region_dt[overlap_types, on=.(region_ID), types:=types]
+
+# make gr for corresponding genes, make mock ranges for events with multiple genes:
+gene_gr <- event_dt[, GRanges(seqnames = ifelse(is.na(gene_start) | is.na(gene_end), 'chrX', as.character(seqnames)),
+                               ranges = IRanges(start = ifelse(is.na(gene_start) | is.na(gene_end), 1, gene_start), 
+                                                end = ifelse(is.na(gene_start) | is.na(gene_end), 1, gene_end)), 
+                               strand = strand)]
+
+upstream <- ifelse(strand(event_gr[region_dt[, ID]]) == '-', 
+                   end(event_gr[region_dt[, ID]]) < start(activeChromHMM[region_dt[, region_ID]]),
+                   end(activeChromHMM[region_dt[, region_ID]]) < start(event_gr[region_dt[, ID]]))
+region_dt[, event_distance := distance(event_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
+region_dt[, gene_distance := distance(gene_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
+region_dt[, adjacency_distance := pmin(distance(downstream_gr[ID], activeChromHMM[region_ID]),
+                                                        distance(upstream_gr[ID], activeChromHMM[region_ID]))*ifelse(upstream, -1, 1)]
+region_dt[, region_type := 'intergenic']
+region_dt[sapply(types, function(this_types) 'transcript' %in% this_types), region_type := 'genic']
+region_dt[gene_distance == 0, region_type := 'genic (event gene)']
+region_dt[event_distance == 0, region_type := 'genic (event overlap)']
+region_dt[, region_type := factor(region_type, levels=c('genic (event overlap)', 'genic (event gene)', 'genic', 'intergenic'))]
+stopifnot(identical(region_dt[sapply(types, is.null), region_ID], region_dt[region_type == 'intergenic', region_ID]))
+```
+
+```{r,fig.width=16, fig.height=12}
+ggplot(coef_table, aes(x = response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ coefficient_sign + robust) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+
+ggplot(coef_table, aes(x = response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ expression_bias + coefficient_sign) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+
+ggplot(coef_table, aes(x = mark, fill = response)) + geom_bar(position = 'dodge') + facet_grid(`Event Type` ~ expression_bias, scales = 'free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Counts for Selected Features') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + theme_bw() + theme(strip.background = element_rect(fill = 'white'), axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ggplot(region_dt, aes(x = region_width, color = mark)) + geom_density() + facet_wrap(response ~ `Event Type`, ncol = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Region length for Selected Features') + scale_fill_brewer(palette = 'Paired') + scale_x_log10()
+```
+
+
+```{r,fig.width=16, fig.height=12}
+# ggplot(region_dt, aes(x = event_distance, color = mark)) + geom_density() + facet_wrap(response ~ `Event Type`, ncol = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Distance of Selected Region to Event') + scale_fill_brewer(palette = 'Paired')
+ggplot(region_dt[robust == 'robust'], aes(x = region_width, color = response)) +
+  geom_density() + 
+  facet_grid(`Event Type` ~ mark, scales ='free_y') +
+  labs(title = 'Region length for Selected Features') +
+  theme_bw() + scale_x_log10() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+ggsave(file.path(plot_dir, paste(event_folder, 'region_length.pdf', sep = '_')), width = 8, height = 4)
+
+ggplot(region_dt[robust == 'robust'], aes(x = response, fill = region_type)) +
+  geom_bar(position = 'fill') +
+  facet_grid(`Event Type` ~ mark) +
+  labs(title = 'Region type for Selected Features') +
+  theme_bw() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+ggsave(file.path(plot_dir, paste(event_folder, 'region_type.pdf')), width = 8, height = 4)
+
+ggplot(region_dt[robust == 'robust'], aes(x = region_width, y = ..density.., fill = response)) +
+    geom_histogram(position = 'dodge') + 
+    facet_grid(`Event Type` ~ mark, scales ='free_y') +
+    labs(title = 'Region length for Selected Features') +
+    theme_bw() + scale_x_log10() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+ggplot(region_dt[robust == 'robust'], aes(x = event_distance, color = response)) + geom_density() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + labs(title = 'Distance of Selected Region to Event') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(region_dt[robust == 'robust'], aes(x = event_distance, y = ..density.., fill = response)) + geom_histogram(position = 'dodge') + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + labs(title = 'Distance of Selected Region to Event') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+ggplot(region_dt[robust == 'robust'], aes(y = event_distance, x = coefficient_sign, color = response)) + geom_boxplot() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + labs(title = 'Distance of Selected Region to Event') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+ggplot(region_dt[robust == 'robust'], aes(x = gene_distance, color = response)) + geom_density() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y')  + labs(title = 'Distance of Selected Region to Event Gene') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+ggplot(region_dt[robust == 'robust'], aes(x = gene_distance, y=..density.., fill = response)) + geom_histogram(position = 'dodge') + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y')  + labs(title = 'Distance of Selected Region to Event Gene') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+ggplot(region_dt[robust == 'robust'], aes(y = gene_distance, x = coefficient_sign, color = response)) + geom_boxplot() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + labs(title = 'Distance of Selected Region to Event Gene') + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+# ggplot(region_dt, aes(y = event_distance, x = response, color = response)) + geom_boxplot() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Distance of Selected Region to Event') + scale_fill_brewer(palette = 'Paired') + ggpubr::stat_compare_means()
+# ggplot(region_dt, aes(y = event_distance, x = coefficient_sign, color = response)) + geom_boxplot() + facet_wrap(`Event Type` ~ mark, nrow  = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Distance of Selected Region to Event') + scale_fill_brewer(palette = 'Paired') + ggpubr::geom_pwc(tip.length = 0, label = "p.format")
+
+# ggplot(region_dt, aes(x = adjacency_distance, color = mark)) + geom_density() + facet_wrap(response ~ `Event Type`, ncol = 2, scales='free') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Distance of Selected Region to Event Adjacent') + scale_fill_brewer(palette = 'Paired')
+```
+
+
+```{r}
+library(simpleCache)
+library(qvalue)
+library(LOLA)
+regionDB <- loadRegionDB(c("/nfs/data/references/LOLA/LOLACore/hg38", "/nfs/data/references/LOLA/tf_motifs/hg38"))
+# tf_motif_db <- loadRegionDB("/nfs/data/references/LOLA/tf_motifs/hg38")
+```
+
+```{r}
+# library(PWMEnrich)
+# library(PWMEnrich.Hsapiens.background)
+# data("PWMLogn.hg19.MotifDb.Hsap")
+# library(Biostrings)
+# genome_fasta <- 'GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz'
+# genome <- readDNAStringSet(genome_fasta)
+# chr_names <- tstrsplit(names(genome), "[ \t]+", keep = 1)[[1]] # split names by tab/space
+# names(genome) <- chr_names
+# useBigMemoryPWMEnrich(TRUE)
+# registerCoresPWMEnrich(40)
+
+lola <- rbindlist(sapply(to_analyze, function(this_event){
+  rbindlist(sapply(c("FALSE", "TRUE"), function(this_random){
+    interesting_events <- coef_table[random == this_random & `Event Type` == this_event & expression_bias == 'epigenetic only' & robust == 'robust']
+    regions <- 
+      c(activeChromHMM[interesting_events[!is.na(region_ID), unique(region_ID)]],
+      upstream_gr[interesting_events[region == 'upstream_other_region', ID]],
+      downstream_gr[interesting_events[region == 'downstream_other_region', ID]],
+      event_gr[interesting_events[region == 'event_name', ID]]
+    )
+    my_universe <- 
+    c(activeChromHMM[unique(background_region_ids)],
+                         upstream_gr[interesting_events[, unique(ID)]],
+                         downstream_gr[interesting_events[, unique(ID)]],
+                         event_gr[interesting_events[, unique(ID)]])
+    
+    lola_core_res <-
+      runLOLA(
+        userSets = reduce(regions),
+        userUniverse = my_universe,
+          #activeChromHMM[!seqnames(activeChromHMM) %in% c('chrY', 'chrX')],
+          # activeChromHMM[unique(to(chromhmm_hits)[from(chromhmm_hits) %in% as.integer(names(event_list)) &
+          #                                                        event_dt[from(chromhmm_hits), `Event Type` == this_event]])],
+        regionDB = regionDB,
+        cores = ncores
+        # redefineUserSets = TRUE
+      )
+    
+    # res = motifEnrichment(genome[regions], PWMLogn.hg19.MotifDb.Hsap, verbose = FALSE)
+    # report.top = groupReport(res, by.top.motifs=TRUE)
+    # as.data.table(report.top@d)
+  }, simplify = FALSE), idcol = 'random', fill=TRUE)
+}, simplify = FALSE), idcol = 'Event Type', fill=TRUE)
+fwrite(lola, 'lola.csv.gz')
+gc()
+```
+```{r, eval=FALSE}
+stopifnot(all(interesting_events[!is.na(region_ID), region] %in% activeChromHMM[unique(background_region_ids)]$name))
+states_per_segment <- strsplit(x = activeChromHMM[unique(background_region_ids)]$chrom_state, split = ',', fixed = TRUE)
+names(states_per_segment) <- activeChromHMM[unique(background_region_ids)]$name
+
+states_dt <- rbindlist(sapply(states_per_segment, function(states) data.table(state = states), simplify = FALSE), idcol = "region")
+# background_states <- split(states_dt[, region], states_dt[, state])
+# selected_states <- split(states_dt[region %in% interesting_events[!is.na(region_ID), region], region], states_dt[region %in% interesting_events[!is.na(region_ID), region], state])
+ggplot(rbindlist(list(background = states_dt, selected = states_dt[region %in% interesting_events[!is.na(region_ID), region]]), idcol = 'set')[, .N, by=.(state, set)], aes(x=state, y=N)) + geom_col() + facet_grid(set ~ ., scales = 'free_y') + theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust = 1), strip.background = element_rect(fill = 'white'))
+
+```
+
+```{r, eval=FALSE}
+reduced_tf_motifs <- reduce(unlist(tf_motif_db$regionGRL))
+length(my_universe)
+sum(my_universe %over% reduced_tf_motifs)
+```
+
+```{r, eval=FALSE}
+print(event_dt[ID %in% keep_rows, table(`Event Type`)])
+print(event_dt[ID %in% as.integer(names(event_list)), table(`Event Type`)])
+print(event_dt[ID %in% metric_table[random == 'FALSE', as.integer(unique(event))], table(`Event Type`)])
+print(event_dt[ID %in% metric_table[random == 'FALSE' & gene_expression == "FALSE", as.integer(unique(event))], table(`Event Type`)])
+events_with_model <- as.integer(names(event_list))
+events_with_gene_expression <- metric_table[random == 'FALSE' & gene_expression == "TRUE", as.integer(unique(event))]
+events_with_epigenetic <- metric_table[random == 'FALSE' & gene_expression == "FALSE", as.integer(unique(event))]
+events_without_feature <- setdiff(setdiff(events_with_model, events_with_gene_expression), events_with_epigenetic)
+stopifnot(length(setdiff(unique(c(events_without_feature, events_with_epigenetic, events_with_gene_expression)), unique(events_with_model))) == 0)
+stopifnot(length(setdiff(unique(events_with_model), unique(c(events_without_feature, events_with_epigenetic, events_with_gene_expression)))) == 0)
+```
+
+```{r, eval=FALSE}
+entropy_dt <- aggregated_dt[, .(entropy = as.numeric(entropy::entropy(entropy::discretize(PSI, 50, range(c(0,1))), method = 'ML', unit = 'log2')), sd = sd(PSI), mean_summed_enhancer = mean(summed_enhancer, na.rm = TRUE), median_summed_enhancer = median(summed_enhancer, na.rm = TRUE), mean_max_promoter = mean(max_promoter, na.rm = TRUE), median_max_promoter = median(max_promoter, na.rm = TRUE)), by=.(`Event Type`, ID)]
+ggplot(entropy_dt, aes(x = entropy, fill = `Event Type`)) + geom_histogram(position = 'dodge') + facet_wrap(~ `Event Type`, scales = 'free')
+ggplot(entropy_dt, aes(x = sd, y = entropy, color = `Event Type`)) + geom_point() + facet_wrap(~ `Event Type`, scales = 'free') + theme_bw()
+entropy_dt[, rbindlist(lapply(.SD, function(x) {
+  my_cor <- cor.test(x, entropy, method = 'spearman', use = 'na.or.complete')
+  list(rho=my_cor$estimate,
+       pval=my_cor$p.value)
+  }), idcol = 'column'), .SDcols = c(
+    'sd',
+    'mean_summed_enhancer',
+    'median_summed_enhancer',
+    'mean_max_promoter',
+    'median_max_promoter'
+  ), by = `Event Type`]
+entropy_dt[ID %in% events_without_feature, annotation:='no_feature']
+entropy_dt[ID %in% events_with_epigenetic, annotation:='epigenetic']
+entropy_dt[ID %in% events_with_gene_expression, annotation:='gene_expression']
+ggplot(entropy_dt[!is.na(annotation)], aes(x = entropy, color = annotation)) + geom_histogram(position = 'dodge') + facet_wrap(~ `Event Type`)
+```
+
+
+```{r, eval=FALSE}
+for (id in metric_table[random == "FALSE" & ntest >= 25 & dataset == "test" & gene_expression == "FALSE" , ][order(r2, decreasing = TRUE), unique(event)][1:10]){
   print(
     ggplot(
-      data.table(PSI = example_ols$y, fitted = predict(example_ols)),
-      aes(x = PSI, y = fitted)
+      pred_table[event == id & random == "FALSE"],
+      aes(x = trues, y = pred, color = dataset)
     ) + geom_abline(
       intercept = 0,
       slope = 1,
       color = 'grey'
-    ) + geom_point() + theme_bw() + labs(
+    ) + facet_wrap( ~ model)
+      + geom_point() + theme_bw() 
+    + labs(
       title = sprintf(
-        'Event: %s, nsamples: %d, nexplanatory: %d, r2: %.2f',
-        example_id,
-        nsamples_dt[example_id, nsamples],
-        length(coef(example_ols)) - 1,
-        metric_table[metric == 'r2' &
-                       random == "FALSE" & event == example_id, values]
+        'Event: %s, ntrain: %d, ntest: %d, nexplanatory: %d (Gene Expression: %s),\nr2 train, test: %.2f, %.2f, rmse train, test: %.2f, %.2f',
+        id,
+        metric_table[random == "FALSE" & event == id & dataset == 'train', nsamples],
+        metric_table[random == "FALSE" & event == id & dataset == 'train', ntest],
+        metric_table[random == "FALSE" & event == id & dataset == 'train', n_var],
+        metric_table[random == "FALSE" & event == id & dataset == 'train', gene_expression],
+        metric_table[random == "FALSE" & event == id & dataset == 'train', r2],
+        metric_table[random == "FALSE" & event == id & dataset == 'test', r2],
+        metric_table[random == "FALSE" & event == id & dataset == 'train', rmse],
+        metric_table[random == "FALSE" & event == id & dataset == 'test', rmse]
       )
     )
   )
 }
 ```
-
-
-```{r, fig.width=16, fig.height=11, eval=FALSE}
-# my_colors <- rev(c("#CC79A7", "#009E73", "#999999"))
-
-for (this_event in to_analyze) {
-  # pheatmap(as.matrix(dcast(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], formula = `Samples, Features` + region ~ `Mark, PSI Variance`, value.var = 'coefs', fill = 0L)[, -c(1, 2)]), cluster_cols = FALSE, cluster_rows = FALSE)
-  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
-  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
-  # ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
-  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & !grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
-  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + theme(legend.position = 'bottom') + scale_color_manual(values = my_colors))
-  #   ggsave(filename = file.path(plot_dir, paste0('coef_', this_event, '.pdf')), width = 14, height = 8)
-  # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & (region == 'Gene-Wide' | mark ==  'Width')], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_wrap(~ region + mark, nrow = 2) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
-  #       + labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors))
-  # ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 9, height = 6)
-  print(
-    ggplot(
-      rank_dt[feature != '(Intercept)' &
-                this_event == `Event Type` &
-                alpha == 'OLS' & !random & (region == 'Gene-Wide' | mark ==  'Width')], 
-    aes(
-        y = `Samples, Features`,
-        x = `PSI Variance`,
-        fill = coefs
-    )
-    ) + facet_wrap( ~ region + mark, nrow = 2) + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev) + theme(legend.position = 'bottom')
-    #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
-  )
-  ggsave(filename = file.path(plot_dir, paste0('coef_non_epigenetic_', this_event, '.pdf')), width = 5, height = 6)
-  print(
-    ggplot(
-    rank_dt[feature != '(Intercept)' &
-                this_event == `Event Type` &
-                alpha == 'OLS' &
-                region != 'Gene-Wide' &
-                mark != 'Width' &
-                grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)],
-    aes(
-        y = `Samples, Features`,
-        x = `PSI Variance`,
-        fill = coefs
-    )
-    ) + facet_grid(region ~ mark, scales = 'free_y') + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev)
-  #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
-  )
-  ggsave(filename = file.path(plot_dir, paste0('coef_cCRE_', this_event, '.pdf')), width =9, height = 10.5)
-  print(
-    ggplot(
-    rank_dt[feature != '(Intercept)' &
-                this_event == `Event Type` &
-                alpha == 'OLS' &
-                region != 'Gene-Wide' &
-                mark != 'Width' &
-                !grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)],
-    aes(
-        y = `Samples, Features`,
-        x = `PSI Variance`,
-        fill = coefs
-    )
-    ) + facet_grid(region ~ mark) + geom_tile() + theme_bw() + scale_fill_gradient2() + scale_y_discrete(limits=rev)
-    #just_text(angle = 45, hjust=1))+labs(y = 'Coefficient', size = 'Absolute Coefficient') + scale_shape_manual(values = LETTERS) + scale_color_manual(values = my_colors)
-  )
-  ggsave(filename = file.path(plot_dir, paste0('coef_exon_intron', this_event, '.pdf')), width =9, height = 7)
-  
-}
-
-```
-
-# make roc_curves for total models:
-```{r, fig.height=6, fig.width=12}
-library(ggplot2)
-library(glmnet)
-library(ranger)
-library(PRROC)
-library(patchwork)
-all_plots <- list()
-all_aucs <- list()
-cm_list <- sapply(to_analyze, function(this_event){
-    feature_vector <- c('noEpigenetic', 'all', 'onlyEpigenetic')
-    as_list <- pbmclapply(feature_vector, function(features) {
-        models <- readRDS(paste(this_event, 'all_var.all', features, 'binomial.rds', sep = '_'))
-        print(paste(this_event, features))
-        cvfits <- models$cvfit
-        explanatory <- models$explanatory
-        # real_test_ids <-
-        #   Reduce(intersect, lapply(names(models$test_by_group), function(grouping_col)
-        #     test_data[get(grouping_col) %in% models$test_by_group[[grouping_col]], which = TRUE]))
-        only_first <- models$test_data[get(names(models$test_by_group)[1]) %in% models$test_by_group[[1]] &
-                           !(get(names(models$test_by_group)[2]) %in% models$test_by_group[[2]])]
-        only_second <- models$test_data[get(names(models$test_by_group)[2]) %in% models$test_by_group[[2]] &
-                           !(get(names(models$test_by_group)[1]) %in% models$test_by_group[[1]])]
-        strict_test_data <- models$test_data[do.call(CJ, models$test_by_group), on=names(models$test_by_group), nomatch=NULL]
-        test_data_list <- list(only_first, only_second, strict_test_data)
-        names(test_data_list) <- c(names(models$test_by_group), paste(names(models$test_by_group), collapse = "_AND_"))
-        sapply(test_data_list, 
-               function(test_data){
-          sapply(names(cvfits), function(alpha){
-            cvfit <- cvfits[[alpha]]
-            if (endsWith(alpha, 'OLS'))
-            {
-              predicted <-
-                predict(cvfit, newdata = test_data[, ..explanatory])
-              predicted_label <- ifelse(predict(cvfit, newdata = test_data[, ..explanatory], type = 'response') < .5, control_class, case_class)
-            } else if (endsWith(alpha, 'RF')) {
-              predicted <- predict(cvfit$finalModel, data = test_data[, ..explanatory])$predictions[, case_class]
-              predicted_label <- ifelse(predicted < .5, control_class, case_class)
-            } else {
-              predicted <-
-                predict(cvfit$finalModel, newx = as.matrix(test_data[, ..explanatory]), s = lambda.1sd(cvfit), type = 'response')[, 1]
-              predicted_label <- predict(cvfit$finalModel, newx = as.matrix(test_data[, ..explanatory]), s = lambda.1sd(cvfit), type = 'class')[, 1]
-            }
-          predicted_label <- ordered(predicted_label, levels = class_levels)
-          roc <- PRROC::roc.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
-          prc <- PRROC::pr.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
-          list(AUROC=roc$auc,
-               AUPRC=prc$auc.integral,
-               dt=setNames(rbind(data.table(roc$curve)[, type:=roc$type], data.table(prc$curve)[, type:=prc$type]), c('Recall', 'Precision', 'Threshold', 'Type')),
-               cm = caret::confusionMatrix(predicted_label, test_data[, binary], positive=case_class, mode = "everything"),
-               MCC=ModelMetrics::mcc(test_data[, ifelse(binary == case_class, 1, 0)], predicted, 0.5),
-               size_dt=data.table(nsamples=models$nsamples, ntest=test_data[, .N]),
-               abline_dt=data.table(intercept=c(0, test_data[, sum(binary == case_class)/.N]), slope=c(1, 0), Type=c('ROC', 'PR')))
-          }, simplify = FALSE)
-        }, simplify = FALSE)
-    })
-    names(as_list) <- feature_vector
-    curve_dt <- rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
-    abline_dt <- rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$abline_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
-    curve_dt[, (c('Random', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
-    curve_dt[Random == 'FALSE', Random:="Real"]
-    curve_dt[Random == 'TRUE', Random:="Random"]
-    print(ggplot(curve_dt, aes(x=Recall, y=Precision, color=Model, linetype=Features)) + geom_abline(data=abline_dt, aes(slope=slope, intercept=intercept), color='grey') + geom_line() + facet_grid(Type + Random ~ `Test on`) + theme_bw() + labs(title = this_event))
-    measure_dt <- rbindlist(lapply(as_list, function(test_list) 
-      rbindlist(lapply(test_list, function(roc_list)
-      rbindlist(lapply(roc_list, function(element)
-        c(
-          element[c('AUROC', 'AUPRC', 'MCC')],
-          list(
-            Kappa = element$cm$overall['Kappa'],
-            `Balanced Accuracy` = element$cm$byClass['Balanced Accuracy']
-          )
-        )), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
-    measure_dt <- melt(measure_dt, id.vars = c('Features', 'Model', 'Test on'), variable.name = 'Measure', value.name = 'Value')
-    measure_dt[, (c('Random', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
-    measure_dt[Random == 'FALSE', Random:="Real"]
-    measure_dt[Random == 'TRUE', Random:="Random"]
-  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Random)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='white')) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
-    list(measure_dt=measure_dt, curve_dt=curve_dt, size_table=rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$size_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features'))
-  # flat_as_list <- unlist(unlist(as_list, recursive = FALSE), recursive = FALSE)
-  # names(flat_as_list) <- gsub('nocCRE', 'wo/ cCRE', names(flat_as_list), fixed = TRUE)
-  # for (alpha in names(models[[1]]$cvfit)) {
-  #   roc_list <- flat_as_list[endsWith(names(flat_as_list), paste0(alpha, '.roc'))]
-  #   roc_list <- roc_list[order(names(roc_list))]
-  #   auc_list <- sapply(names(roc_list), function(x){
-  #     var <- tstrsplit(x, '_', fixed = TRUE, keep = 1)[[1]]
-  #     paste0(var, ': ', round(roc_list[[x]][["auc"]], 2))
-  #   })
-  # plot_list <- lapply(unique(tstrsplit(names(roc_list), '.', fixed=TRUE, keep=1)[[1]]), function(var) {
-  #     tmp_roc_list <- roc_list[startsWith(names(roc_list), var)]
-  #     if (var == 'all_var' && all(grepl('FALSE::RF', names(roc_list), fixed=TRUE))) {
-  #       all_aucs[[this_event]] <<- sub('all', this_event, auc_list[names(tmp_roc_list)])
-  #       all_aucs[[paste(this_event, "simple", sep = "_")]] <<- sub('all', this_event, auc_list[paste0(var,'.', c("all_all", "wo/ cCRE_all"), '_binomial.', alpha, '.roc')])
-  #     }
-  #     names(tmp_roc_list) <- gsub(paste0('_binomial\\.', alpha, '\\.roc$'), '', gsub(paste0('^',var,'\\.'), '', names(tmp_roc_list)))
-  #     
-  #     if (var == 'all_var' && all(grepl('FALSE::RF', names(roc_list), fixed=TRUE))) {
-  #     all_plots[[this_event]] <<- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
-  #               color = "darkgrey", linetype = "dashed") +
-  #           labs(title=this_event, color='Samples, Features (Event Type: AUC)', x = 'Specificity', y = 'Sensitivity') +
-  #           theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
-  #     all_plots[[paste(this_event, "simple", sep = "_")]] <<- ggroc(tmp_roc_list[c("all_all", "wo/ cCRE_all")]) + geom_abline(intercept = 1, slope = 1,
-  #               color = "darkgrey", linetype = "dashed") +
-  #           labs(title=this_event, color='Samples, Features (Event Type: AUC)', x = 'Specificity', y = 'Sensitivity') +
-  #           theme_bw() + theme(legend.position = 'bottom')
-  #     }
-  #     
-  #     p <- ggroc(tmp_roc_list) + geom_abline(intercept = 1, slope = 1,
-  #               color = "darkgrey", linetype = "dashed") +
-  #           labs(title=tstrsplit(var, '_', fixed = TRUE, keep = 1)[[1]], color='Samples, Features (variance: AUC)', x = 'Specificity', y = 'Sensitivity') + 
-  #           scale_color_discrete(labels=sapply(names(tmp_roc_list), function(x) paste0(sub('_', ', ', x, fixed = TRUE), ' (', paste(auc_list[grep(x, names(auc_list), fixed = TRUE)], collapse = ', '), ')'))) + 
-  #           theme_bw() + theme(legend.position = 'bottom') + guides(color=guide_legend(nrow=4))
-  #     p
-  #   })
-  # print(Reduce(`+`, plot_list) + plot_layout(guides = "collect") + plot_annotation(paste(this_event, alpha)) & theme(legend.position = 'bottom'))# + plot_layout(guides = "collect") & theme(legend.position = 'bottom'))
-  # # ggsave(filename = file.path(plot_dir, paste0('roc_', this_event, '_', alpha, '.pdf')), width = 11.7, height = 5)
-  #   # print(ggroc(roc_list) + 
-  #         # labs(title=paste(this_event, alpha), color='data_explanatory_response_alpha') + scale_color_discrete(labels=paste(names(roc_list), sapply(roc_list, function(x) paste0('(', round(x[["auc"]], 2),')')))) + theme_bw())
-  # }
-  # 
-  # flat_as_list[endsWith(names(flat_as_list), '.cm')]
-}, simplify = FALSE)
-gc()
-
-```
-```{r}
-for (this_event in to_analyze) {
-  print(cm_list[[this_event]]$size_table[, .(Event=this_event, Models=paste(Features, Model, sep = '::', collapse = ', ')), by=.(nsamples, ntest)][])
-}
-```
-
-
-```{r, eval=FALSE}
-((all_plots$SE + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')'))) + (all_plots$RI + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
-ggsave(filename = file.path(plot_dir, 'roc_both.pdf'), width = 9, height = 5.5)
-print(cm_list$SE$`all_var.all_all_binomial.FALSE::RF.cm`)
-print(cm_list$RI$`all_var.all_all_binomial.FALSE::RF.cm`)
-```
-```{r figure6, eval=FALSE}
-((all_plots$SE_simple + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE_simple)))), ' (', all_aucs$SE_simple, ' , ', all_aucs$RI_simple , ')'))) + (all_plots$RI_simple + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE_simple)))), ' (', all_aucs$SE_simple, ' , ', all_aucs$RI_simple, ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
-ggsave(filename = file.path(plot_dir, 'roc_both_simple.pdf'), width = 9, height = 5.5)
-```
- 
-```{r, eval=FALSE}
-size_table <- rbindlist(sapply(to_analyze, function(this_event) rbindlist(lapply(all_models[, this_event], function(model){data.table('Train Size' = model$nsamples, 'Test Size' = nrow(model$test_data))}), idcol='model'), simplify = FALSE), idcol = 'event_name')
-size_table[, var := tstrsplit(model, '_', fixed=TRUE, keep=1)]
-size_table[, data := tstrsplit(model, '.', fixed=TRUE, keep=2)]
-size_table[, data := tstrsplit(data, '_', fixed=TRUE, keep=1)]
-size_table <- unique(size_table, by=c('event_name', 'Train Size', 'Test Size', 'var', 'data'))
-size_table_cast <- dcast(size_table, var + data ~ event_name, value.var = c('Train Size', 'Test Size'))
-fwrite(size_table_cast[, c(1,2,4,6,3,5)], 'ml_data_sizes.txt')
-size_table_cast
-```
-
