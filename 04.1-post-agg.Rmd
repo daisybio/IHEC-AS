@@ -134,7 +134,10 @@ new_n_cCRE_cols <- paste('#cCRE', n_cCRE_cols, sep =';')
 ```{r, fig.width=16, fig.height=10}
 melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = c('ID', 'Event Type', 'gene_id'), variable.name = 'IHEC', value.name = 'PSI', variable.factor = FALSE)
 melted_psi <- melted_psi[!is.na(PSI)]
+```
 
+
+```{r, fig.width=16, fig.height=10, eval=FALSE}
 single_gene_psi <- melted_psi[!grepl(pattern = '_and_', gene_id, fixed = TRUE)]
 multi_gene_psi <- melted_psi[grepl(pattern = '_and_', gene_id, fixed = TRUE), strsplit(x = as.character(gene_id), split = '_and_', fixed = TRUE), by=.(ID, `Event Type`, IHEC, PSI, gene_id)][, .(ID, `Event Type`, gene_id=V1, IHEC, PSI)]
 
@@ -153,13 +156,20 @@ ggplot(melt(metabolic_genes, id.vars = 'gene_id', measure.vars = c('SE', 'RI')),
 
 
 ```{r, fig.width=16, fig.height=10}
-aggregated_dt[melted_psi[ID %in% keep_rows & !is.na(PSI)], on=.(ID, IHEC), PSI:=PSI]
+aggregated_dt[melted_psi[ID %in% keep_rows_manual & !is.na(PSI)], on=.(ID, IHEC), PSI:=PSI]
 aggregated_dt <- aggregated_dt[!is.na(PSI)]
 
-cols_to_add <- c('gene_id', 'distance_TSS', 'distance_TES', 'width;upstream_other_region', 'width;event_name', 'width;downstream_other_region', 'Event Type', '3ss', '5ss')
+cols_to_add <- c('gene_id', 'distance_TSS', 'distance_TES', 'width;upstream_other_region', 'width;event_name', 'width;downstream_other_region', 'Event Type', '3ss', '5ss', 'Variability')
 aggregated_dt[event_dt, on=.(ID), (cols_to_add):=mget(cols_to_add)]
-aggregated_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
+
+gene_quants <- readRDS('suppa_analysis/gene_expressions_TSL.rds')
+# manually change gene_id for ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13 from the manual id
+aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
 aggregated_dt[gene_quants, on=c(gene_id='gene_id', IHEC='epirr_id_without_version'), gene_expression:=gene_tpm]
+
+# make sure all of the gene_expression values are at least one:
+stopifnot(all(aggregated_dt[, gene_expression >= 1]))
+# log the expression
 aggregated_dt[, gene_expression:=log2(gene_expression)]
 
 aggregated_dt[, gene_id:=gsub(pattern = '.\\d+$', '', gene_id)]
@@ -174,17 +184,18 @@ enhancer_melt <- melt(summed_enhancer, id.vars = 'Ensembl ID', variable.name = '
 promoter_merged[enhancer_melt, on=c(uuid='uuid', gene_id='Ensembl ID'), summed_enhancer:=summed_enhancer]
 
 aggregated_dt[promoter_merged, on=.(IHEC, gene_id), c('summed_enhancer', 'max_promoter'):=.(summed_enhancer, max_promoter)]
-dennis_cor <- aggregated_dt[, lapply(.SD, function(x){ 
+dennis_cor <- aggregated_dt[ID %in% keep_rows, lapply(.SD, function(x){ 
     if (.N < 25) return(as.numeric(NA)) 
     cor(x, PSI, method = 'spearman', use = 'na.or.complete')}), .SDcols = c('summed_enhancer', 'max_promoter'), by=.(`Event Type`, ID)]
-aggregated_dt[, gene_id:=NULL]
+# aggregated_dt[, gene_id:=NULL]
 ggpubr::ggscatterhist(dennis_cor, x = 'summed_enhancer', y = 'max_promoter', color = 'Event Type')
 ```
 
-```{r}
+```{r, eval=FALSE}
 entropy_dt <- aggregated_dt[, .(entropy = as.numeric(entropy::entropy(entropy::discretize(PSI, 20, range(c(0,1))), method = 'ML', unit = 'log2')), sd = sd(PSI), mean_summed_enhancer = mean(summed_enhancer, na.rm = TRUE), median_summed_enhancer = median(summed_enhancer, na.rm = TRUE), mean_max_promoter = mean(max_promoter, na.rm = TRUE), median_max_promoter = median(max_promoter, na.rm = TRUE)), by=.(`Event Type`, ID)]
-ggplot(entropy_dt, aes(x = entropy, fill = `Event Type`)) + geom_histogram(position = 'dodge') + facet_wrap(~ `Event Type`, scales = 'free')
-ggplot(entropy_dt, aes(x = sd, y = entropy, color = `Event Type`)) + geom_point() + facet_wrap(~ `Event Type`, scales = 'free') + theme_bw()
+entropy_dt[, high_var:= ID %in% c(var_events$SE$`0.5`, var_events$RI$`0.5`)]
+ggplot(entropy_dt, aes(x = entropy, fill = high_var)) + geom_histogram(position = 'dodge') + facet_wrap(~ `Event Type`, scales = 'free')
+ggplot(entropy_dt, aes(x = sd, y = entropy, color = high_var)) + geom_point() + facet_wrap(~ `Event Type`, scales = 'free') + theme_bw()
 entropy_dt[, rbindlist(lapply(.SD, function(x) {
   my_cor <- cor.test(x, entropy, method = 'spearman', use = 'na.or.complete')
   list(rho=my_cor$estimate,
@@ -200,21 +211,28 @@ entropy_dt[, rbindlist(lapply(.SD, function(x) {
 
 ```{r, fig.width=16, fig.height=10}
 percentiles <- c(1/3, .5, 2/3)
-sample_quartiles <- aggregated_dt[, split(quantile(PSI, probs = percentiles, names= FALSE), as.character(round(percentiles, 2))), by = .(`Event Type`, IHEC)]
+sample_quartiles <- aggregated_dt[ID %in% keep_rows, split(quantile(PSI, probs = percentiles, names= FALSE), as.character(round(percentiles, 2))), by = .(`Event Type`, IHEC)]
 melted_sample_quartiles <- melt(sample_quartiles, id.vars = c('Event Type', 'IHEC'), variable.name='Percentage', value.name = 'quantile')
 print(ggplot(melted_sample_quartiles, aes(x = quantile, fill = Percentage)) + geom_histogram(binwidth = 0.01) + theme_bw() + theme(legend.position = 'bottom') + facet_wrap(~`Event Type`, scales='free_y') + labs(x='PSI Quantile', y='Count'))
 ggsave(filename = file.path(plot_dir, 'percentage_dist.pdf'), width = 6, height = 3)
-event_quartiles <- aggregated_dt[, .(Mean=mean(PSI), `SD`=sd(PSI), `NA Percentage`= 1- length(IHEC)/aggregated_dt[, uniqueN(IHEC)]), by = .(`Event Type`, ID)]
-print(ggplot(event_quartiles, aes(x = Mean, y = SD, color = `Event Type`)) + geom_point() + geom_hline(data=event_quartiles[, .(median_sd=median(SD, na.rm = TRUE)), by = `Event Type`], aes(yintercept = median_sd, color = `Event Type`)) + theme_bw())
-ggsave(filename = file.path(plot_dir, 'PSI_mean_sd.pdf'), width = 8, height = 5)
-
-print(ggplot(event_quartiles, aes(x = `NA Percentage`, y = SD, color = `Event Type`)) + geom_point() + geom_smooth(aes(color = `Event Type`), method='lm') + ggpubr::stat_cor(aes(color = `Event Type`)) + theme_bw())
-ggsave(filename = file.path(plot_dir, 'PSI_sd_na.pdf'), width = 8, height = 4)
-
+# TODO: use this instead of sd: sqrt(rowSums((event_mat - rowMeans(event_mat, na.rm = TRUE))^2, na.rm = TRUE)/(length(sample_cols) - 1))
+# event_quartiles <- aggregated_dt[, .(Mean=mean(PSI), `SD`=sqrt(sum((mean(PSI) - PSI)^2)/(length(sample_cols) - 1)), `NA Percentage`= 1 - length(IHEC)/aggregated_dt[, uniqueN(IHEC)]), by = .(`Event Type`, ID)]
+# event_quartiles[entropy_dt, on=.NATURAL, Entropy:=entropy]
+# print(ggplot(event_quartiles, aes(x = Mean, y = SD, color = Entropy)) + geom_point() + geom_hline(data=event_quartiles[, .(median_sd=median(SD, na.rm = TRUE)), by = `Event Type`], aes(yintercept = median_sd)) + theme_bw() + facet_wrap(~`Event Type`, scales='free') + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'lightgrey', high = 'darkblue'))
+# ggsave(filename = file.path(plot_dir, 'PSI_mean_sd.pdf'), width = 8, height = 5)
+# 
+# print(ggplot(event_quartiles, aes(x = `NA Percentage`, y = SD, color = Entropy)) + geom_point() + geom_smooth(method='lm') + ggpubr::stat_cor() + theme_bw() + facet_wrap(~`Event Type`, scales='free') + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'lightgrey', high = 'darkblue'))
+# ggsave(filename = file.path(plot_dir, 'PSI_sd_na.pdf'), width = 8, height = 4)
+# 
+# print(ggplot(event_quartiles, aes(x = SD, y = Entropy, color = `NA Percentage`)) + geom_point() + ggpubr::stat_cor() + theme_bw() + facet_wrap(~`Event Type`, scales='free') + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'darkblue', high = 'lightgrey'))
+# ggsave(filename = file.path(plot_dir, 'PSI_entropy_sd.pdf'), width = 8, height = 4)
 for (this_event in to_analyze) {
-  print(ggplot(aggregated_dt[`Event Type` == this_event & IHEC %in% aggregated_dt[, sample(unique(IHEC), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + theme_bw() + facet_wrap(. ~ IHEC) + labs(title = this_event, y='Count'))
+  print(ggplot(aggregated_dt[`Event Type` == this_event & IHEC %in% aggregated_dt[ID %in% keep_rows, sample(unique(IHEC), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + theme_bw() + facet_wrap(. ~ IHEC) + labs(title = this_event, y='Count'))
   
-  print(ggplot(aggregated_dt[ID %in% aggregated_dt[`Event Type` == this_event, sample(unique(ID), size = 16)]], aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + stat_bin(aes(y=..count.., label=ifelse(..count..==0,"",..count..)), geom="text", hjust=-.5, angle = 90, binwidth = .05) + theme_bw() + facet_wrap(. ~ ID) + labs(title = this_event, y='Count'))
+  print(ggplot(aggregated_dt[ID %in% aggregated_dt[`Event Type` == this_event & ID %in% keep_rows, sample(unique(ID), size = 16)]]
+               # [event_quartiles, on=.(ID), event_str:=paste(ID, 'SD:', round(SD, 2), 'H', round(Entropy, 2), sep=', ')]
+               , aes(x = PSI)) + geom_histogram(color = 'white', binwidth = .05) + stat_bin(aes(y=..count.., label=ifelse(..count..==0,"",..count..)), geom="text", hjust=-.5, angle = 90, binwidth = .05) + theme_bw() + facet_wrap(. ~ Variability + ID) + #event_str) +
+        labs(title = this_event, y='Count'))
   # print(ggplot(aggregated_dt[ID %in% aggregated_dt[`Event Type` == this_event, sample(unique(ID), size = 16)]], aes(x = log(PSI/(1-PSI)))) + geom_histogram(color = 'white', binwidth = .05) + stat_bin(aes(y=..count.., label=ifelse(..count..==0,"",..count..)), geom="text", hjust=-.5, angle = 90, binwidth = .05) + theme_bw() + facet_wrap(. ~ ID) + labs(title = this_event, y='Count'))
 }
 ```
@@ -222,10 +240,10 @@ for (this_event in to_analyze) {
 ```{r, fig.width=16, fig.height=10}
 safe_colorblind_palette <- c("#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499", 
                              "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
-id_vars <- c('IHEC', 'ID', 'Event Type')
+id_vars <- c('IHEC', 'ID', 'Event Type', 'Variability', 'gene_id')
 features <- setdiff(names(aggregated_dt), id_vars)
 marks <- unique(tstrsplit(features, ';', fixed=TRUE, keep = 1)[[1]])
-print(ggplot(melt(aggregated_dt, id.vars = c('IHEC', 'ID', 'Event Type'), measure.vars = features, variable.name = 'feature', value.name = 'value')[, .(sd=sd(value, na.rm=TRUE)), by=.(`Event Type`, feature)], aes(y = reorder(feature, sd), x = sd)) + geom_point() + facet_wrap(.~`Event Type`, ncol=2) + labs(x = 'SD', y = 'Variable') + theme_bw())# + theme(axis.text.x = element_text(angle=, hjust=1)))
+print(ggplot(melt(aggregated_dt[ID %in% keep_rows], id.vars = id_vars, measure.vars = features, variable.name = 'feature', value.name = 'value')[, .(feature_sd=stats::sd(value, na.rm=TRUE)), by=.(`Event Type`, feature)], aes(y = reorder(feature, feature_sd), x = feature_sd)) + geom_point() + facet_wrap(.~`Event Type`, ncol=2) + labs(x = 'SD', y = 'Variable') + theme_bw())# + theme(axis.text.x = element_text(angle=, hjust=1)))
 ggsave(filename = file.path(plot_dir, 'feature_dists',  'sds.pdf'), width = 5, height = 16)
 
 # ggplot(agg_melt, aes(x = value, color = feature)) + geom_density() + facet_wrap(. ~ `Event Type`, nrow=2) + geom_text_repel(
@@ -234,8 +252,8 @@ ggsave(filename = file.path(plot_dir, 'feature_dists',  'sds.pdf'), width = 5, h
 for (mark in marks) {
   agg_melt <-
     melt(
-      aggregated_dt,
-      id.vars = c('IHEC', 'ID', 'Event Type'),
+      aggregated_dt[ID %in% keep_rows],
+      id.vars = id_vars,
       measure.vars = features[startsWith(features, mark)]
     )
   if (any(agg_melt[, grepl(';', variable, fixed = TRUE)])) {

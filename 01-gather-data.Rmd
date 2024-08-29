@@ -249,7 +249,7 @@ grep -E 'transcript_support_level "1";|transcript_support_level "2";' gencode.v2
 # load metadata
 metadata <- data.table::fread(sample_metadata_file)
 metadata <- merge(metadata, sample_dt[assay_type == 'RNA-Seq', .('mRNA'=experiment_type == 'mRNA-Seq'), by=epirr_id_without_version])
-ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Apr_2024_Final.json'), recursive = FALSE)
 sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
     cols <- as.numeric(strsplit(x, ",")[[1]])
     rgb(cols[1], cols[2], cols[3], maxColorValue = 255)

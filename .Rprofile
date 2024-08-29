@@ -15,6 +15,7 @@ library(R.utils)
 library(data.table)
 library(pbmcapply)
 library(ggplot2)
+library(ggpubr)
 library(ggrepel)
 library(umap)
 library(pheatmap)
@@ -62,21 +63,19 @@ control_class <- "excluded"
 case_class <- "included"
 class_levels <- c(control_class, case_class)
 
-classification_measure <- "AUC"
-
-lambda.1sd <- function(model_glmnet, type.measure = classification_measure) {
-  max(model_glmnet$results[
-    model_glmnet$results[[type.measure]] >=
-      (model_glmnet$results[rownames(model_glmnet$bestTune), type.measure] -
-        model_glmnet$results[rownames(model_glmnet$bestTune), paste0(type.measure, "SD")]),
-    "lambda"
-  ], na.rm = TRUE)
-}
+minimum_events <- 25
 
 vicinity <- 5e5
 
 sample_metadata_file <- "IHEC_metadata_harmonization.v1.2.extended.csv"
+ontology_column <- "harmonized_sample_ontology_term_high_order_fig1"
+variability_colors <- c('Low'="#56B4E9", 'All'="#999999", 'High'="#D55E00")  
+
 plot_dir <- "images/Rplots"
+if (!dir.exists(plot_dir)) {
+  dir.create(plot_dir, recursive = TRUE)
+}
+publication_plots_dir <- "../65f465a3da21f80541769df9/images"
 
 split_features <- function(dt, feature_col, sep = ";") {
   dt[, (c("mark", "region")) := tstrsplit(gsub("`", "", get(feature_col)), sep, fixed = TRUE, keep = c(1, 2))]

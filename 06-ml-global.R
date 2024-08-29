@@ -2,20 +2,22 @@ source('06-ml.R')
 
 for (this_event in aggregated_dt[, levels(`Event Type`)]){
   print(this_event)
-  feature_data <- aggregated_dt[this_event == `Event Type`, -'Event Type']
+  feature_data <- aggregated_dt[this_event == `Event Type` & ID %in% keep_rows, -'Event Type']
   # feature_data[, cCRE_near:=ID %in% ids_with_cCREs]
   #names(feature_data)[names(feature_data) != response & keep_cols(feature_data, aggregation) & !grepl('tile', names(feature_data), fixed = TRUE) & !endsWith(names(feature_data), 'percentage') & !endsWith(names(feature_data), 'count') & !endsWith(names(feature_data), 'presence')]
   
   # cCRE_rows <- feature_data[, ID %in% ids_with_cCREs]
   # no_cCRE_rows <- feature_data[, !ID %in% ids_with_cCREs]
   
-  all_var <- feature_data[, ID %in% var_events[[this_event]]$`0`]
-  # high_var <- feature_data[, ID %in% var_events[[this_event]]$`0.5`]
-  # low_var <- feature_data[, ID %in% setdiff(var_events[[this_event]]$`0`, var_events[[this_event]]$`0.5`)]
-  var_list <- list(all_var=all_var)#, low_var=low_var, high_var=high_var)
+  all_var <- feature_data[, rep(TRUE, .N)]
+  high_var <- feature_data[, Variability == 'High Variability']
+  low_var <- feature_data[, Variability == 'Low Variability']
+  var_list <- list(all_var=all_var, low_var=low_var, high_var=high_var)
   
   feature_data[, ID := NULL]
   feature_data[, IHEC := NULL]
+  feature_data[, Variability := NULL]
+  feature_data[, gene_id := NULL]
   
   explanatory_all <- names(feature_data)[!names(feature_data) %in% c(response, grouping_cols)]
   
@@ -46,14 +48,53 @@ for (this_event in aggregated_dt[, levels(`Event Type`)]){
   
   family <- c('binomial')
   alpha <- list(c(1))
-  data_rows <- list(all=TRUE)#c(replicate(length(family)*2, list(all=TRUE)), replicate(length(family), list(nocCRE=no_cCRE_rows)), replicate(length(family) * length(cCRE_type_explanatory), list(cCRE=cCRE_rows)))#replicate(4, cCRE_rows, simplify = FALSE))
-  filter_rows <- unlist(sapply(var_list, function(var) sapply(data_rows, function(data) data & var, simplify = FALSE), simplify = FALSE), recursive = FALSE)
+  # data_rows <- list(all=TRUE)#c(replicate(length(family)*2, list(all=TRUE)), replicate(length(family), list(nocCRE=no_cCRE_rows)), replicate(length(family) * length(cCRE_type_explanatory), list(cCRE=cCRE_rows)))#replicate(4, cCRE_rows, simplify = FALSE))
+  filter_rows <- var_list #unlist(sapply(var_list, function(var) sapply(data_rows, function(data) data & var, simplify = FALSE), simplify = FALSE), recursive = FALSE)
   # run_glmnet(data = feature_data, explanatory = explanatory$all, response = response, filter_rows = filter_rows$high_var.nocCRE, family = family, parallel = parallel, nfolds = nfolds, alpha = alpha[[1]], grouping_cols = grouping_cols)
-  result_names <- paste(this_event, names(filter_rows), names(explanatory), family, sep='_')
-  res_list <- mapply(run_glmnet, SIMPLIFY = FALSE, USE.NAMES = TRUE, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=parallel, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols))
-  # run_glmnet(model_name=result_names[[which(result_names == "SE_all_var.all_onlyEpigenetic_binomial")]], save_model=TRUE, filter_rows=filter_rows[[1]], explanatory=explanatory[[which(result_names == "SE_all_var.all_onlyEpigenetic_binomial")]], family=family, response=response, data=feature_data, parallel=parallel, nfolds=nfolds, alpha=alpha[[1]], grouping_cols=grouping_cols)
-  # res <- slurmR::Slurm_Map(run_glmnet, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=parallel, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols),
-             # mc.cores = ncores, njobs = length(result_names), sbatch_opt = list(time="01:00:00", mem="50G", c="40", p="exbio-cpu"), plan = "submit")
+  
+  combination_ids <- expand.grid(filter_rows=seq_along(filter_rows), explanatory=seq_along(explanatory))
+  
+  result_names <- paste(this_event, names(filter_rows)[combination_ids$filter_rows], names(explanatory)[combination_ids$explanatory], family, sep='_')
+  res_list <- mapply(run_glmnet, SIMPLIFY = FALSE, USE.NAMES = TRUE, model_name=result_names, save_model=TRUE, filter_rows=filter_rows[combination_ids$filter_rows], explanatory=explanatory[combination_ids$explanatory], family=family, response=response, data=list(feature_data), parallel=parallel, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols))
+  # test_id <- which(result_names == 'RI_high_var_noEpigenetic_binomial')
+  # run_glmnet(
+  #   model_name = result_names[test_id],
+  #   save_model = TRUE,
+  #   filter_rows = filter_rows[[combination_ids$filter_rows[test_id]]],
+  #   explanatory = explanatory[[combination_ids$explanatory[test_id]]],
+  #   family = family,
+  #   response = response,
+  #   data = feature_data,
+  #   parallel = parallel,
+  #   nfolds = nfolds,
+  #   alpha = alpha[[1]],
+  #   grouping_cols = grouping_cols
+  # )
+  # res <-
+  #   slurmR::Slurm_Map(
+  #     f = run_glmnet,
+  #     model_name = result_names,
+  #     data = list(feature_data),
+  #     explanatory = explanatory[combination_ids$explanatory],
+  #     filter_rows = filter_rows[combination_ids$filter_rows],
+  #     family = family,
+  #     response = response,
+  #     nfolds = nfolds,
+  #     parallel = parallel,
+  #     save_model = TRUE,
+  #     alpha = alpha,
+  #     grouping_cols = list(grouping_cols),
+  #     njobs = length(result_names),
+  #     mc.cores = ncores,
+  #     plan = "submit",
+  #     sbatch_opt = list(
+  #       time = "01:00:00",
+  #       mem = "50G",
+  #       c = "40",
+  #       p = "exbio-cpu"
+  #     ),
+  #     export = ls()
+  #   )
   # clustermq::Q(run_glmnet, model_name=result_names, save_model=TRUE, filter_rows=filter_rows, explanatory=explanatory, family=family, response=response, data=list(feature_data), parallel=TRUE, nfolds=nfolds, alpha=alpha, grouping_cols=list(grouping_cols), n_jobs = 3, log_worker=TRUE, memory="60G", template=list(cores=40))
   # names(res_list) <- 
   

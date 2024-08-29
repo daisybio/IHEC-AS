@@ -11,20 +11,21 @@ run_glmnet <-
            scale_explanatory = TRUE,
            scale_response = FALSE,
            family = 'gaussian',
-           type.measure = ifelse(family == 'gaussian', 'mse', 'Balanced Accuracy'),
+           type.measure = ifelse(family == 'gaussian', 'mse', 'BalancedAccuracy'),
            nfolds = 5,
            parallel = FALSE,
            alpha = 1,
+           # lambda_list = NULL,
            seed = 1234,
            grouping_cols = c("seqnames", "harmonized_sample_ontology_term_high_order_fig1"),
            save_model = FALSE,
-           v = TRUE,
+           verbose = TRUE,
            robust_features = FALSE) {
     if (parallel) {
       require(doMC)
       registerDoMC(min(ncores, nfolds))
     }
-    print(model_name)
+    if (verbose) print(model_name)
     # set seed
     set.seed(seed)
     # make copy so we don't change original data by reference
@@ -59,7 +60,7 @@ run_glmnet <-
         cumsum(group_counts) >= (perc_test * this_data[, .N])
       )))]
     }, simplify = FALSE)
-    if (v)
+    if (verbose)
       sapply(grouping_cols, function(group)
         message(
           paste0(
@@ -81,7 +82,7 @@ run_glmnet <-
       # split in included and excluded
       dichotomization_thresholds <-
         c(1 / 3, 2 / 3) # this_data[, quantile(get(response), c(1/3, 2/3))]
-      if (v)
+      if (verbose)
         message(
           paste(
             'dichotomization thresholds:',
@@ -104,7 +105,7 @@ run_glmnet <-
       real_test_ids <-
         Reduce(intersect, lapply(names(test_by_group), function(grouping_col)
           test_data[get(grouping_col) %in% test_by_group[[grouping_col]], which = TRUE]))
-      if (v) {
+      if (verbose) {
         message(
           sprintf(
             "Number of train samples: %d, Number of test samples: %d, Percentage %.2f",
@@ -151,7 +152,7 @@ run_glmnet <-
     # this_data[, (explanatory) := lapply(.SD, as.numeric), .SDcols = explanatory]
     # test_data[, (explanatory) := lapply(.SD, as.numeric), .SDcols = explanatory]
     
-    # now replace NA by mean value and
+    # now replace NA by mean value and scale explanatory vars
     for (j in which(names(this_data) %in% explanatory)) {
       this_mean <- mean(this_data[[j]], na.rm = TRUE)
       set(this_data, which(is.na(this_data[[j]])), j, this_mean)
@@ -181,7 +182,7 @@ run_glmnet <-
     # make cv
     #TODO: find way to split into foldid somthing like this: sapply(grouping_cols, function(group) caret::groupKFold(this_data[, factor(get(group))], nfolds))
     cvfit <- list()
-    if (v) message('finding folds')
+    if (verbose) message('finding folds')
     
     if (is.null(grouping_cols)) {
       folds <-
@@ -219,7 +220,7 @@ run_glmnet <-
     # lapply(folds, function(ids) this_data[-ids, table(get(response), droplevels(seqnames))])
     
     for (random in c(FALSE, TRUE)) {
-      if (v) message(sprintf("random: %s", random))
+      if (verbose) message(sprintf("random: %s", random))
       if (random)
         this_data[, (response) := sample(get(response))]
       
@@ -239,17 +240,24 @@ run_glmnet <-
         #                 length.out = 100))
         # for (link in c('identity')) {
           #, 'logit')) {
+        
         # my_lm <- lm(PSI ~ ., data = as.data.frame(cbind(this_data[, 'PSI'], makeX(this_data[, "harmonized_sample_ontology_term_high_order_fig1"]))))
         # lm_dt <- data.table(pred=predict(my_lm), trues=this_data[, PSI], sample_ontology=this_data$harmonized_sample_ontology_term_high_order_fig1)
         # lm_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
         # ggplot(lm_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
-        # # 
-        # my_lme <- lme4::lmer(PSI ~ + gene_expression + (gene_expression|harmonized_sample_ontology_term_high_order_fig1), data = this_data)
+        # # # 
+        # my_lme <- lme4::lmer(PSI ~ gene_expression + (gene_expression|harmonized_sample_ontology_term_high_order_fig1), data = this_data)
         # lme_dt <- data.table(pred=predict(my_lme), trues=this_data[, PSI], sample_ontology=this_data$harmonized_sample_ontology_term_high_order_fig1, gene_expression=this_data$gene_expression)
         # lme_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
         # ggplot(lme_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
-        # ggplot(lme_dt, aes(y = trues, y = gene_expression, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
-        # # 
+        # ggplot(lme_dt, aes(y = trues, x = gene_expression, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
+        # #
+        # my_lm_ge <- lm(PSI ~ gene_expression, data = this_data)
+        # lm_ge_dt <- data.table(pred=predict(my_lm_ge), trues=this_data[, PSI], sample_ontology=this_data$harmonized_sample_ontology_term_high_order_fig1, gene_expression=this_data$gene_expression)
+        # lm_ge_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
+        # ggplot(lm_ge_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
+        # ggplot(lm_ge_dt, aes(y = trues, x = gene_expression, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
+        # # # 
         # full_lm <- glm(
         #   formula = formula(paste(
         #     response,
@@ -263,7 +271,7 @@ run_glmnet <-
         # full_lm_dt <- data.table(pred=predict(full_lm), trues=this_data[, PSI], sample_ontology=this_data$harmonized_sample_ontology_term_high_order_fig1)
         # full_lm_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
         # ggplot(full_lm_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
-        # 
+        # # 
         # epi_lm <- glm(
         #   formula = formula(paste(
         #     response,
@@ -278,15 +286,20 @@ run_glmnet <-
         # ggplot(epi_lm_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + scale_color_manual(values = sample_hex_colors)
         
         
-          if (v) message(sprintf("glmnet"))
+          if (verbose) message(sprintf("glmnet"))
           # browser()
+          penalty.factor <- rep(1, length(explanatory))
+          penalty.factor[explanatory == 'gene_expression'] <- 0
+          
           orig_glmnet <-
             cv.glmnet(
               as.matrix(this_data[, ..explanatory]),
               this_data[, get(response)],
+              # lambda = lambda_list[[as.character(random)]],
               family = 'gaussian', #(link = link),
-              type.measure = 'mse',
+              type.measure = type.measure,
               foldid = foldid,
+              penalty.factor = penalty.factor,
               parallel = parallel,
               keep = FALSE,
               alpha = alpha
@@ -327,15 +340,17 @@ run_glmnet <-
             coef(this_cvfit[[paste(random, alpha, sep = "::")]], s = my_lambda)# this_cvfit[[paste(random, alpha, sep = "::")]]$bestTune$lambda) #model_glmnet$bestTune$lambda)
           nonzero_explanatory <-
             rownames(coefs)[as.matrix(coefs != 0 &
-                                        rownames(coefs) != '(Intercept)')]
+                                        !rownames(coefs) %in% c('(Intercept)', 'gene_expression'))]
           if (length(nonzero_explanatory) > 0) {
             fold_features <- lapply(folds, function(ids) {
               net <- glmnet(as.matrix(this_data[ids, ..explanatory]),
                               this_data[ids, get(response)],
                               family = 'gaussian', #(link = link),
-                              type.measure = 'mse',
+                              type.measure = type.measure,
+                              penalty.factor = penalty.factor,
                               keep = FALSE,
-                              alpha = alpha, lambda = orig_glmnet$lambda)
+                              alpha = alpha,
+                              lambda = orig_glmnet$lambda)
               single_coefs <- coef(net, s = orig_glmnet$lambda.1se)[coef(net, s = orig_glmnet$lambda.1se)[, 1] != 0, ][-1]
               names(single_coefs)
               })
@@ -441,7 +456,7 @@ run_glmnet <-
           method = "cv",
           index = folds,
           search = 'grid',
-          verboseIter = v,
+          verboseIter = verbose,
           classProbs = TRUE,
           allowParallel = parallel,
           returnData = FALSE,
@@ -457,6 +472,7 @@ run_glmnet <-
                 prSummary(data, lev, model),
                 MCC = ModelMetrics::mcc(ifelse(data$obs == case_class, 1, 0), data[[case_class]], 0.5)
               )
+            names(out) <- gsub(' ', '', names(out), fixed = TRUE)
             return(out)
           },
           selectionFunction = "oneSE"
@@ -480,7 +496,8 @@ run_glmnet <-
         # cvfit_test_results[[control_class]] <- 1 - cvfit_test_results[[case_class]]
         # twoClassSummary(cvfit_test_results, lev = class_levels)
         # caret::confusionMatrix(data=cvfit_test_results[, pred], reference=test_data[, get(response)], positive=case_class, mode='everything')
-        if (v) message(sprintf("glmnet"))
+        case_weights <- this_data[, as.numeric(1 / (table(get(response))[get(response)] / length(get(response))))]
+        if (verbose) message(sprintf("glmnet"))
         model_glmnet <-
           caret::train(
             x = this_data[, ..explanatory],
@@ -488,6 +505,7 @@ run_glmnet <-
             method = 'glmnet',
             metric = type.measure,
             trControl = myControl,
+            weights = case_weights,
             tuneGrid = expand.grid(alpha = alpha,
                                    lambda = 10 ^ -(rev(
                                      seq(1, 4, length.out = 21)
@@ -539,13 +557,15 @@ run_glmnet <-
             )
           this_cvfit[[paste(random, "OLS", sep = "::")]]$data <- NULL
         }
-        if (v) message(sprintf("ranger"))
+        if (verbose) message(sprintf("ranger"))
         model_ranger <-
           caret::train(
             x = this_data[, ..explanatory],
             y = this_data[, get(response)],
             method = 'ranger',
             metric = type.measure,
+            sample.fraction = rep(this_data[, min(table(get(response)))/.N], 2),
+            # case.weights = case_weights,
             # class.weights = this_data[, table(get(response))/.N],
             #sample.
             num.threads = ifelse(parallel, max(floor(ncores/nfolds), 1L), 1L),
@@ -564,7 +584,6 @@ run_glmnet <-
             importance = "impurity"
           )
         this_cvfit[[paste(random, "RF", sep = "::")]] <- model_ranger
-        
         # train_results <- cbind(data.table(obs = this_data[, get(response)], data.table(model_ranger$finalModel$predictions)))
         # train_results[, pred := ordered(ifelse(model_ranger$finalModel$predictions[, control_class] > model_ranger$finalModel$predictions[, case_class], control_class, case_class))]
         # twoClassSummary(train_results, lev = class_levels)
@@ -642,7 +661,7 @@ run_glmnet <-
     }
     if (save_model)
     {
-      if (v) message(sprintf("writing model ..."))
+      if (verbose) message(sprintf("writing model ..."))
       saveRDS(object = res_list, file = paste0(model_name, '.rds'))}
     return(res_list)
   }

@@ -24,18 +24,26 @@ load('aggregating.rda')
 #     cols <- as.numeric(strsplit(x, ",")[[1]])
 #     rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
 # })
+event_folder <- 
+                  # "event_models"
+                  "event_models_smaller"
+                  # "event_models_local"
+# create event specific publication plot folder
+publication_plots_dir <- file.path(publication_plots_dir, event_folder)
+dir.create(publication_plots_dir, showWarnings = FALSE)
+plot_dir <- file.path(plot_dir, event_folder)
+dir.create(plot_dir, showWarnings = FALSE)
 ```
 
 
-```{r}
-event_folder <- 
-                  "event_models"
-                  # "event_models_smaller"
-                  # "event_models_local"
+```{r, eval = FALSE}
+rotated_folder <- paste(event_folder, "rotated", sep = "_")
+filtered_folder <- paste(event_folder, "filtered", sep = "_")
                 
 # read only the event models where there is also an OLS model, i.e., there exists a robust version
 event_files <- list.files(event_folder, pattern = 'robust.rds$', full.names = TRUE)
-event_files_different_psi <- list.files(paste(event_folder, "rotated", sep = "_"), pattern = 'robust.rds$', full.names = TRUE)
+event_files_different_psi <- list.files(rotated_folder, pattern = 'robust.rds$', full.names = TRUE, recursive = TRUE)
+event_files_filtered <- list.files(filtered_folder, pattern = 'robust.rds$', full.names = TRUE)
 
 # # Get the file info for all files
 # files_info <- file.info(event_files)
@@ -44,19 +52,31 @@ event_files_different_psi <- list.files(paste(event_folder, "rotated", sep = "_"
 # one_hour_ago <- Sys.time() - .5*60*60
 # event_files <- rownames(subset(files_info, mtime > one_hour_ago))
 
-event_list <- pbmcapply::pbmclapply(event_files, readRDS)
-  # pbapply::pb
+event_list <- #pbmcapply::pbmclapply
+              pbapply::pblapply(event_files, readRDS)
 names(event_list) <- sub(".rds", '', basename(event_files), fixed = TRUE)
 
-event_list_different_psi <- pbmcapply::pbmclapply(event_files_different_psi, readRDS)
-  # pbapply::pb
+event_list_different_psi <- #pbmcapply::pbmclapply
+                            pbapply::pblapply(event_files_different_psi, readRDS)
 names(event_list_different_psi) <- paste('rotated', sub(".rds", '', basename(event_files_different_psi), fixed = TRUE), sep = '_')
 
-event_list <- c(event_list, event_list_different_psi)
+rotated_index <- basename(dirname(event_files_different_psi))
+
+names(event_list_different_psi) <- paste0(names(event_list_different_psi), 'rotatedindex', rotated_index)
+
+event_list_filtered <- #pbmcapply::pbmclapply
+                      pbapply::pblapply(event_files_filtered, readRDS)
+names(event_list_filtered) <- paste('filtered', sub(".rds", '', basename(event_files_filtered), fixed = TRUE), sep = '_')
+
+
+event_list <- c(event_list, 
+                event_list_different_psi,
+                event_list_filtered
+                )
 ```
 
 
-```{r}
+```{r, eval = FALSE}
 events_with_OLS <- sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))
 
 anova_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
@@ -70,50 +90,59 @@ anova_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id)
     if(length(model$cvfit[[paste0(random, '::FEATURES')]]$full) >= (model$nsamples - 2))
       return(NULL)
     anova_base_res <- #tryCatch({
-      anova(ols_base, ols, test = 'Chi')
+      anova(ols_base, ols, test = 'F')
     # }, error = function(e) {
     #   browser()
     #   matrix(nrow = 2, ncol = 5)
     # })
     anova_res <- #tryCatch({
-      anova(ols, ols_ge, test = 'Chi')
+      anova(ols, ols_ge, test = 'F')
     # }, error = function(e) {
     #   browser()
     #   matrix(nrow = 2, ncol = 5)
     # })
-    orig_ge <- 'gene_expression' %in% model$cvfit[[paste0(random, '::FEATURES')]]$full
-    return(data.table(gene_expression_selected = orig_ge,
-                      anova_pval = anova_res[2, 5],
-                      anova_base_pval = anova_base_res[2, 5]))
+    return(data.table(#gene_expression_selected = summary(ols_ge)[["coefficients"]]['gene_expression', 'Pr(>|t|)'],
+                      anova_pval = anova_res[2, 'Pr(>F)'],
+                      anova_base_pval = anova_base_res[2, 'Pr(>F)']))
   }, simplify = FALSE), idcol = 'random')
 }, simplify = FALSE), idcol = 'event')
 
 anova_table[is.na(anova_pval), expression_bias:='expression bias']
 
+anova_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
+
 anova_table[, robust := 'not robust']
 anova_table[endsWith(event, '_robust'), robust := 'robust']
+anova_table[startsWith(event, 'filtered_'), robust := 'filtered']
 
 anova_table[, rotated := 'not rotated']
 anova_table[startsWith(event, 'rotated_'), rotated := 'rotated']
 
 # remove the _robust suffix and the rotated_ prefix
-anova_table[, ID:=as.integer(gsub('_robust|rotated_', '', event))]
+anova_table[, ID:=as.integer(gsub('(to\\d+)?_robust|rotated_|filtered_', '', event))]
+# add the ID that this mapped to
+anova_table[, rotated_index:=as.integer(gsub('rotatedindex', '', rotated_index))]
 
-anova_table[event_dt, on=.(ID), 'Event Type':= `Event Type`]
+anova_table[event_dt, on=.(ID), c('Event Type', 'Variability'):= .(`Event Type`, Variability)]
 anova_table[random == TRUE, response := 'randomized response']
 anova_table[random == FALSE, response := 'real response']
 anova_table[random == FALSE & rotated == 'rotated', response := 'rotated response']
+# anova_table[random == FALSE & rotated == 'rotated', response := 'rotated response']
+anova_table[, response := factor(response, levels = c('real response', 'rotated response', 'randomized response'))]
 anova_table <- anova_table[!(random == "TRUE" & rotated == 'rotated')]
 
-anova_table[, padj := p.adjust(anova_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated)]
+anova_table[, padj := p.adjust(anova_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated, rotated_index)]
 anova_table[, expression_bias := ifelse(padj <= .05, 
-                                        'expression bias',
-                                        'epigenetic only')]
-anova_table[gene_expression_selected == TRUE, expression_bias:='expression bias']
-anova_table[, padj_base := p.adjust(anova_base_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated)]
+                                        'Expression Bias',
+                                        'Epigenetic Only')]
+# anova_table[gene_expression_selected == TRUE, expression_bias:='Expression Bias']
+anova_table[, padj_base := p.adjust(anova_base_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated, rotated_index)]
 anova_table[, intercept_only := ifelse(padj_base > .05, 
                                         'intercept_only',
                                         'complex model')]
+# anova_table[ID %in% c(var_events$SE$`0.5`, var_events$RI$`0.5`), var:='high var']
+# anova_table[is.na(var), var:='low var']
+# anova_table[, var:=factor(var, levels=c('high var', 'low var'))]
 stopifnot(anova_table[, all('intercept only' != intercept_only, na.rm = TRUE)])
 
 # Test for checking that each model has one robust and one non-robust version
@@ -121,14 +150,10 @@ stopifnot(anova_table[, all('intercept only' != intercept_only, na.rm = TRUE)])
 ```
 
 
-```{r, fig.width=14, fig.height=7}
-ggplot(anova_table, aes(x = expression_bias, fill=gene_expression_selected)) + geom_bar(position = 'dodge') + facet_wrap(~ `Event Type` + response + robust, scales = 'free', nrow = 2) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) +
-  #add text to each bar with the number of events
-  geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=1.3)
-```
 
-```{r}
-add_vector <- c('gene_expression_selected', 'expression_bias', 'ID', 'response', 'Event Type', 'robust')
+```{r, eval = FALSE}
+add_vector <- c(#'gene_expression_selected', 
+                'expression_bias', 'ID', 'response', 'Event Type', 'robust', 'Variability')
 
 feature_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
   model <- event_list[[id]]
@@ -140,6 +165,7 @@ feature_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(i
     return(rbindlist(lapply(features, function(f) data.table(feature = f)), idcol = 'fold'))
   }, simplify = FALSE), idcol = 'random')
 }, simplify = FALSE), idcol = 'event')
+feature_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
 feature_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
 feature_table <- na.omit(feature_table, cols=add_vector)
 
@@ -155,6 +181,7 @@ coef_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
     return(res_dt)
   }, simplify = FALSE), idcol = 'random')
 }, simplify = FALSE), idcol = 'event')
+coef_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
 coef_table[, let(c('mark', 'region'), tstrsplit(feature, ';', fixed=TRUE))]
 coef_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
 coef_table <- na.omit(coef_table, cols=add_vector)
@@ -216,13 +243,17 @@ pred_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
                      ),
          gene_expression='gene_expression' %in% model$cvfit[[paste0(random, '::FEATURES')]],
          n_var=length(new_explanatory),
-         nsamples=model$nsamples
+         nsamples=model$nsamples,
+         fold=model$foldid
          #, ntest=test_data[, .N]
          )
   }, simplify = FALSE), idcol = 'random')
 }, simplify = FALSE), idcol = 'event')
+pred_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
 
-metric_table <- pred_table[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples)] #, ntest)]
+metric_table <- pred_table[, .(r=suppressWarnings(cor(pred, trues)), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples)] #, ntest)]
+metric_table[, fold:=0]
+metric_table <- rbind(metric_table, pred_table[, .(r=suppressWarnings(cor(pred, trues)), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples, fold)])
 metric_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
 metric_table <- na.omit(metric_table, cols=add_vector)
 
@@ -231,28 +262,121 @@ metric_table <- na.omit(metric_table, cols=add_vector)
 
 # Test for checking bot the robust and not robust models have the same features
 # stopifnot(coef_table[, .(robust_subset=all(.SD[robust=='robust', feature] %in% .SD[robust=='not robust', feature])), by=.(ID, response)][, all(robust_subset)])
+rm(event_list_different_psi)
+rm(event_list)
+gc()
+# export all _tables
+fwrite(pred_table, file.path(event_folder, 'pred_table.csv.gz'))
+fwrite(metric_table, file.path(event_folder, 'metric_table.csv.gz'))
+fwrite(coef_table, file.path(event_folder, 'coef_table.csv.gz'))
+fwrite(anova_table, file.path(event_folder, 'anova_table.csv.gz'))
+fwrite(feature_table, file.path(event_folder, 'feature_table.csv.gz'))
+```
+
+# Load precomputed tables 
+```{r}
+# read in all _tables
+pred_table <- fread(file.path(event_folder, 'pred_table.csv.gz'), stringsAsFactors = TRUE)
+metric_table <- fread(file.path(event_folder, 'metric_table.csv.gz'), stringsAsFactors = TRUE)
+metric_table[, `Event Type` := factor(`Event Type`, levels=to_analyze)]
+coef_table <- fread(file.path(event_folder, 'coef_table.csv.gz'), stringsAsFactors = TRUE)
+anova_table <- fread(file.path(event_folder, 'anova_table.csv.gz'), stringsAsFactors = TRUE)
+anova_table[, to_ID:=as.integer(gsub('rotated_\\d+to(\\d+)_robust(_robust)?', '\\1', event))]
+anova_table[rotated == 'not rotated', `Rotated Hit` := ifelse(ID %in% anova_table[, unique(to_ID)], 'Hit by Rotation', 'Not Hit')]
+coef_table[anova_table, on=.(event), `Rotated Hit`:= .(`Rotated Hit`)]
+feature_table <- fread(file.path(event_folder, 'feature_table.csv.gz'), stringsAsFactors = TRUE)
 ```
 
 
 ```{r}
-# no model built:
-aggregated_dt[!ID %in% anova_table[random == FALSE, unique(ID)], .(ID=uniqueN(ID)), by=`Event Type`]
+event_counts <- rbindlist(list(Filtered=event_dt[ID %in% keep_rows, .(.N), by=.(`Event Type`)], # filtered events
+          Quantified=aggregated_dt[, .(N=uniqueN(ID)), by=`Event Type`], # events quantified:
+          # `Not Quantified`=event_dt[ID %in% setdiff(keep_rows, aggregated_dt[, unique(ID)])][, .N, by=`Event Type`], # no event quantified:
+          `No Model`=aggregated_dt[!ID %in% anova_table[random == FALSE & rotated == 'not rotated', unique(ID)], .(N=uniqueN(ID)), by=`Event Type`], # no model built:
+          `Model`=anova_table[rotated == 'not rotated' & random == FALSE & robust == 'robust', .N, by=.(`Event Type`)], # models built:
+          `Epigenetic\nOnly Model`=anova_table[rotated == 'not rotated' & random == FALSE & robust == 'robust' & expression_bias == 'Epigenetic Only', .N, by=.(`Event Type`)]# epigenetic only:
+          ), idcol = 'filtering')
+# event_counts[`Event Type` == 'RI', N:=-N]
 
-# no event quantified:
-event_dt[ID %in% setdiff(keep_rows, aggregated_dt[, unique(ID)])][, .N, by=`Event Type`]
+# events built:
+print(anova_table[, table(expression_bias, response, robust, `Event Type`)])
 
-# events quantified:
-aggregated_dt[, .(ID=uniqueN(ID)), by=`Event Type`]
+ggplot(event_counts, aes(x=N, y=reorder(filtering, N))) + 
+  geom_col() + 
+  theme_bw() + 
+  theme(strip.background = element_rect(fill = 'white'), text = element_text(size = 20), axis.text.x = element_blank()) +
+  facet_wrap(~ `Event Type`, scales = 'free_x') +
+  # add label with the exact number and rotate by 90 degrees
+  geom_text(aes(label=N), vjust=1.1, size=4, angle=90) +
+  labs(x='Number of Events', y=NULL) # make fill colors use 
+ggsave(file.path(plot_dir, 'event_counts.pdf'), width = 7, height = 3)
 ```
 
 
-```{r, fig.width=12, fig.height=8}
-ten_plot_dt <- pred_table[event == '100_robust' & model == 'ols']
-ten_dt <- fread("event_models/feature_table_100.csv.gz")
+```{r, fig.width=24, fig.height=7}
+ggplot(anova_table, aes(x = expression_bias, #fill=gene_expression_selected, 
+                        fill = Variability)) + geom_bar() + facet_grid(`Event Type` ~ response + robust + rotated_index, scales = 'free_y') + theme_bw() + theme(strip.background = element_rect(fill = 'white')) + #scale_fill_manual(values = c('TRUE' = 'lightgrey', 'FALSE' = 'grey20')) + 
+  scale_fill_manual(values=c('Low Variability'=variability_colors[['Low']], 'High Variability'=variability_colors[['High']])) + geom_text(aes(label = after_stat(count)), stat='count', vjust=1.3)
+```
+
+```{r}
+event_count_dt <- anova_table[robust != 'filtered', {counts=.SD[, .(count=.N), by=rotated_index][, count]; .(mean_count=mean(counts), sd_count=sd(counts)/sqrt(uniqueN(rotated_index)))}, by=.(`Event Type`, response, #gene_expression_selected, 
+  expression_bias, Variability, `Rotated Hit`)]
+event_count_dt[response == 'real response', response := 'Real']
+event_count_dt[response == 'rotated response', response := 'Rotated']
+event_count_dt[response == 'randomized response', response := 'Random']
+event_count_dt[, response := factor(response, levels=c('Real', 'Rotated', 'Random'))]
+event_count_dt[expression_bias == 'Expression Bias', expression_bias := 'Expression\nBias']
+event_count_dt[expression_bias == 'Epigenetic Only', expression_bias := 'Epigenetic\nOnly']
+# split Variability from the levels
+event_count_dt[, Variability := sub(' Variability', '', Variability, fixed = TRUE)]
+event_count_dt[, Variability := factor(Variability, levels=c('High', 'Low'))]
+event_count_dt[, `Event Type` := factor(`Event Type`, levels=c('SE', 'RI'))]
+event_count_dt[order(Variability, decreasing = TRUE), cumsum_mean_count:=cumsum(mean_count), by=.(`Event Type`, response, #`Rotated Hit`,
+                                                                                             expression_bias)]
+ggplot(event_count_dt, #[response != 'randomized response'], 
+       aes(y = mean_count, x = expression_bias, fill = Variability)) + 
+    geom_col() + 
+    facet_grid(`Event Type` ~ response# + `Rotated Hit`
+               , scales='free_y') + theme_bw() + 
+    theme(legend.box="vertical", strip.background = element_rect(fill = 'white'), legend.position = 'bottom', axis.title.x=element_blank()) + 
+    scale_fill_manual(values=variability_colors) + 
+    labs(y = 'Number of Events', color = 'Gene Expression Selected') +
+    geom_errorbar(aes(y=cumsum_mean_count, ymin=cumsum_mean_count-sd_count, ymax=cumsum_mean_count+sd_count), width=.2) #
+    # geom_text(aes(label=mean_count), position=position_dodge(width=0.9), vjust=1.3)
+ggsave(file.path(plot_dir, 'events_rotation.png'), width=6, height=3)
+ggsave(file.path(publication_plots_dir, 'events_rotation.png'), width=6, height=3, dpi = 600)
+# ggsave(file.path(publication_plots_dir, 'events_rotation.pdf'), width=6, height=3)
+
+event_count_dt[order(Variability, decreasing = TRUE), cumsum_mean_count_rotation:=cumsum(mean_count), by=.(`Event Type`, response, `Rotated Hit`,
+                                                                                             expression_bias)]
+event_count_dt[response == 'Real', expression_bias:=sub('\n', ' ', expression_bias, fixed = TRUE)]
+ggplot(event_count_dt[response == 'Real'],
+       aes(y = mean_count, x = Variability, fill = expression_bias)) +
+    geom_col(position='fill') + 
+    geom_text(aes(label = mean_count), 
+              position = position_fill(vjust = 0.5)) + 
+    facet_grid(`Event Type` ~ `Rotated Hit`, scales='free_y') + 
+    theme_bw() + 
+    theme(legend.box = "vertical", 
+          strip.background = element_rect(fill = 'white'), 
+          legend.position = 'bottom') + 
+    scale_fill_manual(values=c(`Epigenetic Only` = 'orange', `Expression Bias` = 'steelblue')) +
+    labs(y = 'Proportion of Events', fill=NULL)
+ggsave(file.path(plot_dir, 'events_hit.png'), width=5, height=3)
+ggsave(file.path(publication_plots_dir, 'events_hit.pdf'), width=5, height=3)
+
+```
+
+```{r, fig.width=12, fig.height=8, eval=FALSE}
+ten_dt <- fread("event_feature_tables/feature_table_10010.csv.gz")
+for(this_model in c('logit', 'ols')){
+ten_plot_dt <- pred_table[event == '10010_robust' & model == this_model]
 stopifnot(identical(ten_plot_dt$trues, ten_dt$PSI))
 ten_plot_dt[, sample_ontology := ten_dt$harmonized_sample_ontology_term_high_order_fig1]
 # ten_plot_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
-ggplot(ten_plot_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(ten_plot_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+print(ggplot(ten_plot_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(ten_plot_dt[, paste0('Original LM ', this_model, ' r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))]))
+}
 # ggpubr::ggscatterhist(ten_plot_dt, x = 'trues', y = 'pred', color = 'sample_ontology') + geom_abline(intercept = 0, slope = 1)
 
 ten_dt[, harmonized_sample_ontology_term_high_order_fig1:=as.factor(harmonized_sample_ontology_term_high_order_fig1)]
@@ -260,14 +384,14 @@ ten_dt[, harmonized_sample_ontology_term_high_order_fig1:=as.factor(harmonized_s
 lm_ten <- lm(PSI ~ ., data = as.data.frame(cbind(ten_dt[, 'PSI'], makeX(ten_dt[, "harmonized_sample_ontology_term_high_order_fig1"]))))
 lm_ten_dt <- data.table(pred=predict(lm_ten), trues=ten_dt[, PSI], sample_ontology=ten_dt$harmonized_sample_ontology_term_high_order_fig1)
 # lm_ten_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
-ggplot(lm_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lm_ten_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+ggplot(lm_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lm_ten_dt[, paste0('Mean cell type r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
 
 # ten_dt[, `H3K36me3;event_name`:=scale(`H3K36me3;event_name`)]
 ten_dt[, gene_expression:=scale(gene_expression)]
 lme_ten <- lme4::lmer(PSI ~ gene_expression + (gene_expression|harmonized_sample_ontology_term_high_order_fig1), data = ten_dt)
 lme_ten_dt <- data.table(pred=predict(lme_ten), trues=ten_dt[, PSI], sample_ontology=ten_dt$harmonized_sample_ontology_term_high_order_fig1)
 # lme_ten_dt[, .(r=cor(pred, trues), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues))]
-ggplot(lme_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lme_ten_dt[, paste0('r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
+ggplot(lme_ten_dt, aes(x = trues, y = pred, color = sample_ontology)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + theme_bw() + guides(color=guide_legend(ncol=2)) + ggtitle(lme_ten_dt[, paste0('gene_expression|cell_type r=', round(cor(pred, trues), 2), ', r2=', round(MLmetrics::R2_Score(pred, trues), 2), ', mse=', round(MLmetrics::MSE(pred, trues), 2), ', rmse=', round(MLmetrics::RMSE(pred, trues), 2), ', mae=', round(MLmetrics::MAE(pred, trues), 2))])
 ```
 
 ```{r, fig.width=14, fig.height=12, eval=FALSE}
@@ -291,22 +415,172 @@ ggplot(dcast(coef_table[, .(n_features = uniqueN(feature) - 1), by=.(ID, respons
 ggsave(file.path(plot_dir, 'n_features_scatter.pdf'), width = 10, height = 5)
 ```
 
-# Comparison between logit, ols and ols_ge:
+# check which events are more often predicted or whose features can predict better
+```{r, eval=FALSE}
+file_dt <- data.table(filename = list.files(paste(event_folder, "rotated", sep = "_"), recursive = TRUE, include.dirs = FALSE))
+file_dt[, rotation_index := dirname(filename)]
+file_dt[, c('from', 'to') := tstrsplit(gsub('_robust', '', basename(tools::file_path_sans_ext(filename)), fixed=TRUE), "to", fixed=TRUE)]
+file_dt <- rbind(file_dt, file_dt[!from %in% to, .(filename=NA, from=NA, to=from), by = rotation_index])
+aggregated_file_dt <- file_dt[, .(N=uniqueN(from)), by=.(rotation_index, to)]
+ggplot(file_dt[, .(N=uniqueN(na.omit(from))), by=.(rotation_index, to)], aes(x = N)) + geom_histogram(binwidth = 1, color = 'white') + facet_wrap(~ rotation_index)
+```
 
-```{r,fig.width=10, fig.height=12}
+```{r, eval=FALSE}
+event_dt[anova_table[response == 'rotated response', .N, by = to_ID][order(-N)][1:5, to_ID], .(ID, event_id, gene_id, alternative_transcripts)]
+
+for (this_event in to_analyze) {
+  print(this_event)
+  tmp_table <- anova_table[`Event Type` == this_event]
+  for (i in tmp_table[, na.omit(unique(rotated_index))]) {
+    print(upset(UpSetR::fromList(list(
+      to=tmp_table[response == 'rotated response' & rotated_index == i, unique(to_ID)], 
+      from=tmp_table[response == 'rotated response' & rotated_index == i, unique(ID)], 
+      real=tmp_table[response == 'real response' & robust != 'filtered', unique(ID)]
+    )), nintersects = NA, order.by = "freq"))
+  }
+  print(upset(UpSetR::fromList(list(
+    to = tmp_table[response == 'rotated response', unique(to_ID)], 
+    from = tmp_table[response == 'rotated response', unique(ID)], 
+    real = tmp_table[response == 'real response' & robust != 'filtered', unique(ID)]
+  )), nintersects = NA, order.by = "freq"))
+  
+  print(ggplot(tmp_table[response == 'rotated response', .N, by = to_ID], aes(x = N)) + stat_ecdf())
+  print(ggplot(tmp_table[response == 'rotated response', .N, by = ID], aes(x = N)) + stat_ecdf())
+  # print(ggplot(tmp_table[response == 'real response' & robust != 'filtered', .N, by = ID], aes(x = N)) + geom_bar())
+}
+```
+
+# check filtered vs not filtered
+
+```{r}
+# get the list of IDs for the intersection and the set differences for the IDs that are robust and filtered for each event type
+filtered_vs_robust_ids <- sapply(to_analyze, function(this_event) {
+  robust_ids <- anova_table[response == 'real response' & `Event Type` == this_event & robust == "robust", ID]
+  filtered_ids <- anova_table[response == 'real response' & `Event Type` == this_event & robust == "filtered", ID]
+  list(intersection=intersect(robust_ids, filtered_ids), robust_only=setdiff(robust_ids, filtered_ids), filtered_only=setdiff(filtered_ids, robust_ids))
+})
+filtered_vs_robust_ids
+stopifnot(all(metric_table[response == 'real response' & model == 'ols' & fold == 0 & ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE)][, table(ID)] == 2))
+```
+
+
+
+```{r}
+# Maybe make test to compare the two distributions? should be paired as well
+plot_dt <- metric_table[response == 'real response' & model == 'ols' & fold == 0 & ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE)][order(ID)]
+# ggpubr::compare_means(mse ~ robust, data = plot_dt, paired = TRUE, group.by = c('Event Type', 'Variability'), p.adjust.method = 'bonferroni')
+ggplot(plot_dt, aes(y = mse, x = robust)) +#, fill=robust)) + 
+    # show mean in geom_boxplot and add the mean as a point
+    geom_violin() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    geom_boxplot(width = 0.5) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_grid(`Event Type` ~ Variability, scales='free_y') + 
+    labs(y = 'MSE') + 
+    theme_bw() +
+    ggpubr::stat_compare_means(label.y.npc = 'middle', label.x.npc = 'middle', paired=TRUE)#, method.args = list(alternative = "greater"))
+```
+
+```{r}
+# coef_table[, setdiff(.SD[robust == 'filtered', feature], .SD[robust == 'robust', feature]), by=.(`Event Type`, response, expression_bias, ID)]
+filtered_vs_original <- coef_table[response == 'real response', {
+  filtered_features <- .SD[robust == 'filtered', feature]
+  robust_features <- .SD[robust == 'robust', feature]
+  .(
+    length_filtered = length(filtered_features),
+    length_robust = length(robust_features),
+    intersect = length(intersect(filtered_features, robust_features)),
+    same_features = setequal(filtered_features, robust_features),
+    same_expression_bias = setequal(.SD[robust == 'filtered', expression_bias], 
+                                    .SD[robust == 'robust', expression_bias]),
+    robust_expression_bias = .SD[robust == 'robust', unique(expression_bias)],
+    filtered_expression_bias = .SD[robust == 'filtered', unique(expression_bias)]
+  )
+}, by=.(`Event Type`, ID)]
+filtered_vs_original[, `Feature Change` := !same_features]
+filtered_vs_original[, `Expression Bias Change` := !same_expression_bias]
+filtered_no_robust <- filtered_vs_original[is.na(robust_expression_bias), ID]
+stopifnot(identical(filtered_no_robust,
+                    anova_table[response == 'real response', .SD['filtered' %in% robust & !'robust' %in% robust], by=.(ID, response)][, ID]))
+for (this_event in to_analyze) {
+  print(
+    ggplot(filtered_vs_original[`Event Type` == this_event],
+           aes(x = `Feature Change`, fill = `Expression Bias Change`)) +
+      geom_bar() +
+      facet_grid(filtered_expression_bias ~ robust_expression_bias) +
+      labs(title = this_event)
+  )
+}
+filtered_vs_original[ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE), .(`Feature Change`=sum(`Feature Change`), .N, `%No Feature Change`=round(100*sum(!`Feature Change`)/.N, 1)), by=.(`Event Type`)]
+```
+
+```{r}
+ggplot(coef_table[response != 'rotated response', .N, by=.(`Event Type`, Variability, response, expression_bias, robust, ID)], 
+       aes(y = N, x = robust, group = ID)) + 
+    geom_point(alpha = .5, aes(color = expression_bias)) + 
+    geom_line(alpha = .5) + 
+    facet_grid(`Event Type` ~ response + Variability)
+```
+
+
+# Comparison Performances:
+## OLS LOGIT
+
+
+```{r,fig.width=10, fig.height=6, eval=FALSE}
 for (metric in c('r', 'r2', 'mse', 'rmse', 'mae')){
-  p <- ggplot(metric_table, aes(y = get(metric), x = response, color=expression_bias)) + 
-      # show mean in geom_boxplot and add the mean as a point
-     geom_boxplot() +
-     stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
-     facet_grid(`Event Type` + model ~ robust, scales ='free_y') + 
-     labs(title = metric, y = metric) + 
-     theme_bw() +
-     ggpubr::stat_compare_means(method = 'wilcox.test', vjust = .5)
+  dir.create(file.path(plot_dir, 'model_performances'), showWarnings = FALSE)
+  p <- ggplot(metric_table[response == 'real response'], aes(y = get(metric), x = expression_bias, fill=model)) + 
+    # show mean in geom_boxplot and add the mean as a point
+    geom_boxplot() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_wrap(`Event Type` + Variability + robust ~ ., scales='free', nrow = 2) + 
+    labs(title = metric, y = metric) + 
+    theme_bw()
+     # ggpubr::stat_compare_means(method = 'wilcox.test', vjust = .5)
+  ggsave(file.path(plot_dir, 'model_performances', paste(event_folder, metric, '.pdf', sep = '_')), width = 12, height = 10)
+  # if (metric == 'r2') p <- p + ylim(c(-1, 1))
+  print(p)
+  p <- ggplot(metric_table[response == 'real response'], aes(y = get(metric), x = expression_bias, fill=robust)) + 
+    # show mean in geom_boxplot and add the mean as a point
+    geom_boxplot() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_wrap(`Event Type` + Variability + model ~ ., scales='free', nrow = 2) + 
+    labs(title = metric, y = metric) + 
+    theme_bw()
+     # ggpubr::stat_compare_means(method = 'wilcox.test', vjust = .5)
   ggsave(file.path(plot_dir, 'model_performances', paste(event_folder, metric, '.pdf', sep = '_')), width = 12, height = 10)
   # if (metric == 'r2') p <- p + ylim(c(-1, 1))
   print(p)
 }
+ggplot(metric_table[response == 'real response'], aes(y = n_var/nsamples, x = expression_bias, fill=model)) +  
+    # show mean in geom_boxplot and add the mean as a point
+    geom_boxplot() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_wrap(`Event Type` + Variability + robust ~ ., scales='free_y', nrow = 2) + 
+    theme_bw()
+```
+
+## real, rotated
+```{r,fig.width=10, fig.height=6, eval=FALSE}
+for (metric in c('r', 'r2', 'mse', 'rmse', 'mae')){
+  p <- ggplot(metric_table[model == 'ols'], aes(y = get(metric), x = expression_bias, fill=response)) + 
+    # show mean in geom_boxplot and add the mean as a point
+    geom_boxplot() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_wrap(`Event Type` + Variability + robust ~ ., scales='free', nrow = 2) + 
+    labs(title = metric, y = metric) + 
+    theme_bw()
+     # ggpubr::stat_compare_means(method = 'wilcox.test', vjust = .5)
+  ggsave(file.path(plot_dir, 'model_performances', paste(event_folder, metric, '.pdf', sep = '_')), width = 12, height = 10)
+  # if (metric == 'r2') p <- p + ylim(c(-1, 1))
+  print(p)
+}
+ggplot(metric_table[model == 'ols'], aes(y = n_var/nsamples, x = expression_bias, fill=response)) +  
+    # show mean in geom_boxplot and add the mean as a point
+    geom_boxplot() + #scale_fill_manual(values = c('expression bias' = 'lightgrey', 'epigenetic only' = 'grey20')) + scale_color_manual(values = c('Low Variability' = '#CC79A7', 'High Variability' = '#009E73')) +
+    stat_summary(fun=mean, geom="point", shape=18, size=3, position = position_dodge(.75)) +
+    facet_wrap(`Event Type` + Variability + robust ~ ., scales='free_y', nrow = 2) + 
+    theme_bw()
 ```
 
 ```{r}
@@ -316,45 +590,93 @@ activeChromHMM_dt <- data.table(region = activeChromHMM$name,
            region_ID = seq_along(activeChromHMM))
 coef_table[activeChromHMM_dt, on=.(region), c('chrom_state', 'region_width', 'region_ID') := .(chrom_state, region_width, region_ID)]
 stopifnot(identical(coef_table[!is.na(region_ID), region_width], coef_table[!is.na(region_ID), width(activeChromHMM[region_ID])]))
+# add width for event_region, downstream and upstream regions
+coef_table[is.na(region_ID) & region == 'event_name', region_width:= width(event_gr[ID])]
+coef_table[is.na(region_ID) & region == 'downstream_other_region', region_width:= width(downstream_gr[ID])]
+coef_table[is.na(region_ID) & region == 'upstream_other_region', region_width:= width(upstream_gr[ID])]
+
+# add chrom_state
 coef_table[, chrom_state:=list(strsplit(chrom_state, split = ',', fixed = TRUE))]
 coef_table[, coefficient_sign:= ifelse(Estimate > 0, 'positive coefficient', 'negative coefficient')]
 coef_table[, region_type := 'not chromhmm region']
+
+# add response
+coef_table[, Response:=tools::toTitleCase(tstrsplit(response, ' ', fixed=TRUE, keep = 1)[[1]])]
+coef_table[, Response:=factor(Response, levels = c('Real', 'Rotated', 'Randomized'))]
+
+# make event type to factor
+coef_table[, `Event Type`:=factor(`Event Type`, levels = to_analyze)]
 ```
 
 ```{r}
-ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Apr_2024_Final.json'), recursive = FALSE)
 hex_colors <- sapply(unlist(ihec_ia_colors$experiment, recursive = FALSE), function(x) {
     cols <- as.numeric(strsplit(x, ",")[[1]])
     rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
 })
-hex_colors <- c(hex_colors, DNAm=hex_colors[['WGBS']])
-
+hex_colors <- c(hex_colors, DNAm=hex_colors[['WGBS']], summed_enhancer='darkorange', max_promoter='tomato')
 
 coef_table[, plot_feature:=mark]
-coef_table[plot_feature %in% c('max_promoter', 'summed_enhancer'), plot_feature := 'H3K27ac']
+# coef_table[plot_feature %in% c('max_promoter', 'summed_enhancer'), plot_feature := 'H3K27ac']
 
 plot_colors <- setNames(rep("dark grey", coef_table[, uniqueN(plot_feature)]), coef_table[, unique(plot_feature)])
 for(name in names(hex_colors)) {
   inds <- startsWith(names(plot_colors), name)
   plot_colors[inds] <- hex_colors[name]
 }
-anova_table[, table(expression_bias, response, robust, `Event Type`)]
+```
 
-ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
-  ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
-  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) + 
-  geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) #+
-  # ylim(0, 400)
-ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts.pdf', sep = '_')), width = 9, height = 7) 
-# ggsave(file.path(plot_dir, 'mark_counts.pdf'), width = 6, height = 3) 
+```{r,fig.width=16, fig.height=12}
+ggplot(coef_table[feature != '(Intercept)'], aes(x = Response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ coefficient_sign + Variability + robust) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
 
-ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only' & robust == 'robust', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
-  ggplot2::facet_wrap(`Event Type` ~ ., scales = 'free_y') +
-  # ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
-  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
-  # geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) +
-  # ylim(0, 400)
-ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts_robust.pdf', sep = '_')), width = 6, height = 3) 
+ggplot(coef_table[feature != '(Intercept)'], aes(x = Response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ expression_bias + coefficient_sign + robust) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+
+ggplot(coef_table[feature != '(Intercept)'], aes(x = mark, fill = Response)) + geom_bar(position = 'dodge') + facet_grid(`Event Type` ~ expression_bias + Variability + robust, scales = 'free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Counts for Selected Features') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + theme_bw() + theme(strip.background = element_rect(fill = 'white'), axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+ggplot(coef_table[expression_bias == 'Epigenetic Only' & feature != '(Intercept)'], aes(x = Response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ Variability + robust) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+
+# ggplot(region_dt, aes(x = region_width, color = mark)) + geom_density() + facet_wrap(response ~ `Event Type`, ncol = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Region length for Selected Features') + scale_fill_brewer(palette = 'Paired') + scale_x_log10()
+```
+
+```{r}
+# ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'Epigenetic Only', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust, Variability)], ggplot2::aes(x = plot_feature, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
+#   ggplot2::facet_wrap(`Event Type` ~ response + Variability, scales = 'free_y', nrow=2) +
+#   ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) + 
+#   geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) #+ ylim(0, 350)
+# ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts.pdf', sep = '_')), width = 9, height = 7) 
+# # ggsave(file.path(plot_dir, 'mark_counts.pdf'), width = 6, height = 3) 
+# 
+# ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'Epigenetic Only' & robust == 'robust', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
+#   ggplot2::facet_wrap(`Event Type` ~ ., scales = 'free_y') +
+#   # ggplot2::facet_grid(`Event Type` ~ robust, scales = 'free') +
+#   ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) + ggplot2::labs(title = 'Event Counts for Selected Features of Event-Specific Models', y = 'Number of Events', x = NULL, fill = 'Mark') + ggplot2::theme_bw() + ggplot2::scale_fill_manual(values = plot_colors) + ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
+#   # geom_text(stat='count', aes(label=..count..), position=position_dodge(width=0.9), vjust=-.5) +
+#   # ylim(0, 400)
+# ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts_robust.pdf', sep = '_')), width = 6, height = 3) 
+
+err_dt <- coef_table[mark != '(Intercept)' & expression_bias == 'Epigenetic Only' & robust == 'robust', .(mark=unique(mark)), by=.(event, response, rotated_index, `Event Type`, robust, Variability)][, {counts=.SD[, .(count=.N), by=rotated_index][, count]; .(mean_count=mean(counts), sd_count=sd(counts)/sqrt(uniqueN(rotated_index)))}, by=.(`Event Type`, response, mark, Variability)]
+err_dt[, Response:=tools::toTitleCase(tstrsplit(response, ' ', fixed=TRUE, keep = 1)[[1]])]
+err_dt[, Response:=factor(Response, levels = c('Real', 'Rotated', 'Randomized'))]
+err_dt[, Variability:=factor(sub(pattern = " Variability", replacement = "", x = Variability, fixed = TRUE), levels = c('Low', 'High'))]
+err_dt[, `Event Type`:=factor(`Event Type`, levels = c('SE', 'RI'))]
+# remove _ from the mark column and put it in titleCase
+err_dt[, mark:=tools::toTitleCase(gsub('_', ' ', mark))]
+# do the same to the names of the plot_colors
+names(plot_colors) <- tools::toTitleCase(gsub('_', ' ', names(plot_colors)))
+
+ggplot(err_dt, aes(x = Response, y=mean_count, fill = mark)) + 
+    ggplot2::geom_col(position = 'dodge') +
+    ggplot2::geom_errorbar(aes(ymin=mean_count-sd_count, ymax=mean_count+sd_count), width=.7, position=position_dodge(.9)) +
+    ggplot2::facet_wrap(`Event Type` ~ Variability, scales = 'free_y', nrow = 2) +
+    ggplot2::labs(#title = 'Event Counts for Selected Features of Event-Specific Models', 
+                  y = NULL, 
+                  x = NULL, fill = 'Mark') + 
+    ggplot2::theme_bw() + 
+    ggplot2::scale_fill_manual(values = plot_colors) + 
+    ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
+ggsave(file.path(plot_dir, 'mark_counts_error.pdf'), width = 6.1, height = 4)
+ggsave(file.path(publication_plots_dir, 'mark_counts_error.pdf'), width = 6.1, height = 4)
 
 # ggplot2::ggplot(coef_table[plot_feature != '(Intercept)' & expression_bias == 'epigenetic only' & robust == 'not robust', .(plot_feature=unique(plot_feature)), by=.(event, response, `Event Type`, robust)], ggplot2::aes(x = response, fill = plot_feature)) + ggplot2::geom_bar(position = 'dodge') + 
 #   ggplot2::facet_wrap(`Event Type` ~ ., scales = 'free_y') +
@@ -371,27 +693,48 @@ ggsave(file.path(plot_dir, paste(event_folder, 'mark_counts_robust.pdf', sep = '
 # for the smaller ones:
 if (event_folder == "event_models_smaller") {
   chromhmm_hits_smaller <- findOverlaps(event_gr, activeChromHMM, maxgap = vicinity/10, ignore.strand=TRUE)
-  background_region_ids <- to(chromhmm_hits_smaller)[from(chromhmm_hits_smaller) %in% anova_table[, ID]]
+  background_ids_by_event <- sapply(to_analyze, function(this_event) to(chromhmm_hits_smaller)[from(chromhmm_hits_smaller) %in% anova_table[`Event Type` == this_event, ID]])
+  background_region_ids <- unlist(background_ids_by_event, use.names = FALSE)
   background_dt <- activeChromHMM_dt[background_region_ids]
   background_dt[, ID := from(chromhmm_hits_smaller)[from(chromhmm_hits_smaller) %in% anova_table[, ID]]]
-} else {
-  # TODO: add a background distribution using these chromhmm regions, and then compare the distribution of the coefficients for the different models to the background distribution
+} else if (event_folder == "event_models") {
+  # add a background distribution using these chromhmm regions, and then compare the distribution of the coefficients for the different models to the background distribution
   background_region_ids <- to(chromhmm_hits)[from(chromhmm_hits) %in% anova_table[, ID]]
   background_dt <- activeChromHMM_dt[background_region_ids]
   background_dt[, ID := from(chromhmm_hits)[from(chromhmm_hits) %in% anova_table[, ID]]]
+} else if (event_folder == "event_models_local") {
+  background_region_ids <- integer()
+  background_dt <- data.table(region = character(), chrom_state = character(), region_width = integer(), region_ID = integer(), ID = integer())
 }
-background_dt[, response := 'background']
-background_dt[, robust := 'robust']
-background_dt[event_dt, on=.(ID), `Event Type` := `Event Type`]
 stopifnot(identical(background_dt[, region_ID], background_region_ids))
 
-background_dt <- rbindlist(sapply(coef_table[!is.na(region_ID), unique(mark)], function(x) background_dt, simplify = FALSE), idcol='mark')
+# make a background of all the alternative regions that could have been selected
+# all IDs of events where any model has been built
+alternative_background <- data.table(region = c(rep('upstream_other_region', anova_table[, uniqueN(ID)]),
+                      rep('event_name', anova_table[, uniqueN(ID)]),
+                      rep('upstream_other_region', anova_table[, uniqueN(ID)])),
+           chrom_state = NA,
+           region_width = width(c(upstream_gr[anova_table[, unique(ID)]],
+                      event_gr[anova_table[, unique(ID)]],
+                      downstream_gr[anova_table[, unique(ID)]])),
+           region_ID = NA,
+           ID = rep(anova_table[, unique(ID)], 3)
+          )
 
-region_dt <- rbind(coef_table[!is.na(region_ID) & expression_bias == 'epigenetic only'], background_dt, fill=TRUE)
+background_dt <- rbind(alternative_background, background_dt)
+background_dt[, response := 'background']
+background_dt[, robust := 'robust']
+background_dt[event_dt, on=.(ID), `Event Type` := `Event Type`] # add the event type to the background regions
+background_dt <- rbindlist(sapply(coef_table[, as.character(unique(mark))], 
+                                  function(x) background_dt, simplify = FALSE), idcol='mark')
+
+region_dt <- rbind(coef_table#[!is.na(region_ID) & expression_bias == 'Epigenetic Only']
+                   , background_dt, fill=TRUE)
+region_dt[, `Event Type` := factor(`Event Type`, levels=to_analyze)]
 region_dt[, response:=factor(response, levels=c('background', 'real response', 'rotated response', 'randomized response'))]
 
-anno_hits <- findOverlaps(activeChromHMM[region_dt[, region_ID]], annotation)
-overlap_types <- data.table(region_ID = region_dt[, region_ID][from(anno_hits)], overlap_type=annotation[to(anno_hits)]$type)[, .(types=list(overlap_type)), by=region_ID]
+anno_hits <- findOverlaps(activeChromHMM[region_dt[!is.na(region_ID), region_ID]], annotation)
+overlap_types <- data.table(region_ID = region_dt[!is.na(region_ID), region_ID][from(anno_hits)], overlap_type=as.character(annotation[to(anno_hits)]$type))[, .(types=list(overlap_type)), by=region_ID]
 region_dt[overlap_types, on=.(region_ID), types:=types]
 
 # make gr for corresponding genes, make mock ranges for events with multiple genes:
@@ -400,29 +743,167 @@ gene_gr <- event_dt[, GRanges(seqnames = ifelse(is.na(gene_start) | is.na(gene_e
                                                 end = ifelse(is.na(gene_start) | is.na(gene_end), 1, gene_end)), 
                                strand = strand)]
 
-upstream <- ifelse(strand(event_gr[region_dt[, ID]]) == '-', 
-                   end(event_gr[region_dt[, ID]]) < start(activeChromHMM[region_dt[, region_ID]]),
-                   end(activeChromHMM[region_dt[, region_ID]]) < start(event_gr[region_dt[, ID]]))
-region_dt[, event_distance := distance(event_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
-region_dt[, gene_distance := distance(gene_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
-region_dt[, adjacency_distance := pmin(distance(downstream_gr[ID], activeChromHMM[region_ID]),
+upstream <- ifelse(strand(event_gr[region_dt[!is.na(region_ID), ID]]) == '-', 
+                   end(event_gr[region_dt[!is.na(region_ID), ID]]) < start(activeChromHMM[region_dt[!is.na(region_ID), region_ID]]),
+                   end(activeChromHMM[region_dt[!is.na(region_ID), region_ID]]) < start(event_gr[region_dt[!is.na(region_ID), ID]]))
+region_dt[!is.na(region_ID), event_distance := distance(event_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
+region_dt[!is.na(region_ID), gene_distance := distance(gene_gr[ID], activeChromHMM[region_ID])*ifelse(upstream, -1, 1)]
+region_dt[!is.na(region_ID), adjacency_distance := pmin(distance(downstream_gr[ID], activeChromHMM[region_ID]),
                                                         distance(upstream_gr[ID], activeChromHMM[region_ID]))*ifelse(upstream, -1, 1)]
+# set all the distances of the regions that are alternative to 0 
+region_dt[is.na(region_ID) & region != "", event_distance := 0]
+region_dt[is.na(region_ID) & region != "", gene_distance := 0]
+region_dt[is.na(region_ID) & region != "", adjacency_distance := 0]
+
+
+# Function to create TSS tables
+create_TSS_dt <- function(event_dt, col_start, col_end, prefix) {
+  TSS_dt <- event_dt[, .(starts = unlist(ifelse(strand == '-', get(col_end), get(col_start))), 
+                         seqnames, strand), by = .(ID)]
+  TSS_dt[, (paste0(prefix, "_merging_ID")) := .I]
+  TSS_gr <- TSS_dt[, GRanges(seqnames = seqnames, 
+                             ranges = IRanges(start = starts, end = starts), 
+                             strand = strand)]
+  TSS_gr$ID <- TSS_dt$ID
+  list(dt = TSS_dt, gr = TSS_gr)
+}
+
+# Create inclusion and exclusion TSS tables
+inclusion_TSS <- create_TSS_dt(event_dt, "alternative_start", "alternative_end", "inclusion")
+exclusion_TSS <- create_TSS_dt(event_dt, "reference_start", "reference_end", "exclusion")
+
+# Function to calculate and merge distances
+merge_and_calculate_distances <- function(region_dt, tss_merging_dt, TSS_dt, TSS_gr, prefix, region_gr) {
+  col_name <- paste0(prefix, "_merging_ID")
+  merged_dt <- merge(tss_merging_dt, TSS_dt, by = "ID", allow.cartesian = TRUE)
+  stopifnot(!any(duplicated(merged_dt, by = c("mergingTSS_ID", col_name))))
+  # check if region_ID in columns and use it, otherwise use ID to calculate distances
+  id_col <- ifelse("region_ID" %in% names(merged_dt), "region_ID", "ID")
+  merged_dt[, distances := distance(region_gr[get(id_col)], TSS_gr[get(col_name)])]
+  
+  upstream <- merged_dt[, ifelse(strand(TSS_gr[get(col_name)]) == '-',
+                     end(TSS_gr[get(col_name)]) < start(region_gr[get(id_col)]),
+                     end(region_gr[get(id_col)]) < start(TSS_gr[get(col_name)]))]
+  
+  merged_dt[, distances := distances * ifelse(upstream, -1, 1)]
+  
+  region_dt[merged_dt[, .(distance = min(distances)), by = .(mergingTSS_ID)], 
+            on = .(mergingTSS_ID), (paste0(prefix, "_TSS_distance")) := distance]
+}
+
+# Apply distance calculations for different regions
+apply_distance_calculations <- function(region_dt, region_name, inclusion_TSS, exclusion_TSS, region_gr) {
+  if (region_name == "activeChromHMM") {
+    region_dt[!is.na(region_ID), mergingTSS_ID := .I]
+    tss_merging_dt <- region_dt[!is.na(mergingTSS_ID), .(mergingTSS_ID, region_ID, ID)]
+  } else {
+    region_dt[region == region_name, mergingTSS_ID := .I]
+    tss_merging_dt <- region_dt[!is.na(mergingTSS_ID), .(mergingTSS_ID, ID)]
+  }
+  
+  merge_and_calculate_distances(region_dt, tss_merging_dt, inclusion_TSS$dt, inclusion_TSS$gr, "inclusion", region_gr)
+  merge_and_calculate_distances(region_dt, tss_merging_dt, exclusion_TSS$dt, exclusion_TSS$gr, "exclusion", region_gr)
+  region_dt[, mergingTSS_ID := NULL] # Clear mergingTSS_ID at the end of function
+}
+
+# Define region groups
+region_groups <- list(
+  list(name = "activeChromHMM", gr = activeChromHMM),
+  list(name = "upstream_other_region", gr = upstream_gr),
+  list(name = "event_name", gr = event_gr),
+  list(name = "downstream_other_region", gr = downstream_gr)
+)
+
+# Loop through region groups to apply distance calculations
+for (region_group in region_groups) {
+  apply_distance_calculations(region_dt, region_group$name, inclusion_TSS, exclusion_TSS, region_group$gr)
+}
+
+# first categorize broad types of regions
 region_dt[, region_type := 'intergenic']
-region_dt[sapply(types, function(this_types) 'transcript' %in% this_types), region_type := 'genic']
-region_dt[gene_distance == 0, region_type := 'genic (event gene)']
-region_dt[event_distance == 0, region_type := 'genic (event overlap)']
-region_dt[, region_type := factor(region_type, levels=c('genic (event overlap)', 'genic (event gene)', 'genic', 'intergenic'))]
-stopifnot(identical(region_dt[sapply(types, is.null), region_ID], region_dt[region_type == 'intergenic', region_ID]))
+region_dt[sapply(types, function(this_types) 'transcript' %in% this_types), region_type := 'transcript']
+region_dt[sapply(types, function(this_types) 'exon' %in% this_types), region_type := 'exon']
+region_dt[is.na(region_ID) & region != "", region_type := 'exon']
+region_dt[event_distance == 0 & region_type == 'transcript' & !is.na(region_ID), region_type := 'exon'] # to make sure that purely adjacent events are also covered
+
+# now add overlaps if applicable
+region_dt[, overlap_suffix := '']
+region_dt[gene_distance == 0, overlap_suffix := ' (event gene)']
+region_dt[exclusion_TSS_distance == 0 | inclusion_TSS_distance == 0, overlap_suffix := ' (TSS)']
+# region_dt[, region_type := paste(region_type, '(inclusion TSS)')]
+region_dt[event_distance == 0, overlap_suffix := ' (event overlap)']
+region_dt[, region_type := paste0(region_type, overlap_suffix)]
+region_dt[, region_type := factor(region_type, levels=c('exon (event overlap)', 'exon (TSS)', 'exon (event gene)', 'transcript (event gene)', 'exon', 'transcript', 'intergenic'))]
+
+# replace NA in list columns with empty list to be able to write to file:
+for (col in names(region_dt)) {
+  if (is.list(region_dt[[col]])) {
+    set(region_dt, j = col, value = lapply(region_dt[[col]], function(x) if (is.null(x) || all(is.na(x))) character() else x))
+  }
+}
+
+#write region_dt to csv.gz in the event folder
+fwrite(region_dt, file.path(event_folder, 'region_dt.csv.gz'))
+
+# check that the intergenic regions are the same:
+# stopifnot(identical(region_dt[sapply(types, is.null), region_ID], region_dt[region_type == 'intergenic', region_ID]))
+# unfortunately, there is an adjacent case here:
+# gene_gr[region_dt[sapply(types, is.null) & region_type != 'intergenic', unique(ID)]]
+# activeChromHMM[region_dt[sapply(types, is.null) & region_type != 'intergenic', unique(region_ID)]]
 ```
 
+```{r}
+# read region_dt from csv.gz in the event folder
+region_dt2 <- fread(file.path(event_folder, 'region_dt.csv.gz'))
+# split chrom_state and types columns from char into lists using the pipe | as separator
+if (any(grepl(pattern = '|', x = region_dt2$chrom_state, fixed = TRUE)))
+  region_dt2[, chrom_state := strsplit(chrom_state, '|', fixed = TRUE)]
+if (any(grepl(pattern = '|', x = region_dt2$types, fixed = TRUE)))
+  region_dt2[, types := strsplit(types, '|', fixed = TRUE)]
+```
+
+
+# hit vs not hit
 ```{r,fig.width=16, fig.height=12}
-ggplot(coef_table, aes(x = response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ coefficient_sign + robust) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+ggplot(region_dt[!is.na(`Rotated Hit`) & response == 'real response' & mark %in% c(histone_marks, 'DNAm')], aes(x = `Rotated Hit`, fill = region_type)) +
+  geom_bar(position = 'fill') +
+  facet_grid(`Event Type` + Variability ~ mark + expression_bias, scales='free_y') + 
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .2)) +
+  geom_text(stat='count', aes(fill = NULL, label=..count..), y = 1, vjust=-1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = 'Region type for Selected Features') +
+  theme_bw() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
 
-ggplot(coef_table, aes(x = response, fill = mark)) + geom_bar(position = 'fill') + facet_grid(`Event Type` ~ expression_bias + coefficient_sign) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Count Proportions for Selected Features') + scale_fill_manual(values = hex_colors) + theme_bw() + theme(strip.background = element_rect(fill = 'white'))
+ggplot(region_dt[!is.na(`Rotated Hit`) & response == 'real response' & mark %in% c(histone_marks, 'DNAm')], aes(x = `Rotated Hit`, fill = region_type)) +
+  geom_bar(position = 'fill') +
+  facet_grid(`Event Type` + Variability ~ expression_bias, scales='free_y') + 
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .2)) +
+  geom_text(stat='count', aes(fill = NULL, label=..count..), y = 1, vjust=-1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = 'Region type for Selected Features') +
+  theme_bw() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+```
 
-ggplot(coef_table, aes(x = mark, fill = response)) + geom_bar(position = 'dodge') + facet_grid(`Event Type` ~ expression_bias, scales = 'free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Mark Counts for Selected Features') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + theme_bw() + theme(strip.background = element_rect(fill = 'white'), axis.text.x = element_text(angle = 45, hjust = 1))
+# filtered vs not filtered
+```{r,fig.width=16, fig.height=12}
+ggplot(region_dt[response == 'real response' & ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE)], aes(x = robust, fill = region_type)) +
+  geom_bar(position = 'fill') +
+  facet_grid(`Event Type` + Variability ~ mark + expression_bias, scales='free_y') + 
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .2)) +
+  geom_text(stat='count', aes(fill = NULL, label=..count..), y = 1, vjust=-1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = 'Region type for Selected Features') +
+  theme_bw() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
 
-# ggplot(region_dt, aes(x = region_width, color = mark)) + geom_density() + facet_wrap(response ~ `Event Type`, ncol = 2, scales='free_y') + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = 'Region length for Selected Features') + scale_fill_brewer(palette = 'Paired') + scale_x_log10()
+ggplot(region_dt[response == 'real response' & ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE)], aes(x = robust, fill = region_type)) +
+  geom_bar(position = 'fill') +
+  facet_grid(`Event Type` + Variability ~ expression_bias, scales='free_y') + 
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .2)) +
+  geom_text(stat='count', aes(fill = NULL, label=..count..), y = 1, vjust=-1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = 'Region type for Selected Features') +
+  theme_bw() + theme(legend.position = 'bottom', axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_rect(fill = 'white'))
+
 ```
 
 
@@ -487,8 +968,8 @@ regionDB <- loadRegionDB(c("/nfs/data/references/LOLA/LOLACore/hg38", "/nfs/data
 # registerCoresPWMEnrich(40)
 
 lola <- rbindlist(sapply(to_analyze, function(this_event){
-  rbindlist(sapply(c("FALSE", "TRUE"), function(this_random){
-    interesting_events <- coef_table[random == this_random & `Event Type` == this_event & expression_bias == 'epigenetic only' & robust == 'robust']
+  rbindlist(sapply(coef_table[, levels(response)], function(this_response){
+    interesting_events <- coef_table[response == this_response & `Event Type` == this_event & expression_bias == 'Epigenetic Only' & robust == 'robust']
     regions <- 
       c(activeChromHMM[interesting_events[!is.na(region_ID), unique(region_ID)]],
       upstream_gr[interesting_events[region == 'upstream_other_region', ID]],
@@ -496,7 +977,7 @@ lola <- rbindlist(sapply(to_analyze, function(this_event){
       event_gr[interesting_events[region == 'event_name', ID]]
     )
     my_universe <- 
-    c(activeChromHMM[unique(background_region_ids)],
+    c(activeChromHMM[background_dt[`Event Type` == this_event & !is.na(region_ID), unique(region_ID)]],
                          upstream_gr[interesting_events[, unique(ID)]],
                          downstream_gr[interesting_events[, unique(ID)]],
                          event_gr[interesting_events[, unique(ID)]])
@@ -516,11 +997,12 @@ lola <- rbindlist(sapply(to_analyze, function(this_event){
     # res = motifEnrichment(genome[regions], PWMLogn.hg19.MotifDb.Hsap, verbose = FALSE)
     # report.top = groupReport(res, by.top.motifs=TRUE)
     # as.data.table(report.top@d)
-  }, simplify = FALSE), idcol = 'random', fill=TRUE)
+  }, simplify = FALSE), idcol = 'response', fill=TRUE)
 }, simplify = FALSE), idcol = 'Event Type', fill=TRUE)
-fwrite(lola, 'lola.csv.gz')
+fwrite(lola, paste0(event_folder, '_lola.csv.gz'))
 gc()
 ```
+
 ```{r, eval=FALSE}
 stopifnot(all(interesting_events[!is.na(region_ID), region] %in% activeChromHMM[unique(background_region_ids)]$name))
 states_per_segment <- strsplit(x = activeChromHMM[unique(background_region_ids)]$chrom_state, split = ',', fixed = TRUE)

@@ -84,7 +84,6 @@ rank_dt[, random := as.logical(random)]
 
 ```{r, fig.width=16, fig.height=11, eval=FALSE}
 # my_colors <- rev(c("#CC79A7", "#009E73", "#999999"))
-
 for (this_event in to_analyze) {
   # pheatmap(as.matrix(dcast(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], formula = `Samples, Features` + region ~ `Mark, PSI Variance`, value.var = 'coefs', fill = 0L)[, -c(1, 2)]), cluster_cols = FALSE, cluster_rows = FALSE)
   # print(ggplot(rank_dt[feature != '(Intercept)' & this_event == `Event Type` & alpha == 'OLS' & region != 'Gene-Wide' & mark != 'Width' & grepl('(CTCF)|(DNase)|(ELS)|(PLS)', region)], aes(x = `Samples, Features`, y = coefs, color=`PSI Variance`, shape = `Samples, Features`, size = abs(coefs))) + facet_grid(mark ~ region) + geom_hline(yintercept = 0) + geom_point() + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())#element_text(angle = 45, hjust=1))
@@ -149,7 +148,7 @@ for (this_event in to_analyze) {
 ```
 
 # make roc_curves for total models:
-```{r, fig.height=6, fig.width=12}
+```{r, fig.height=6, fig.width=12, eval=FALSE}
 # library(ggplot2)
 # library(glmnet)
 # library(ranger)
@@ -159,9 +158,15 @@ all_plots <- list()
 all_aucs <- list()
 cm_list <- sapply(to_analyze, function(this_event){
     feature_vector <- c('noEpigenetic', 'all', 'onlyEpigenetic')
-    as_list <- pbmclapply(feature_vector, function(features) {
-        models <- readRDS(paste(this_event, 'all_var.all', features, 'binomial.rds', sep = '_'))
-        print(paste(this_event, features))
+    feature_names <- c('Intrinsic', 'Epigenetic and Intrinsic', 'Epigenetic')
+    names(feature_names) <- feature_vector
+    vars <- c('low_var', 'high_var', 'all_var')
+    var_names <- c('Low Variability', 'High Variability', 'All Variability')
+    names(var_names) <- vars
+    combs <- expand.grid(feature_vector=feature_vector, vars=vars)
+    as_list <- pbmcmapply(features=combs$feature_vector, var=combs$vars, FUN = function(features, var) {
+        models <- readRDS(paste(this_event, var, features, 'binomial.rds', sep = '_'))
+        print(paste(this_event, var, features))
         cvfits <- models$cvfit
         explanatory <- models$explanatory
         # real_test_ids <-
@@ -174,18 +179,27 @@ cm_list <- sapply(to_analyze, function(this_event){
         strict_test_data <- models$test_data[do.call(CJ, models$test_by_group), on=names(models$test_by_group), nomatch=NULL]
         test_data_list <- list(only_first, only_second, strict_test_data)
         names(test_data_list) <- c(names(models$test_by_group), paste(names(models$test_by_group), collapse = "_AND_"))
-        sapply(test_data_list, 
+        test_res <- sapply(test_data_list, 
                function(test_data){
           sapply(names(cvfits), function(alpha){
             cvfit <- cvfits[[alpha]]
+            
             if (endsWith(alpha, 'OLS')) {
               predicted <-
                 predict(cvfit, newdata = test_data[, ..explanatory], type = 'response')
               predicted_label <- ifelse(predicted < .5, control_class, case_class)
+              varImpDT <- as.data.table(summary(cvfit)[["coefficients"]], keep.rownames = 'feature')
             } else {
               predicted <-
                 predict(cvfit, newdata = test_data[, ..explanatory], type = 'prob')[, case_class]
               predicted_label <- predict(cvfit, newdata = test_data[, ..explanatory], type = 'raw')
+              if (endsWith(alpha, 'RF')) {
+                varImpDT <- as.data.table(varImp(cvfit)$importance, keep.rownames = 'feature')
+                setnames(varImpDT, 'Overall', 'Estimate')
+              } else { # glmnet 
+                varImpDT <- as.data.table(as.matrix(coef(cvfit$finalModel, s = cvfit$bestTune$lambda)), keep.rownames = 'feature')
+                setnames(varImpDT, 's1', 'Estimate')
+              }
             }
           predicted_label <- ordered(predicted_label, levels = class_levels)
           roc <- PRROC::roc.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = TRUE)
@@ -195,24 +209,36 @@ cm_list <- sapply(to_analyze, function(this_event){
             prc <- PRROC::pr.curve(scores.class0 = predicted, weights.class0 = test_data[, ifelse(binary == case_class, 1, 0)], curve = FALSE)
             prc$curve <- data.table(c(0, 1), prc$auc.integral, unique(predicted))
           }
-            
+            browser()
           list(AUROC=roc$auc,
                AUPRC=prc$auc.integral,
                dt=setNames(rbind(data.table(roc$curve)[, type:=roc$type], data.table(prc$curve)[, type:=prc$type]), c('Recall', 'Precision', 'Threshold', 'Type')),
                cm=caret::confusionMatrix(predicted_label, test_data[, binary], positive=case_class, mode = "everything"),
                MCC=ModelMetrics::mcc(test_data[, ifelse(binary == case_class, 1, 0)], predicted, 0.5),
-               size_dt=data.table(nsamples=models$nsamples, ntest=test_data[, .N]),
-               abline_dt=data.table(intercept=c(0, test_data[, sum(binary == case_class)/.N]), slope=c(1, 0), Type=c('ROC', 'PR')))
+               size_dt=data.table(nsamples=models$nsamples, npos_train=test_data[, sum(binary == case_class)], ntest=test_data[, .N], npos_test=test_data[, sum(binary == case_class)]),
+               abline_dt=data.table(intercept=c(0, test_data[, sum(binary == case_class)/.N]), slope=c(1, 0), Type=c('ROC', 'PR')),
+               varImpDT=varImpDT
+               )
           }, simplify = FALSE)
         }, simplify = FALSE)
-    })
-    names(as_list) <- feature_vector
+        names(test_res)[names(test_res) == 'seqnames'] <- 'Unknown Chromosome'
+        names(test_res)[names(test_res) == 'harmonized_sample_ontology_term_high_order_fig1'] <- 'Unknown Tissue/Cell'
+        names(test_res)[names(test_res) == 'seqnames_AND_harmonized_sample_ontology_term_high_order_fig1'] <- 'Both Unknown'
+        
+        test_res
+    }, SIMPLIFY = FALSE)
+    names(as_list) <- paste(feature_names[combs$feature_vector], var_names[combs$vars], sep = "::")
+    varImp_dt <- rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$varImpDT), idcol = 'Model', fill = TRUE)), idcol = 'Test on', fill = TRUE)), idcol = 'Features', fill = TRUE)
     curve_dt <- rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
     abline_dt <- rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$abline_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
+    varImp_dt[, c('Features', 'Variability') := tstrsplit(Features, '::')]
+    fwrite(varImp_dt, paste0(this_event, '_varImp.csv'))
+    abline_dt[, c('Features', 'Variability') := tstrsplit(Features, '::')]
+    curve_dt[, c('Features', 'Variability') := tstrsplit(Features, '::')]
     curve_dt[, (c('Random', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
     curve_dt[Random == 'FALSE', Random:="Real"]
     curve_dt[Random == 'TRUE', Random:="Random"]
-    print(ggplot(curve_dt, aes(x=Recall, y=Precision, color=Model, linetype=Features)) + geom_abline(data=abline_dt, aes(slope=slope, intercept=intercept), color='grey') + geom_line() + facet_grid(Type + Random ~ `Test on`) + theme_bw() + labs(title = this_event))
+    print(ggplot(curve_dt, aes(x=Recall, y=Precision, color=Model, linetype=Features)) + geom_abline(data=abline_dt, aes(slope=slope, intercept=intercept), color='grey') + geom_line() + facet_grid(Type + Random ~ `Test on` + Variability) + theme_bw() + labs(title = this_event))
     measure_dt <- rbindlist(lapply(as_list, function(test_list) 
       rbindlist(lapply(test_list, function(roc_list)
       rbindlist(lapply(roc_list, function(element)
@@ -225,16 +251,11 @@ cm_list <- sapply(to_analyze, function(this_event){
         )), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features')
     measure_dt <- melt(measure_dt, id.vars = c('Features', 'Model', 'Test on'), variable.name = 'Measure', value.name = 'Value')
     measure_dt[, (c('Labels', 'Model')):=tstrsplit(Model, '::', fixed = TRUE)]
-    measure_dt[`Test on` == 'seqnames', `Test on`:='Unknown Chromosome']
-    measure_dt[`Test on` == 'harmonized_sample_ontology_term_high_order_fig1', `Test on`:='Unknown Tissue/Cell']
-    measure_dt[`Test on` == 'seqnames_AND_harmonized_sample_ontology_term_high_order_fig1', `Test on`:='Both Unknown']
     measure_dt[Labels == 'FALSE', Labels:="Real"]
     measure_dt[Labels == 'TRUE', Labels:="Random"]
-    measure_dt[Features == 'onlyEpigenetic', Features:="Epigenetic"]
-    measure_dt[Features == 'noEpigenetic', Features:="Intrinsic"]
-    measure_dt[Features == 'all', Features:="Epigenetic and Intrinsic"]
-  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
-    list(measure_dt=measure_dt, curve_dt=curve_dt, size_table=rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$size_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features'))
+    measure_dt[, c('Features', 'Variability') := tstrsplit(Features, '::')]
+  print(ggplot(measure_dt, aes(y = Value, x = Model, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Test on` + Variability) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust=1)) + labs(title = this_event))
+    list(measure_dt=measure_dt, curve_dt=curve_dt, abline_dt=abline_dt, size_table=rbindlist(lapply(as_list, function(test_list) rbindlist(lapply(test_list, function(roc_list) rbindlist(lapply(roc_list, function(element) element$size_dt), idcol = 'Model')), idcol = 'Test on')), idcol = 'Features'))
   # flat_as_list <- unlist(unlist(as_list, recursive = FALSE), recursive = FALSE)
   # names(flat_as_list) <- gsub('nocCRE', 'wo/ cCRE', names(flat_as_list), fixed = TRUE)
   # for (alpha in names(models[[1]]$cvfit)) {
@@ -281,18 +302,206 @@ cm_list <- sapply(to_analyze, function(this_event){
 gc()
 saveRDS(cm_list, 'cm_list.rds')
 ```
+```{r}
+cm_list <- readRDS('cm_list.rds')
+```
 
 ```{r}
 for (this_event in to_analyze) {
-  print(cm_list[[this_event]]$size_table[, .(Event=this_event, Models=paste(Features, Model, sep = '::', collapse = ', ')), by=.(nsamples, ntest)][])
+  print(cm_list[[this_event]]$size_table[, .(Event=this_event, Models=paste(unique(paste(tstrsplit(x = Features, split='::', fixed=TRUE)[[2]], `Test on`, sep = '::')), collapse = ', ')), by=.(nsamples, ntest, npos_test/ntest)])  
+  varImp_dt <- fread(paste0(this_event, '_varImp.csv'), stringsAsFactors = TRUE)
+  varImp_dt[, feature := gsub(pattern = '`', replacement = '', x = feature, fixed = TRUE)]
 }
 ```
 
+
+```{r}
+curve_dt <- rbindlist(sapply(cm_list, function(x) x$curve_dt, simplify=FALSE), idcol = 'Event Type')
+curve_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
+curve_dt[Features == 'Intrinsic', Features := 'Non Epigenetic']
+curve_dt[Features == 'Epigenetic and Intrinsic', Features := 'All']
+curve_dt[, Features:= factor(Features, levels = c('All', 'Non Epigenetic', 'Epigenetic'))]
+curve_dt[, Response:=factor(Random, levels=c('Real', 'Random'))]
+abline_dt <- rbindlist(sapply(cm_list, function(x) x$abline_dt, simplify=FALSE), idcol = 'Event Type')
+abline_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
+abline_dt[, Features := factor(Features, levels = c('Epigenetic and Intrinsic', 'Intrinsic', 'Epigenetic'))]
+abline_dt[Features == 'Intrinsic', Features := 'Non Epigenetic']
+abline_dt[Features == 'Epigenetic and Intrinsic', Features := 'All']
+abline_dt[, Features:= factor(Features, levels = c('All', 'Non Epigenetic', 'Epigenetic'))]
+
+ggplot(curve_dt[Model == 'RF' & `Test on` == 'Both Unknown'], 
+             aes(x=Recall, y=Precision, color=Features, linetype=Response)) + 
+        geom_abline(data=unique(abline_dt[`Test on` == 'Both Unknown', .(Variability, `Event Type`, intercept, slope, Type)]), aes(slope=slope, intercept=intercept), color='black') + 
+        geom_line() + 
+        ggh4x::facet_grid2(Type ~ `Event Type` + Variability, strip = ggh4x::strip_nested()) + 
+        scale_y_continuous(breaks = c(0, 1)) +
+        scale_x_continuous(breaks = c(0, 1)) +
+        theme_bw() + theme(strip.background = element_rect(fill = 'white'), legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'MLcurves.pdf'), width = 9, height = 4)
+ggsave(filename = file.path(publication_plots_dir, 'MLcurves.pdf'), width = 9, height = 4)
+```
+
+
 ```{r}
 mixed_metrics <- rbindlist(sapply(cm_list, function(x) x$measure_dt, simplify=FALSE), idcol = 'Event Type')
-ggplot(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown'], aes(y = Value, x = Features, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Event Type`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) + geom_text(aes(label = round(Value, 2), color='black'), position=position_dodge(width=0.9), vjust=-.5) + ylim(c(0,1.1))
-ggsave(filename = file.path(plot_dir, 'mixed_metrics.pdf'), width = 12, height = 6)
+
+mixed_metrics[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
+mixed_metrics[Features == 'Intrinsic', Features := 'Non Epigenetic']
+mixed_metrics[Features == 'Epigenetic and Intrinsic', Features := 'All']
+mixed_metrics[, Features:= factor(Features, levels = c('All', 'Non Epigenetic', 'Epigenetic'))]
+mixed_metrics[, Measure := factor(Measure, levels = c('Balanced\nAccuracy', 'AUROC', 'AUPRC', 'MCC', 'Kappa'))]
+mixed_metrics[, Variability := factor(Variability, levels = c('High Variability', 'All Variability', 'Low Variability'))]
+mixed_metrics[, Response:=factor(Labels, levels=c('Random','Real'))]
+
+mixed_metrics[`Test on` == 'Both Unknown', `Test on` := 'Chr &\nCell']
+mixed_metrics[`Test on` == 'Unknown Chromosome', `Test on` := 'Chr']
+mixed_metrics[`Test on` == 'Unknown Tissue/Cell', `Test on` := 'Cell']
+# mixed_metrics[, `Test on`:=sub(x = `Test on`, pattern = ' ', replacement = '\n', fixed = TRUE)]
+mixed_metrics[, `Test on`:=factor(`Test on`, levels=c('Chr &\nCell', 'Chr', 'Cell'))]
+
+hline_dt <- setDT(mixed_metrics[, expand.grid(`Event Type`=levels(`Event Type`), 'Variability'=levels(Variability), Measure=levels(Measure))])
+hline_dt[copy(unique(abline_dt[`Test on` == 'Both Unknown' & Type == 'PR', .(Variability, `Event Type`, intercept, slope, Type)]))[, Measure := 'AUPRC'], on=.NATURAL, intercept:=intercept]
+hline_dt[Measure == 'AUROC', intercept := 0.5]
+hline_dt[Measure == 'Balanced\nAccuracy', intercept := 0.5]
+hline_dt[Measure == 'MCC', intercept := 0]
+hline_dt <- hline_dt[Measure != 'Kappa']
+
+ggplot(mixed_metrics[Model == 'RF' & `Test on` == 'Chr &\nCell' & Measure != 'Kappa'],
+       aes(y = Value, x = Variability, fill = Features, color = Response, alpha = Response)) +
+  geom_col(position = 'dodge') +
+  facet_grid(Measure ~ `Event Type`) +
+  scale_color_manual(values=c('Real'='black', 'Random'='NA')) +
+  scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) +
+  theme_bw() + theme(strip.background = element_rect(fill = 'white')) +
+  geom_text(aes(label = paste0('.', 100*round(Value, 2)), angle=90, hjust=-0.1, vjust=0.5, color='black'), show.legend = FALSE, position=position_dodge(width=0.9)) +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .25)) +
+  theme(legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'mixed_metrics.pdf'), width = 10, height = 5)
+ggplot(mixed_metrics[Model == 'RF' & `Test on` == 'Chr &\nCell' & Measure != 'Kappa'], 
+       aes(y = Value, x = Labels, color = Features)) + 
+    geom_hline(data=hline_dt, aes(yintercept=intercept), linetype='dashed', color = 'grey') +
+    geom_point() +
+    geom_line(aes(group = Features)) +
+    ggh4x::facet_grid2(Measure ~ `Event Type` + Variability, strip = ggh4x::strip_nested(), scales='free') + 
+    scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + 
+    theme_bw() + theme(strip.background = element_rect(fill = 'white')) + 
+    # expand_limits(y = 1) +
+    # scale_y_continuous(limits = c(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown' & Measure != 'Kappa', min(Value)], 1)
+    scale_y_continuous(breaks = function(x) seq(ceiling(min(x) * 10)/10, floor(max(x) * 10)/10, by = .2)) +
+    theme(legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'mixed_metrics_dumbbell.pdf'), width = 6.5, height = 4)
+ggsave(filename = file.path(publication_plots_dir, 'mixed_metrics_dumbbell.pdf'), width = 6.5, height = 4)
 ```
+```{r}
+mixed_metrics[Model == "1", Model:='LASSO']
+mixed_metrics[Model == "OLS", Model:='LogReg']
+mixed_metrics[, Model:=factor(Model, levels=c('LASSO', 'LogReg', 'RF'))]
+ggplot(mixed_metrics[`Test on` == 'Chr &\nCell' & Measure != 'Kappa' & Labels == 'Real'],
+       aes(y = Value, x = Model, color = Features)) + 
+    geom_hline(data=hline_dt, aes(yintercept=intercept), linetype='dashed', color = 'grey') +
+    geom_point() +
+    geom_line(aes(group = Features)) +
+    ggh4x::facet_grid2(Measure ~ `Event Type` + Variability, strip = ggh4x::strip_nested(), scales='free') + 
+    scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + 
+    theme_bw() + theme(strip.background = element_rect(fill = 'white'), axis.text.x = element_text(angle=45, hjust=1)) + 
+    # expand_limits(y = 1) +
+    # scale_y_continuous(limits = c(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown' & Measure != 'Kappa', min(Value)], 1)
+    scale_y_continuous(breaks = function(x) seq(ceiling(min(x) * 10)/10, floor(max(x) * 10)/10, by = .2)) +
+    theme(legend.position = 'none')
+ggsave(filename = file.path(plot_dir, 'mixed_metrics_model_dumbbell.pdf'), width = 6.5, height = 4)
+ggsave(filename = file.path(publication_plots_dir, 'mixed_metrics_model_dumbbell.pdf'), width = 6.5, height = 4)
+```
+
+```{r}
+# TODO double check hline_dt. AUPRC is there twice for each combination
+hline_dt <- setDT(mixed_metrics[, expand.grid(`Event Type`=levels(`Event Type`), Variability=levels(Variability), Measure=levels(Measure), `Test on`=levels(`Test on`))])
+hline_dt[copy(unique(abline_dt[Type == 'PR', .(Variability, `Event Type`, intercept, slope, Type)]))[, Measure := 'AUPRC'], on=.NATURAL, intercept:=intercept]
+hline_dt[Measure == 'AUROC', intercept := 0.5]
+hline_dt[Measure == 'Balanced\nAccuracy', intercept := 0.5]
+hline_dt[Measure == 'MCC', intercept := 0]
+hline_dt <- hline_dt[Measure != 'Kappa']
+
+ggplot(mixed_metrics[Model == 'RF' & Labels == 'Real' & Measure != 'Kappa'], 
+       aes(y = Value, x = `Test on`, color = Features)) + 
+    geom_hline(data=hline_dt, aes(yintercept=intercept), linetype='dashed', color = 'grey') +
+    geom_point() +
+    geom_line(aes(group = Features)) +
+    ggh4x::facet_grid2(Measure ~ `Event Type` + Variability, strip = ggh4x::strip_nested(), scales='free') + 
+    scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + 
+    theme_bw() + theme(strip.background = element_rect(fill = 'white'), axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) + 
+    # expand_limits(y = 1) +
+    # scale_y_continuous(limits = c(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown' & Measure != 'Kappa', min(Value)], 1), breaks = seq(0, 1, by = .5)) +
+    scale_y_continuous(breaks = function(x) seq(ceiling(min(x) * 10)/10, floor(max(x) * 10)/10, by = .2)) +
+    labs(x = "Test on Unseen Chromosome (Chr) or Cell Type (Cell) or Both (Chr & Cell)") +
+    theme(legend.position = 'bottom')
+ggsave(filename = file.path(plot_dir, 'mixed_metrics_test_dumbbell.pdf'), width = 6.5, height = 5)
+ggsave(filename = file.path(publication_plots_dir, 'mixed_metrics_test_dumbbell.pdf'), width = 6.5, height = 5)
+```
+
+```{r}
+library(patchwork)
+library(ggh4x)
+varImp_dt <- rbindlist(sapply(to_analyze, function(this_event) fread(paste0(this_event, '_varImp.csv'), stringsAsFactors = TRUE), simplify = FALSE), idcol = 'Event Type')
+
+varImp_dt[, `Event Type`:=factor(`Event Type`, levels=c('SE', 'RI'))]
+varImp_dt[`Event Type` == 'SE', feature := gsub('other_region', 'Intron', feature, fixed=TRUE)]
+varImp_dt[`Event Type` == 'RI', feature := gsub('other_region', 'Exon', feature, fixed=TRUE)]
+varImp_dt[`Event Type` == 'SE', feature := gsub('event_name', 'SE', feature, fixed=TRUE)]
+varImp_dt[`Event Type` == 'RI', feature := gsub('event_name', 'RI', feature, fixed=TRUE)]
+
+varImp_dt[, let(c('Random', 'Architecture'), tstrsplit(Model, '::', fixed=TRUE))]
+# varImp_dt[, feature := gsub(pattern = '`', replacement = '', x = feature, fixed = TRUE)]
+varImp_dt[, feature:=gsub('_', ' ', feature, fixed = TRUE)]
+varImp_dt[, let(c('feature', 'region'), tstrsplit(feature, ';', fixed=TRUE))]
+varImp_dt[, region:=tools::toTitleCase(region)]
+varImp_dt[, feature:=tools::toTitleCase(feature)]
+varImp_dt[, region:=sub(pattern = ' ', replacement = '\n', x = region, fixed = TRUE)]
+# varImp_dt[, feature:=sub(pattern = ' ', replacement = '\n', x = feature, fixed = TRUE)]
+varImp_dt[Features == 'Intrinsic', Features := 'Non Epigenetic']
+varImp_dt[Features == 'Epigenetic and Intrinsic', Features := 'All']
+varImp_dt[, Features:= factor(Features, levels = c('All', 'Non Epigenetic', 'Epigenetic'))]
+# varImp_dt[, Features := factor(Features, levels = c('Epigenetic and Intrinsic', 'Intrinsic', 'Epigenetic'))]
+
+region_plot <- ggplot(varImp_dt[Architecture == 'RF' & `Test on` == 'Both Unknown' & Random == 'FALSE' & !is.na(region)], aes(x = factor(region, levels = c("Upstream\nIntron", "SE", "Downstream\nIntron", "Upstream\nExon", "RI", "Downstream\nExon")), 
+                                                                                                                              y = reorder(feature, Estimate), 
+                                                                                                                              fill = Estimate)) + 
+    geom_tile() + 
+    ggh4x::facet_grid2(Features ~ `Event Type` + Variability, scales = 'free', strip = ggh4x::strip_nested()) +
+    theme_bw() + 
+    theme(strip.background = element_rect(fill = 'white')) + 
+    scale_fill_continuous(type = 'viridis') + 
+    labs(y = 'Region-dependent Features', x = 'Region', fill = 'Variable\nImportance')
+
+no_region_plot <- ggplot(varImp_dt[Architecture == 'RF' & `Test on` == 'Both Unknown' & Random == 'FALSE' & is.na(region)], aes(x = region, y = reorder(feature, Estimate), fill = Estimate)) + 
+    geom_tile() + 
+    ggh4x::facet_grid2(Features ~ `Event Type` + Variability, scales = 'free', strip = ggh4x::strip_nested()) +
+    theme_bw() + 
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), strip.background = element_rect(fill = 'white')) + 
+    scale_fill_continuous(type = 'viridis') + 
+    labs(y = 'Region-independent Features', x = NULL, fill = 'Variable\nImportance')
+
+full_plot <- (no_region_plot / region_plot + plot_layout(guides = "collect", axis_titles = "collect"))
+print(full_plot)
+ggsave(full_plot, filename = file.path(plot_dir, 'varImp.pdf'), width = 12, height = 8)
+ggsave(full_plot, filename = file.path(publication_plots_dir, 'varImp.pdf'), width = 12, height = 8)
+```
+
+
+```{r, eval=FALSE}
+poster_dt <- mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown' & Measure %in% c('Balanced\nAccuracy', 'AUPRC', 'MCC') & Variability == 'All Variability']
+poster_dt[Features == 'Intrinsic', Features := 'Non Epigenetic']
+poster_dt[Features == 'Epigenetic and Intrinsic', Features := 'All']
+poster_dt[, Features:= factor(Features, levels = c('All', 'Non Epigenetic', 'Epigenetic'))]
+ggplot(poster_dt, aes(y = Value, x = Variability, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Event Type`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) + geom_text(aes(label = paste0('.', 100*round(Value, 2)), angle=90, hjust=-0.1, vjust=0.5, color='black'), show.legend = FALSE, position=position_dodge(width=0.9)) + scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .25)) + theme(legend.position = 'bottom', axis.title.x=element_blank(), axis.text.x=element_blank(), axis.title.y=element_blank(), axis.ticks.x=element_blank())
+ggsave(filename = file.path(plot_dir, 'poster_metrics.svg'), width = 7, height = 3.5)
+```
+
+
+```{r, eval=FALSE}
+ggplot(mixed_metrics[Model == 'RF' & `Test on` == 'Both Unknown' & Measure %in% c('Balanced\nAccuracy', 'AUPRC', 'MCC') & Variability == 'All Variability' & `Event Type` == 'SE'], aes(y = Value, x = Features, fill = Features, color = Labels, alpha = Labels)) + geom_col(position = 'dodge') + facet_grid(Measure ~ `Event Type`) + scale_color_manual(values=c('Real'='black', 'Random'='NA')) + scale_alpha_manual(values=c('Real'=1, 'Random'=0.5)) + theme_bw() + theme(strip.background = element_rect(fill = 'white')) + geom_text(aes(label = paste0('.', 100*round(Value, 2)), angle=90, hjust=-0.1, vjust=0.5, color='black'), show.legend = FALSE, position=position_dodge(width=0.9)) + scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1, by = .25)) + theme(legend.position = 'bottom', axis.title.y=element_blank()) + guides(fill="none")
+ggsave(filename = file.path(plot_dir, 'poster_metrics_SE.pdf'), width = 4, height = 4)
+```
+
 
 ```{r, eval=FALSE}
 ((all_plots$SE + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')'))) + (all_plots$RI + scale_color_discrete(labels=paste0(sub('_', ', ', gsub('_binomial\\.FALSE::RF\\.roc$', '', gsub('^all_var\\.', '', names(all_aucs$SE)))), ' (', all_aucs$SE, ' , ', all_aucs$RI , ')')))) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')

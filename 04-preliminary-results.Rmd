@@ -132,6 +132,12 @@ not_gonosomes <- event_dt[!seqnames %in% c('chrY', 'chrX'), which = TRUE]
 
 keep_rows <- intersect(intersect(single_genes_only, non_overlapping_other), not_gonosomes)
 
+# include experimental events manually, to make sure models are built for this:
+manual_ids <- c(4019, 4020, 460:463, 310:314, 8201:8202, 1658, 1048:1049, 13896:13897)
+# make sure keep_rows and manual_ids are disjoint
+stopifnot(length(intersect(keep_rows, manual_ids)) == 0)
+keep_rows_manual <- unique(sort(c(keep_rows, manual_ids)))
+
 stopifnot(identical(event_dt[, ID], seq(nrow(event_dt))))# && max_ID == event_dt[, max(ID)])
 cols_to_factor <- c('event_id', 'gene_id', 'seqnames', 'strand', 'Event Type')
 event_dt[,(cols_to_factor) := lapply(.SD, as.factor), .SDcols = cols_to_factor]
@@ -143,7 +149,185 @@ saveRDS(event_res, 'event_res.rds')
 rm(event_res)
 ```
 
-```{r, fig.width = 12, fig.height = 12}
+```{r, eval=FALSE}
+# plot ecdf
+plot_ecdf <- function(mc_dt, interactive = TRUE, pal = RColorBrewer::brewer.pal(12, "Set3")) {
+  require(ggplot2)
+  stopifnot(!is.null(mc_dt))
+  nk <- length(levels(mc_dt$k))
+  if(nk > length(pal)){
+    pal <- grDevices::colorRampPalette(colors = pal)(nk)
+  }
+  ggp <-
+    ggplot(mc_dt, aes(x = ConsensusIndex, y = CDF, color = k)) + geom_step() + theme_bw()+
+    scale_color_manual(values = pal)
+  if (interactive)
+    ggp <- plotly::ggplotly(ggp)
+  return(ggp)
+}
+
+add_max_curvature <- function(dt, column, h = 1) {
+  # Ensure dt is a data.table
+  if (!inherits(dt, "data.table")) {
+    stop("dt must be a data.table")
+  }
+  # Calculate lagged and lead values of the target column
+  dt[, paste0(column, "_lagged") := data.table::shift(get(column), type = "lag")]
+  dt[, paste0(column, "_lead") := data.table::shift(get(column), type = "lead")]
+  
+  # Calculate the second derivative
+  dt[, second_derivative := (get(paste0(column, "_lead")) - 2 * get(column) + get(paste0(column, "_lagged"))) / (h ^
+                                                                                                                   2)]
+  
+  # Identify the index of the maximum curvature point
+  max_curv_index <- which.max(dt$second_derivative)
+  
+  # Add a column to indicate the maximum curvature point
+  dt[, `maximum curvature` := 'no']
+  dt[max_curv_index, `maximum curvature` := 'maximum curvature']
+  
+  # Optionally, clean up by removing the intermediate columns
+  dt[, c(paste0(column, "_lagged"),
+         paste0(column, "_lead"),
+         "second_derivative") := NULL]
+  
+  return(invisible(dt))
+}
+
+# plot delta area
+plot_delta_area <- function(mc_dt, interactive = TRUE) {
+  stopifnot(!is.null(mc_dt))
+  
+  mc_dt <- mc_dt[order(k, ConsensusIndex)]
+  
+  area_under_curve <- mc_dt[, .(AUC = {
+    # Calculate the widths (differences in ConsensusIndex) and heights (CDF values)
+    widths <- diff(.SD$ConsensusIndex)
+    heights <- head(.SD$CDF,-1)
+    # Calculate the area of each rectangle and sum them up
+    sum(widths * heights)
+  }), by = k]
+  
+  # Compute delta Area
+  area_under_curve[, DeltaAUC := c(NA, diff(AUC))]
+  area_under_curve[k == '2', DeltaAUC := AUC]
+  
+  add_max_curvature(area_under_curve, "DeltaAUC")
+  
+  # View the results
+  ggp <-
+    ggplot(area_under_curve, aes(x = k, y = DeltaAUC, group = 1)) + geom_line() + geom_point(aes(color =
+                                                                                                   `maximum curvature`)) +
+    scale_color_manual(values = c('maximum curvature' = 'red')) + theme_bw()
+  if (interactive) {
+    ggp <- plotly::ggplotly(ggp)
+    for (i in seq_along(ggp$x$data))
+      if (length(ggp$x$data[[i]]$legendgroup) > 0)
+        if (ggp$x$data[[i]]$legendgroup == "no")
+          ggp$x$data[[i]]$showlegend <- FALSE
+  }
+  
+  return(ggp)
+}
+
+# plot PAC
+plot_pac <- function(mc_dt,
+                     interactive = TRUE,
+                     x1 = .05,
+                     x2 = 1 - x1) {
+  stopifnot(!is.null(mc_dt))
+  
+  pac_dt <-
+    merge(mc_dt[ConsensusIndex <= x1, .(y1 = max(CDF)), by = k], mc_dt[ConsensusIndex <= x2, .(y2 =
+                                                                                                 max(CDF)), by = k])
+  pac_dt[, PAC := y2 - y1]
+  pac_dt[, `minimum PAC` := 'no']
+  pac_dt[PAC == min(PAC), `minimum PAC` := 'minimum PAC']
+  
+  add_max_curvature(pac_dt, "PAC")
+  
+  # View the results
+  ggp <-
+    ggplot(pac_dt, aes(x = k,
+                       y = PAC,
+                       group = 1)) + geom_line() + geom_point(aes(color = `maximum curvature`, shape = `minimum PAC`)) +
+    scale_color_manual(values = c('maximum curvature' = 'red')) + scale_shape_manual(values = c('minimum PAC' = 17, 'no' = 16), breaks= 'minimum PAC') + theme_bw()
+  if (interactive) {
+    ggp <- plotly::ggplotly(ggp)
+    for (i in seq_along(ggp$x$data))
+      if (length(ggp$x$data[[i]]$legendgroup) > 0)
+        if (ggp$x$data[[i]]$legendgroup == "no")
+          ggp$x$data[[i]]$showlegend <- FALSE
+  }
+  return(ggp)
+}
+```
+
+
+
+```{r}
+psi_melt <- melt(event_dt, measure.vars = sample_cols, variable.name = 'IHEC', value.name = 'PSI')
+psi_stats <- psi_melt[, .(`NA Percentage` = sum(is.na(PSI))/length(sample_cols),
+                                                                                           `Mean PSI` = mean(PSI, na.rm = TRUE),
+                                                                                           `PSI SD` = sd(PSI, na.rm = TRUE),
+                                                                                           `Adjusted PSI SD` = sqrt(sum((PSI - mean(PSI, na.rm = TRUE))^2, 
+                                                                                                                        na.rm = TRUE)/(length(sample_cols) - 1)),
+                                                                                           MAD = mad(PSI, na.rm = TRUE),
+                                                                                           Entropy = entropy::entropy(entropy::discretize(PSI, 20, range(c(0,1))), 
+                                                                                             method = 'ML', unit = 'log2')
+                                                                                           ), by=ID]
+# merge new columns onto event_dtdistance
+event_dt[psi_stats, on='ID', let(`NA Percentage` = `NA Percentage`, `Mean PSI` = `Mean PSI`, `PSI SD` = `PSI SD`, `Adjusted PSI SD` = `Adjusted PSI SD`, MAD = MAD, Entropy = Entropy)]
+# compute median Adj SD per event type on IDs in keep_rows
+median_adj_sd <- event_dt[ID %in% keep_rows, .(med=median(`Adjusted PSI SD`, na.rm = TRUE), tmp_event_type=`Event Type`), by=`Event Type`][, `Event Type`:=NULL][]
+
+event_dt[ID %in% keep_rows, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
+event_dt[ID %in% manual_ids, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
+
+event_dt[, Variability := factor(Variability, levels=c('Low Variability', 'High Variability'))]
+```
+
+
+```{r, fig.width = 12, fig.height = 8}
+ggplot(event_dt[ID %in% keep_rows], aes(x = `NA Percentage`, y = `PSI SD`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`)
+ggplot(event_dt[ID %in% keep_rows], aes(x = `NA Percentage`, y = `MAD`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`)
+ggplot(event_dt[ID %in% keep_rows], aes(x = `NA Percentage`, y = `Adjusted PSI SD`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`)
+ggplot(event_dt[ID %in% keep_rows], aes(x = `Adjusted PSI SD`, y = MAD, color = `NA Percentage`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`) + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'darkblue', high = 'lightgrey')
+ggplot(event_dt[ID %in% keep_rows], aes(x = `Adjusted PSI SD`, y = Entropy, color = `NA Percentage`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`) + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'darkblue', high = 'lightgrey')
+ggplot(event_dt[ID %in% keep_rows], aes(y = `Adjusted PSI SD`, x = `Mean PSI`, color = `NA Percentage`)) + geom_point() + theme_bw() + facet_wrap(~`Event Type`) + theme(strip.background = element_rect(fill = 'white')) + scale_color_gradient(low = 'darkblue', high = 'lightgrey') + geom_hline(data=event_dt[ID %in% keep_rows, .(median_sd=median(`Adjusted PSI SD`, na.rm = TRUE)), by = `Event Type`], aes(yintercept = median_sd)) 
+```
+
+```{r, eval=FALSE}
+require(seriation)
+lapply(to_analyze, function(this_event){
+  no_na_psi_dt <- na.omit(psi_melt[ID %in% keep_rows & `Event Type` == this_event], cols = 'PSI')
+  event_ids <- no_na_psi_dt[, unique(ID)]
+  distance_combs <- as.data.table(t(combn(event_ids, 2)))
+  distance_combs$distance <- pbmcmapply(distance_combs$V1, distance_combs$V2, FUN = function(x, y) transport::wasserstein1d(no_na_psi_dt[ID == x, PSI], no_na_psi_dt[ID == y, PSI]))
+  dist_obj <- as.dist(as.matrix(dcast(rbind(distance_combs, setnames(copy(distance_combs), old = c("V1", "V2"), new=c("V2", "V1"))),
+                                      V1 ~ V2, value.var = 'distance'), rownames = 'V1'))
+  psi_mat <- as.matrix(dcast(no_na_psi_dt, IHEC ~ ID, value.var = 'PSI'), rownames = 'IHEC')
+  # check if there are any missing values of inf in the distance matrix
+  if (any(is.na(dist_obj)) | any(is.infinite(dist_obj))) {
+    warning("There are missing or infinite values in the distance matrix. Please check the data.")
+  }
+  # maxK <- 30
+  # ccp <- ConsensusClusterPlus::ConsensusClusterPlus(dist_obj, maxK = maxK, reps=10, innerLinkage = 'ward.D2', finalLinkage = 'ward.D2', seed = 1, verbose = TRUE)
+  # Kvec <- 2:maxK
+  # names(Kvec) <- Kvec
+  # mc_dt <- rbindlist(lapply(Kvec, function(i){
+  #   consensus_matrix <- ccp[[i]]$consensusMatrix
+  #   consensus_values <- consensus_matrix[lower.tri(consensus_matrix)]
+  #   ecdf_data <- ecdf(consensus_values)
+  #   list(ConsensusIndex = consensus_values, CDF = ecdf_data(consensus_values))
+  # }), idcol = 'k')
+  # mc_dt[, k:=factor(k, levels=Kvec)]
+  # heatmap(psi_mat, Colv = as.dendrogram(reorder(hclust(dist_obj, method = 'ward.D2'), dist=dist_obj, method="OLO")), na.rm=FALSE, scale= 'none')
+  pheatmap(psi_mat, cluster_cols = reorder(hclust(dist_obj, method = 'ward.D2'), dist=dist_obj, method="OLO"), cutree_cols = 3, show_colnames = FALSE, show_rownames = FALSE)
+})
+```
+
+```{r, fig.width = 12, fig.height = 12, eval=FALSE}
 var_events <- sapply(to_analyze, function(event) {
   this_event_dt <- event_dt[`Event Type` == event]
   event_mat <- as.matrix(this_event_dt[ID %in% keep_rows, ..sample_cols])
@@ -155,19 +339,28 @@ var_events <- sapply(to_analyze, function(event) {
   # check event psi variation
   event_psi_sd <- apply(event_mat, 1, sd, na.rm = TRUE)
   event_psi_mean <- apply(event_mat, 1, mean, na.rm = TRUE)
+  event_psi_impute_sd <- apply(t(glmnet::na.replace(t(event_mat), m = event_psi_mean)), 1, sd, na.rm = TRUE)
+  event_psi_adj_sd <- sqrt(rowSums((event_mat - rowMeans(event_mat, na.rm = TRUE))^2, na.rm = TRUE)/(length(sample_cols) - 1))
+  event_psi_entropy <- apply(event_mat, 1, function(PSI) as.numeric(entropy::entropy(entropy::discretize(PSI, 20, range(c(0,1))), method = 'ML', unit = 'log2')))
+  
+  stopifnot(all(abs(event_psi_impute_sd - event_psi_adj_sd) < 1e-10, na.rm = TRUE))
+  
   # hist(event_psi_sd, 30, main = event)
-  print(ggplot(data.table(sd = event_psi_sd, na_percentage=na_percentage), aes(x = na_percentage, y = sd)) + geom_point() + labs(title=event, x=paste0('na percentage (overall ', length(sample_cols), ')')) + theme_bw())
-  sd_mean_dt <- data.table(sd = event_psi_sd, event_psi_mean=event_psi_mean)
+  sd_mean_dt <- data.table(sd = event_psi_sd, event_psi_mean=event_psi_mean, entropy=event_psi_entropy, na_percentage=na_percentage, sd_impute=event_psi_adj_sd)
+  print(ggplot(sd_mean_dt, aes(x = na_percentage, y = sd)) + geom_point() + labs(title=event, x=paste0('na percentage (overall ', length(sample_cols), ')')) + theme_bw())
+  print(ggplot(sd_mean_dt, aes(x = na_percentage, y = sd_impute)) + geom_point() + labs(title=event, x=paste0('na percentage (overall ', length(sample_cols), ')')) + theme_bw())
+  print(ggplot(sd_mean_dt, aes(x = sd_impute, y = entropy)) + geom_point() + labs(title=event) + theme_bw())
+  
   quants <- seq(0, .9, .1)
   var_events <- sapply(quants, function(quant) {
-    threshold <- quantile(event_psi_sd, quant, na.rm=TRUE)
-    idx <- which(event_psi_sd >= threshold)
+    threshold <- quantile(event_psi_adj_sd, quant, na.rm=TRUE)
+    idx <- which(event_psi_adj_sd >= threshold)
     stopifnot(identical(names(idx), rownames(event_mat)[idx]))
     sd_mean_dt[idx, percentage:=as.character(quant)]
     names(idx)
   })
   names(var_events) <- quants
-  print(ggplot(sd_mean_dt, aes(x = event_psi_mean, y = sd, color = percentage)) + geom_hline(yintercept = quantile(event_psi_sd, quants, na.rm=TRUE, names=FALSE)) + geom_point() + labs(title=event, x='mean psi') + theme_bw())
+  print(ggplot(sd_mean_dt, aes(x = event_psi_mean, y = sd_impute, color = percentage)) + geom_hline(yintercept = quantile(event_psi_adj_sd, quants, na.rm=TRUE, names=FALSE)) + geom_point() + labs(title=event, x='mean psi') + theme_bw())
   
   
   print(pheatmap(event_mat, show_colnames = FALSE, show_rownames = FALSE, main = event, cluster_rows = FALSE, cluster_cols = FALSE))
@@ -175,6 +368,9 @@ var_events <- sapply(to_analyze, function(event) {
   print(pheatmap(event_mat[intersect(var_events[['0.5']], names(rmv)[!rmv]), ], show_colnames = FALSE, main = paste(event, '0.5 var threshold')))
   var_events
 }, simplify = FALSE)
+# add Variability column to event_dt
+event_dt[, Variability := "Low Variability"]
+event_dt[ID %in% c(var_events$SE$`0.5`, var_events$RI$`0.5`), Variability := "High Variability"]
 ```
 
 ```{r}
@@ -186,6 +382,7 @@ ggplot(melt(event_dt[ID %in% keep_rows], id.vars = c('ID', 'gene_id', 'seqnames'
 ggsave(filename = file.path(plot_dir, 'event_nas.pdf'))
 ggplot(melt(event_dt[ID %in% keep_rows], id.vars = c('ID', 'gene_id', 'seqnames', 'strand', 'Event Type'), measure.vars = sample_cols, variable.name = 'IHEC', value.name = 'PSI')[, .(na_proportion=sum(is.nan(PSI))/(.N)), by = .(ID, `Event Type`)], aes(x = na_proportion)) + facet_wrap(. ~ `Event Type`, scales = 'free') + stat_ecdf() + labs(title = 'na proportion by events')
 ```
+
 ```{r, eval=FALSE}
 library(Biostrings)
 genome_fasta <- 'GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz'
@@ -262,7 +459,7 @@ scores5[, sequence:=NULL]
 ```{r}
 metadata <- data.table::fread(sample_metadata_file)
 metadata <- metadata[epirr_id_without_version %in% sample_cols]
-ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Mar18_2024.json'), recursive = FALSE)
+ihec_ia_colors <- unlist(jsonlite::read_json('IHEC_EpiATLAS_IA_colors_Apr_2024_Final.json'), recursive = FALSE)
 sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
     cols <- as.numeric(strsplit(x, ",")[[1]])
     rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
@@ -293,7 +490,17 @@ event_transcripts[data.table(transcript_id = used_transcripts$transcript_id,
                              transcript_start = start(used_transcripts), 
                              transcript_end = end(used_transcripts)), on=.NATURAL, 
                   c('transcript_start', 'transcript_end') := .(transcript_start, transcript_end)]
-event_dt[event_transcripts[, .(gene_start=min(transcript_start), gene_end=max(transcript_end)), by=ID], on=.NATURAL, c('gene_start', 'gene_end') := .(gene_start, gene_end)]
+
+other_transcripts <- event_dt[, .(transcript_id=unique(unlist(reference_transcripts))), by=ID]
+used_other_transcripts <- annotation[annotation$transcript_id %in% unique(other_transcripts$transcript_id) & annotation$type == 'transcript']
+other_transcripts[data.table(transcript_id = used_other_transcripts$transcript_id, 
+                             transcript_start = start(used_other_transcripts), 
+                             transcript_end = end(used_other_transcripts)), on=.NATURAL, 
+                  c('transcript_start', 'transcript_end') := .(transcript_start, transcript_end)]
+
+# used transcripts are the ones that include the alternative regions, i.e., that are part of the alternative transcripts
+event_dt[event_transcripts[, .(alternative_start=list(transcript_start), alternative_end=list(transcript_end), gene_start=min(transcript_start), gene_end=max(transcript_end)), by=ID], on=.NATURAL, c('alternative_start', 'alternative_end', 'gene_start', 'gene_end') := .(alternative_start, alternative_end, gene_start, gene_end)]
+event_dt[other_transcripts[, .(reference_start=list(transcript_start), reference_end=list(transcript_end)), by=ID], on=.NATURAL, c('reference_start', 'reference_end') := .(reference_start, reference_end)]
 
 # used_genes <- annotation[annotation$gene_id %in% event_dt[, gene_id] & annotation$type == 'gene', ]
 # event_dt[data.table(gene_id = used_genes$gene_id, gene_start = start(used_genes), gene_end = end(used_genes)), on = 'gene_id', c('gene_start', 'gene_end') := .(gene_start, gene_end)]
@@ -301,11 +508,17 @@ event_dt[event_transcripts[, .(gene_start=min(transcript_start), gene_end=max(tr
 ss_dt <- merge(scores3, scores5, by = 'ID')
 event_dt[ss_dt, on='ID', c('3ss', '5ss') := .(i.3ss, i.5ss)]
 
-event_dt[strand == '-', distance_TSS:=log2(gene_end - end(event_gr[ID]))]
-event_dt[strand != '-', distance_TSS:=log2(start(event_gr[ID]) - gene_start)]
+event_dt[, distance_TSS := ifelse(strand == '-', 
+                                  log2(gene_end - end(event_gr[ID])), 
+                                  log2(start(event_gr[ID]) - gene_start))]
+# event_dt[strand == '-', distance_TSS:=log2(gene_end - end(event_gr[ID]))]
+# event_dt[strand != '-', distance_TSS:=log2(start(event_gr[ID]) - gene_start)]
 
-event_dt[strand == '-', distance_TES:=log2(start(event_gr[ID]) - gene_start)]
-event_dt[strand != '-', distance_TES:=log2(gene_end - end(event_gr[ID]))]
+event_dt[, distance_TES := ifelse(strand == '-', 
+                                  log2(start(event_gr[ID]) - gene_start), 
+                                  log2(gene_end - end(event_gr[ID])))]
+# event_dt[strand == '-', distance_TES:=log2(start(event_gr[ID]) - gene_start)]
+# event_dt[strand != '-', distance_TES:=log2(gene_end - end(event_gr[ID]))]
 
 # add stats about enhancers
 # signal_psi_dt[, count_enhancer := as.integer(table(c(signal_psi_dt[, ID], from(enhancer_hits)))) - 1L]
@@ -313,7 +526,7 @@ event_dt[strand != '-', distance_TES:=log2(gene_end - end(event_gr[ID]))]
 # signal_psi_dt[data.table(ID = from(distances_enhancers), distance = mcols(distances_enhancers)$distance), on = .(ID), distance_enhancer := distance]
 
 # load gene quantifications
-gene_quants <- readRDS('suppa_analysis/gene_expressions.rds')
+# gene_quants <- readRDS('suppa_analysis/gene_expressions_TSL.rds')
 
 # separator_gene_ids <- '_and_'
 # signal_psi_dt <- event_dt[, .(ID, PSI = get(ihec), gene_id)]
@@ -353,18 +566,16 @@ activeChromHMM <- rtracklayer::import("StackedChromHMM_hg38_V1_EnhancerStates.be
 activeChromHMM$chrom_state <- activeChromHMM$name
 activeChromHMM$name <- sprintf('chromhmm_%d', seq_along(activeChromHMM))
 chromhmm_hits <- findOverlaps(event_gr, activeChromHMM, maxgap = vicinity, ignore.strand=TRUE)
-chromhmm_in_vicinity <- sort(unique(to(chromhmm_hits)[from(chromhmm_hits) %in% keep_rows]))
+chromhmm_in_vicinity <- sort(unique(to(chromhmm_hits)[from(chromhmm_hits) %in% keep_rows_manual]))
 
 event_gr$name <- event_dt[, ID]
 upstream_gr$name <- sprintf('up_%d', event_dt[, ID])
 downstream_gr$name <- sprintf('down_%d', event_dt[, ID])
-```
 
-```{r}
 # write the bed files over which averaging should be done:
-aggregateOver <- c(event_gr[keep_rows],
-                   upstream_gr[keep_rows],
-                   downstream_gr[keep_rows],
+aggregateOver <- c(event_gr[keep_rows_manual],
+                   upstream_gr[keep_rows_manual],
+                   downstream_gr[keep_rows_manual],
                    # cCRE_gr[cCREs_in_vicinity_ids],
                    activeChromHMM[chromhmm_in_vicinity])
 rtracklayer::export(aggregateOver, 'aggregateOver.bed')
