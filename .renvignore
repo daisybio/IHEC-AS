@@ -3,3 +3,4 @@ sample_dts*
 .cache/
 *event_models*
 old_*/
+event_feature_tables
