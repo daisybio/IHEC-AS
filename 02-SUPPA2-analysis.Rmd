@@ -1,0 +1,81 @@
+---
+title: "SUPPA2 Analysis"
+output: html_notebook
+---
+
+Make SUPPA2 Analysis folder:
+
+```{bash, make-suppa-folder}
+mkdir -p suppa_analysis
+cd suppa_analysis
+# download gencode annotation
+wget -q -O gencode.v29.annotation.gtf.gz ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
+gunzip -f gencode.v29.annotation.gtf.gz
+# filter gencode annotation for TSL 1 and 2
+grep -E 'transcript_support_level "1";|transcript_support_level "2";' gencode.v29.annotation.gtf > gencode.v29.TSL12.gtf
+
+```
+
+Load Isoform Quantifications:
+
+```{r, load-isoform-quants}
+# read the file table
+download_metadata <- fread("processed_data/file_table.csv.gz")
+# get the isoform quantification files
+isoform_files <- download_metadata[assay_type == 'RNA-Seq', file.path(rna_data_dir, basename(file_path))]
+cols_to_keep <- c('transcript_id', 'gene_id', 'effective_length', 'expected_count', 'TPM')
+# load the isoform quantification files
+iso_quants_list <- pbmcapply::pbmclapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, fill = TRUE, select = cols_to_keep)
+names(iso_quants_list) <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", basename(isoform_files))
+stopifnot(all(download_metadata[assay_type == 'RNA-Seq', epirr_id_without_version] == names(iso_quants_list)))
+# make one isoform quantification table
+isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'epirr_id_without_version')
+isoform_quants[, epirr_id_without_version := as.factor(epirr_id_without_version)]
+
+# load annotation file
+annotation <- rtracklayer::import('suppa_analysis/gencode.v29.TSL12.gtf')
+# filter for transcripts on TSL 1 and 2
+isoform_quants <- isoform_quants[transcript_id %in% annotation$transcript_id]
+```
+
+```{r, recompute-tpm}
+# recompute TPM values on the transcripts with TSL 1 and 2
+isoform_quants[effective_length > 0, RPK := 1000 * expected_count/effective_length, by=epirr_id_without_version]
+isoform_quants[, TPM := 1000000*RPK/sum(RPK, na.rm = TRUE), by=epirr_id_without_version]
+isoform_quants[is.na(TPM), TPM := 0]
+```
+
+```{r, export-expression}
+# compute and export the gene expression in TPM by summing up transcript TPMS
+gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(epirr_id_without_version, gene_id)]
+gene_expr_file <- paste0('suppa_analysis/gene_expressions.rds')
+saveRDS(gene_quants, gene_expr_file)
+
+# bring tpms to wide format
+tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ epirr_id_without_version, value.var = 'TPM', fill = 0)
+
+# export expression for analysis with suppa
+suppa_expr_filename <- paste0('suppa_analysis/tpm_expressions.tsv')
+fileConn<-file(suppa_expr_filename)
+writeLines(paste(names(tpm_dt)[-1], collapse = '\t'), fileConn)
+close(fileConn)
+fwrite(tpm_dt, suppa_expr_filename, sep='\t', append = TRUE)
+```
+
+Actual SUPPA2 analysis:
+
+```{bash, engine.opts="-l", eval=FALSE, conda-env}
+conda env create -f env.yml
+```
+
+```{bash, engine.opts="-l", runSUPPA}
+cd suppa_analysis
+conda activate ihec-as
+dir_path=events/
+mkdir -p ${dir_path}
+suppa.py generateEvents -i gencode.v29.TSL12.gtf -o ${dir_path}/gencode.v29.TSL12.events -f ioe -e SE SS MX RI FL --pool-genes
+for event in SE A5 A3 MX RI AF AL
+do 
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.TSL12.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO -f 1 --save_tpm_events
+done
+```

@@ -1,0 +1,76 @@
+---
+title: "07-manual_ids"
+output: html_document
+date: "2024-08-14"
+---
+
+
+```{r}
+library(glmnet)
+library(ranger)
+library(caret)
+library(MLmetrics)
+```
+
+```{r}
+aggregated_dt <-
+  fread(file.path('processed_data', 'aggregated_dt_filtered.csv.gz'), stringsAsFactors = TRUE)
+load(file.path('processed_data', 'aggregating.rda'))
+event_dirs <- c('event_models_long', 
+                'event_models', 
+                'event_models_local')
+event_dirs <- file.path('processed_data', event_dirs)
+event_file_dt <- rbindlist(sapply(event_dirs, function(event_dir) {
+  rbindlist(sapply(as.character(c(manual_ids, c(4021, 4022, 459, 979, 309))), function(id) {
+      list(filename=list.files(event_dir, pattern = paste0('^', id, "[_.]"), full.names = TRUE))
+  }, simplify = FALSE), idcol = 'ID')
+}, simplify = FALSE), idcol = 'folder')
+event_file_dt[grepl("robust", filename, fixed = TRUE)]
+```
+
+
+# CD45 / PTPRC
+
+```{r}
+# for each id in 4019:4022 for each event folder, list the .rds files starting with that id with lapply
+event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 1658, filename])
+summary(event_model$cvfit$`FALSE::OLS_GE`)
+```
+
+
+```{r}
+event_dt[ID == 1658, !sample_cols, with = FALSE]
+activeChromHMM[c(54093, 54111)]
+event_gr[1658]
+```
+![CD45](images/CD451658.png)
+
+# FN1
+
+```{r}
+event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 4022, filename])
+summary(event_model$cvfit$`FALSE::OLS_GE`)
+```
+
+```{r}
+event_dt[ID == 4022, !sample_cols, with = FALSE]
+activeChromHMM[c(419854, 420041)]
+event_gr[4022]
+```
+
+![FN1](images/FN4022.png)
+
+# CTNND1
+
+```{r}
+event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 13897, filename])
+summary(event_model$cvfit$`FALSE::OLS_GE`)
+print(event_model$nsamples)
+```
+
+```{r}
+event_dt[ID == 13897, !sample_cols, with = FALSE]
+# activeChromHMM[c(419854, 420041)]
+event_gr[13897]
+```
+
