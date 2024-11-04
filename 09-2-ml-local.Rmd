@@ -1,0 +1,427 @@
+---
+title: "ML event models"
+output: pdf_document
+---
+
+# check models
+```{r}
+library(glmnet)
+library(ranger)
+library(caret)
+library(MLmetrics)
+```
+
+```{r, load-data}
+load('processed_data/aggregating.rda')
+aggregated_dt <-
+  fread('processed_data/aggregated_dt_filtered.csv.gz', stringsAsFactors = TRUE)
+event_folder <- 
+                  # "event_models_long"
+                  "event_models"
+                  # "event_models_local"
+# create event specific publication plot folder
+plot_dir <- file.path(plot_dir, event_folder)
+dir.create(plot_dir, showWarnings = FALSE)
+event_folder <- file.path('processed_data', event_folder)
+```
+
+
+```{r, create-tables}
+pred_table_path <- file.path(event_folder, 'pred_table.csv.gz')
+metric_table_path <- file.path(event_folder, 'metric_table.csv.gz')
+coef_table_path <- file.path(event_folder, 'coef_table.csv.gz')
+anova_table_path <- file.path(event_folder, 'anova_table.csv.gz')
+feature_table_path <- file.path(event_folder, 'feature_table.csv.gz')
+
+if (any(!file.exists(pred_table_path, metric_table_path, coef_table_path, anova_table_path, feature_table_path))){
+  rotated_folder <- paste(event_folder, "rotated", sep = "_")
+  filtered_folder <- paste(event_folder, "filtered", sep = "_")
+                  
+  # read only the event models where there is also an OLS model, i.e., there exists a robust version
+  event_files <- list.files(event_folder, pattern = 'robust.rds$', full.names = TRUE)
+  # rotated versions:
+  event_files_different_psi <- list.files(rotated_folder, pattern = 'robust.rds$', full.names = TRUE, recursive = TRUE)
+  # with filtered features
+  event_files_filtered <- list.files(filtered_folder, pattern = 'robust.rds$', full.names = TRUE)
+  
+  # read the models for the different versions
+  event_list <- pbapply::pblapply(event_files, readRDS)
+  names(event_list) <- sub(".rds", '', basename(event_files), fixed = TRUE)
+  
+  event_list_different_psi <- pbapply::pblapply(event_files_different_psi, readRDS)
+  names(event_list_different_psi) <- paste('rotated', sub(".rds", '', basename(event_files_different_psi), fixed = TRUE), sep = '_')
+  
+  rotated_index <- basename(dirname(event_files_different_psi))
+  
+  names(event_list_different_psi) <- paste0(names(event_list_different_psi), 'rotatedindex', rotated_index)
+  
+  event_list_filtered <- 
+                        pbapply::pblapply(event_files_filtered, readRDS)
+  names(event_list_filtered) <- paste('filtered', sub(".rds", '', basename(event_files_filtered), fixed = TRUE), sep = '_')
+  
+  # merge the event lists
+  event_list <- c(event_list, 
+                  event_list_different_psi,
+                  event_list_filtered
+                  )
+  
+  # check the ones that have an OLS, should be all
+  events_with_OLS <- sapply(event_list, function(x) any(endsWith(names(x$cvfit), 'OLS')))
+  stopifnot(all(events_with_OLS))
+  
+  # get the main table that checks between the basic models and with gene expression
+  anova_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+    model <- event_list[[id]]
+  
+    rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+      ols <- model$cvfit[[paste0(random, '::OLS')]]
+      if (is.null(ols)) return(NULL)
+      ols_ge <- model$cvfit[[paste0(random, '::OLS_GE')]]
+      ols_base <- model$cvfit[[paste0(random, '::OLS_BASE')]]
+      if(length(model$cvfit[[paste0(random, '::FEATURES')]]$full) >= (model$nsamples - 2))
+        return(NULL)
+      anova_base_res <- 
+        
+        anova(ols_base, ols, test = 'F')
+      
+      anova_res <-
+        anova(ols, ols_ge, test = 'F')
+      
+      return(data.table(
+                        anova_pval = anova_res[2, 'Pr(>F)'],
+                        anova_base_pval = anova_base_res[2, 'Pr(>F)']))
+    }, simplify = FALSE), idcol = 'random')
+  }, simplify = FALSE), idcol = 'event')
+  
+  # if the p-value is NA, then it is expression bias
+  anova_table[is.na(anova_pval), expression_bias:='expression bias']
+  
+  # split the event name
+  anova_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
+  # first set all to non-robust
+  anova_table[, robust := 'not robust']
+  anova_table[endsWith(event, '_robust'), robust := 'robust']
+  # asses the filtered ones
+  anova_table[startsWith(event, 'filtered_'), robust := 'filtered']
+  
+  # first set all to non-rotated
+  anova_table[, rotated := 'not rotated']
+  # asses the rotated ones
+  anova_table[startsWith(event, 'rotated_'), rotated := 'rotated']
+  
+  # remove the _robust suffix and the rotated_ prefix
+  anova_table[, ID:=as.integer(gsub('(to\\d+)?_robust|rotated_|filtered_', '', event))]
+  # add the ID of the rotation
+  anova_table[, rotated_index:=as.integer(gsub('rotatedindex', '', rotated_index))]
+  # add the event type and variability
+  anova_table[event_dt, on=.(ID), c('Event Type', 'Variability'):= .(`Event Type`, Variability)]
+  # add response information
+  anova_table[random == TRUE, response := 'randomized response']
+  anova_table[random == FALSE, response := 'real response']
+  anova_table[random == FALSE & rotated == 'rotated', response := 'rotated response']
+  # set the levels
+  anova_table[, response := factor(response, levels = c('real response', 'rotated response', 'randomized response'))]
+  # remove the ones that are random and rotated
+  anova_table <- anova_table[!(random == "TRUE" & rotated == 'rotated')]
+  # adjust p-values per group
+  anova_table[, padj := p.adjust(anova_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated, rotated_index)]
+  # add epression bias based on adjusted pval
+  anova_table[, expression_bias := ifelse(padj <= .05, 
+                                          'Expression Bias',
+                                          'Epigenetic Only')]
+  # do the same for comparison against base model
+  anova_table[, padj_base := p.adjust(anova_base_pval, method = 'fdr'), by=.(`Event Type`, response, robust, rotated, rotated_index)]
+  anova_table[, intercept_only := ifelse(padj_base > .05, 
+                                          'intercept_only',
+                                          'complex model')]
+  # check that all the models are actually better than the base models
+  stopifnot(anova_table[, all('intercept only' != intercept_only, na.rm = TRUE)])
+  
+  # add the ID that this rotation mapped to, so the rotated response of which this was used
+  anova_table[, to_ID:=as.integer(gsub('rotated_\\d+to(\\d+)_robust(_robust)?', '\\1', event))]
+  # check whether a rotation hit this event
+  anova_table[rotated == 'not rotated', `Rotated Hit` := ifelse(ID %in% anova_table[, unique(to_ID)], 'Hit by Rotation', 'Not Hit')]
+  
+  # columns to add to other tables
+  add_vector <- c('expression_bias', 'ID', 'response', 'Event Type', 'robust', 'Variability')
+  
+  # extract the features of the models and their folds
+  feature_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+    model <- event_list[[id]]
+    rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+      ols <- model$cvfit[[paste0(random, '::OLS')]]
+      if (is.null(ols)) return(NULL)
+      features <- model$cvfit[[paste0(random, '::FEATURES')]]
+      return(rbindlist(lapply(features, function(f) data.table(feature = f)), idcol = 'fold'))
+    }, simplify = FALSE), idcol = 'random')
+  }, simplify = FALSE), idcol = 'event')
+  feature_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
+  feature_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+  feature_table <- na.omit(feature_table, cols=add_vector)
+  
+  # extract the coefficients of the models
+  coef_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+    model <- event_list[[id]]
+    rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+      ols <- model$cvfit[[paste0(random, '::OLS')]]
+      if (is.null(ols)) return(NULL)
+      res_dt <- as.data.table(summary(ols)[["coefficients"]], keep.rownames = 'feature')
+      res_dt <- res_dt[, feature := gsub('`', '', feature, fixed = TRUE)]
+      return(res_dt)
+    }, simplify = FALSE), idcol = 'random')
+  }, simplify = FALSE), idcol = 'event')
+  coef_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
+  coef_table[, let(c('mark', 'region'), tstrsplit(feature, ';', fixed=TRUE))]
+  coef_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+  coef_table <- na.omit(coef_table, cols=add_vector)
+  coef_table[anova_table, on=.(event), `Rotated Hit`:= .(`Rotated Hit`)]
+  
+  # gather the predictions of the models
+  pred_table <- rbindlist(sapply(names(event_list)[events_with_OLS], function(id){
+    model <- event_list[[id]]
+    rbindlist(sapply(c("FALSE", "TRUE"), function(random){
+      ols <- model$cvfit[[paste0(random, '::OLS')]]
+      if (is.null(ols)) return(NULL)
+      ols_ge <- model$cvfit[[paste0(random, '::OLS_GE')]]
+      logit <- model$cvfit[[paste0(random, '::LOGIT')]]
+      new_explanatory <- gsub('`', '', names(coef(ols))[-1], fixed = TRUE)
+      train_pred_ols <- predict(ols)
+      train_pred_ols_ge <- predict(ols_ge)
+      train_pred_logit <- predict(logit, type='response')
+      train_true <- ols$y
+      
+      data.table(
+           pred = c(train_pred_ols, 
+                    train_pred_ols_ge, 
+                    train_pred_logit
+                    ),
+           trues = c(train_true, 
+                     train_true, 
+                     train_true
+                     ),
+           model = c(rep('ols', model$nsamples), 
+                     rep('ols_ge', model$nsamples), 
+                     rep('logit', model$nsamples)
+                     ),
+           dataset = c(rep('train', model$nsamples * 3)),
+           gene_expression='gene_expression' %in% model$cvfit[[paste0(random, '::FEATURES')]],
+           n_var=length(new_explanatory),
+           nsamples=model$nsamples,
+           fold=model$foldid
+           )
+    }, simplify = FALSE), idcol = 'random')
+  }, simplify = FALSE), idcol = 'event')
+  pred_table[, c('event', 'rotated_index') := tstrsplit(event, 'rotatedindex', fixed = TRUE)]
+  
+  # calculate the metrics of the predictions
+  metric_table <- pred_table[, .(r=suppressWarnings(cor(pred, trues)), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples)] #, ntest)]
+  metric_table[, fold:=0]
+  metric_table <- rbind(metric_table, pred_table[, .(r=suppressWarnings(cor(pred, trues)), r2=MLmetrics::R2_Score(pred, trues), mse=MLmetrics::MSE(pred, trues), rmse=MLmetrics::RMSE(pred, trues), mae=MLmetrics::MAE(pred, trues)), by=.(event, random, model, dataset, n_var, gene_expression, nsamples, fold)])
+  metric_table[anova_table, on=.(event, random), (add_vector):=mget(add_vector)]
+  metric_table <- na.omit(metric_table, cols=add_vector)
+  metric_table[, `Event Type` := factor(`Event Type`, levels=to_analyze)]
+  
+  # clean up
+  rm(event_list_different_psi)
+  rm(event_list)
+  gc()
+  # export all _tables
+  fwrite(pred_table, pred_table_path)
+  fwrite(metric_table, metric_table_path)
+  fwrite(coef_table, coef_table_path)
+  fwrite(anova_table, anova_table_path)
+  fwrite(feature_table, feature_table_path)
+} else {
+# Load precomputed tables 
+  pred_table <- fread(pred_table_path, stringsAsFactors = TRUE)
+  metric_table <- fread(metric_table_path, stringsAsFactors = TRUE)
+  metric_table[, `Event Type` := factor(`Event Type`, levels=to_analyze)]
+  coef_table <- fread(coef_table_path, stringsAsFactors = TRUE)
+  anova_table <- fread(anova_table_path, stringsAsFactors = TRUE)
+  feature_table <- fread(feature_table_path, stringsAsFactors = TRUE)
+}
+```
+
+
+```{r, counting-events}
+event_counts <- rbindlist(list(Filtered=event_dt[ID %in% keep_rows, .(.N), by=.(`Event Type`)], # filtered events
+          Quantified=aggregated_dt[, .(N=uniqueN(ID)), by=`Event Type`], # events quantified:
+          # `Not Quantified`=event_dt[ID %in% setdiff(keep_rows, aggregated_dt[, unique(ID)])][, .N, by=`Event Type`], # no event quantified:
+          `No Model`=aggregated_dt[!ID %in% anova_table[random == FALSE & rotated == 'not rotated', unique(ID)], .(N=uniqueN(ID)), by=`Event Type`], # no model built:
+          `Model`=anova_table[rotated == 'not rotated' & random == FALSE & robust == 'robust', .N, by=.(`Event Type`)], # models built:
+          `Epigenetic\nOnly Model`=anova_table[rotated == 'not rotated' & random == FALSE & robust == 'robust' & expression_bias == 'Epigenetic Only', .N, by=.(`Event Type`)]# epigenetic only:
+          ), idcol = 'filtering')
+# event_counts[`Event Type` == 'RI', N:=-N]
+
+# events built:
+print(anova_table[, table(expression_bias, response, robust, `Event Type`)])
+
+ggplot(event_counts, aes(x=N, y=reorder(filtering, N))) + 
+  geom_col() + 
+  theme_bw() + 
+  theme(strip.background = element_rect(fill = 'white'), text = element_text(size = 20), axis.text.x = element_blank()) +
+  facet_wrap(~ `Event Type`, scales = 'free_x') +
+  # add label with the exact number and rotate by 90 degrees
+  geom_text(aes(label=N), vjust=1.1, size=4, angle=90) +
+  labs(x='Number of Events', y=NULL) # make fill colors use 
+ggsave(file.path(plot_dir, 'event_counts.pdf'), width = 7, height = 3)
+```
+
+
+```{r, generate-count-plots}
+event_count_dt <- anova_table[robust != 'filtered', {counts=.SD[, .(count=.N), by=rotated_index][, count]; .(mean_count=mean(counts), sd_count=sd(counts)/sqrt(uniqueN(rotated_index)))}, by=.(`Event Type`, response, #gene_expression_selected, 
+  expression_bias, Variability, `Rotated Hit`)]
+event_count_dt[response == 'real response', response := 'Real']
+event_count_dt[response == 'rotated response', response := 'Rotated']
+event_count_dt[response == 'randomized response', response := 'Random']
+event_count_dt[, response := factor(response, levels=c('Real', 'Rotated', 'Random'))]
+event_count_dt[expression_bias == 'Expression Bias', expression_bias := 'Expression\nBias']
+event_count_dt[expression_bias == 'Epigenetic Only', expression_bias := 'Epigenetic\nOnly']
+# split Variability from the levels
+event_count_dt[, Variability := sub(' Variability', '', Variability, fixed = TRUE)]
+event_count_dt[, Variability := factor(Variability, levels=c('High', 'Low'))]
+event_count_dt[, `Event Type` := factor(`Event Type`, levels=c('SE', 'RI'))]
+event_count_dt[order(Variability, decreasing = TRUE), cumsum_mean_count:=cumsum(mean_count), by=.(`Event Type`, response, #`Rotated Hit`,
+                                                                                             expression_bias)]
+ggplot(event_count_dt, #[response != 'randomized response'], 
+       aes(y = mean_count, x = expression_bias, fill = Variability)) + 
+    geom_col() + 
+    facet_grid(`Event Type` ~ response# + `Rotated Hit`
+               , scales='free_y') + theme_bw() + 
+    theme(legend.box="vertical", strip.background = element_rect(fill = 'white'), legend.position = 'bottom', axis.title.x=element_blank()) + 
+    scale_fill_manual(values=variability_colors) + 
+    labs(y = 'Number of Events', color = 'Gene Expression Selected') +
+    geom_errorbar(aes(y=cumsum_mean_count, ymin=cumsum_mean_count-sd_count, ymax=cumsum_mean_count+sd_count), width=.2) #
+    # geom_text(aes(label=mean_count), position=position_dodge(width=0.9), vjust=1.3)
+ggsave(file.path(plot_dir, 'events_rotation.png'), width=6, height=3, dpi = 600)
+
+event_count_dt[order(Variability, decreasing = TRUE), cumsum_mean_count_rotation:=cumsum(mean_count), by=.(`Event Type`, response, `Rotated Hit`,
+                                                                                             expression_bias)]
+event_count_dt[response == 'Real', expression_bias:=sub('\n', ' ', expression_bias, fixed = TRUE)]
+ggplot(event_count_dt[response == 'Real'],
+       aes(y = mean_count, x = Variability, fill = expression_bias)) +
+    geom_col(position='fill') + 
+    geom_text(aes(label = mean_count), 
+              position = position_fill(vjust = 0.5)) + 
+    facet_grid(`Event Type` ~ `Rotated Hit`, scales='free_y') + 
+    theme_bw() + 
+    theme(legend.box = "vertical", 
+          strip.background = element_rect(fill = 'white'), 
+          legend.position = 'bottom') + 
+    scale_fill_manual(values=c(`Epigenetic Only` = 'orange', `Expression Bias` = 'steelblue')) +
+    labs(y = 'Proportion of Events', fill=NULL)
+ggsave(file.path(plot_dir, 'events_hit.png'), width=5, height=3)
+
+```
+
+# check filtered vs not filtered
+
+```{r}
+# get the list of IDs for the intersection and the set differences for the IDs that are robust and filtered for each event type
+filtered_vs_robust_ids <- sapply(to_analyze, function(this_event) {
+  robust_ids <- anova_table[response == 'real response' & `Event Type` == this_event & robust == "robust", ID]
+  filtered_ids <- anova_table[response == 'real response' & `Event Type` == this_event & robust == "filtered", ID]
+  list(intersection=intersect(robust_ids, filtered_ids), robust_only=setdiff(robust_ids, filtered_ids), filtered_only=setdiff(filtered_ids, robust_ids))
+})
+filtered_vs_robust_ids
+stopifnot(all(metric_table[response == 'real response' & model == 'ols' & fold == 0 & ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE)][, table(ID)] == 2))
+```
+
+
+```{r, feature-changes}
+# Compute feature changes
+filtered_vs_original <- coef_table[response == 'real response', {
+  filtered_features <- .SD[robust == 'filtered', feature]
+  robust_features <- .SD[robust == 'robust', feature]
+  .(
+    length_filtered = length(filtered_features),
+    length_robust = length(robust_features),
+    intersect = length(intersect(filtered_features, robust_features)),
+    same_features = setequal(filtered_features, robust_features),
+    same_expression_bias = setequal(.SD[robust == 'filtered', expression_bias], 
+                                    .SD[robust == 'robust', expression_bias]),
+    robust_expression_bias = .SD[robust == 'robust', unique(expression_bias)],
+    filtered_expression_bias = .SD[robust == 'filtered', unique(expression_bias)]
+  )
+}, by=.(`Event Type`, ID)]
+filtered_vs_original[, `Feature Change` := !same_features]
+filtered_vs_original[, `Expression Bias Change` := !same_expression_bias]
+filtered_no_robust <- filtered_vs_original[is.na(robust_expression_bias), ID]
+stopifnot(identical(filtered_no_robust,
+                    anova_table[response == 'real response', .SD['filtered' %in% robust & !'robust' %in% robust], by=.(ID, response)][, ID]))
+for (this_event in to_analyze) {
+  print(
+    ggplot(filtered_vs_original[`Event Type` == this_event],
+           aes(x = `Feature Change`, fill = `Expression Bias Change`)) +
+      geom_bar() +
+      facet_grid(filtered_expression_bias ~ robust_expression_bias) +
+      labs(title = this_event)
+  )
+}
+filtered_vs_original[ID %in% unlist(filtered_vs_robust_ids['intersection', ], use.names = FALSE), .(`Feature Change`=sum(`Feature Change`), .N, `%No Feature Change`=round(100*sum(!`Feature Change`)/.N, 1)), by=.(`Event Type`)]
+```
+
+```{r}
+# make dt with the chromhmm regions
+activeChromHMM_dt <- data.table(region = activeChromHMM$name,
+           chrom_state = activeChromHMM$chrom_state,
+           region_width = width(activeChromHMM),
+           region_ID = seq_along(activeChromHMM))
+coef_table[activeChromHMM_dt, on=.(region), c('chrom_state', 'region_width', 'region_ID') := .(chrom_state, region_width, region_ID)]
+stopifnot(identical(coef_table[!is.na(region_ID), region_width], coef_table[!is.na(region_ID), width(activeChromHMM[region_ID])]))
+
+# add width for event_region, downstream and upstream regions
+coef_table[is.na(region_ID) & region == 'event_name', region_width:= width(event_gr[ID])]
+coef_table[is.na(region_ID) & region == 'downstream_other_region', region_width:= width(downstream_gr[ID])]
+coef_table[is.na(region_ID) & region == 'upstream_other_region', region_width:= width(upstream_gr[ID])]
+
+# add chrom_state
+coef_table[, chrom_state:=list(strsplit(chrom_state, split = ',', fixed = TRUE))]
+coef_table[, coefficient_sign:= ifelse(Estimate > 0, 'positive coefficient', 'negative coefficient')]
+coef_table[, region_type := 'not chromhmm region']
+
+# add response
+coef_table[, Response:=tools::toTitleCase(tstrsplit(response, ' ', fixed=TRUE, keep = 1)[[1]])]
+coef_table[, Response:=factor(Response, levels = c('Real', 'Rotated', 'Randomized'))]
+
+# make event type to factor
+coef_table[, `Event Type`:=factor(`Event Type`, levels = to_analyze)]
+```
+
+```{r}
+# add summed enhancer and max promoter to the color levels
+hex_colors <- c(mark_hex_colors, summed_enhancer='darkorange', max_promoter='tomato')
+
+coef_table[, plot_feature:=mark]
+
+plot_colors <- setNames(rep("dark grey", coef_table[, uniqueN(plot_feature)]), coef_table[, unique(plot_feature)])
+for(name in names(hex_colors)) {
+  inds <- startsWith(names(plot_colors), name)
+  plot_colors[inds] <- hex_colors[name]
+}
+```
+
+
+```{r, plot-mark-counts}
+err_dt <- coef_table[mark != '(Intercept)' & expression_bias == 'Epigenetic Only' & robust == 'robust', .(mark=unique(mark)), by=.(event, response, rotated_index, `Event Type`, robust, Variability)][, {counts=.SD[, .(count=.N), by=rotated_index][, count]; .(mean_count=mean(counts), sd_count=sd(counts)/sqrt(uniqueN(rotated_index)))}, by=.(`Event Type`, response, mark, Variability)]
+err_dt[, Response:=tools::toTitleCase(tstrsplit(response, ' ', fixed=TRUE, keep = 1)[[1]])]
+err_dt[, Response:=factor(Response, levels = c('Real', 'Rotated', 'Randomized'))]
+err_dt[, Variability:=factor(sub(pattern = " Variability", replacement = "", x = Variability, fixed = TRUE), levels = c('Low', 'High'))]
+err_dt[, `Event Type`:=factor(`Event Type`, levels = c('SE', 'RI'))]
+# remove _ from the mark column and put it in titleCase
+err_dt[, mark:=tools::toTitleCase(gsub('_', ' ', mark))]
+# do the same to the names of the plot_colors
+names(plot_colors) <- tools::toTitleCase(gsub('_', ' ', names(plot_colors)))
+
+ggplot(err_dt, aes(x = Response, y=mean_count, fill = mark)) + 
+    ggplot2::geom_col(position = 'dodge') +
+    ggplot2::geom_errorbar(aes(ymin=mean_count-sd_count, ymax=mean_count+sd_count), width=.7, position=position_dodge(.9)) +
+    ggplot2::facet_wrap(`Event Type` ~ Variability, scales = 'free_y', nrow = 2) +
+    ggplot2::labs(#title = 'Event Counts for Selected Features of Event-Specific Models', 
+                  y = NULL, 
+                  x = NULL, fill = 'Mark') + 
+    ggplot2::theme_bw() + 
+    ggplot2::scale_fill_manual(values = plot_colors) + 
+    ggplot2::theme(legend.position="bottom", strip.background = element_rect(fill = 'white')) 
+ggsave(file.path(plot_dir, 'mark_counts_error.pdf'), width = 6.1, height = 4)
+```
