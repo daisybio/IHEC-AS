@@ -1,6 +1,8 @@
 ---
 title: "preliminary-results"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 
@@ -146,18 +148,6 @@ cols_to_factor <- c('event_id', 'gene_id', 'seqnames', 'strand')
 event_dt[,(cols_to_factor) := lapply(.SD, as.factor), .SDcols = cols_to_factor]
 ```
 
-```{r, compute-variability}
-# compute Adj SD per event
-event_dt[, `Adjusted PSI SD` := sqrt(rowSums((.SD - rowMeans(.SD, na.rm = TRUE))^2, na.rm = TRUE)/(length(sample_cols) - 1)), .SDcols = sample_cols]
-# compute median Adj SD per event type on IDs in keep_rows
-median_adj_sd <- event_dt[ID %in% keep_rows, .(med=median(`Adjusted PSI SD`, na.rm = TRUE), tmp_event_type=`Event Type`), by=`Event Type`][, `Event Type`:=NULL]
-# assign variability to each event
-event_dt[ID %in% keep_rows, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
-event_dt[ID %in% manual_ids, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
-# make sure the order is correct
-event_dt[, Variability := factor(Variability, levels=c('Low Variability', 'High Variability'))]
-```
-
 Export sequences for MaxEntScan
 
 ```{bash, download-genome}
@@ -215,6 +205,8 @@ tar -xf maxentscan.tar.gz && mv -f fordownload maxentscan && rm maxentscan.tar.g
 cd maxentscan/
 perl score3.pl ../processed_data/3ss.fasta > ../processed_data/3scores.txt
 perl score5.pl ../processed_data/5ss.fasta > ../processed_data/5scores.txt
+cd ..
+rm -r maxentscan/
 ```
 
 ```{r, read-MaxEntScanScores}
@@ -236,7 +228,7 @@ scores5[, sequence:=NULL]
 ```{r, read-metadata}
 # load metadata and subset
 metadata <- data.table::fread(sample_metadata_file)
-metadata <- metadata[epirr_id_without_version %in% sample_cols]
+metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
 # load colors and transform from rgb to hex
 ihec_ia_colors <- unlist(jsonlite::read_json('data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json'), recursive = FALSE)
 sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {

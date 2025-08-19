@@ -23,7 +23,12 @@ library(svglite)
 # library(RSNNS)
 # library(MLmetrics)
 
-sample_metadata_file <- "data/IHEC_metadata_harmonization.v1.3.extended.csv"
+ggplot2::theme_set(
+  theme_bw() +
+    theme(strip.background = element_rect(fill = NA))
+)
+
+sample_metadata_file <- "data/IHEC_sample_metadata_harmonization.v1.4_extended.csv"
 ontology_column <- "harmonized_sample_ontology_term_high_order_fig1"
 
 

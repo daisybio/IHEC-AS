@@ -1,6 +1,8 @@
 ---
 title: "SUPPA2 Analysis"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 Make SUPPA2 Analysis folder:
@@ -26,33 +28,36 @@ isoform_files <- download_metadata[assay_type == 'RNA-Seq', file.path(rna_data_d
 cols_to_keep <- c('transcript_id', 'gene_id', 'effective_length', 'expected_count', 'TPM')
 # load the isoform quantification files
 iso_quants_list <- pbmcapply::pbmclapply(isoform_files, data.table::fread, stringsAsFactor=TRUE, fill = TRUE, select = cols_to_keep)
-names(iso_quants_list) <- gsub("^.*?(IHECRE[0-9]{8}).*$", "\\1", basename(isoform_files))
-stopifnot(all(download_metadata[assay_type == 'RNA-Seq', epirr_id_without_version] == names(iso_quants_list)))
+names(iso_quants_list) <- download_metadata[assay_type == 'RNA-Seq', uuid]
+
 # make one isoform quantification table
-isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'epirr_id_without_version')
-isoform_quants[, epirr_id_without_version := as.factor(epirr_id_without_version)]
+isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = 'uuid')
+isoform_quants[, uuid := as.factor(uuid)]
 
 # load annotation file
 annotation <- rtracklayer::import('suppa_analysis/gencode.v29.TSL12.gtf')
 # filter for transcripts on TSL 1 and 2
 isoform_quants <- isoform_quants[transcript_id %in% annotation$transcript_id]
+tpms <- isoform_quants[download_metadata[assay_type == "RNA-Seq", .(uuid, epirr_id_without_version, experiment_type)], on = .(uuid), c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)][, .(tpm=sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)]
+ggplot(tpms, aes(x = tpm, fill = experiment_type)) + geom_histogram()
 ```
 
 ```{r, recompute-tpm}
 # recompute TPM values on the transcripts with TSL 1 and 2
-isoform_quants[effective_length > 0, RPK := 1000 * expected_count/effective_length, by=epirr_id_without_version]
-isoform_quants[, TPM := 1000000*RPK/sum(RPK, na.rm = TRUE), by=epirr_id_without_version]
+isoform_quants[effective_length > 0, RPK := 1000 * expected_count/effective_length, by=.(uuid, epirr_id_without_version)]
+isoform_quants[, TPM := 1000000*RPK/sum(RPK, na.rm = TRUE), by=.(uuid, epirr_id_without_version)]
 isoform_quants[is.na(TPM), TPM := 0]
+ggplot(isoform_quants[, .(tpm=sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) + geom_histogram()
 ```
 
 ```{r, export-expression}
 # compute and export the gene expression in TPM by summing up transcript TPMS
-gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(epirr_id_without_version, gene_id)]
+gene_quants <- isoform_quants[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(uuid, epirr_id_without_version, gene_id)]
 gene_expr_file <- paste0('suppa_analysis/gene_expressions.rds')
 saveRDS(gene_quants, gene_expr_file)
 
 # bring tpms to wide format
-tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ epirr_id_without_version, value.var = 'TPM', fill = 0)
+tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ uuid, value.var = 'TPM', fill = 0)
 
 # export expression for analysis with suppa
 suppa_expr_filename <- paste0('suppa_analysis/tpm_expressions.tsv')

@@ -1,6 +1,8 @@
 ---
 title: "Match Data"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 
@@ -8,6 +10,7 @@ output: html_notebook
 mkdir -p data
 # download the sample metadata v1.3 from GitHub, make sure you download this into "sample_metadata_file" defined in .Rprofile
 wget -q -O data/IHEC_metadata_harmonization.v1.3.extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/9b195bfe18a9e1a8a74096ed16716ffe87ce0c29/openrefine/v1.3/IHEC_metadata_harmonization.v1.3.extended.csv
+wget -q -O data/IHEC_sample_metadata_harmonization.v1.4_extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
 
 mkdir -p processed_data
 ```
@@ -47,22 +50,94 @@ download_metadata[assay_type == 'WGBS' & uuid == 'imputed', uuid := NA]
 # set empty uuids to NA
 download_metadata[uuid == "", uuid := NA]
 # get the epirr_ids which have both RNA-Seq types and set the totalRN to NA
-both_RNA <- download_metadata[assay_type == 'RNA-Seq', if(.SD[, sum(!is.na(uuid)) > 1]).(both_RNA=TRUE), by=epirr_id_without_version]
-download_metadata[epirr_id_without_version %in% both_RNA[, epirr_id_without_version] & experiment_type == 'total-RNA-Seq', uuid := NA]
+# both_RNA <- download_metadata[assay_type == 'RNA-Seq', if(.SD[, sum(!is.na(uuid)) > 1]).(both_RNA=TRUE), by=epirr_id_without_version]
+# download_metadata[epirr_id_without_version %in% both_RNA[, epirr_id_without_version] & experiment_type == 'total-RNA-Seq', uuid := NA]
 # remove empty uuids
 
 download_metadata <- download_metadata[!is.na(uuid)]
-# make sure we have 405 entries with 3 different assays and 8 different entries
-stopifnot(download_metadata[, .(unique_assays=uniqueN(assay_type), unique_experiments=uniqueN(experiment_type)), by = epirr_id_without_version][, all(unique_assays == 3) & all(unique_experiments == 8)])
+# make sure we have 405 entries with 3 different assays and at least 8 different entries (some have more because we have some with both RNA assays)
+stopifnot(download_metadata[, .(unique_assays=uniqueN(assay_type), unique_experiments=uniqueN(experiment_type)), by = epirr_id_without_version][, all(unique_assays == 3) & all(unique_experiments >= 8)])
 ```
 
 
-```{r, make-ftp-list}
-# read experiment metadata for observed and imputed data
+```{r, check-qc}
+# read experiment metadata for observed data
 experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv") # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
+
+# get qc files https://ihec.sd4h.ca/IHEC/readme/*_qc_summary.csv
+rna_qc <- fread("data/EpiATLAS_rnaseq_qc_summary.csv")
+rna_qc[experiment_metadata, on=c(uuid="uuid"), c("experiment_type", "trimmed_read_length", "paired_end", "analyzed_as_stranded"):=.(experiment_type, trimmed_read_length, paired_end, analyzed_as_stranded)]
+
+rna_qc[, included := "EpiATLAS"]
+rna_qc[uuid %in% download_metadata[assay_type == "RNA-Seq", uuid], included := "this_project"]
+# ggplot(rna_qc, aes(x = total)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 45e6, linetype='dashed') + labs(title = "Total Reads Density Plot")
+# ggplot(rna_qc, aes(x = fraction_mapped)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = "Fraction Mapped Density Plot")
+# ggplot(rna_qc, aes(x = fraction_intergenic)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .15, linetype='dashed') + labs(title = "Fraction Intergenic Density Plot")
+# ggplot(rna_qc, aes(x = fraction_rrna)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .3, linetype='dashed') + labs(title = "Fraction rRNA Density Plot")
+# ggplot(rna_qc, aes(x = fraction_duplicates)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 0.95, linetype='dashed') + labs(title = "Fraction Duplicated Density Plot")
+# ggplot(rna_qc, aes(x = fraction_duplicates, color = data_generating_centre)) + geom_density() + facet_grid( ~ experiment_type) + geom_vline(xintercept = .4, linetype='dashed') + labs(title = "Fraction Duplicated Density Plot")
+rna_qc[, rna_potentially_problematic := FALSE]
+rna_qc[total < 45e6 | fraction_mapped < .5 | fraction_intergenic > .15 | fraction_rrna > .3 | fraction_duplicates > 0.95, rna_potentially_problematic := TRUE]
+rna_qc[, epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)]
+rna_qc_stats <- c("epirr_id_without_version", "uuid", "rna_potentially_problematic", "fraction_mapped", "fraction_intergenic", "fraction_rrna", "fraction_duplicates")
+
+chip_qc <- fread("data/EpiATLAS_chipseq_qc_summary.csv")
+chip_qc_stats <- names(chip_qc)[!names(chip_qc) %in% c( "uuid", "data_generating_centre", "epirr_id", "antibody")]
+chip_qc[, included := "EpiATLAS"]
+chip_qc[uuid %in% download_metadata[assay_type == "ChIP-Seq", uuid], included := "this_project"]
+# ggplot(chip_qc, aes(x = `flagstat_qc:mapped_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 60, linetype='dashed') + labs(title = "Mapped Reads Density Plot")
+# ggplot(chip_qc, aes(x = `flagstat_qc:paired_properly_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 90, linetype='dashed') + labs(title = "Paired Properly Reads Density Plot")
+# ggplot(chip_qc, aes(x = `dup_qc:dupes_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 90, linetype='dashed') + labs(title = "Duplicates Density Plot")
+# ggplot(chip_qc, aes(x = `pbc_qc:NRF`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = " Non-Redundant Fraction (NRF) and PCR Bottlenecking Coefficients 1 and 2 Density Plot")
+# ggplot(chip_qc, aes(x = `pbc_qc:PBC1`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = "PCR Bottlenecking Coefficients 1 Density Plot")
+# ggplot(chip_qc, aes(x = `pbc_qc:PBC2`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 1, linetype='dashed') + labs(title = "PCR Bottlenecking Coefficients 2 Density Plot")
+# ggplot(chip_qc, aes(x = `frip_macs2_qc:rep1.FRiP`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .1, linetype='dashed') + labs(title = "Fraction of Reads in Peaks Density Plot")
+# ggplot(chip_qc, aes(x = `overlap_frip_qc:rep1-pr.FRiP`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .1, linetype='dashed') + labs(title = "Fraction of Reads in Peaks across Replicates Density Plot")
+chip_qc[, potentially_problematic := FALSE]
+chip_qc_stats <- c("potentially_problematic", chip_qc_stats)
+# removed : | `flagstat_qc:paired_properly_pct` < 90 
+chip_qc[`flagstat_qc:mapped_pct` < 60 | `dup_qc:dupes_pct` > 90 | `pbc_qc:NRF` < .5 | `pbc_qc:PBC1` < .5 | `pbc_qc:PBC2` < 1 | `frip_macs2_qc:rep1.FRiP` < .02 | `overlap_frip_qc:rep1-pr.FRiP` < .02, potentially_problematic := TRUE]
+chip_qc[, epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)]
+chip_qc_long <- melt(chip_qc, id.vars = c("epirr_id_without_version", "potentially_problematic", "included", "antibody"), measure.vars = chip_qc_stats)
+chip_qc_wide <- dcast(chip_qc_long, epirr_id_without_version + included ~ antibody + variable)
+
+wgbs_qc <- fread("data/EpiATLAS_wgbs_qc_summary.csv")
+wgbs_qc[, included := "EpiATLAS"]
+wgbs_qc[uuid %in% download_metadata[assay_type == "WGBS", uuid], included := "this_project"]
+wgbs_qc[experiment_metadata, on=c(uuid="uuid"), c("experiment_type"):=.(experiment_type)]
+# ggplot(wgbs_qc, aes(x = `Mean_CpG_Coverage`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 3, linetype='dashed') + labs(title = "Mean CpG Coverage Density Plot")
+# ggplot(wgbs_qc, aes(x = `BS_conversion_Rate`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .95, linetype='dashed') + labs(title = "Bisulfite Conversion Rate Density Plot")
+# ggplot(wgbs_qc, aes(x = `GC_cov_Correlation`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = c(-.7, .7), linetype='dashed') + labs(title = "GC Coverage Correlation Density Plot")
+wgbs_qc[, wgbs_potentially_problematic := FALSE]
+wgbs_qc[`Mean_CpG_Coverage` < 3 | `BS_conversion_Rate` < .95 | `GC_cov_Correlation` < -.7 | `GC_cov_Correlation` > .7 , wgbs_potentially_problematic := TRUE]
+wgbs_qc[, epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)]
+wgbs_qc_stats <- c("epirr_id_without_version", "wgbs_potentially_problematic", "Mean_CpG_Coverage", "BS_conversion_Rate", "GC_cov_Correlation")
+
+# now merge all three qc tables based on epirr_id_without_version but only the ones where included == "this_project"
+merged_qc <-
+  merge(
+    merge(chip_qc_wide[included == "this_project", -"included"], 
+          rna_qc[included == "this_project", ..rna_qc_stats], 
+          by = "epirr_id_without_version",
+          all = TRUE), 
+    wgbs_qc[included == "this_project", ..wgbs_qc_stats],
+    by = "epirr_id_without_version",
+    all = TRUE
+  )
+fwrite(merged_qc, "processed_data/qc_summary.csv")
+
+download_metadata[, table(experiment_type, uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]))]
+download_metadata[uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]), uniqueN(epirr_id_without_version)]
+potentially_remove_epirr <- download_metadata[uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]), unique(epirr_id_without_version)]
+metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version], table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
+metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version] & ! epirr_id_without_version %in% potentially_remove_epirr, table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
+```
+
+```{r, make-ftp-list}
 # add epirr_id for the specific version and software version
 download_metadata[experiment_metadata, on=.NATURAL, c("epirr_id", "software_version"):=.(epirr_id, software_version)]
 
+# read experiment metadata for observed +imputed data
 imputed_experiment_metadata <- fread("data/EpiATLAS_imputed_experiment_metadata.csv") # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_imputed_experiment_metadata.csv
 # add epirr_id for the specific version and data_path
 imputed_experiment_metadata[, epirr_id_without_version:=tstrsplit(epirr_id, ".", fixed=TRUE, keep=1)]
@@ -89,7 +164,6 @@ here we need to download the files from the sftp
 
 ```{r, check-downloaded-files}
 # check whether all files are downloaded:
-# rna:
 stopifnot("some RNA-Seq files are not downloaded yet"=all(file.exists(download_metadata[assay_type == 'RNA-Seq', file.path(rna_data_dir, basename(file_path))])), 
           "some ChIP-Seq files are not downloaded yet"=all(file.exists(download_metadata[assay_type == 'ChIP-Seq', file.path(chip_data_dir, basename(file_path))])), 
           "some WGBS matrices are not downloaded yet"=all(file.exists(file.path(wgbs_matrices_data_dir, basename(wgbs_matrices)))))
