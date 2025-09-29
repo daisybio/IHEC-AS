@@ -51,7 +51,7 @@ wgbs_data_dir <- file.path(data_dir, "WGBS")
 wgbs_matrices_data_dir <- file.path(data_dir, "WGBS_matrices")
 sample_dt_dir <- "sample_dts"
 
-histone_marks <- c("H3K27ac", "H3K27me3", "H3K36me3", "H3K4me1", "H3K4me3", "H3K9me3")
+histone_marks <- c("H3K9me3", "H3K27me3", "H3K27ac", "H3K4me1", "H3K4me3", "H3K36me3")
 as_events <- c("SE", "RI", "AL", "AF", "A3", "A5", "MX")
 to_analyze <- c("SE", "RI")
 cor_methods <- c("pearson", "spearman")

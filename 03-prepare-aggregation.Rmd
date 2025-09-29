@@ -137,7 +137,7 @@ not_gonosomes <- event_dt[!seqnames %in% c('chrY', 'chrX'), which = TRUE]
 keep_rows <- intersect(intersect(single_genes_only, non_overlapping_other), not_gonosomes)
 
 # include experimental events manually, to make sure models are built for this:
-manual_ids <- c(4019, 4020, 460:463, 310:314, 8201:8202, 1658, 1048:1049, 13896:13897)
+manual_ids <- c() #TODO new manual ids necessary? 4019, 4020, 460:463, 310:314, 8201:8202, 1658, 1048:1049, 13896:13897)
 
 # make sure keep_rows and manual_ids are disjoint
 stopifnot(length(intersect(keep_rows, manual_ids)) == 0)

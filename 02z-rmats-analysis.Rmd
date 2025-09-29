@@ -1,0 +1,201 @@
+---
+title: "rMATS to SUPPA"
+author: "Quirin Manz"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+bam_dt <- data.table(
+  bam = c(
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009331/1.0.0/1.1.0/hg38_no_alt/75/8177/work/f4/ff34e2e7a1b6216bbf8c59e26ae4f1/K009331_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009330/1.0.0/1.1.0/hg38_no_alt/75/8176/work/df/4d3fa1685efcf134929b12b9e4f549/K009330_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009333/1.0.0/1.1.0/hg38_no_alt/75/8175/work/c8/cade5167cf026da3936366fc259718/K009333_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009332/1.0.0/1.1.0/hg38_no_alt/75/8174/work/65/9dd6bf34e3471ee9c22a2b1e5146a2/K009332_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009334/1.0.0/1.1.0/hg38_no_alt/75/8167/work/5e/d8b4bda598d2913427aef88915cffd/K009334_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009335/1.0.0/1.1.0/hg38_no_alt/75/8168/work/f3/3873664c8ce4a3af54a2ad0e384ea6/K009335_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009337/1.0.0/1.1.0/hg38_no_alt/75/8173/work/07/2b4827c201cb47633a59b2b9959845/K009337_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009336/1.0.0/1.1.0/hg38_no_alt/75/8172/work/02/1e59765267de0efbc517b570c11ed8/K009336_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009339/1.0.0/1.1.0/hg38_no_alt/75/8171/work/1c/8a1cd58f6e9e829e21e4b9a44b4322/K009339_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009338/1.0.0/1.1.0/hg38_no_alt/75/8170/work/85/4cfd38648a13da79969248d2febc39/K009338_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009341/1.0.0/1.1.0/hg38_no_alt/75/8179/work/9d/975f47eee547312ffa13a743637bca/K009341_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009340/1.0.0/1.1.0/hg38_no_alt/75/8178/work/0d/d5d92a6c288c8285ef39ace05434af/K009340_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009343/1.0.0/1.1.0/hg38_no_alt/75/8181/work/b5/9f398b50552276c3b282983dc537d4/K009343_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009342/1.0.0/1.1.0/hg38_no_alt/75/8180/work/e8/8e03bbd5675b7e4d15bef907d44840/K009342_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009345/1.0.0/1.1.0/hg38_no_alt/75/8183/work/88/2d179ca34731b49671ac9965ba5591/K009345_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009344/1.0.0/1.1.0/hg38_no_alt/75/8182/work/6a/c3f7a5f2bd95c34a4d057cee451b10/K009344_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009347/1.0.0/1.1.0/hg38_no_alt/75/8185/work/2a/7e107c95b4dc215f2c8ea24298c96f/K009347_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009346/1.0.0/1.1.0/hg38_no_alt/75/8184/work/33/852a5b510bc382fbd14b030040f5ec/K009346_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009349/1.0.0/1.1.0/hg38_no_alt/75/8187/work/ba/510ecfe57780797980928b0cf4a05d/K009349_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009348/1.0.0/1.1.0/hg38_no_alt/75/8186/work/52/b8bf5b82bbe29e42d2e031530a8be4/K009348_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009351/1.0.0/1.1.0/hg38_no_alt/75/8188/work/ed/a9edeb002a80e66be0806f3cb76148/K009351_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009350/1.0.0/1.1.0/hg38_no_alt/75/8202/work/4f/dea973195470756c5f863602ab0120/K009350_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009352/1.0.0/1.1.0/hg38_no_alt/75/8189/work/be/fa20d950f8dad490bf50a0e96f7308/K009352_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009354/1.0.0/1.1.0/hg38_no_alt/75/8191/work/d3/b42747e0d28b9c77580e4b61968fc1/K009354_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009353/1.0.0/1.1.0/hg38_no_alt/75/8190/work/3a/d2e4e2914d351492a092231153ce89/K009353_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009356/1.0.0/1.1.0/hg38_no_alt/75/8193/work/d8/c76ab062480d6955faa0800b6da841/K009356_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009355/1.0.0/1.1.0/hg38_no_alt/75/8192/work/3d/6de682131a37684e32c7528549e324/K009355_m4_n10_toGenome.markdup.bam",
+    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009358/1.0.0/1.1.0/hg38_no_alt/75/8195/work/a7/7f9e9b3f840e1eaaa7c762a2a957fc/K009358_m4_n10_toGenome.markdup.bam"
+  ))
+bam_dt[, path := tstrsplit(bam, "/work", keep = 1)]
+bam_mapping <- fread("rmats_mapping/DEEP.RNA_Seq.EpiRRID_exptype_path.IHEC.tsv", header = FALSE)
+setnames(bam_mapping, 1:4, c("project", "epirr", "experiment_type", "path"))
+bam_dt[bam_mapping, on = .NATURAL, c("epirr", "experiment_type"):=.(epirr, experiment_type)]
+bam_dt[, sample_name := paste(epirr, experiment_type, sep = "_")]
+```
+
+```{r, fig.width=12, fig.height=8}
+#ID format for suppa: "ENSG00000000419.12;SE:chr20:50940933-50941129:50941209-50942031:-"
+average_read_coverage <- 20
+min_average_PSI = .05
+max_average_PSI = .95
+min_read_coverage <- 10
+min_samples_coverage <- 3
+for (rmats_dir in c("rmats_out", "rmats_out_2")) {
+  for (junction_counts in c("SE.MATS.JC.txt", "SE.MATS.JCEC.txt")) {
+    junction_file <- file.path(rmats_dir, junction_counts)
+    dt <-
+      fread(junction_file,
+            stringsAsFactors = TRUE)
+    id_vars <-
+      c(
+        "ID",
+        "GeneID",
+        "geneSymbol",
+        "chr",
+        "strand",
+        "exonStart_0base",
+        "exonEnd",
+        "upstreamES",
+        "upstreamEE",
+        "downstreamES",
+        "downstreamEE"
+      )
+    long_dt <-
+      melt(
+        dt,
+        id.vars = id_vars,
+        measure.vars = c("IJC_SAMPLE_1", "SJC_SAMPLE_1", "IncLevel1")
+      )
+    long_dt[, bam_dt[, sample_name] := tstrsplit(value, ",", fixed = TRUE, type.convert = TRUE)]
+    long_long_dt <-
+      melt(
+        long_dt,
+        id.vars = c(id_vars, "variable"),
+        measure.vars = bam_dt[, sample_name],
+        variable.name = "sample_name"
+      )
+    long_long_dt[, experiment_type := tstrsplit(sample_name, "_", keep = 2)]
+    long_long_dt[, suppa_id:=sprintf("%s;SE:%s:%s-%s:%s-%s:%s",
+                       GeneID,
+                       chr,
+                       upstreamEE,
+                       exonStart_0base + 1,
+                       exonEnd,
+                       downstreamES + 1,
+                       strand)]
+    average_count_dt <-
+      rbind(long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(average_count = mean(value) * 2), by = .(ID)],
+            long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(average_count = mean(value) * 2), by = .(experiment_type, ID)], fill = TRUE)
+    print(
+      ggplot(
+        average_count_dt,
+        aes(x = average_count + 1, color = experiment_type)
+      ) + geom_line(aes(y = 1 - after_stat(y)), stat = 'ecdf') + scale_x_log10() + geom_vline(xintercept = average_read_coverage + 1) + labs(title = junction_file)
+    )
+    average_psi_dt <-
+      rbind(long_long_dt[variable %in% c("IncLevel1"), .(average_psi = mean(value, na.rm = TRUE)), by =
+                           .(ID)],
+            long_long_dt[variable %in% c("IncLevel1"), .(average_psi = mean(value, na.rm = TRUE)), by =
+                           .(experiment_type, ID)], fill = TRUE)
+    print(
+      ggplot(average_psi_dt, aes(x = average_psi, fill = experiment_type)) + geom_histogram(position = "dodge") + geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) + labs(title = junction_file)
+    )
+    print(
+      ggplot(
+        average_psi_dt[average_psi >= min_average_PSI &
+                         average_psi <= max_average_PSI],
+        aes(x = average_psi, fill = experiment_type)
+      ) + geom_histogram(position = "dodge", binwidth = .05) + geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) + labs(title = junction_file)
+    )
+    
+    keep_ids_orig <-
+      intersect(average_psi_dt[!is.na(experiment_type) &
+                                 average_psi >= min_average_PSI &
+                                 average_psi <= max_average_PSI, ID, by = experiment_type][duplicated(ID), ID],
+                average_count_dt[!is.na(experiment_type) &
+                                   average_count >= average_read_coverage, ID, by = experiment_type][duplicated(ID), ID])
+    
+
+    # Step 1: Compute total counts per event/sample
+    event_sample_counts <- long_long_dt[
+      variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"),
+      .(total_count = sum(value)),
+      by = .(ID, sample_name)
+    ]
+    
+    # Step 2: Create grid of thresholds to test
+    min_read_cutoffs <- c(5, 10, 15, 20)
+    min_sample_cutoffs <- c(1, 3, 5, 10)
+    
+    # Step 3: Expand combinations and compute how many events pass
+    plot_dt <- CJ(min_read_coverage = min_read_cutoffs,
+                  min_samples_coverage = min_sample_cutoffs)
+    
+    plot_dt[, n_pass := event_sample_counts[
+      total_count >= min_read_coverage,
+      .N,
+      by = ID
+    ][N >= min_samples_coverage, .N],
+    by = .(min_read_coverage, min_samples_coverage)]
+    ggplot(plot_dt, aes(x = min_samples_coverage, y = n_pass,
+                  color = factor(min_read_coverage))) +
+    geom_line() +
+    geom_point() +
+    labs(
+      title = junction_file,
+      x = "Minimum number of samples with sufficient read count",
+      y = "Number of events (ID) retained",
+      color = "Min per-sample read count"
+    )
+    keep_ids_min_sample <- long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(total_count = sum(value)), by = .(ID, sample_name)][total_count >= min_read_coverage, .N, by = ID][N >= min_samples_coverage, ID]
+    
+    # suppa_table <- dcast(long_long_dt[variable == "IncLevel1" & ID %in% keep_ids], suppa_id ~ sample_name, value.var = "value")
+    
+    long_long_dt[average_psi_dt, on = .NATURAL, average_psi := average_psi]
+    long_long_dt[, imputed_value := value]
+    long_long_dt[is.na(imputed_value) &
+                   variable == "IncLevel1", imputed_value := average_psi]
+    for (keep_ids_name in c("orig", "min_sample")){
+      keep_ids <- get(paste0("keep_ids_", keep_ids_name))
+      for (col in c("value", "imputed_value")) {
+        event_mat <-
+          as.matrix(dcast(long_long_dt[ID %in% keep_ids &
+                                         variable == "IncLevel1"], sample_name ~ ID, value.var = col),
+                    rownames = "sample_name")
+        
+        for (i in 1:ncol(event_mat)) {
+          event_mat[is.na(event_mat[, i]), i] <-
+            mean(event_mat[, i], na.rm = TRUE)
+        }
+        event_pca <- rsvd::rpca(event_mat, 4)
+        rsvd::ggscreeplot(event_pca)
+        variance = event_pca$sdev ^ 2
+        explained_variance_ratio = round(variance / event_pca$var, 3) * 100
+        plot_dt <- as.data.table(event_pca$x, keep.rownames = "uuid")
+        setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
+        print(rsvd::ggindplot(
+          event_pca,
+          groups = unlist(tstrsplit(rownames(event_mat), "_", keep = 2)),
+          ind_labels = FALSE
+        ) + labs(title = paste(junction_file, keep_ids_name, col)))
+        print(rsvd::ggindplot(
+          event_pca,
+          pcs = c(1, 3),
+          groups = unlist(tstrsplit(rownames(event_mat), "_", keep = 2)),
+          ind_labels = FALSE
+        ) + labs(title = paste(junction_file, keep_ids_name, col)))
+      }}
+  }
+}
+#TODO convert ids to suppa space to check overlaps
+```

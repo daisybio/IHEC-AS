@@ -62,11 +62,16 @@ stopifnot(download_metadata[, .(unique_assays=uniqueN(assay_type), unique_experi
 
 ```{r, check-qc}
 # read experiment metadata for observed data
-experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv") # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
+experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv", stringsAsFactors = TRUE) # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
+experiment_metadata[, uuid := as.character(uuid)]
 
 # get qc files https://ihec.sd4h.ca/IHEC/readme/*_qc_summary.csv
-rna_qc <- fread("data/EpiATLAS_rnaseq_qc_summary.csv")
+rna_qc <- fread("data/EpiATLAS_rnaseq_qc_summary.csv", stringsAsFactors = TRUE)
+rna_qc[, uuid := as.character(uuid)]
 rna_qc[experiment_metadata, on=c(uuid="uuid"), c("experiment_type", "trimmed_read_length", "paired_end", "analyzed_as_stranded"):=.(experiment_type, trimmed_read_length, paired_end, analyzed_as_stranded)]
+rna_qc[, trimmed_read_length := sapply(strsplit(as.character(trimmed_read_length), ";", fixed = TRUE), function(x) {stopifnot(length(unique(x)) == 1); as.integer(unique(x))})]
+rna_qc[is.na(trimmed_read_length), stopifnot(uuid == "d1be4297-a068-438f-83fa-0cc62223cc56")]
+rna_qc[is.na(trimmed_read_length), trimmed_read_length := 36L]
 
 rna_qc[, included := "EpiATLAS"]
 rna_qc[uuid %in% download_metadata[assay_type == "RNA-Seq", uuid], included := "this_project"]
@@ -81,7 +86,8 @@ rna_qc[total < 45e6 | fraction_mapped < .5 | fraction_intergenic > .15 | fractio
 rna_qc[, epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)]
 rna_qc_stats <- c("epirr_id_without_version", "uuid", "rna_potentially_problematic", "fraction_mapped", "fraction_intergenic", "fraction_rrna", "fraction_duplicates")
 
-chip_qc <- fread("data/EpiATLAS_chipseq_qc_summary.csv")
+chip_qc <- fread("data/EpiATLAS_chipseq_qc_summary.csv", stringsAsFactors = TRUE)
+chip_qc[, uuid := as.character(uuid)]
 chip_qc_stats <- names(chip_qc)[!names(chip_qc) %in% c( "uuid", "data_generating_centre", "epirr_id", "antibody")]
 chip_qc[, included := "EpiATLAS"]
 chip_qc[uuid %in% download_metadata[assay_type == "ChIP-Seq", uuid], included := "this_project"]
@@ -101,7 +107,8 @@ chip_qc[, epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, kee
 chip_qc_long <- melt(chip_qc, id.vars = c("epirr_id_without_version", "potentially_problematic", "included", "antibody"), measure.vars = chip_qc_stats)
 chip_qc_wide <- dcast(chip_qc_long, epirr_id_without_version + included ~ antibody + variable)
 
-wgbs_qc <- fread("data/EpiATLAS_wgbs_qc_summary.csv")
+wgbs_qc <- fread("data/EpiATLAS_wgbs_qc_summary.csv", stringsAsFactors = TRUE)
+wgbs_qc[, uuid := as.character(uuid)]
 wgbs_qc[, included := "EpiATLAS"]
 wgbs_qc[uuid %in% download_metadata[assay_type == "WGBS", uuid], included := "this_project"]
 wgbs_qc[experiment_metadata, on=c(uuid="uuid"), c("experiment_type"):=.(experiment_type)]
@@ -132,6 +139,7 @@ potentially_remove_epirr <- download_metadata[uuid %in% c(rna_qc[rna_potentially
 metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version], table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
 metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version] & ! epirr_id_without_version %in% potentially_remove_epirr, table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
 ```
+
 
 ```{r, make-ftp-list}
 # add epirr_id for the specific version and software version

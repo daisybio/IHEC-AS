@@ -1,0 +1,187 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+# load the image
+load('processed_data/aggregating.rda')
+qc_dt <- fread("processed_data/qc_summary.csv")
+gene_quants <- readRDS("suppa_analysis/gene_expressions.rds")
+download_metadata <- fread("processed_data/file_table.csv.gz")
+fig1_color_dt <- unique(metadata[, .(harmonized_sample_ontology_term_high_order_fig1, harmonized_sample_ontology_term_high_order_fig1_color)])
+color_mapping <- setNames(fig1_color_dt$harmonized_sample_ontology_term_high_order_fig1_color, fig1_color_dt$harmonized_sample_ontology_term_high_order_fig1)
+color_mapping_hex <- sapply(strsplit(color_mapping, ","), function(x) rgb(x[1], x[2], x[3], maxColorValue=255))
+```
+
+```{r, fig.width=12, fig.height=10}
+metadata_order <- melt(metadata, id.vars=c("EpiRR_ordering", "epirr_id_without_version"), measure.vars = c("automated_experiments_RNA-Seq_mRNA-Seq", "automated_experiments_RNA-Seq_total-RNA-Seq"), variable.name = "experiment_type", value.name = "uuid")[uuid != ""][order(EpiRR_ordering, uuid)]
+metadata_order[, experiment_type := tstrsplit(experiment_type, "_", keep = 4)]
+gene_mat <- as.matrix(dcast(gene_quants, uuid ~ gene_id), 
+                       rownames = 'uuid')[metadata_order[, uuid], ]
+gene_pca <- rsvd::rpca(gene_mat, 4)
+rsvd::ggscreeplot(gene_pca)
+variance = gene_pca$sdev^2
+explained_variance_ratio = round(variance/gene_pca$var, 3) * 100
+plot_dt <- as.data.table(gene_pca$x, keep.rownames = "uuid")
+setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
+plot_dt[download_metadata[assay_type == "RNA-Seq"], on=.NATURAL, c("experiment_type", "epirr_id_without_version"):=.(experiment_type, epirr_id_without_version)]
+plot_dt[qc_dt, on=.NATURAL, c("fraction_mapped", "fraction_intergenic", "fraction_rrna", "fraction_duplicates") := .(fraction_mapped, fraction_intergenic, fraction_rrna, fraction_duplicates)]
+plot_dt <- merge(plot_dt, metadata)
+setorder(plot_dt, EpiRR_ordering, uuid)
+stopifnot(rownames(gene_pca$x) == plot_dt$uuid)
+ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_mapped)) +
+  geom_point() +
+  labs(title = "PCA of gene expression data", 
+       x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+       y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""))
+ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_intergenic)) +
+  geom_point() +
+  labs(title = "PCA of gene expression data", 
+       x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+       y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""))
+ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_rrna)) +
+  geom_point() +
+  labs(title = "PCA of gene expression data", 
+       x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+       y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""))
+ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_duplicates)) +
+  geom_point() +
+  labs(title = "PCA of gene expression data", 
+       x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+       y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""))
+rsvd::ggindplot(gene_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE)
+rsvd::ggindplot(gene_pca, pcs = c(1,3), groups = plot_dt[, experiment_type], ind_labels = FALSE)
+onto_plot <- rsvd::ggindplot(gene_pca, groups = plot_dt[, factor(harmonized_sample_ontology_term_high_order_fig1, levels=unique(harmonized_sample_ontology_term_high_order_fig1))], ind_labels = FALSE, alpha.ellipse = 0) + scale_color_manual(values = color_mapping_hex)
+onto_plot[["guides"]][["colour"]] <- NULL
+onto_plot
+```
+
+```{r, fig.width=12, fig.height=10}
+# Now do this first on RI and then on SE events
+for (this_event in to_analyze){
+  # and with and without the filtered events
+  curr_dt <- event_dt[`Event Type` == this_event]
+  for (this_filter in list(curr_dt[, ID], keep_rows)){
+    # filter the data
+    filtered_dt <- curr_dt[ID %in% this_filter]
+    for (this_experiment_type in list(c("total-RNA-Seq", "mRNA-Seq"), c("total-RNA-Seq"), c("mRNA-Seq"))) {
+      integration <- c("original")
+      # impute all NA's by colmean
+      if (length(this_experiment_type) == 2) {
+        integration <- c("original")#, "integrated")
+      }
+      for (this_integration in integration){
+        warning("Processing ", this_event, " events, ", ifelse(identical(this_filter, curr_dt[, ID]), "all", "filtered"), " events, ", paste(this_experiment_type, collapse = " & "), " samples, ", this_integration, " data", sep = "")
+        this_sample_cols <- download_metadata[experiment_type %in% this_experiment_type, uuid]
+        event_mat <- as.matrix(dcast(melt(filtered_dt, id.vars = "ID", measure.vars = this_sample_cols, na.rm = TRUE), variable ~ ID), rownames = TRUE)[metadata_order[uuid %in% this_sample_cols, uuid], ]
+        if (this_integration == "integrated") {
+          # integrate the data
+          stopifnot(metadata_order[, uuid] == rownames(event_mat))
+          ## --- helpers
+          clip  <- function(p, eps=1e-4) pmin(pmax(p, eps), 1-eps)
+          logit <- function(p) qlogis(clip(p))
+          ilogit<- function(z) plogis(z)
+          
+          ## --- identify valid anchors: exactly 2 rows per epirr, one per assay
+          pairs_dt <- metadata_order[, if(.SD[, length(uuid) > 1]) .SD, by=epirr_id_without_version]
+          batch <- factor(metadata_order$experiment_type)
+          
+          ## --- transform: logit(PSI)
+          Y_raw <- apply(event_mat, 2, logit)  # samples x events; NAs preserved
+          
+          ## --- keep events with enough observations in BOTH assays (reduces NA impute bias)
+          min_per_batch <- 10
+          keep_ev <- vapply(seq_len(ncol(Y_raw)), function(j){
+            tab <- tapply(!is.na(Y_raw[, j]), batch, sum)
+            all(!is.na(tab)) && all(tab >= min_per_batch)
+          }, logical(1))
+          Y <- Y_raw[, keep_ev, drop=FALSE]
+          
+          ## --- impute remaining NAs WITHIN assay (ComBat cannot handle NA)
+          impute_within_batch <- function(mat, batch){
+            out <- mat
+            for(b in levels(batch)){
+              idx <- which(batch == b)
+              mu  <- colMeans(out[idx, , drop=FALSE], na.rm=TRUE)
+              miss <- is.na(out[idx, , drop=FALSE])
+              if(any(miss)) out[idx, ][miss] <- rep(mu, each=length(idx))[miss]
+            }
+            out
+          }
+          Y_imp <- impute_within_batch(Y, batch)
+          
+          subj_factor <- factor(ifelse(metadata_order$uuid %in% pairs_dt[, uuid], metadata_order$epirr_id_without_version, NA))
+          Y_adj <- removeBatchEffect(
+            Y_imp, batch = factor(meta$experiment_type), design = model.matrix(~ 0 + subj_factor)
+          )
+          
+          # 5) (optional) back to PSI for visualization / PCA
+          event_mat_adj <- apply(Y_adj, 2, ilogit)
+          
+        }
+        for (i in 1:ncol(event_mat)){
+          event_mat[is.na(event_mat[,i]), i] <- mean(event_mat[,i], na.rm = TRUE)
+        }
+        event_pca <- rsvd::rpca(event_mat, 4)
+        rsvd::ggscreeplot(event_pca)
+        variance = event_pca$sdev^2
+        explained_variance_ratio = round(variance/event_pca$var, 3) * 100
+        plot_dt <- as.data.table(event_pca$x, keep.rownames = "uuid")
+        setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
+        plot_dt[download_metadata[assay_type == "RNA-Seq"], on=.NATURAL, c("experiment_type", "epirr_id_without_version"):=.(experiment_type, epirr_id_without_version)]
+        plot_dt[qc_dt, on=.NATURAL, c("fraction_mapped", "fraction_intergenic", "fraction_rrna", "fraction_duplicates") := .(fraction_mapped, fraction_intergenic, fraction_rrna, fraction_duplicates)]
+        plot_dt <- merge(plot_dt, metadata)
+        setorder(plot_dt, EpiRR_ordering, uuid)
+        stopifnot(rownames(event_pca$x) == plot_dt$uuid)
+        title_string <- paste("PCA of", this_event, "events; filtered", identical(this_filter == keep_rows), "; experiment_type:", paste(this_experiment_type, collapse = " and "))
+        print(ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_mapped)) +
+          geom_point() +
+          labs(title = title_string, 
+               x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+               y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = "")))
+        print(ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_intergenic)) +
+          geom_point() +
+          labs(title = title_string, 
+               x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+               y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = "")))
+        print(ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_rrna)) +
+          geom_point() +
+          labs(title = title_string, 
+               x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+               y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = "")))
+        print(ggplot(plot_dt, aes(x=PC1, y=PC2, color=fraction_duplicates)) +
+          geom_point() +
+          labs(title = title_string, 
+               x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+               y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = "")))
+        print(rsvd::ggindplot(event_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE))
+        print(rsvd::ggindplot(event_pca, pcs = c(1,3), groups = plot_dt[, experiment_type], ind_labels = FALSE))
+        onto_plot <- rsvd::ggindplot(event_pca, groups = plot_dt[, factor(harmonized_sample_ontology_term_high_order_fig1, levels=unique(harmonized_sample_ontology_term_high_order_fig1))], ind_labels = FALSE, alpha.ellipse = 0) + scale_color_manual(values = color_mapping_hex)
+        onto_plot[["guides"]][["colour"]] <- NULL
+        print(onto_plot)
+      }
+    }
+  }
+}
+```
+
+```{r, test-integration}
+# 
+```
+
+# TODO variability or clustering:
+
+```{r, compute-variability, eval=FALSE}
+# compute Adj SD per event
+event_dt[, `Adjusted PSI SD` := sqrt(rowSums((.SD - rowMeans(.SD, na.rm = TRUE))^2, na.rm = TRUE)/(length(sample_cols) - 1)), .SDcols = sample_cols]
+# compute median Adj SD per event type on IDs in keep_rows
+median_adj_sd <- event_dt[ID %in% keep_rows, .(med=median(`Adjusted PSI SD`, na.rm = TRUE), tmp_event_type=`Event Type`), by=`Event Type`][, `Event Type`:=NULL]
+# assign variability to each event
+event_dt[ID %in% keep_rows, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
+event_dt[ID %in% manual_ids, Variability := ifelse(`Adjusted PSI SD`>=median_adj_sd[`Event Type` == tmp_event_type, med], 'High Variability', 'Low Variability'), by=`Event Type`]
+# make sure the order is correct
+event_dt[, Variability := factor(Variability, levels=c('Low Variability', 'High Variability'))]
+```
