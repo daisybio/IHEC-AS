@@ -6,11 +6,14 @@ output:
 ---
 
 
-```{bash, download-metadata}
+```{bash, download-metadata, eval=FALSE}
 mkdir -p data
-# download the sample metadata v1.3 from GitHub, make sure you download this into "sample_metadata_file" defined in .Rprofile
-wget -q -O data/IHEC_metadata_harmonization.v1.3.extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/9b195bfe18a9e1a8a74096ed16716ffe87ce0c29/openrefine/v1.3/IHEC_metadata_harmonization.v1.3.extended.csv
+# download the sample metadata v1.4 from GitHub, make sure you download this into "sample_metadata_file" defined in .Rprofile
 wget -q -O data/IHEC_sample_metadata_harmonization.v1.4_extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
+# download experiment metadata and qc summaries from sftp
+echo "get IHEC/readme/EpiATLAS_experiment_metadata.csv data/" | sftp sftp.bcgsc.ca
+echo "get IHEC/readme/*_qc_summary.csv data/" | sftp sftp.bcgsc.ca
+echo "get IHEC/post_processed_data/ChIP-Seq_imputed/imputation_primarymetrics.txt data/" | sftp sftp.bcgsc.ca
 
 mkdir -p processed_data
 ```
@@ -61,6 +64,7 @@ stopifnot(download_metadata[, .(unique_assays=uniqueN(assay_type), unique_experi
 
 
 ```{r, check-qc}
+dir.create("processed_data", showWarnings = FALSE)
 # read experiment metadata for observed data
 experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv", stringsAsFactors = TRUE) # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
 experiment_metadata[, uuid := as.character(uuid)]
