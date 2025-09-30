@@ -4,6 +4,12 @@ if (interactive() && Sys.getenv("RSTUDIO") == "") {
 }
 renv::settings$ignored.packages(c("cCRE_hits", "hits", "hits_used", "agg_hits", "chromhmm_hits"), persist = FALSE)
 
+# vscode specific settings
+library(jsonlite)
+library(rlang)
+library(languageserver)
+library(httpgd)
+
 library(R.utils)
 library(data.table)
 library(pbmcapply)
