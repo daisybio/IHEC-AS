@@ -19,17 +19,27 @@ Load Isoform Quantifications:
 
 ```{r, load-isoform-quants}
 # load annotation file
-annotation <- rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf')
-tx_filtered <- annotation[
-  annotation$type == "transcript" &
-  annotation$transcript_type == "protein_coding" &
-  annotation$transcript_support_level %in% c("1", "2")
+unfiltered_annotation <- rtracklayer::import('suppa_analysis/gencode.v29.annotation.gtf')
+
+valid_biotypes <- c("protein_coding", "lincRNA", "processed_transcript", 
+                    "antisense", "sense_intronic", "sense_overlapping", 
+                    "retained_intron", "transcribed_unprocessed_pseudogene")
+
+tx_filtered <- unfiltered_annotation[
+  unfiltered_annotation$type == "transcript" &
+  unfiltered_annotation$transcript_type %in% valid_biotypes &
+  unfiltered_annotation$transcript_support_level %in% c("1", "2")
 ]
 
 # Then extract all associated exons, etc.
 filtered_ids <- unique(tx_filtered$transcript_id)
-annotation <- annotation[annotation$transcript_id %in% filtered_ids]
-rtracklayer::export(annotation, "suppa_analysis/gencode.v29.protein_coding_TSL12.gtf")
+annotation <- unfiltered_annotation[unfiltered_annotation$transcript_id %in% filtered_ids]
+# filter autosomes
+standard_chroms <- paste0("chr", c(1:22))
+annotation <- annotation[seqnames(annotation) %in% standard_chroms]
+# export filtered annotation
+gtf_file <- "gencode.v29.autosomes_polyA_TSL12.gtf"
+rtracklayer::export(annotation, file.path("suppa_analysis", gtf_file))
 
 # read the file table
 download_metadata <- fread("processed_data/file_table.csv.gz")
@@ -84,11 +94,11 @@ conda env create -f env.yml
 ```{bash, engine.opts="-l", runSUPPA}
 cd suppa_analysis
 conda activate ihec-as
-dir_path=events/
+dir_path=events
 mkdir -p ${dir_path}
-suppa.py generateEvents -i gencode.v29.protein_coding_TSL12.gtf -o ${dir_path}/gencode.v29.protein_coding_TSL12.events -f ioe -e SE SS MX RI FL --pool-genes
+suppa.py generateEvents -i gencode.v29.autosomes_polyA_TSL12.gtf -o ${dir_path}/gencode.v29.autosomes_polyA_TSL12.events -f ioe -e SE SS MX RI FL --pool-genes
 for event in SE A5 A3 MX RI AF AL
 do 
-    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.protein_coding_TSL12.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO -f 1 --save_tpm_events
+    suppa.py psiPerEvent -i ${dir_path}/gencode.v29.autosomes_polyA_TSL12.events_${event}_strict.ioe -e tpm_expressions.tsv -o ${dir_path}/event_${event} -m INFO -f 1 --save_tpm_events
 done
 ```
