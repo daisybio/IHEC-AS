@@ -58,7 +58,7 @@ wgbs_matrices_data_dir <- file.path(data_dir, "WGBS_matrices")
 sample_dt_dir <- "sample_dts"
 
 histone_marks <- c("H3K9me3", "H3K27me3", "H3K27ac", "H3K4me1", "H3K4me3", "H3K36me3")
-as_events <- c("SE", "RI", "AL", "AF", "A3", "A5", "MX")
+as_events <- c("SE", "RI", "A3", "A5", "MX", "AL", "AF")
 to_analyze <- c("SE", "RI")
 cor_methods <- c("pearson", "spearman")
 
@@ -70,10 +70,10 @@ minimum_events <- 25
 
 vicinity <- 5e5
 
-variability_colors <- c('Low'="#56B4E9", 'All'="#999999", 'High'="#D55E00")  
+variability_colors <- c("Low" = "#56B4E9", "All" = "#999999", "High" = "#D55E00")
 
 plot_dir <- "images/Rplots"
 if (!dir.exists(plot_dir)) {
   dir.create(plot_dir, recursive = TRUE)
 }
- my_lambda <- 'lambda.1se'
+my_lambda <- "lambda.1se"

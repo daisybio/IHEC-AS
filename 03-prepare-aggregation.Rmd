@@ -11,6 +11,168 @@ Export sequences for MaxEntScan
 wget -q -O data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz http://ftp.ncbi.nlm.nih.gov/genomes/archive/old_genbank/Eukaryotes/vertebrates_mammals/Homo_sapiens/GRCh38/seqs_for_alignment_pipelines/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
 ```
 
+```{r, filter_suppa_events}
+library(UpSetR)
+library(grid)
+
+min_average_PSI <- .05
+max_average_PSI <- 1 - min_average_PSI
+average_tpm_coverage <- 1
+
+psi_input_dir <- "suppa_analysis/events_filtered"
+# first read the samples that have been quantified
+header <- readLines("suppa_analysis/tpm_expressions_filtered.tsv", n = 1)
+sample_cols <- strsplit(header, "\t", TRUE)[[1]]
+metadata <- data.table::fread(sample_metadata_file)
+metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
+# load colors and transform from rgb to hex
+ihec_ia_colors <- unlist(jsonlite::read_json("data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json"), recursive = FALSE)
+sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
+  cols <- as.numeric(strsplit(x, ",")[[1]])
+  rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+mark_hex_colors <- sapply(unlist(ihec_ia_colors$experiment, recursive = FALSE), function(x) {
+  cols <- as.numeric(strsplit(x, ",")[[1]])
+  rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+mark_hex_colors <- c(mark_hex_colors, DNAm = mark_hex_colors[["WGBS"]])
+
+file_metadata <- fread("processed_data/file_table.csv.gz")
+
+keep_ids <- sapply(as_events, function(event_type) {
+  suppa_psi_file <- paste0(psi_input_dir, "/event_", event_type, ".psi")
+  suppa_tpm_file <- paste0(psi_input_dir, "/event_", event_type, ".tpm") # stores the summed TPM expression of all transcripts involved in the event
+
+  event_dt <- fread(suppa_psi_file)
+  tpm_dt <- fread(suppa_tpm_file)
+
+  setnames(event_dt, "V1", "event_id")
+  setnames(tpm_dt, "V1", "event_id")
+
+  long_dt <- melt(event_dt, id.vars = "event_id", variable.name = "uuid", value.name = "psi", variable.factor = TRUE)
+  long_dt[file_metadata, on = .(uuid), c("experiment_type", "epirr_id_without_version") := .(i.experiment_type, i.epirr_id_without_version)]
+  
+  long_tpm_dt <- melt(tpm_dt, id.vars = "event_id", variable.name = "uuid", value.name = "tpm", variable.factor = TRUE)
+  long_tpm_dt[file_metadata, on = .(uuid), c("experiment_type", "epirr_id_without_version") := .(i.experiment_type, i.epirr_id_without_version)]
+
+  average_psi_dt <-
+        rbind(
+          long_dt[, .(average_psi = mean(psi, na.rm = TRUE)),
+            by =
+              .(event_id)
+          ],
+          long_dt[, .(average_psi = mean(psi, na.rm = TRUE)),
+            by =
+              .(experiment_type, event_id)
+          ],
+          fill = TRUE
+        )
+          print(
+          ggplot(average_psi_dt, aes(x = average_psi, fill = experiment_type)) +
+            geom_histogram(position = "dodge") +
+            geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
+            labs(title = sprintf("Average PSI: %s", event_type))
+        )
+        print(
+          ggplot(
+            average_psi_dt[average_psi >= min_average_PSI &
+              average_psi <= max_average_PSI],
+            aes(x = average_psi, fill = experiment_type)
+          ) +
+            geom_histogram(position = "dodge", binwidth = .05) +
+            geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
+            labs(title = sprintf("Average PSI: %s, %f <= PSI < %f", event_type, min_average_PSI, max_average_PSI))
+        )
+    average_tpm_dt <-
+        rbind(
+          long_tpm_dt[, .(average_tpm = mean(tpm, na.rm = TRUE)),
+            by =
+              .(event_id)
+          ],
+          long_tpm_dt[, .(average_tpm = mean(tpm, na.rm = TRUE)),
+            by =
+              .(experiment_type, event_id)
+          ],
+          fill = TRUE
+        )
+        print(
+          ggplot(
+            average_tpm_dt,
+            aes(x = average_tpm + 1, color = experiment_type)
+          ) +
+            geom_line(aes(y = 1 - after_stat(y)), stat = "ecdf") +
+            scale_x_log10() +
+            geom_vline(xintercept = average_tpm_coverage + 1) +
+            labs(title = sprintf("Average Read Coverage: %s with line at %d", event_type, average_tpm_coverage + 1))
+        )
+    average_dt <- merge(average_psi_dt, average_tpm_dt)
+   
+   min_tpm_cutoff <- seq(0, 1, by = 0.2)
+   min_PSI_cutoffs <- seq(0, 0.05, by = 0.01)
+
+        plot_dt <- CJ(
+          average_tpm_coverage = min_tpm_cutoff,
+          min_average_PSI = min_PSI_cutoffs
+        )
+
+
+
+        plot_dt[, n_pass := average_dt[
+          !is.na(experiment_type) &
+            average_tpm >= average_tpm_coverage &
+            average_psi >= min_average_PSI &
+            average_psi <= 1 - min_average_PSI,
+          event_id,
+          by = experiment_type
+        ][duplicated(event_id), .N],
+        by = .(average_tpm_coverage, min_average_PSI)
+        ]
+
+        print(ggplot(plot_dt, aes(
+          x = min_average_PSI, y = n_pass,
+          color = factor(average_tpm_coverage)
+        )) +
+          geom_line() +
+          geom_point() +
+          labs(
+            title = sprintf("Min averages per experiment type: %s", event_type),
+            x = "Minimum average PSI",
+            y = "Number of events (ID) retained",
+            color = "Min average tpm coverage"
+          ))
+
+
+  keep_ids_orig <-
+        average_dt[
+          !is.na(experiment_type) &
+            average_tpm >= average_tpm_coverage &
+            average_psi >= min_average_PSI &
+            average_psi <= 1 - min_average_PSI,
+          event_id,
+          by = experiment_type
+        ][duplicated(event_id), event_id]
+
+  # keep only events with at least two values that are not NA
+  # valid_sds <- apply(event_dt[, ..sample_cols], 1, sd, na.rm = TRUE) > 0
+  # valid_sds[is.na(valid_sds)] <- FALSE
+  event_dt <- event_dt[event_dt$event_id %in% keep_ids_orig]
+  
+  intersect_ids <- keep_ids_orig
+  
+  rmats_file <- sprintf("suppa_analysis/events_rmats/event_%s.psi", event_type)
+  if (file.exists(rmats_file)) {
+    rmats_dt <- fread(rmats_file)
+    setnames(rmats_dt, "V1", "suppa_id")
+    # create upsetplot of events found by both methods
+    method_upset <- upset(fromList(list(suppa = intersect_ids, rmats = rmats_dt$suppa_id)))
+    print(method_upset)
+    grid.text(sprintf("%s", event_type), x = 0.65, y = 0.95, gp = gpar(fontsize = 20))
+    intersect_ids <- intersect(keep_ids_orig, rmats_dt$suppa_id)
+  }
+  keep_ids_orig
+}, simplify = FALSE)
+```
+
 ```{r, load-events}
 # either "filtered" or "basic", depending on the annotation used above
 for (filter_suffix in c("rmats", "filtered")) {
@@ -32,6 +194,8 @@ for (filter_suffix in c("rmats", "filtered")) {
     #TODO: remove once all rmats is processed:
     sample_cols <- intersect(sample_cols, names(event_dt))
     event_dt <- event_dt[, c("event_id", sample_cols), with = FALSE]
+    
+    event_dt[, table(event_id %in% keep_ids[[event_type]])]
 
     # keep only events with at least two values that are not NA
     valid_sds <- apply(event_dt[, ..sample_cols], 1, sd, na.rm = TRUE) > 0
@@ -243,19 +407,6 @@ for (filter_suffix in c("rmats", "filtered")) {
 
   #```{r, read-metadata}
   # load metadata and subset
-  metadata <- data.table::fread(sample_metadata_file)
-  metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
-  # load colors and transform from rgb to hex
-  ihec_ia_colors <- unlist(jsonlite::read_json("data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json"), recursive = FALSE)
-  sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
-    cols <- as.numeric(strsplit(x, ",")[[1]])
-    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
-  })
-  mark_hex_colors <- sapply(unlist(ihec_ia_colors$experiment, recursive = FALSE), function(x) {
-    cols <- as.numeric(strsplit(x, ",")[[1]])
-    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
-  })
-  mark_hex_colors <- c(mark_hex_colors, DNAm = mark_hex_colors[["WGBS"]])
   #```
 
 

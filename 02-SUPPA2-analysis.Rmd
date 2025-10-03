@@ -45,59 +45,50 @@ valid_biotypes <- c(
   "antisense", "sense_intronic", "sense_overlapping",
   "retained_intron", "transcribed_unprocessed_pseudogene"
 )
-tx_filtered <- unfiltered_annotation[
+tx_filter <- unfiltered_annotation[
   unfiltered_annotation$type == "transcript" &
     unfiltered_annotation$transcript_type %in% valid_biotypes &
     unfiltered_annotation$transcript_support_level %in% c("1", "2")
 ]
-tx_filtered_basic <- tx_filtered[!is.na(tx_filtered$tag) & tx_filtered$tag == "basic"]
+tx_filter_name <- "filtered"
 
-tx_filter_list <- list(
-  filtered = tx_filtered,
-  basic = tx_filtered_basic
-)
+# filter the annotation
+annotation <- unfiltered_annotation[unfiltered_annotation$transcript_id %in% tx_filter$transcript_id]
+# filter autosomes
+standard_chroms <- paste0("chr", c(1:22))
+annotation <- annotation[seqnames(annotation) %in% standard_chroms]
+# export filtered annotation
+gtf_file <- paste0("gencode.v29.", tx_filter_name, ".gtf")
+rtracklayer::export(annotation, file.path("suppa_analysis", gtf_file))
 
-for (tx_filter_name in names(tx_filter_list)) {
-  tx_filter <- tx_filter_list[[tx_filter_name]]
+# filter for transcripts
+isoform_quants_filtered <- isoform_quants[transcript_id %in% annotation$transcript_id]
+print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
+  geom_histogram() +
+  labs(title = tx_filter_name))
 
-  # filter the annotation
-  annotation <- unfiltered_annotation[unfiltered_annotation$transcript_id %in% tx_filter$transcript_id]
-  # filter autosomes
-  standard_chroms <- paste0("chr", c(1:22))
-  annotation <- annotation[seqnames(annotation) %in% standard_chroms]
-  # export filtered annotation
-  gtf_file <- paste0("gencode.v29.", tx_filter_name, ".gtf")
-  rtracklayer::export(annotation, file.path("suppa_analysis", gtf_file))
+# recompute TPM values on the transcripts
+isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
+isoform_quants_filtered[, TPM := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
+isoform_quants_filtered[is.na(TPM), TPM := 0]
+print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
+  geom_histogram() +
+  labs(title = tx_filter_name))
 
-  # filter for transcripts
-  isoform_quants_filtered <- isoform_quants[transcript_id %in% annotation$transcript_id]
-  print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
-    geom_histogram() +
-    labs(title = tx_filter_name))
+# compute and export the gene expression in TPM by summing up transcript TPMS
+gene_quants <- isoform_quants_filtered[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(uuid, epirr_id_without_version, gene_id)]
+gene_expr_file <- paste0("suppa_analysis/gene_expressions_", tx_filter_name, ".rds")
+saveRDS(gene_quants, gene_expr_file)
 
-  # recompute TPM values on the transcripts
-  isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
-  isoform_quants_filtered[, TPM := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
-  isoform_quants_filtered[is.na(TPM), TPM := 0]
-  print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
-    geom_histogram() +
-    labs(title = tx_filter_name))
+# bring tpms to wide format
+tpm_dt <- data.table::dcast(isoform_quants_filtered, transcript_id ~ uuid, value.var = "TPM", fill = 0)
 
-  # compute and export the gene expression in TPM by summing up transcript TPMS
-  gene_quants <- isoform_quants_filtered[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(uuid, epirr_id_without_version, gene_id)]
-  gene_expr_file <- paste0("suppa_analysis/gene_expressions_", tx_filter_name, ".rds")
-  saveRDS(gene_quants, gene_expr_file)
-
-  # bring tpms to wide format
-  tpm_dt <- data.table::dcast(isoform_quants_filtered, transcript_id ~ uuid, value.var = "TPM", fill = 0)
-
-  # export expression for analysis with suppa
-  suppa_expr_filename <- paste0("suppa_analysis/tpm_expressions_", tx_filter_name, ".tsv")
-  fileConn <- file(suppa_expr_filename)
-  writeLines(paste(names(tpm_dt)[-1], collapse = "\t"), fileConn)
-  close(fileConn)
-  fwrite(tpm_dt, suppa_expr_filename, sep = "\t", append = TRUE)
-}
+# export expression for analysis with suppa
+suppa_expr_filename <- paste0("suppa_analysis/tpm_expressions_", tx_filter_name, ".tsv")
+fileConn <- file(suppa_expr_filename)
+writeLines(paste(names(tpm_dt)[-1], collapse = "\t"), fileConn)
+close(fileConn)
+fwrite(tpm_dt, suppa_expr_filename, sep = "\t", append = TRUE)
 ```
 
 
@@ -110,15 +101,15 @@ conda env create -f env.yml
 ```{bash, engine.opts="-l", runSUPPA}
 cd suppa_analysis
 conda activate ihec-as
-for suffix in filtered basic
+for suffix in filtered #basic
 do
-    expr_file=tpm_expressions_${suffix}.tsv
     dir_path=events_${suffix}
     mkdir -p ${dir_path}
-    suppa.py generateEvents -i gencode.v29.${suffix}.gtf -o ${dir_path}/gencode.v29.${suffix}.events -f ioe -e SE SS MX RI FL --pool-genes
+    suppa.py generateEvents -i gencode.v29.${suffix}.gtf -o ${dir_path}/gencode.v29.${suffix}.events -f ioe -e SE SS MX RI FL #--pool-genes
+    expr_file=tpm_expressions_${suffix}.tsv
     for event in SE A5 A3 MX RI AF AL
     do 
-        suppa.py psiPerEvent -i ${dir_path}/gencode.v29.${suffix}.events_${event}_strict.ioe -e ${expr_file} -o ${dir_path}/event_${event} -m INFO -f 1 --save_tpm_events
+        suppa.py psiPerEvent -i ${dir_path}/gencode.v29.${suffix}.events_${event}_strict.ioe -e ${expr_file} -o ${dir_path}/event_${event} -m INFO --save_tpm_events #-f 1
     done
 done
 ```
