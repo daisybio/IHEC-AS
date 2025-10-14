@@ -4,18 +4,20 @@ if (interactive() && Sys.getenv("RSTUDIO") == "") {
 }
 renv::settings$ignored.packages(c("cCRE_hits", "hits", "hits_used", "agg_hits", "chromhmm_hits"), persist = FALSE)
 
-# vscode specific settings
+# vscode specific libraries
 library(jsonlite)
 library(rlang)
 library(languageserver)
 library(httpgd)
 
+# general libraries
 library(R.utils)
 library(data.table)
 library(pbmcapply)
 library(rtracklayer)
 library(ggplot2)
 library(svglite)
+library(grDevices)
 # library(ggpubr)
 # library(ggrepel)
 # library(umap)
@@ -43,7 +45,6 @@ data.table::setDTthreads(ncores)
 message(sprintf("mc.cores: %d", options()$mc.cores))
 options(mc.cores = ncores)
 message(sprintf("set mc.cores to: %d", options()$mc.cores))
-setOption("ignore.interactive", TRUE)
 
 if (!rmarkdown::pandoc_available()) {
   Sys.setenv(RSTUDIO_PANDOC = "/usr/lib/rstudio-server/bin/quarto/bin/tools")
@@ -58,7 +59,8 @@ wgbs_matrices_data_dir <- file.path(data_dir, "WGBS_matrices")
 sample_dt_dir <- "sample_dts"
 
 histone_marks <- c("H3K9me3", "H3K27me3", "H3K27ac", "H3K4me1", "H3K4me3", "H3K36me3")
-as_events <- c("SE", "RI", "A3", "A5", "MX", "AL", "AF")
+#TODO: make decision on 
+as_events <- c("SE", "RI", "A3", "A5", "MX") #, "AL", "AF")
 to_analyze <- c("SE", "RI")
 cor_methods <- c("pearson", "spearman")
 
@@ -71,6 +73,17 @@ minimum_events <- 25
 vicinity <- 5e5
 
 variability_colors <- c("Low" = "#56B4E9", "All" = "#999999", "High" = "#D55E00")
+
+ihec_ia_colors <- unlist(jsonlite::read_json("data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json"), recursive = FALSE)
+sample_hex_colors <- sapply(unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE), function(x) {
+  cols <- as.numeric(strsplit(x, ",")[[1]])
+  rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+mark_hex_colors <- sapply(unlist(ihec_ia_colors$experiment, recursive = FALSE), function(x) {
+  cols <- as.numeric(strsplit(x, ",")[[1]])
+  rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+})
+mark_hex_colors <- c(mark_hex_colors, DNAm = mark_hex_colors[["WGBS"]])
 
 plot_dir <- "images/Rplots"
 if (!dir.exists(plot_dir)) {
