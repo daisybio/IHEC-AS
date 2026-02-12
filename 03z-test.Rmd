@@ -7,7 +7,7 @@ output:
 
 ```{r}
 # load the image
-load(paste0("processed_data/aggregating.rda"))
+load("processed_data/aggregating.rda")
 qc_dt <- fread("processed_data/qc_summary.csv")
 qc_cols <- c(
   "fraction_mapped",
@@ -115,22 +115,26 @@ for (this_event in to_analyze) {
 
       # compute distances between events using wasserstein distance in 1D
       # make all possible combinations of the event IDs:
-      distance_combs <-
-        as.data.table(t(combn(filtered_dt[, ID], 2)))
-      # normalized_hist_bins <- pbmclapply(long_dt[, ID], function(x) hist(long_dt[ID == x, value], breaks = seq(0, 1, by = binwidth_psi), plot = FALSE)[["density"]])
-      # names(normalized_hist_bins) <- long_dt[, ID]
+      # get or create:
+      distance_combs_path <- file.path("processed_data", paste("eventdistances", this_title, ".rds", sep = "_"))
+      if (file.exists(distance_combs_path)){
+        distance_combs <- readRDS(distance_combs_path)
+      } else {
+        distance_combs <- as.data.table(t(combn(filtered_dt[, ID], 2)))
 
-      distance_combs$distance <-
-        pbmcmapply(
-          distance_combs$V1,
-          distance_combs$V2,
-          FUN = function(x, y) {
-            transport::wasserstein1d(
-              long_dt[x == ID, value], # normalized_hist_bins[[x]], normalized_hist_bins[[y]])
-              long_dt[y == ID, value]
-            )
-          }
-        )
+        distance_combs$distance <-
+          pbmcmapply(
+            distance_combs$V1,
+            distance_combs$V2,
+            FUN = function(x, y) {
+              transport::wasserstein1d(
+                long_dt[x == ID, value], # normalized_hist_bins[[x]], normalized_hist_bins[[y]])
+                long_dt[y == ID, value]
+              )
+            }, mc.cores = 120L
+          )
+        saveRDS(distance_combs, distance_combs_path)
+      }
 
       event_dist_obj <-
         as.dist(as.matrix(dcast(
@@ -141,12 +145,34 @@ for (this_event in to_analyze) {
           )), V1 ~ V2,
           value.var = "distance"
         ), rownames = "V1"))
-      if (any(is.na(event_dist_obj)) |
+      if (any(is.na(event_dist_obj)) ||
         any(is.infinite(event_dist_obj))) {
         warning(
           "There are missing or infinite values in the distance matrix. Please check the data."
         )
       }
+      # what is the opimal number of clusters for the events?
+      # Cut the dendrogram into k clusters
+      sil_widths <- sapply(2:10, function(k) {
+        pam_fit <- pam(event_dist_obj, diss = TRUE, k = k)
+        pam_fit$silinfo$avg.width
+      })
+      
+      plot(2:10, sil_widths, type = "b", xlab = "Number of clusters", ylab = "Average silhouette width")
+      optimal_k <- which.max(sil_widths) + 1
+      
+      gap <- cluster::clusGap(
+        x = as.matrix(event_dist_obj),
+        FUNcluster = function(x, k) {
+          hc <- seriation:::reorder.hclust(hclust(as.dist(x), method = "complete"),
+                                           dist = as.dist(x),
+                                           method = "OLO")
+          list(cluster = cutree(hc, k = k))
+        },
+        K.max = 10,
+        B = 500
+      )
+      plot(gap)
 
       event_mat <-
         as.matrix(dcast(
@@ -170,13 +196,6 @@ for (this_event in to_analyze) {
         method = "OLO"
       )
 
-      event_clust <-
-        seriation:::reorder.hclust(
-          hclust(event_dist_obj, method = "complete"),
-          dist = event_dist_obj,
-          method = "OLO"
-        )
-
       row_anno <-
         as.data.frame(metadata_order[uuid %in% rownames(event_mat), .(
           epirr_id_without_version,
@@ -196,7 +215,7 @@ for (this_event in to_analyze) {
           main = paste(this_title, i),
           event_mat,
           cluster_cols = col_clust,
-          cutree_cols = 3,
+          cutree_cols = 5,
           cutree_rows = 2,
           show_colnames = FALSE,
           clustering_method = "ward.D2",
@@ -245,7 +264,7 @@ for (this_event in to_analyze) {
         )) +
           geom_point() +
           labs(
-            title = "PCA of gene expression data",
+            title = title_string,
             x = paste(
               "PC1 (",
               explained_variance_ratio[1],

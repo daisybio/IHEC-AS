@@ -9,7 +9,7 @@ output:
 ```{bash, download-metadata, eval=FALSE}
 mkdir -p data
 # download the sample metadata v1.4 from GitHub, make sure you download this into "sample_metadata_file" defined in .Rprofile
-wget -q -O data/IHEC_sample_metadata_harmonization.v1.4_extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
+wget -nc -O data/IHEC_sample_metadata_harmonization.v1.4_extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
 # download experiment metadata and qc summaries from sftp
 echo "get IHEC/readme/EpiATLAS_experiment_metadata.csv data/" | sftp sftp.bcgsc.ca
 echo "get IHEC/readme/*_qc_summary.csv data/" | sftp sftp.bcgsc.ca
@@ -39,13 +39,18 @@ chip_seq_cols <- grep("automated_experiments_ChIP-Seq", names(experiment_dt), va
 full_chip <- rowSums(experiment_dt[, lapply(.SD, function(x) x == ""), .SDcols = chip_seq_cols]) == 0
 # get epirr_ids which have all three data types
 epirr_ids_to_use <- experiment_dt[full_chip & automated_experiments_WGBS_standard != "" & `automated_experiments_RNA-Seq` != "", epirr_id_without_version]
+rna_seq_epirrs <- experiment_dt[`automated_experiments_RNA-Seq` != "", epirr_id_without_version]
 ```
 
 ```{r, select-data-to-download}
-# subset metadata again using the epirr_ids we want to use
+# subset metadata again using the epirr_ids we want to use, but drag along the rna_seq_epirrs
 download_metadata <- metadata[epirr_id_without_version %in% epirr_ids_to_use, ..experiment_cols]
 # melt data table
 download_metadata <- melt(download_metadata, id.vars = "epirr_id_without_version", variable.name = "column", value.name = "uuid", na.rm = TRUE)
+rna_only_metadata <- melt(metadata[epirr_id_without_version %in% setdiff(rna_seq_epirrs, epirr_ids_to_use), .(epirr_id_without_version, `automated_experiments_RNA-Seq_mRNA-Seq`, `automated_experiments_RNA-Seq_total-RNA-Seq`)],
+                          id.vars = "epirr_id_without_version", variable.name = "column", value.name = "uuid", na.rm = TRUE)
+download_metadata <- rbind(download_metadata, rna_only_metadata)
+
 # split the column names to get the assay type and experiment type
 download_metadata <- download_metadata[, c("assay_type", "experiment_type"):=tstrsplit(column, "_", fixed = TRUE, keep=c(3, 4))]
 # remove imputed WGBS data
@@ -59,12 +64,11 @@ download_metadata[uuid == "", uuid := NA]
 
 download_metadata <- download_metadata[!is.na(uuid)]
 # make sure we have 405 entries with 3 different assays and at least 8 different entries (some have more because we have some with both RNA assays)
-stopifnot(download_metadata[, .(unique_assays=uniqueN(assay_type), unique_experiments=uniqueN(experiment_type)), by = epirr_id_without_version][, all(unique_assays == 3) & all(unique_experiments >= 8)])
+stopifnot(download_metadata[epirr_id_without_version %in% epirr_ids_to_use, .(unique_assays=uniqueN(assay_type), unique_experiments=uniqueN(experiment_type)), by = epirr_id_without_version][, all(unique_assays == 3) & all(unique_experiments >= 8)])
 ```
 
 
 ```{r, check-qc}
-dir.create("processed_data", showWarnings = FALSE)
 # read experiment metadata for observed data
 experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv", stringsAsFactors = TRUE) # from https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
 experiment_metadata[, uuid := as.character(uuid)]
@@ -137,11 +141,11 @@ merged_qc <-
   )
 fwrite(merged_qc, "processed_data/qc_summary.csv")
 
-download_metadata[, table(experiment_type, uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]))]
-download_metadata[uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]), uniqueN(epirr_id_without_version)]
+download_metadata[epirr_id_without_version %in% epirr_ids_to_use, table(experiment_type, uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]))]
+download_metadata[epirr_id_without_version %in% epirr_ids_to_use & uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]), uniqueN(epirr_id_without_version)]
 potentially_remove_epirr <- download_metadata[uuid %in% c(rna_qc[rna_potentially_problematic == TRUE, uuid], chip_qc[potentially_problematic == TRUE, uuid], wgbs_qc[wgbs_potentially_problematic == TRUE, uuid]), unique(epirr_id_without_version)]
-metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version], table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
-metadata[epirr_id_without_version %in% download_metadata[, epirr_id_without_version] & ! epirr_id_without_version %in% potentially_remove_epirr, table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
+metadata[epirr_id_without_version %in% epirr_ids_to_use, table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
+metadata[epirr_id_without_version %in% epirr_ids_to_use & ! epirr_id_without_version %in% potentially_remove_epirr, table(harmonized_sample_ontology_term_high_order_fig1, epiATLAS_status)]
 ```
 
 

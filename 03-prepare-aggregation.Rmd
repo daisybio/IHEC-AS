@@ -11,47 +11,10 @@ metadata <- data.table::fread(sample_metadata_file)
 metadata <- metadata[epirr_id_without_version %in% file_metadata[, unique(epirr_id_without_version)]]
 # TODO: this filter should be cleaner, together with file_metadata
 # metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
-bam_dt <- data.table(
-  bam = c(
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009331/1.0.0/1.1.0/hg38_no_alt/75/8177/work/f4/ff34e2e7a1b6216bbf8c59e26ae4f1/K009331_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009330/1.0.0/1.1.0/hg38_no_alt/75/8176/work/df/4d3fa1685efcf134929b12b9e4f549/K009330_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009333/1.0.0/1.1.0/hg38_no_alt/75/8175/work/c8/cade5167cf026da3936366fc259718/K009333_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009332/1.0.0/1.1.0/hg38_no_alt/75/8174/work/65/9dd6bf34e3471ee9c22a2b1e5146a2/K009332_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009334/1.0.0/1.1.0/hg38_no_alt/75/8167/work/5e/d8b4bda598d2913427aef88915cffd/K009334_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009335/1.0.0/1.1.0/hg38_no_alt/75/8168/work/f3/3873664c8ce4a3af54a2ad0e384ea6/K009335_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009337/1.0.0/1.1.0/hg38_no_alt/75/8173/work/07/2b4827c201cb47633a59b2b9959845/K009337_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009336/1.0.0/1.1.0/hg38_no_alt/75/8172/work/02/1e59765267de0efbc517b570c11ed8/K009336_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009339/1.0.0/1.1.0/hg38_no_alt/75/8171/work/1c/8a1cd58f6e9e829e21e4b9a44b4322/K009339_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009338/1.0.0/1.1.0/hg38_no_alt/75/8170/work/85/4cfd38648a13da79969248d2febc39/K009338_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009341/1.0.0/1.1.0/hg38_no_alt/75/8179/work/9d/975f47eee547312ffa13a743637bca/K009341_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009340/1.0.0/1.1.0/hg38_no_alt/75/8178/work/0d/d5d92a6c288c8285ef39ace05434af/K009340_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009343/1.0.0/1.1.0/hg38_no_alt/75/8181/work/b5/9f398b50552276c3b282983dc537d4/K009343_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009342/1.0.0/1.1.0/hg38_no_alt/75/8180/work/e8/8e03bbd5675b7e4d15bef907d44840/K009342_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009345/1.0.0/1.1.0/hg38_no_alt/75/8183/work/88/2d179ca34731b49671ac9965ba5591/K009345_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009344/1.0.0/1.1.0/hg38_no_alt/75/8182/work/6a/c3f7a5f2bd95c34a4d057cee451b10/K009344_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009347/1.0.0/1.1.0/hg38_no_alt/75/8185/work/2a/7e107c95b4dc215f2c8ea24298c96f/K009347_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009346/1.0.0/1.1.0/hg38_no_alt/75/8184/work/33/852a5b510bc382fbd14b030040f5ec/K009346_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009349/1.0.0/1.1.0/hg38_no_alt/75/8187/work/ba/510ecfe57780797980928b0cf4a05d/K009349_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009348/1.0.0/1.1.0/hg38_no_alt/75/8186/work/52/b8bf5b82bbe29e42d2e031530a8be4/K009348_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009351/1.0.0/1.1.0/hg38_no_alt/75/8188/work/ed/a9edeb002a80e66be0806f3cb76148/K009351_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009350/1.0.0/1.1.0/hg38_no_alt/75/8202/work/4f/dea973195470756c5f863602ab0120/K009350_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009352/1.0.0/1.1.0/hg38_no_alt/75/8189/work/be/fa20d950f8dad490bf50a0e96f7308/K009352_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009354/1.0.0/1.1.0/hg38_no_alt/75/8191/work/d3/b42747e0d28b9c77580e4b61968fc1/K009354_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009353/1.0.0/1.1.0/hg38_no_alt/75/8190/work/3a/d2e4e2914d351492a092231153ce89/K009353_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009356/1.0.0/1.1.0/hg38_no_alt/75/8193/work/d8/c76ab062480d6955faa0800b6da841/K009356_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009355/1.0.0/1.1.0/hg38_no_alt/75/8192/work/3d/6de682131a37684e32c7528549e324/K009355_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009358/1.0.0/1.1.0/hg38_no_alt/75/8195/work/a7/7f9e9b3f840e1eaaa7c762a2a957fc/K009358_m4_n10_toGenome.markdup.bam"
-  )
-)
-bam_dt[, path := tstrsplit(bam, "/work", keep = 1)]
-bam_mapping <- fread("rmats_mapping/DEEP.RNA_Seq.EpiRRID_exptype_path.IHEC.tsv", header = FALSE)
-setnames(bam_mapping, 1:4, c("project", "epirr", "experiment_type", "path"))
-bam_dt[bam_mapping, on = .NATURAL, c("epirr", "experiment_type") := .(epirr, experiment_type)]
-bam_dt[, sample_name := paste(epirr, experiment_type, sep = "_")]
-experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv")
-bam_dt[experiment_metadata[, epirr := epirr_id], on = .NATURAL, uuid := uuid]
+rmats_command_file <- "data/rmats_split_post_commands.tsv"
+command_dt <- fread(rmats_command_file)
+# bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
 ```
-
 
 ```{r, filter_events_per_method, fig.width=16, fig.height=12}
 library(UpSetR)
@@ -99,88 +62,96 @@ filtered_events <- sapply(as_events, function(event_type) {
     list.files(
       path = rmats_dir,
       pattern = rmats_file_pattern,
+      recursive = TRUE,
       full.names = TRUE
     )
-  rmats_dt <- fread(rmats_file)
-  if (event_type == "SE") {
-    rmats_dt[, event_id := sprintf(
-      "%s;%s:%s:%s-%s:%s-%s:%s",
-      GeneID,
-      event_type,
-      chr,
-      upstreamEE,
-      exonStart_0base + 1,
-      exonEnd,
-      downstreamES + 1,
-      strand
-    )]
-  } else if (event_type == "RI") {
-    rmats_dt[, event_id := sprintf(
-      "%s;%s:%s:%s:%s-%s:%s:%s",
-      GeneID,
-      event_type,
-      chr,
-      upstreamES + 1,
-      upstreamEE,
-      downstreamES + 1,
-      downstreamEE,
-      strand
-    )]
-  } else if (event_type == "A3") {
-    rmats_dt[, event_id := sprintf(
-      "%s;%s:%s:%s-%s:%s-%s:%s",
-      GeneID,
-      event_type,
-      chr,
-      ifelse(strand == "+", flankingEE, longExonEnd),
-      ifelse(strand == "+", longExonStart_0base + 1, flankingES + 1),
-      ifelse(strand == "+", flankingEE, shortEE),
-      ifelse(strand == "+", shortES + 1, flankingES + 1),
-      strand
-    )]
-  } else if (event_type == "A5") {
-    rmats_dt[, event_id := sprintf(
-      "%s;%s:%s:%s-%s:%s-%s:%s",
-      GeneID,
-      event_type,
-      chr,
-      ifelse(strand == "+", longExonEnd, flankingEE),
-      ifelse(strand == "+", flankingES + 1, longExonStart_0base + 1),
-      ifelse(strand == "+", shortEE, flankingEE),
-      ifelse(strand == "+", flankingES + 1, shortES + 1),
-      strand
-    )]
-  } else if (event_type == "MX") {
-    rmats_dt[, event_id := sprintf(
-      "%s;%s:%s:%s-%s:%s-%s:%s-%s:%s-%s:%s",
-      GeneID,
-      event_type,
-      chr,
-      upstreamEE,
-      `1stExonStart_0base` + 1,
-      `1stExonEnd`,
-      downstreamES + 1,
-      upstreamEE,
-      `2ndExonStart_0base` + 1,
-      `2ndExonEnd`,
-      downstreamES + 1,
-      strand
-    )]
-  } else {
-    stop("Not implemented yet")
-  }
-  # convert to long format which still has comma-separated values
-  rmats_dt <- melt(rmats_dt, id.vars = c("event_id"), measure.vars = c("IJC_SAMPLE_1", "SJC_SAMPLE_1", "IncLevel1"), value.name = "value", variable.name = "type", variable.factor = TRUE)
-  # add sample names, by splitting by comma and retaining the order of which they appear in the rmats input file
-  rmats_dt[, bam_dt[, uuid] := tstrsplit(value, ",", fixed = TRUE, type.convert = TRUE)]
-  # convert to real long format to have one row per sample
-  rmats_dt <-
-    melt(
-      rmats_dt,
-      id.vars = c("type", "event_id"),
-      measure.vars = bam_dt[, uuid],
-      variable.name = "uuid"
-    )
+  # Since I have multiple files with different uuids, I have to melt them separately and then rbindlist them
+  rmats_dt <- rbindlist(pbmclapply(rmats_file, function(filename) {
+    dt <- fread(filename)
+
+    if (event_type == "SE") {
+      dt[, event_id := sprintf(
+        "%s;%s:%s:%s-%s:%s-%s:%s",
+        GeneID,
+        event_type,
+        chr,
+        upstreamEE,
+        exonStart_0base + 1,
+        exonEnd,
+        downstreamES + 1,
+        strand
+      )]
+    } else if (event_type == "RI") {
+      dt[, event_id := sprintf(
+        "%s;%s:%s:%s:%s-%s:%s:%s",
+        GeneID,
+        event_type,
+        chr,
+        upstreamES + 1,
+        upstreamEE,
+        downstreamES + 1,
+        downstreamEE,
+        strand
+      )]
+    } else if (event_type == "A3") {
+      dt[, event_id := sprintf(
+        "%s;%s:%s:%s-%s:%s-%s:%s",
+        GeneID,
+        event_type,
+        chr,
+        ifelse(strand == "+", flankingEE, longExonEnd),
+        ifelse(strand == "+", longExonStart_0base + 1, flankingES + 1),
+        ifelse(strand == "+", flankingEE, shortEE),
+        ifelse(strand == "+", shortES + 1, flankingES + 1),
+        strand
+      )]
+    } else if (event_type == "A5") {
+      dt[, event_id := sprintf(
+        "%s;%s:%s:%s-%s:%s-%s:%s",
+        GeneID,
+        event_type,
+        chr,
+        ifelse(strand == "+", longExonEnd, flankingEE),
+        ifelse(strand == "+", flankingES + 1, longExonStart_0base + 1),
+        ifelse(strand == "+", shortEE, flankingEE),
+        ifelse(strand == "+", flankingES + 1, shortES + 1),
+        strand
+      )]
+    } else if (event_type == "MX") {
+      dt[, event_id := sprintf(
+        "%s;%s:%s:%s-%s:%s-%s:%s-%s:%s-%s:%s",
+        GeneID,
+        event_type,
+        chr,
+        upstreamEE,
+        `1stExonStart_0base` + 1,
+        `1stExonEnd`,
+        downstreamES + 1,
+        upstreamEE,
+        `2ndExonStart_0base` + 1,
+        `2ndExonEnd`,
+        downstreamES + 1,
+        strand
+      )]
+    } else {
+      stop("Not implemented yet")
+    }
+    # convert to long format which still has comma-separated values
+    dt <- melt(dt, id.vars = c("event_id"), measure.vars = c("IJC_SAMPLE_1", "SJC_SAMPLE_1", "IncLevel1"), value.name = "value", variable.name = "type", variable.factor = TRUE)
+    # add sample names, by splitting by comma and retaining the order of which they appear in the rmats input file
+    uuid_vec <- bam_dt[run_name == basename(dirname(filename)), strsplit(uuid_string, ",", fixed = TRUE)[[1]]]
+    dt[, (uuid_vec) := tstrsplit(value, ",", fixed = TRUE, type.convert = TRUE)]
+    # convert to real long format to have one row per sample
+    dt <-
+      melt(
+        dt,
+        id.vars = c("type", "event_id"),
+        measure.vars = uuid_vec,
+        variable.name = "uuid"
+      )
+  }))
+
+
   # make sure counts are non-NA
   rmats_dt[type != "IncLevel1", stopifnot(!is.na(value))]
   # rename columns
@@ -189,6 +160,16 @@ filtered_events <- sapply(as_events, function(event_type) {
   rmats_dt[, type := droplevels(type)]
   # for filtering we do not need to keep track of which count it is (inclusion or skipping)
   rmats_dt <- rmats_dt[, .(value = sum(value)), by = .(type, event_id, uuid)]
+  rmats_dt[, stopifnot(sum(type == "psi") == sum(type == "count"))]
+  # recreate missing combinations with NA values
+  rmats_dt <- melt(dcast(rmats_dt, type + event_id ~ uuid, measure.var = "value"),
+    id.vars = c("type", "event_id"),
+    variable.name = "uuid",
+    value.name = "value",
+    variable.factor = TRUE
+  )
+  # fill count NAs with 0
+  rmats_dt[type == "count" & is.na(value), value := 0]
 
   #### Merge the tables ----
   event_dt <- rbindlist(list(rmats = rmats_dt, suppa = suppa_dt), idcol = "method")
