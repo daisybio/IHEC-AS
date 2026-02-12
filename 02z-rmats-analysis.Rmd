@@ -6,45 +6,20 @@ output: html_document
 ---
 
 ```{r}
-bam_dt <- data.table(
-  bam = c(
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009331/1.0.0/1.1.0/hg38_no_alt/75/8177/work/f4/ff34e2e7a1b6216bbf8c59e26ae4f1/K009331_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009330/1.0.0/1.1.0/hg38_no_alt/75/8176/work/df/4d3fa1685efcf134929b12b9e4f549/K009330_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009333/1.0.0/1.1.0/hg38_no_alt/75/8175/work/c8/cade5167cf026da3936366fc259718/K009333_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009332/1.0.0/1.1.0/hg38_no_alt/75/8174/work/65/9dd6bf34e3471ee9c22a2b1e5146a2/K009332_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009334/1.0.0/1.1.0/hg38_no_alt/75/8167/work/5e/d8b4bda598d2913427aef88915cffd/K009334_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009335/1.0.0/1.1.0/hg38_no_alt/75/8168/work/f3/3873664c8ce4a3af54a2ad0e384ea6/K009335_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009337/1.0.0/1.1.0/hg38_no_alt/75/8173/work/07/2b4827c201cb47633a59b2b9959845/K009337_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009336/1.0.0/1.1.0/hg38_no_alt/75/8172/work/02/1e59765267de0efbc517b570c11ed8/K009336_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009339/1.0.0/1.1.0/hg38_no_alt/75/8171/work/1c/8a1cd58f6e9e829e21e4b9a44b4322/K009339_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009338/1.0.0/1.1.0/hg38_no_alt/75/8170/work/85/4cfd38648a13da79969248d2febc39/K009338_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009341/1.0.0/1.1.0/hg38_no_alt/75/8179/work/9d/975f47eee547312ffa13a743637bca/K009341_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009340/1.0.0/1.1.0/hg38_no_alt/75/8178/work/0d/d5d92a6c288c8285ef39ace05434af/K009340_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009343/1.0.0/1.1.0/hg38_no_alt/75/8181/work/b5/9f398b50552276c3b282983dc537d4/K009343_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009342/1.0.0/1.1.0/hg38_no_alt/75/8180/work/e8/8e03bbd5675b7e4d15bef907d44840/K009342_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009345/1.0.0/1.1.0/hg38_no_alt/75/8183/work/88/2d179ca34731b49671ac9965ba5591/K009345_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009344/1.0.0/1.1.0/hg38_no_alt/75/8182/work/6a/c3f7a5f2bd95c34a4d057cee451b10/K009344_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009347/1.0.0/1.1.0/hg38_no_alt/75/8185/work/2a/7e107c95b4dc215f2c8ea24298c96f/K009347_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009346/1.0.0/1.1.0/hg38_no_alt/75/8184/work/33/852a5b510bc382fbd14b030040f5ec/K009346_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009349/1.0.0/1.1.0/hg38_no_alt/75/8187/work/ba/510ecfe57780797980928b0cf4a05d/K009349_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009348/1.0.0/1.1.0/hg38_no_alt/75/8186/work/52/b8bf5b82bbe29e42d2e031530a8be4/K009348_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009351/1.0.0/1.1.0/hg38_no_alt/75/8188/work/ed/a9edeb002a80e66be0806f3cb76148/K009351_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009350/1.0.0/1.1.0/hg38_no_alt/75/8202/work/4f/dea973195470756c5f863602ab0120/K009350_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009352/1.0.0/1.1.0/hg38_no_alt/75/8189/work/be/fa20d950f8dad490bf50a0e96f7308/K009352_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009354/1.0.0/1.1.0/hg38_no_alt/75/8191/work/d3/b42747e0d28b9c77580e4b61968fc1/K009354_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009353/1.0.0/1.1.0/hg38_no_alt/75/8190/work/3a/d2e4e2914d351492a092231153ce89/K009353_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009356/1.0.0/1.1.0/hg38_no_alt/75/8193/work/d8/c76ab062480d6955faa0800b6da841/K009356_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009355/1.0.0/1.1.0/hg38_no_alt/75/8192/work/3d/6de682131a37684e32c7528549e324/K009355_m4_n10_toGenome.markdup.bam",
-    "/projects/deep_int_dart2/IHEC/IA/Deep/rnaseq/K009358/1.0.0/1.1.0/hg38_no_alt/75/8195/work/a7/7f9e9b3f840e1eaaa7c762a2a957fc/K009358_m4_n10_toGenome.markdup.bam"
-  )
-)
-bam_dt[, path := tstrsplit(bam, "/work", keep = 1)]
-bam_mapping <- fread("rmats_mapping/DEEP.RNA_Seq.EpiRRID_exptype_path.IHEC.tsv", header = FALSE)
-setnames(bam_mapping, 1:4, c("project", "epirr", "experiment_type", "path"))
-bam_dt[bam_mapping, on = .NATURAL, c("epirr", "experiment_type") := .(epirr, experiment_type)]
-bam_dt[, sample_name := paste(epirr, experiment_type, sep = "_")]
+rmats_command_file <- "data/rmats_split_post_commands.tsv"
+command_dt <- fread(rmats_command_file)
 experiment_metadata <- fread("data/EpiATLAS_experiment_metadata.csv")
-bam_dt[experiment_metadata[, epirr := epirr_id], on = .NATURAL, uuid := uuid]
+experiment_metadata[, experiment_type := factor(experiment_type)]
+file_metadata <- fread("processed_data/file_table.csv.gz")
+rna_to_use <- file_metadata[
+  assay_type == "RNA-Seq" &
+    epirr_id_without_version %in% file_metadata[,
+      if (.N >= 8) .SD,
+      by = epirr_id_without_version
+    ][, epirr_id_without_version],
+  uuid
+]
+# bam_dt[experiment_metadata[, epirr := epirr_id], on = .NATURAL, uuid := uuid]
 ```
 
 ```{r, fig.width=12, fig.height=8}
@@ -57,28 +32,30 @@ min_average_PSI <- .05
 max_average_PSI <- 1 - min_average_PSI
 min_read_coverage <- 10
 min_samples_coverage <- 3
-suppa_dir <- file.path("suppa_analysis", "events_rmats")
-dir.create(suppa_dir, recursive = TRUE, showWarnings = FALSE)
+splicing_dir <- file.path("splicing_analysis", "rmats")
+dir.create(splicing_dir, recursive = TRUE, showWarnings = FALSE)
 
-rmats_dir <- "rmats_out"
-event_type <- "MXE"
+rmats_dir <- file.path(data_dir, "rmats", "biotype_filtered")
+event_type <- "SE"
 junction_counts <- "MATS.JC.txt"
+run_name <- "paired_fr-firststrand_75"
 plot_dist <- TRUE
 
 for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
-  for (rmats_dir in c( # "rmats_out_all", "rmats_out_2",
-    "rmats_out" # , "rmats_out_3"
-  )) {
+  for (rmats_dir in list.dirs(file.path(data_dir, "rmats"), recursive = FALSE)
+    # c( # "rmats_out_all", "rmats_out_2",
+    #   "rmats_out" # , "rmats_out_3"
+    # )
+  ) {
+    this_splicing_dir <- file.path(splicing_dir, basename(rmats_dir))
+    dir.create(this_splicing_dir, recursive = TRUE, showWarnings = FALSE)
     for (junction_counts in c(
       "MATS.JC.txt" # , "MATS.JCEC.txt"
     )) {
-      junction_file <- file.path(rmats_dir, paste(event_type, junction_counts, sep = "."))
-      event_type <- substr(event_type, 1, 2)
-      # read file with counts
-      dt <-
-        fread(junction_file)
+      # read annotation file
+      event_annotation <- fread(file.path(rmats_dir, command_dt[grep(basename(rmats_dir), out_folder), run_name][1], paste("fromGTF", event_type, "txt", sep = ".")))
       if (event_type == "SE") {
-        dt[, suppa_id := sprintf(
+        event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s",
           GeneID,
           event_type,
@@ -90,7 +67,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           strand
         )]
       } else if (event_type == "RI") {
-        dt[, suppa_id := sprintf(
+        event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s:%s-%s:%s:%s",
           GeneID,
           event_type,
@@ -102,7 +79,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           strand
         )]
       } else if (event_type == "A3") {
-        dt[, suppa_id := sprintf(
+        event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s",
           GeneID,
           event_type,
@@ -114,7 +91,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           strand
         )]
       } else if (event_type == "A5") {
-        dt[, suppa_id := sprintf(
+        event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s",
           GeneID,
           event_type,
@@ -126,7 +103,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           strand
         )]
       } else if (event_type == "MX") {
-        dt[, suppa_id := sprintf(
+        event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s-%s:%s-%s:%s",
           GeneID,
           event_type,
@@ -145,193 +122,260 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
         stop("Not implemented yet")
       }
 
-      # convert to long format
-      id_vars <-
-        c(
-          "ID",
-          "geneSymbol",
-          "suppa_id"
-        )
+      event_sample_data_path <- file.path(rmats_dir, paste(event_type, junction_counts, "csv.gz", sep = "."))
+      if (file.exists(event_sample_data_path)) {
+        event_sample_data <- fread(file.path(rmats_dir, paste(event_type, junction_counts, "csv.gz", sep = ".")))
+      } else {
+        id_vars <-
+          c(
+            "ID"
+          )
+        measure_vars <-
+          c("IJC_SAMPLE_1", "SJC_SAMPLE_1", "IncLevel1")
+        dt_list <- pbmclapply(command_dt[grep(basename(rmats_dir), out_folder), run_name], function(this_run_name) {
+          junction_file <- file.path(rmats_dir, this_run_name, paste(event_type, junction_counts, sep = "."))
+          # read file with counts
+          dt <-
+            fread(junction_file, select = c(id_vars, measure_vars))
+          event_type <- substr(event_type, 1, 2)
+          # convert to long format
 
-      long_dt <-
-        melt(
-          dt,
-          id.vars = id_vars,
-          measure.vars = c("IJC_SAMPLE_1", "SJC_SAMPLE_1", "IncLevel1")
-        )
-      # add sample names, by splitting by comma and retaining the order of which they appear in the rmats input file
-      long_dt[, bam_dt[, sample_name] := tstrsplit(value, ",", fixed = TRUE, type.convert = TRUE)]
-      # convert to even longer format to have one row per sample
-      long_long_dt <-
-        melt(
-          long_dt,
-          id.vars = c(id_vars, "variable"),
-          measure.vars = bam_dt[, sample_name],
-          variable.name = "sample_name"
-        )
-      # add experiment type
-      long_long_dt[, experiment_type := tstrsplit(sample_name, "_", keep = 2)]
-      # create suppa id
-      long_long_dt[, ]
-      # compute average counts per event and per experiment type and event
-      average_count_dt <-
-        rbind(long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(average_count = mean(value) * 2), by = .(ID)],
-          long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(average_count = mean(value) * 2), by = .(experiment_type, ID)],
-          fill = TRUE
-        )
-      # Compute average PSI per event and per experiment type and event
-      average_psi_dt <-
-        rbind(
-          long_long_dt[variable %in% c("IncLevel1"), .(average_psi = mean(value, na.rm = TRUE)),
-            by =
-              .(ID)
-          ],
-          long_long_dt[variable %in% c("IncLevel1"), .(average_psi = mean(value, na.rm = TRUE)),
-            by =
-              .(experiment_type, ID)
-          ],
-          fill = TRUE
-        )
-      average_dt <- merge(average_psi_dt, average_count_dt)
-      # plot average count and PSI distributions
-      if (plot_dist) {
-        print(
-          ggplot(
-            average_count_dt,
-            aes(x = average_count + 1, color = experiment_type)
-          ) +
-            geom_line(aes(y = 1 - after_stat(y)), stat = "ecdf") +
-            scale_x_log10() +
-            geom_vline(xintercept = average_read_coverage + 1) +
-            labs(title = sprintf("Average Read Coverage: %s with line at %d", junction_file, average_read_coverage + 1))
-        )
-        print(
-          ggplot(average_psi_dt, aes(x = average_psi, fill = experiment_type)) +
-            geom_histogram(position = "dodge") +
-            geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
-            labs(title = sprintf("Average PSI: %s", junction_file))
-        )
-        print(
-          ggplot(
-            average_psi_dt[average_psi >= min_average_PSI &
-              average_psi <= max_average_PSI],
-            aes(x = average_psi, fill = experiment_type)
-          ) +
-            geom_histogram(position = "dodge", binwidth = .05) +
-            geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
-            labs(title = sprintf("Average PSI: %s, %f <= PSI < %f", junction_file, min_average_PSI, max_average_PSI))
-        )
-        ### Check per-sample read coverage filtering ----
-        # Step 1: Compute total counts per event/sample
-        event_sample_counts <- long_long_dt[
-          variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"),
-          .(total_count = sum(value)),
-          by = .(ID, sample_name)
-        ]
+          long_dt <-
+            melt(
+              dt,
+              id.vars = id_vars,
+              measure.vars = measure_vars
+            )
+          # add sample names, by splitting by comma and retaining the order of which they appear in the rmats input file
+          uuids <- command_dt[grep(basename(rmats_dir), out_folder) & run_name == this_run_name, strsplit(uuid_string, ",", fixed = TRUE)][[1]]
+          long_dt[, (uuids) := tstrsplit(value, ",", fixed = TRUE, type.convert = TRUE)]
+          # convert to even longer format to have one row per sample
+          lapply(split(long_dt, long_dt[, variable]),
+            melt,
+            id.vars = c(id_vars, "variable"),
+            measure.vars = uuids,
+            variable.name = "uuid"
+          )
+        })
+        names(dt_list) <- command_dt[grep(basename(rmats_dir), out_folder), run_name]
+        long_dt_list <- sapply(measure_vars, function(measure_var) {
+          rbindlist(sapply(dt_list, function(dt_split) {
+            dt_split[[measure_var]]
+          }, simplify = FALSE), idcol = "run_name")
+        }, simplify = FALSE)
 
-        # Step 2: Create grid of thresholds to test
-        min_read_cutoffs <- c(0, 1, 5, 10, 15, 20)
-        min_sample_cutoffs <- c(1, 3, 5, 10)
+        stopifnot(identical(
+          long_dt_list$IJC_SAMPLE_1[, .(ID, uuid)],
+          long_dt_list$SJC_SAMPLE_1[, .(ID, uuid)]
+        ))
 
-        # Step 3: Expand combinations and compute how many events pass
-        plot_dt <- CJ(
-          min_read_coverage = min_read_cutoffs,
-          min_samples_coverage = min_sample_cutoffs
-        )
+        stopifnot(identical(
+          long_dt_list$SJC_SAMPLE_1[, .(ID, uuid)],
+          long_dt_list$IncLevel1[, .(ID, uuid)]
+        ))
 
-        plot_dt[, n_pass := event_sample_counts[
-          total_count >= min_read_coverage,
-          .N,
-          by = ID
-        ][N >= min_samples_coverage, .N],
-        by = .(min_read_coverage, min_samples_coverage)
-        ]
+        event_sample_data <- long_dt_list$IJC_SAMPLE_1[, .(ID, uuid, incl_count = value)]
+        event_sample_data[, skip_count := long_dt_list$SJC_SAMPLE_1[, value]]
+        event_sample_data[, psi := long_dt_list$IncLevel1[, value]]
 
-        print(ggplot(plot_dt, aes(
-          x = min_samples_coverage, y = n_pass,
-          color = factor(min_read_coverage)
-        )) +
-          geom_line() +
-          geom_point() +
-          labs(
-            title = junction_file,
-            x = "Minimum number of samples with sufficient read count",
-            y = "Number of events (ID) retained",
-            color = "Min per-sample read count"
-          ))
-
-        ###  Check average read coverages and PSI filtering ----
-
-        # Step 1: Create grid of thresholds to test
-        min_PSI_cutoffs <- seq(0, 0.05, by = 0.01)
-
-        plot_dt <- CJ(
-          average_read_coverage = min_read_cutoffs,
-          min_average_PSI = min_PSI_cutoffs
-        )
-
-
-
-        plot_dt[, n_pass := average_dt[
-          !is.na(experiment_type) &
-            average_count >= average_read_coverage &
-            average_psi >= min_average_PSI &
-            average_psi <= 1 - min_average_PSI,
-          ID,
-          by = experiment_type
-        ][duplicated(ID), .N],
-        by = .(average_read_coverage, min_average_PSI)
-        ]
-
-        print(ggplot(plot_dt, aes(
-          x = min_average_PSI, y = n_pass,
-          color = factor(average_read_coverage)
-        )) +
-          geom_line() +
-          geom_point() +
-          labs(
-            title = sprintf("Min averages per experiment type: %s", junction_file),
-            x = "Minimum average PSI",
-            y = "Number of events (ID) retained",
-            color = "Min average read coverage"
-          ))
+        fwrite(event_sample_data, event_sample_data_path)
       }
 
-      keep_ids_orig <-
+      # event_sample_data[, total_count := incl_count + skip_count]
+
+      # # add experiment type
+      event_sample_data[experiment_metadata, on = .(uuid), experiment_type := experiment_type]
+
+      # compute average counts per event and per experiment type and event
+      # recompute for the RNA used in this analysis as well
+      uuids_to_filter_on <- list(all = event_sample_data[, unique(uuid)], full_epigenomes = rna_to_use)
+      mapply(as.list(names(uuids_to_filter_on)), uuids_to_filter_on, FUN = function(filter_name, uuids_to_filter) {
+        average_dt <- Reduce(
+          merge,
+          pbmclapply(
+            list(
+              function() {
+                rbind(
+                  event_sample_data[uuid %in% uuids_to_filter, .(incl_sum = sum(incl_count, na.rm = TRUE), n_samples = .N), by = ID],
+                  event_sample_data[uuid %in% uuids_to_filter, .(incl_sum = sum(incl_count, na.rm = TRUE), n_samples = .N), by = .(ID, experiment_type)],
+                  fill = TRUE
+                )
+              },
+              function() {
+                rbind(
+                  event_sample_data[uuid %in% uuids_to_filter, .(skip_sum = sum(skip_count, na.rm = TRUE)), by = ID],
+                  event_sample_data[uuid %in% uuids_to_filter, .(skip_sum = sum(skip_count, na.rm = TRUE)), by = .(ID, experiment_type)],
+                  fill = TRUE
+                )
+              },
+              function() {
+                rbind(
+                  event_sample_data[uuid %in% uuids_to_filter, .(average_psi = mean(psi, na.rm = TRUE)), by = ID],
+                  event_sample_data[uuid %in% uuids_to_filter, .(average_psi = mean(psi, na.rm = TRUE)), by = .(ID, experiment_type)],
+                  fill = TRUE
+                )
+              }
+            ),
+            function(f) f(),
+            mc.cores = 3
+          )
+        )
+        average_dt[, average_count := (incl_sum + skip_sum) / n_samples]
+
+        # scatterplot average count vs average PSI
+        ggplot(average_dt, aes(x = average_count + 1, y = average_psi, color = experiment_type)) +
+          geom_point(alpha = .5) +
+          scale_x_log10() +
+          # create a line y ~ x
+          geom_smooth(method = "lm", se = FALSE) +
+          ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", label.y.npc = "bottom") +
+          facet_wrap(~experiment_type) +
+          labs(title = sprintf("Average Count vs Average PSI:"))
+
+        # plot average count and PSI distributions
+        if (plot_dist) {
+          print(
+            ggplot(
+              average_dt,
+              aes(x = average_count + 1, color = experiment_type)
+            ) +
+              geom_line(aes(y = 1 - after_stat(y)), stat = "ecdf") +
+              scale_x_log10() +
+              geom_vline(xintercept = average_read_coverage + 1) +
+              labs(title = sprintf("Average Read Coverage: with line at %d", average_read_coverage + 1))
+          )
+          print(
+            ggplot(average_dt, aes(x = average_psi, fill = experiment_type)) +
+              geom_histogram(position = "dodge") +
+              geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
+              labs(title = sprintf("Average PSI:"))
+          )
+          print(
+            ggplot(
+              average_dt[average_psi >= min_average_PSI &
+                average_psi <= max_average_PSI],
+              aes(x = average_psi, fill = experiment_type)
+            ) +
+              geom_histogram(position = "dodge", binwidth = .05) +
+              geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
+              labs(title = sprintf("Average PSI: %f <= PSI < %f", min_average_PSI, max_average_PSI))
+          )
+
+          ### Check per-sample read coverage filtering ----
+          # Step 1: Compute total counts per event/sample
+
+          # Step 2: Create grid of thresholds to test
+          min_read_cutoffs <- c(0, 1, 5, 10, 15, 20)
+          min_sample_cutoffs <- c(1, 3, 5, 10)
+
+          # Step 3: Expand combinations and compute how many events pass
+          plot_dt <- CJ(
+            min_read_coverage = min_read_cutoffs,
+            min_samples_coverage = min_sample_cutoffs
+          )
+
+          plot_dt[, n_pass := event_sample_data[
+            incl_count + skip_count >= min_read_coverage,
+            .N,
+            by = ID
+          ][N >= min_samples_coverage, .N],
+          by = .(min_read_coverage, min_samples_coverage)
+          ]
+
+          print(ggplot(plot_dt, aes(
+            x = min_samples_coverage, y = n_pass,
+            color = factor(min_read_coverage)
+          )) +
+            geom_line() +
+            geom_point() +
+            labs(
+              # title = junction_file,
+              x = "Minimum number of samples with sufficient read count",
+              y = "Number of events (ID) retained",
+              color = "Min per-sample read count"
+            ))
+
+          ###  Check average read coverages and PSI filtering ----
+
+          # Step 1: Create grid of thresholds to test
+          min_PSI_cutoffs <- seq(0, 0.05, by = 0.01)
+
+          plot_dt <- CJ(
+            average_read_coverage = min_read_cutoffs,
+            min_average_PSI = min_PSI_cutoffs
+          )
+
+          plot_dt[, n_pass := average_dt[
+            !is.na(experiment_type) &
+              average_count >= average_read_coverage &
+              average_psi >= min_average_PSI &
+              average_psi <= 1 - min_average_PSI,
+            ID,
+            by = experiment_type
+          ][duplicated(ID), .N],
+          by = .(average_read_coverage, min_average_PSI)
+          ]
+
+          print(ggplot(plot_dt, aes(
+            x = min_average_PSI, y = n_pass,
+            color = factor(average_read_coverage)
+          )) +
+            geom_line() +
+            geom_point() +
+            labs(
+              title = sprintf("Min averages per experiment type"),
+              x = "Minimum average PSI",
+              y = "Number of events (ID) retained",
+              color = "Min average read coverage"
+            ))
+        }
+        # get IDs to keep based on average PSI and average read coverage
+        keep_ids_orig <-
+          average_dt[
+            !is.na(experiment_type) &
+              average_count >= average_read_coverage &
+              average_psi >= min_average_PSI &
+              average_psi <= 1 - min_average_PSI,
+            ID,
+            by = experiment_type
+          ][duplicated(ID), ID]
+        length(keep_ids_orig)
+        # number of unique IDs passing the filter across all experiment types
         average_dt[
-          !is.na(experiment_type) &
+          is.na(experiment_type) &
             average_count >= average_read_coverage &
             average_psi >= min_average_PSI &
             average_psi <= 1 - min_average_PSI,
-          ID,
-          by = experiment_type
-        ][duplicated(ID), ID]
-      # intersect(
-      #   average_psi_dt[!is.na(experiment_type) &
-      #     average_psi >= min_average_PSI &
-      #     average_psi <= max_average_PSI, ID, by = experiment_type][duplicated(ID), ID],
-      #   average_count_dt[!is.na(experiment_type) &
-      #     average_count >= average_read_coverage, ID, by = experiment_type][duplicated(ID), ID]
-      # )
+          uniqueN(ID)
+        ]
 
-      keep_ids_min_sample <- long_long_dt[variable %in% c("IJC_SAMPLE_1", "SJC_SAMPLE_1"), .(total_count = sum(value)), by = .(ID, sample_name)][total_count >= min_read_coverage, .N, by = ID][N >= min_samples_coverage, ID]
+        # intersect(
+        #   average_psi_dt[!is.na(experiment_type) &
+        #     average_psi >= min_average_PSI &
+        #     average_psi <= max_average_PSI, ID, by = experiment_type][duplicated(ID), ID],
+        #   average_count_dt[!is.na(experiment_type) &
+        #     average_count >= average_read_coverage, ID, by = experiment_type][duplicated(ID), ID]
+        # )
 
-      upset <- upset(
-        fromList(list(orig = keep_ids_orig, min_sample = keep_ids_min_sample)),
-        nsets = 2,
-        order.by = "freq",
-        mainbar.y.label = "Number of events (ID)",
-        sets.x.label = "Total events (ID)"
-      )
-      print(upset)
-      grid.text(sprintf("%s", junction_file), x = 0.65, y = 0.95, gp = gpar(fontsize = 20))
+        keep_ids_min_sample <- event_sample_data[incl_count + skip_count >= min_read_coverage, .N, by = ID][N >= min_samples_coverage, ID]
 
-      long_long_dt[bam_dt, on = .NATURAL, uuid := uuid]
-      suppa_format_dt <- dcast(long_long_dt[ID %in% keep_ids_orig &
-        variable == "IncLevel1"], suppa_id ~ uuid, value.var = "value")
-      suppa_file <- file.path(suppa_dir, paste0("event_", event_type, ".psi"))
-      write.table(as.data.frame(suppa_format_dt[, -"suppa_id"], row.names = suppa_format_dt[, suppa_id]), suppa_file, sep = "\t", quote = FALSE)
-      fwrite(unique(long_long_dt[, .(ID, geneSymbol, suppa_id)]), paste0(suppa_file, ".annot"))
+        upset <- upset(
+          fromList(list(orig = keep_ids_orig, min_sample = keep_ids_min_sample)),
+          nsets = 2,
+          order.by = "freq",
+          mainbar.y.label = "Number of events (ID)",
+          sets.x.label = "Total events (ID)"
+        )
+        print(upset)
+        # grid.text(, x = 0.65, y = 0.95, gp = gpar(fontsize = 20))
+
+        event_sample_data[event_annotation, on = .(ID), suppa_id := suppa_id]
+        # long_long_dt[bam_dt, on = .NATURAL, uuid := uuid]
+        suppa_format_dt <- dcast(event_sample_data[ID %in% keep_ids_orig], suppa_id ~ uuid, value.var = "psi")
+        suppa_file <- file.path(this_splicing_dir, paste0(ifelse(filter_name == "all", filter_name, ""), "event_", event_type, ".psi"))
+        write.table(as.data.frame(suppa_format_dt[, -"suppa_id"], row.names = suppa_format_dt[, suppa_id]), suppa_file, sep = "\t", quote = FALSE)
+        fwrite(unique(event_annotation[, .(ID, geneSymbol, suppa_id)]), paste0(suppa_file, ".annot"))
+      })
 
       ### PCA ----
       # long_long_dt[average_psi_dt, on = .NATURAL, average_psi := average_psi]
