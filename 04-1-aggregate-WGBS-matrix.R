@@ -23,10 +23,11 @@ aggregate_matrix <- function(file, seqname){
   # aggregate by ID and IHEC
   agg_dt <- data.table(ID = melt_agg_from_hits,
                        ihec = melt_mat[melt_agg_to_hits, ihec],
-                       score = melt_mat[melt_agg_to_hits, score])[score != -1, .(score=mean(score)),
+                       score = melt_mat[melt_agg_to_hits, score])[score != -1, .(score=mean(score), 
+                                                                                 n=length(score)),
                                                                     by = .(ID, ihec)]
+                        
   agg_dt[, name:=as.factor(aggregateOver$name[ID])]
-  gc()
   return(agg_dt)
 }
 # bind all chromosomes

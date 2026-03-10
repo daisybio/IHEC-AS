@@ -42,11 +42,13 @@ run_name <- "paired_fr-firststrand_75"
 plot_dist <- TRUE
 
 for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
+  print(event_type)
   for (rmats_dir in list.dirs(file.path(data_dir, "rmats"), recursive = FALSE)
     # c( # "rmats_out_all", "rmats_out_2",
     #   "rmats_out" # , "rmats_out_3"
     # )
   ) {
+    print(basename(rmats_dir))
     this_splicing_dir <- file.path(splicing_dir, basename(rmats_dir))
     dir.create(this_splicing_dir, recursive = TRUE, showWarnings = FALSE)
     for (junction_counts in c(
@@ -78,7 +80,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           downstreamEE,
           strand
         )]
-      } else if (event_type == "A3") {
+      } else if (event_type == "A3SS") {
         event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s",
           GeneID,
@@ -90,7 +92,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           ifelse(strand == "+", shortES + 1, flankingES + 1),
           strand
         )]
-      } else if (event_type == "A5") {
+      } else if (event_type == "A5SS") {
         event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s",
           GeneID,
@@ -102,7 +104,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           ifelse(strand == "+", flankingES + 1, shortES + 1),
           strand
         )]
-      } else if (event_type == "MX") {
+      } else if (event_type == "MXE") {
         event_annotation[, suppa_id := sprintf(
           "%s;%s:%s:%s-%s:%s-%s:%s-%s:%s-%s:%s",
           GeneID,
@@ -137,7 +139,6 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           # read file with counts
           dt <-
             fread(junction_file, select = c(id_vars, measure_vars))
-          event_type <- substr(event_type, 1, 2)
           # convert to long format
 
           long_dt <-
@@ -190,6 +191,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
       # recompute for the RNA used in this analysis as well
       uuids_to_filter_on <- list(all = event_sample_data[, unique(uuid)], full_epigenomes = rna_to_use)
       mapply(as.list(names(uuids_to_filter_on)), uuids_to_filter_on, FUN = function(filter_name, uuids_to_filter) {
+        print(filter_name)
         average_dt <- Reduce(
           merge,
           pbmclapply(
@@ -242,13 +244,13 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
               geom_line(aes(y = 1 - after_stat(y)), stat = "ecdf") +
               scale_x_log10() +
               geom_vline(xintercept = average_read_coverage + 1) +
-              labs(title = sprintf("Average Read Coverage: with line at %d", average_read_coverage + 1))
+              labs(title = sprintf("Average Read Coverage: with line at %d; %s %s %s", average_read_coverage + 1, event_type, basename(rmats_dir), filter_name))
           )
           print(
             ggplot(average_dt, aes(x = average_psi, fill = experiment_type)) +
               geom_histogram(position = "dodge") +
               geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
-              labs(title = sprintf("Average PSI:"))
+              labs(title = sprintf("Average PSI: %s %s %s", event_type, basename(rmats_dir), filter_name))
           )
           print(
             ggplot(
@@ -258,7 +260,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
             ) +
               geom_histogram(position = "dodge", binwidth = .05) +
               geom_vline(xintercept = c(min_average_PSI, max_average_PSI)) +
-              labs(title = sprintf("Average PSI: %f <= PSI < %f", min_average_PSI, max_average_PSI))
+              labs(title = sprintf("Average PSI: %f <= PSI < %f; %s %s %s", min_average_PSI, max_average_PSI, event_type, basename(rmats_dir), filter_name))
           )
 
           ### Check per-sample read coverage filtering ----
@@ -275,7 +277,8 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           )
 
           plot_dt[, n_pass := event_sample_data[
-            incl_count + skip_count >= min_read_coverage,
+            uuid %in% uuids_to_filter &
+              incl_count + skip_count >= min_read_coverage,
             .N,
             by = ID
           ][N >= min_samples_coverage, .N],
@@ -289,7 +292,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
             geom_line() +
             geom_point() +
             labs(
-              # title = junction_file,
+              title = sprintf("%s %s %s", event_type, basename(rmats_dir), filter_name),
               x = "Minimum number of samples with sufficient read count",
               y = "Number of events (ID) retained",
               color = "Min per-sample read count"
@@ -323,7 +326,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
             geom_line() +
             geom_point() +
             labs(
-              title = sprintf("Min averages per experiment type"),
+              title = sprintf("Min averages per experiment type: %s %s %s", event_type, basename(rmats_dir), filter_name),
               x = "Minimum average PSI",
               y = "Number of events (ID) retained",
               color = "Min average read coverage"
@@ -357,7 +360,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
         #     average_count >= average_read_coverage, ID, by = experiment_type][duplicated(ID), ID]
         # )
 
-        keep_ids_min_sample <- event_sample_data[incl_count + skip_count >= min_read_coverage, .N, by = ID][N >= min_samples_coverage, ID]
+        keep_ids_min_sample <- event_sample_data[uuid %in% uuids_to_filter & incl_count + skip_count >= min_read_coverage, .N, by = ID][N >= min_samples_coverage, ID]
 
         upset <- upset(
           fromList(list(orig = keep_ids_orig, min_sample = keep_ids_min_sample)),
@@ -367,12 +370,12 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           sets.x.label = "Total events (ID)"
         )
         print(upset)
-        # grid.text(, x = 0.65, y = 0.95, gp = gpar(fontsize = 20))
+        grid.text(sprintf("%s %s %s", event_type, basename(rmats_dir), filter_name), x = 0.65, y = 0.95, gp = gpar(fontsize = 20))
 
         event_sample_data[event_annotation, on = .(ID), suppa_id := suppa_id]
         # long_long_dt[bam_dt, on = .NATURAL, uuid := uuid]
-        suppa_format_dt <- dcast(event_sample_data[ID %in% keep_ids_orig], suppa_id ~ uuid, value.var = "psi")
-        suppa_file <- file.path(this_splicing_dir, paste0(ifelse(filter_name == "all", filter_name, ""), "event_", event_type, ".psi"))
+        suppa_format_dt <- dcast(event_sample_data[ID %in% keep_ids_orig & uuid %in% uuids_to_filter], suppa_id ~ uuid, value.var = "psi")
+        suppa_file <- file.path(this_splicing_dir, paste0(ifelse(filter_name == "all", filter_name, ""), "event_", substr(event_type, 1, 2), ".psi"))
         write.table(as.data.frame(suppa_format_dt[, -"suppa_id"], row.names = suppa_format_dt[, suppa_id]), suppa_file, sep = "\t", quote = FALSE)
         fwrite(unique(event_annotation[, .(ID, geneSymbol, suppa_id)]), paste0(suppa_file, ".annot"))
       })

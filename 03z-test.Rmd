@@ -15,8 +15,10 @@ qc_cols <- c(
   "fraction_rrna",
   "fraction_duplicates"
 )
+isoform_quants <- fread("splicing_analysis/isoform_quantifications.tsv.gz")
 gene_quants <- readRDS(paste0("suppa_analysis/gene_expressions_filtered.rds"))
-download_metadata <- fread("processed_data/file_table.csv.gz")
+# file_metadata <- fread("processed_data/file_table.csv.gz")
+
 fig1_color_dt <- unique(metadata[, .(get(ontology_column), harmonized_sample_ontology_term_high_order_fig1_color)])
 color_mapping <- setNames(fig1_color_dt$harmonized_sample_ontology_term_high_order_fig1_color, fig1_color_dt[[ontology_column]])
 color_mapping_hex <- sapply(strsplit(color_mapping, ","), function(x) rgb(x[1], x[2], x[3], maxColorValue = 255))
@@ -38,7 +40,7 @@ metadata_order <-
     ),
     variable.name = "experiment_type",
     value.name = "uuid"
-  )[uuid != ""][order(EpiRR_ordering, uuid)]
+  )[uuid != "" & uuid %in% sample_cols][order(EpiRR_ordering, uuid)]
 metadata_order[, experiment_type := tstrsplit(experiment_type, "_", keep = 4)]
 gene_mat <- as.matrix(dcast(gene_quants[gene_id %in% event_dt[, gene_id]], uuid ~ gene_id),
   rownames = "uuid"
@@ -49,7 +51,7 @@ variance <- gene_pca$sdev^2
 explained_variance_ratio <- round(variance / gene_pca$var, 3) * 100
 plot_dt <- as.data.table(gene_pca$x, keep.rownames = "uuid")
 setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
-plot_dt[download_metadata[assay_type == "RNA-Seq"],
+plot_dt[file_metadata[assay_type == "RNA-Seq"],
   on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)
 ]
 plot_dt[qc_dt, on = .NATURAL, (qc_cols) := mget(qc_cols)]
@@ -71,36 +73,42 @@ Reduce(`+`, lapply(qc_cols, function(color_col) {
     )
 }))
 
-onto_plot <- rsvd::ggindplot(gene_pca, groups = plot_dt[, factor(get(ontology_column), levels = unique(get(ontology_column)))], ind_labels = FALSE, alpha.ellipse = 0) + scale_color_manual(values = color_mapping_hex)
-onto_plot[["guides"]][["colour"]] <- NULL
+onto_plot <- rsvd::ggindplot(gene_pca, groups = plot_dt[, factor(get(ontology_column), levels = unique(get(ontology_column)))], ind_labels = FALSE, alpha.ellipse = 0) + 
+  scale_color_manual(values = color_mapping_hex) + 
+  scale_fill_manual(values = color_mapping_hex)
+onto_plot[["guides"]][["guides"]]$colour <- NULL
 (rsvd::ggindplot(gene_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE) + rsvd::ggindplot(gene_pca, pcs = c(1, 3), groups = plot_dt[, experiment_type], ind_labels = FALSE) + plot_layout(guides = "collect")) / onto_plot
 ```
 
 ```{r, fig.width=12, fig.height=10}
 library(seriation)
 this_event <- "RI"
-this_filter <- keep_rows
+this_filter <- keep_rows_manual
 this_method <- "suppa"
+this_transcript_filter <- "biotype_filtered"
 # TODO: would be nice to have the event_dt in a format in which method is a column instead of a prefix of the sample columns
 
 # Now do this first on RI and then on SE events
 for (this_event in to_analyze) {
+  for (this_transcript_filter in transcript_filters) {
   # and with and without the filtered events
-  curr_dt <- event_dt[`Event Type` == this_event]
-  for (this_filter in list( # curr_dt[, ID],
-    keep_rows
+  curr_dt <- event_dt[`Event Type` == this_event & transcript_filter == this_transcript_filter]
+  for (this_filter in list( 
+    curr_dt[, ID],
+    keep_rows_manual
   )) {
     # filter the data
     filtered_dt <- curr_dt[ID %in% this_filter]
-    for (this_method in c("suppa", "rmats")) {
+    # for (this_method in c("suppa", "rmats")) {
       this_title <- paste(
         this_event,
-        this_method,
-        ifelse(identical(this_filter, keep_rows), "filtered", "all")
+        # this_method,
+        this_transcript_filter,
+        ifelse(identical(this_filter, keep_rows_manual), "filtered", "all")
       )
       message(this_title)
-      this_sample_cols <-
-        names(event_dt)[startsWith(names(event_dt), this_method)]
+      this_sample_cols <- sample_cols
+        # names(event_dt)[startsWith(names(event_dt), this_method)]
       long_dt <- melt(
         filtered_dt,
         id.vars = "ID",
@@ -108,9 +116,9 @@ for (this_event in to_analyze) {
         na.rm = TRUE
       )
       # remove the this_method prefix from the variable column
-      long_dt[, variable := sub(paste0("^", this_method, "_"), "", variable)]
-      this_sample_cols <-
-        sub(paste0("^", this_method, "_"), "", this_sample_cols)
+      # long_dt[, variable := sub(paste0("^", this_method, "_"), "", variable)]
+      # this_sample_cols <-
+        # sub(paste0("^", this_method, "_"), "", this_sample_cols)
       long_dt[metadata_order, on = c(variable = "uuid"), experiment_type := i.experiment_type]
 
       # compute distances between events using wasserstein distance in 1D
@@ -151,28 +159,31 @@ for (this_event in to_analyze) {
           "There are missing or infinite values in the distance matrix. Please check the data."
         )
       }
+      event_clust <- seriation:::reorder.hclust(hclust(event_dist_obj, method = "complete"),
+                                       dist = event_dist_obj,
+                                       method = "OLO")
       # what is the opimal number of clusters for the events?
       # Cut the dendrogram into k clusters
       sil_widths <- sapply(2:10, function(k) {
-        pam_fit <- pam(event_dist_obj, diss = TRUE, k = k)
+        pam_fit <- cluster::pam(event_dist_obj, diss = TRUE, k = k)
         pam_fit$silinfo$avg.width
       })
       
       plot(2:10, sil_widths, type = "b", xlab = "Number of clusters", ylab = "Average silhouette width")
       optimal_k <- which.max(sil_widths) + 1
       
-      gap <- cluster::clusGap(
-        x = as.matrix(event_dist_obj),
-        FUNcluster = function(x, k) {
-          hc <- seriation:::reorder.hclust(hclust(as.dist(x), method = "complete"),
-                                           dist = as.dist(x),
-                                           method = "OLO")
-          list(cluster = cutree(hc, k = k))
-        },
-        K.max = 10,
-        B = 500
-      )
-      plot(gap)
+      # gap <- cluster::clusGap(
+      #   x = as.matrix(event_dist_obj),
+      #   FUNcluster = function(x, k) {
+      #     hc <- seriation:::reorder.hclust(hclust(as.dist(x), method = "complete"),
+      #                                      dist = as.dist(x),
+      #                                      method = "OLO")
+      #     list(cluster = cutree(hc, k = k))
+      #   },
+      #   K.max = 10,
+      #   B = 500
+      # )
+      # plot(gap)
 
       event_mat <-
         as.matrix(dcast(
@@ -242,7 +253,7 @@ for (this_event in to_analyze) {
         round(variance / event_pca$var, 3) * 100
       plot_dt <- as.data.table(event_pca$x, keep.rownames = "uuid")
       setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
-      plot_dt[download_metadata[assay_type == "RNA-Seq"], on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)]
+      plot_dt[file_metadata[assay_type == "RNA-Seq"], on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)]
       plot_dt[qc_dt, on = .NATURAL, (qc_cols) := mget(qc_cols)]
       plot_dt <- merge(plot_dt, metadata)
       setorder(plot_dt, EpiRR_ordering, uuid)
@@ -250,9 +261,9 @@ for (this_event in to_analyze) {
       title_string <-
         paste(
           "PCA of",
-          this_event,
+          this_transcript_filter,
           "events; filtered",
-          identical(this_filter, keep_rows),
+          identical(this_filter, keep_rows_manual),
           "; ",
           this_method
         )
@@ -289,7 +300,7 @@ for (this_event in to_analyze) {
           ind_labels = FALSE,
           alpha.ellipse = 0
         ) + scale_color_manual(values = color_mapping_hex)
-      onto_plot[["guides"]][["colour"]] <- NULL
+      onto_plot[["guides"]][["guides"]][["colour"]] <- NULL
       print((
         rsvd::ggindplot(event_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE) + rsvd::ggindplot(
           event_pca,

@@ -36,6 +36,8 @@ tpms <- isoform_quants[download_metadata[assay_type == "RNA-Seq", .(uuid, epirr_
 ggplot(tpms, aes(x = tpm, fill = experiment_type)) +
   geom_histogram()
 
+fwrite(isoform_quants, "splicing_analysis/isoform_quantifications.tsv.gz", sep = "\t")
+
 # bring tpms to wide format
 tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ uuid, value.var = "TPM", fill = 0)
 
