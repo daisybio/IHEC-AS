@@ -5,7 +5,8 @@ output:
     df_print: paged
 ---
 
-```{r}
+```{r load data}
+library(patchwork)
 # load the image
 load("processed_data/aggregating.rda")
 qc_dt <- fread("processed_data/qc_summary.csv")
@@ -15,17 +16,13 @@ qc_cols <- c(
   "fraction_rrna",
   "fraction_duplicates"
 )
-isoform_quants <- fread("splicing_analysis/isoform_quantifications.tsv.gz")
-gene_quants <- readRDS(paste0("suppa_analysis/gene_expressions_filtered.rds"))
+isoform_quants <- fread("splicing_analysis/isoform_quantifications_subset.tsv.gz")
+# gene_quants <- readRDS(paste0("suppa_analysis/gene_expressions_filtered.rds"))
 # file_metadata <- fread("processed_data/file_table.csv.gz")
 
 fig1_color_dt <- unique(metadata[, .(get(ontology_column), harmonized_sample_ontology_term_high_order_fig1_color)])
 color_mapping <- setNames(fig1_color_dt$harmonized_sample_ontology_term_high_order_fig1_color, fig1_color_dt[[ontology_column]])
 color_mapping_hex <- sapply(strsplit(color_mapping, ","), function(x) rgb(x[1], x[2], x[3], maxColorValue = 255))
-```
-
-```{r, fig.width=12, fig.height=10}
-library(patchwork)
 metadata_order <-
   melt(
     metadata,
@@ -42,136 +39,421 @@ metadata_order <-
     value.name = "uuid"
   )[uuid != "" & uuid %in% sample_cols][order(EpiRR_ordering, uuid)]
 metadata_order[, experiment_type := tstrsplit(experiment_type, "_", keep = 4)]
-gene_mat <- as.matrix(dcast(gene_quants[gene_id %in% event_dt[, gene_id]], uuid ~ gene_id),
-  rownames = "uuid"
-)[metadata_order[, uuid], ]
-gene_pca <- rsvd::rpca(gene_mat, 3)
-rsvd::ggscreeplot(gene_pca)
-variance <- gene_pca$sdev^2
-explained_variance_ratio <- round(variance / gene_pca$var, 3) * 100
-plot_dt <- as.data.table(gene_pca$x, keep.rownames = "uuid")
-setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
-plot_dt[file_metadata[assay_type == "RNA-Seq"],
-  on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)
-]
-plot_dt[qc_dt, on = .NATURAL, (qc_cols) := mget(qc_cols)]
-plot_dt <- merge(plot_dt, metadata)
-setorder(plot_dt, EpiRR_ordering, uuid)
-stopifnot(rownames(gene_pca$x) == plot_dt$uuid)
-Reduce(`+`, lapply(qc_cols, function(color_col) {
-  ggplot(plot_dt, aes(
-    x = PC1,
-    y = PC2,
-    color = get(color_col)
-  )) +
-    geom_point() +
-    labs(
-      title = "PCA of gene expression data",
-      x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
-      y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""),
-      color = color_col
-    )
-}))
 
-onto_plot <- rsvd::ggindplot(gene_pca, groups = plot_dt[, factor(get(ontology_column), levels = unique(get(ontology_column)))], ind_labels = FALSE, alpha.ellipse = 0) + 
-  scale_color_manual(values = color_mapping_hex) + 
-  scale_fill_manual(values = color_mapping_hex)
-onto_plot[["guides"]][["guides"]]$colour <- NULL
-(rsvd::ggindplot(gene_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE) + rsvd::ggindplot(gene_pca, pcs = c(1, 3), groups = plot_dt[, experiment_type], ind_labels = FALSE) + plot_layout(guides = "collect")) / onto_plot
+# load transcript ids per filter
+filtered_transcript_ids <- readRDS("splicing_analysis/filtered_transcript_ids.rds")
 ```
 
-```{r, fig.width=12, fig.height=10}
+```{r plot and create, fig.width=12, fig.height=10}
 library(seriation)
-this_event <- "RI"
+this_event <- "SE" # "RI"
 this_filter <- keep_rows_manual
-this_method <- "suppa"
-this_transcript_filter <- "biotype_filtered"
-# TODO: would be nice to have the event_dt in a format in which method is a column instead of a prefix of the sample columns
+# this_method <- "suppa"
+this_transcript_filter <- "tsl_filtered"
+n_pcs_max <- 10L
+n_pcs_min <- 3L
+separation_variance_cutoff <- 0.8
+separation_permutations <- 199L
+separation_seed <- 42L
+separation_results <- list()
+
+get_n_pca_components <- function(mat, max_components = 10L, min_components = 3L) {
+  max_possible <- min(max_components, nrow(mat) - 1L, ncol(mat))
+  if (max_possible < min_components) {
+    stop("Not enough dimensions for PCA: only ", max_possible, " components possible.")
+  }
+  max_possible
+}
+
+compute_avg_silhouette <- function(group_vec, dist_obj) {
+  group_vec <- droplevels(factor(group_vec))
+  if (nlevels(group_vec) < 2L) {
+    return(NA_real_)
+  }
+  sil <- tryCatch(
+    cluster::silhouette(as.integer(group_vec), dist_obj),
+    error = function(e) NULL
+  )
+  if (is.null(sil)) {
+    return(NA_real_)
+  }
+  mean(sil[, "sil_width"], na.rm = TRUE)
+}
+
+compute_dispersion_stats <- function(score_mat, group_vec, dist_obj, permutations = 199L) {
+  group_vec <- droplevels(factor(group_vec))
+  if (nlevels(group_vec) < 2L) {
+    return(list(
+      summary = data.table(
+        method = NA_character_,
+        p_value = NA_real_,
+        mean_within_group_distance = NA_real_
+      ),
+      by_group = data.table(
+        group = levels(group_vec),
+        n = as.integer(table(group_vec)),
+        mean_distance = NA_real_,
+        median_distance = NA_real_
+      )
+    ))
+  }
+
+  dist_to_centroid <- numeric(nrow(score_mat))
+  for (lev in levels(group_vec)) {
+    idx <- which(group_vec == lev)
+    centroid <- colMeans(score_mat[idx, , drop = FALSE], na.rm = TRUE)
+    centered <- score_mat[idx, , drop = FALSE] - matrix(
+      centroid,
+      nrow = length(idx),
+      ncol = ncol(score_mat),
+      byrow = TRUE
+    )
+    dist_to_centroid[idx] <- sqrt(rowSums(centered^2))
+  }
+
+  if (requireNamespace("vegan", quietly = TRUE)) {
+    bd <- vegan::betadisper(dist_obj, group_vec)
+    bd_test <- vegan::permutest(bd, permutations = permutations)
+    p_value <- as.numeric(bd_test$tab[1, "Pr(>F)"])
+    method <- "vegan::permutest(betadisper)"
+  } else {
+    p_value <- tryCatch(
+      as.numeric(summary(aov(dist_to_centroid ~ group_vec))[[1]][["Pr(>F)"]][1]),
+      error = function(e) NA_real_
+    )
+    method <- "stats::aov(distance_to_centroid)"
+  }
+
+  by_group <- data.table(
+    group = levels(group_vec),
+    n = as.integer(table(group_vec)),
+    mean_distance = as.numeric(tapply(dist_to_centroid, group_vec, mean)),
+    median_distance = as.numeric(tapply(dist_to_centroid, group_vec, median))
+  )
+
+  list(
+    summary = data.table(
+      method = method,
+      p_value = p_value,
+      mean_within_group_distance = mean(dist_to_centroid, na.rm = TRUE)
+    ),
+    by_group = by_group
+  )
+}
+
+summarize_pca_separation <- function(
+    pca_obj,
+    plot_dt,
+    label,
+    ontology_col,
+    max_pcs = 10L,
+    min_pcs = 3L,
+    variance_cutoff = 0.8,
+    permutations = 199L,
+    seed = 42L) {
+  pc_cols <- grep("^PC[0-9]+$", names(plot_dt), value = TRUE)
+  pc_cols <- pc_cols[order(as.integer(sub("^PC", "", pc_cols)))]
+  if (length(pc_cols) < 2L) {
+    warning("No PC columns found for separation statistics in ", label)
+    return(NULL)
+  }
+
+  explained_variance <- pca_obj$sdev^2 / pca_obj$var
+  explained_variance[is.na(explained_variance)] <- 0
+  cum_explained <- cumsum(explained_variance)
+  n_from_cutoff <- which(cum_explained >= variance_cutoff)[1]
+  if (is.na(n_from_cutoff)) {
+    n_from_cutoff <- length(pc_cols)
+  }
+  n_use <- min(length(pc_cols), max_pcs, max(min_pcs, n_from_cutoff))
+
+  cols_for_analysis <- c("uuid", "experiment_type", ontology_col, pc_cols[seq_len(n_use)])
+  analysis_dt <- copy(plot_dt[
+    !is.na(plot_dt[["experiment_type"]]) & !is.na(plot_dt[[ontology_col]]),
+    cols_for_analysis,
+    with = FALSE
+  ])
+  setnames(analysis_dt, old = ontology_col, new = "ontology")
+  data.table::set(analysis_dt, j = "experiment_type", value = droplevels(factor(analysis_dt[["experiment_type"]])))
+  data.table::set(analysis_dt, j = "ontology", value = droplevels(factor(analysis_dt[["ontology"]])))
+
+  if (nrow(analysis_dt) < 4L || nlevels(analysis_dt$experiment_type) < 2L || nlevels(analysis_dt$ontology) < 2L) {
+    warning("Insufficient label diversity for separation statistics in ", label)
+    return(NULL)
+  }
+
+  score_mat <- as.matrix(analysis_dt[, pc_cols[seq_len(n_use)], with = FALSE])
+  rownames(score_mat) <- analysis_dt$uuid
+  dist_obj <- dist(score_mat)
+
+  balance <- as.data.table(as.table(table(analysis_dt$experiment_type, analysis_dt$ontology)))
+  setnames(balance, c("experiment_type", "ontology", "N"))
+
+  model_df <- as.data.frame(analysis_dt[, c("experiment_type", "ontology"), with = FALSE])
+  model_method <- "stats::manova(Pillai)"
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+
+  if (requireNamespace("vegan", quietly = TRUE)) {
+    adonis_tbl <- as.data.table(
+      vegan::adonis2(
+        dist_obj ~ experiment_type + ontology,
+        data = model_df,
+        by = "margin",
+        permutations = permutations
+      ),
+      keep.rownames = "term"
+    )
+    adonis_subset <- adonis_tbl[
+      adonis_tbl[["term"]] %in% c("experiment_type", "ontology"),
+      c("term", "Df", "SumOfSqs", "R2", "F", "Pr(>F)"),
+      with = FALSE
+    ]
+    setnames(
+      adonis_subset,
+      old = c("Df", "SumOfSqs", "Pr(>F)"),
+      new = c("df", "sum_squares", "p_value")
+    )
+    model_stats <- adonis_subset
+    model_method <- "vegan::adonis2(by='margin')"
+  } else {
+    resp_dt <- as.data.frame(score_mat)
+    resp_cols <- names(resp_dt)
+    manova_df <- cbind(model_df, resp_dt)
+    response_terms <- paste(resp_cols, collapse = ", ")
+    full_formula <- as.formula(paste0("cbind(", response_terms, ") ~ experiment_type + ontology"))
+    no_exp_formula <- as.formula(paste0("cbind(", response_terms, ") ~ ontology"))
+    no_ont_formula <- as.formula(paste0("cbind(", response_terms, ") ~ experiment_type"))
+
+    manova_fit <- stats::manova(full_formula, data = manova_df)
+    manova_stats <- as.data.table(summary(manova_fit, test = "Pillai")$stats, keep.rownames = "term")
+    setnames(
+      manova_stats,
+      old = c("Pillai", "approx F", "num Df", "den Df", "Pr(>F)"),
+      new = c("pillai", "F", "df1", "df2", "p_value"),
+      skip_absent = TRUE
+    )
+    manova_stats <- manova_stats[manova_stats[["term"]] %in% c("experiment_type", "ontology")]
+
+    full_lm <- stats::lm(full_formula, data = manova_df)
+    no_exp_lm <- stats::lm(no_exp_formula, data = manova_df)
+    no_ont_lm <- stats::lm(no_ont_formula, data = manova_df)
+    get_sse <- function(fit) {
+      sum(stats::resid(fit)^2, na.rm = TRUE)
+    }
+    sse_full <- get_sse(full_lm)
+    partial_r2 <- data.table(
+      term = c("experiment_type", "ontology"),
+      R2 = c(
+        (get_sse(no_exp_lm) - sse_full) / get_sse(no_exp_lm),
+        (get_sse(no_ont_lm) - sse_full) / get_sse(no_ont_lm)
+      )
+    )
+    model_stats <- merge(
+      manova_stats[, c("term", "pillai", "F", "df1", "df2", "p_value"), with = FALSE],
+      partial_r2,
+      by = "term",
+      all.x = TRUE,
+      sort = FALSE
+    )
+  }
+
+  dispersion_exp <- compute_dispersion_stats(score_mat, analysis_dt$experiment_type, dist_obj, permutations = permutations)
+  dispersion_ont <- compute_dispersion_stats(score_mat, analysis_dt$ontology, dist_obj, permutations = permutations)
+  dispersion_summary <- rbind(
+    cbind(data.table(term = "experiment_type"), dispersion_exp$summary),
+    cbind(data.table(term = "ontology"), dispersion_ont$summary),
+    fill = TRUE
+  )
+  dispersion_by_group <- rbind(
+    cbind(data.table(term = "experiment_type"), dispersion_exp$by_group),
+    cbind(data.table(term = "ontology"), dispersion_ont$by_group),
+    fill = TRUE
+  )
+
+  silhouette_stats <- data.table(
+    term = c("experiment_type", "ontology"),
+    avg_silhouette = c(
+      compute_avg_silhouette(analysis_dt$experiment_type, dist_obj),
+      compute_avg_silhouette(analysis_dt$ontology, dist_obj)
+    )
+  )
+
+  list(
+    label = label,
+    method = model_method,
+    n_samples = nrow(analysis_dt),
+    n_pcs = n_use,
+    cumulative_variance = cum_explained[n_use],
+    balance = balance,
+    model_stats = model_stats,
+    silhouette_stats = silhouette_stats,
+    dispersion_summary = dispersion_summary,
+    dispersion_by_group = dispersion_by_group
+  )
+}
+
 
 # Now do this first on RI and then on SE events
-for (this_event in to_analyze) {
-  for (this_transcript_filter in transcript_filters) {
-  # and with and without the filtered events
-  curr_dt <- event_dt[`Event Type` == this_event & transcript_filter == this_transcript_filter]
-  for (this_filter in list( 
-    curr_dt[, ID],
-    keep_rows_manual
-  )) {
-    # filter the data
-    filtered_dt <- curr_dt[ID %in% this_filter]
-    # for (this_method in c("suppa", "rmats")) {
+for (this_transcript_filter in transcript_filters) {
+  # subset the isoform quantifications to the samples we want to use
+  this_filtered_transcripts <- filtered_transcript_ids[[this_transcript_filter]]
+
+  # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
+  isoform_quants_filtered <- copy(isoform_quants[transcript_id %in% this_filtered_transcripts])
+  isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
+  isoform_quants_filtered[, TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
+  isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
+  isoform_quants_filtered[, TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE), .(uuid, epirr_id_without_version)]
+
+  # Run gene expression PCA to check for batch effects and outliers
+  gene_mat <- as.matrix(dcast(isoform_quants_filtered[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(uuid, epirr_id_without_version, gene_id)], uuid ~ gene_id),
+    rownames = "uuid"
+  )[metadata_order[, uuid], ]
+  n_gene_pcs <- get_n_pca_components(gene_mat, max_components = n_pcs_max, min_components = n_pcs_min)
+  gene_pca <- rsvd::rpca(gene_mat, n_gene_pcs)
+  rsvd::ggscreeplot(gene_pca)
+  variance <- gene_pca$sdev^2
+  explained_variance_ratio <- round(variance / gene_pca$var, 3) * 100
+  plot_dt <- as.data.table(gene_pca$x, keep.rownames = "uuid")
+  setnames(
+    plot_dt,
+    old = setdiff(names(plot_dt), "uuid"),
+    new = paste0("PC", seq_len(ncol(plot_dt) - 1L))
+  )
+  plot_dt[file_metadata[assay_type == "RNA-Seq"],
+    on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)
+  ]
+  plot_dt[qc_dt, on = .NATURAL, (qc_cols) := mget(qc_cols)]
+  plot_dt <- merge(plot_dt, metadata)
+  setorder(plot_dt, EpiRR_ordering, uuid)
+  stopifnot(rownames(gene_pca$x) == plot_dt$uuid)
+  gene_sep <- summarize_pca_separation(
+    pca_obj = gene_pca,
+    plot_dt = plot_dt,
+    label = paste("gene", this_transcript_filter, sep = "_"),
+    ontology_col = ontology_column,
+    max_pcs = n_pcs_max,
+    min_pcs = n_pcs_min,
+    variance_cutoff = separation_variance_cutoff,
+    permutations = separation_permutations,
+    seed = separation_seed
+  )
+  if (!is.null(gene_sep)) {
+    separation_results[[gene_sep$label]] <- gene_sep
+    cat("\n--- Separation metrics:", gene_sep$label, "---\n")
+    cat("Model:", gene_sep$method, "| Samples:", gene_sep$n_samples, "| PCs:", gene_sep$n_pcs, "| Cumulative variance:", round(100 * gene_sep$cumulative_variance, 2), "%\n")
+    print(gene_sep$model_stats)
+    print(gene_sep$silhouette_stats)
+    print(gene_sep$dispersion_summary)
+  }
+  print(Reduce(`+`, lapply(qc_cols, function(color_col) {
+    ggplot(plot_dt, aes(
+      x = PC1,
+      y = PC2,
+      color = get(color_col)
+    )) +
+      geom_point() +
+      labs(
+        title = paste("PCA of gene expression data", this_transcript_filter),
+        x = paste("PC1 (", explained_variance_ratio[1], "% explained var.)", sep = ""),
+        y = paste("PC2 (", explained_variance_ratio[2], "% explained var.)", sep = ""),
+        color = color_col
+      )
+  })))
+
+  onto_plot <- rsvd::ggindplot(gene_pca, groups = plot_dt[, factor(get(ontology_column), levels = unique(get(ontology_column)))], ind_labels = FALSE, alpha.ellipse = 0) +
+    scale_color_manual(values = color_mapping_hex) +
+    scale_fill_manual(values = color_mapping_hex)
+  onto_plot[["guides"]][["guides"]]$colour <- NULL
+  print((rsvd::ggindplot(gene_pca, groups = plot_dt[, experiment_type], ind_labels = FALSE) + rsvd::ggindplot(gene_pca, pcs = c(1, 3), groups = plot_dt[, experiment_type], ind_labels = FALSE) + plot_layout(guides = "collect")) / onto_plot)
+  for (this_event in to_analyze) {
+    # and with and without the filtered events
+    curr_dt <- event_dt[`Event Type` == this_event & transcript_filter == this_transcript_filter]
+    for (this_filter in list(
+      # curr_dt[, ID],
+      keep_rows_manual
+    )) {
+      # filter the data
+      filtered_dt <- curr_dt[ID %in% this_filter]
+      # for (this_method in c("suppa", "rmats")) {
       this_title <- paste(
         this_event,
         # this_method,
         this_transcript_filter,
         ifelse(identical(this_filter, keep_rows_manual), "filtered", "all")
       )
-      message(this_title)
+      cat(this_title)
       this_sample_cols <- sample_cols
-        # names(event_dt)[startsWith(names(event_dt), this_method)]
+      # names(event_dt)[startsWith(names(event_dt), this_method)]
       long_dt <- melt(
         filtered_dt,
         id.vars = "ID",
         measure.vars = this_sample_cols,
         na.rm = TRUE
       )
+      # need to recompute this_sample_cols, if one sample is all NA
+      this_sample_cols <- unique(long_dt[, variable])
+
       # remove the this_method prefix from the variable column
       # long_dt[, variable := sub(paste0("^", this_method, "_"), "", variable)]
       # this_sample_cols <-
-        # sub(paste0("^", this_method, "_"), "", this_sample_cols)
+      # sub(paste0("^", this_method, "_"), "", this_sample_cols)
       long_dt[metadata_order, on = c(variable = "uuid"), experiment_type := i.experiment_type]
 
       # compute distances between events using wasserstein distance in 1D
       # make all possible combinations of the event IDs:
       # get or create:
-      distance_combs_path <- file.path("processed_data", paste("eventdistances", this_title, ".rds", sep = "_"))
-      if (file.exists(distance_combs_path)){
-        distance_combs <- readRDS(distance_combs_path)
-      } else {
-        distance_combs <- as.data.table(t(combn(filtered_dt[, ID], 2)))
+      # distance_combs_path <- file.path("processed_data", paste("eventdistances", this_title, ".rds", sep = "_"))
+      # if (file.exists(distance_combs_path)) {
+      #   distance_combs <- readRDS(distance_combs_path)
+      # } else {
+      #   distance_combs <- as.data.table(t(combn(filtered_dt[, ID], 2)))
 
-        distance_combs$distance <-
-          pbmcmapply(
-            distance_combs$V1,
-            distance_combs$V2,
-            FUN = function(x, y) {
-              transport::wasserstein1d(
-                long_dt[x == ID, value], # normalized_hist_bins[[x]], normalized_hist_bins[[y]])
-                long_dt[y == ID, value]
-              )
-            }, mc.cores = 120L
-          )
-        saveRDS(distance_combs, distance_combs_path)
-      }
+      #   distance_combs$distance <-
+      #     pbmcmapply(
+      #       distance_combs$V1,
+      #       distance_combs$V2,
+      #       FUN = function(x, y) {
+      #         transport::wasserstein1d(
+      #           long_dt[x == ID, value], # normalized_hist_bins[[x]], normalized_hist_bins[[y]])
+      #           long_dt[y == ID, value]
+      #         )
+      #       }, mc.cores = 120L
+      #     )
+      #   saveRDS(distance_combs, distance_combs_path)
+      # }
 
-      event_dist_obj <-
-        as.dist(as.matrix(dcast(
-          rbind(distance_combs, setnames(
-            copy(distance_combs),
-            old = c("V1", "V2"),
-            new = c("V2", "V1")
-          )), V1 ~ V2,
-          value.var = "distance"
-        ), rownames = "V1"))
-      if (any(is.na(event_dist_obj)) ||
-        any(is.infinite(event_dist_obj))) {
-        warning(
-          "There are missing or infinite values in the distance matrix. Please check the data."
-        )
-      }
-      event_clust <- seriation:::reorder.hclust(hclust(event_dist_obj, method = "complete"),
-                                       dist = event_dist_obj,
-                                       method = "OLO")
-      # what is the opimal number of clusters for the events?
-      # Cut the dendrogram into k clusters
-      sil_widths <- sapply(2:10, function(k) {
-        pam_fit <- cluster::pam(event_dist_obj, diss = TRUE, k = k)
-        pam_fit$silinfo$avg.width
-      })
-      
-      plot(2:10, sil_widths, type = "b", xlab = "Number of clusters", ylab = "Average silhouette width")
-      optimal_k <- which.max(sil_widths) + 1
-      
+      # event_dist_obj <-
+      #   as.dist(as.matrix(dcast(
+      #     rbind(distance_combs, setnames(
+      #       copy(distance_combs),
+      #       old = c("V1", "V2"),
+      #       new = c("V2", "V1")
+      #     )), V1 ~ V2,
+      #     value.var = "distance"
+      #   ), rownames = "V1"))
+      # if (any(is.na(event_dist_obj)) ||
+      #   any(is.infinite(event_dist_obj))) {
+      #   warning(
+      #     "There are missing or infinite values in the distance matrix. Please check the data."
+      #   )
+      # }
+      # event_clust <- seriation:::reorder.hclust(hclust(event_dist_obj, method = "complete"),
+      #   dist = event_dist_obj,
+      #   method = "OLO"
+      # )
+      # # what is the opimal number of clusters for the events?
+      # # Cut the dendrogram into k clusters
+      # sil_widths <- sapply(2:10, function(k) {
+      #   pam_fit <- cluster::pam(event_dist_obj, diss = TRUE, k = k)
+      #   pam_fit$silinfo$avg.width
+      # })
+
+      # plot(2:10, sil_widths, type = "b", xlab = "Number of clusters", ylab = "Average silhouette width")
+      # optimal_k <- which.max(sil_widths) + 1
+
       # gap <- cluster::clusGap(
       #   x = as.matrix(event_dist_obj),
       #   FUNcluster = function(x, k) {
@@ -189,52 +471,54 @@ for (this_event in to_analyze) {
         as.matrix(dcast(
           long_dt,
           variable ~ ID
-        ), rownames = TRUE)[metadata_order[uuid %in% this_sample_cols, uuid], ]
+        ), rownames = TRUE)
+      # TODO: what is wrong with dd570e0c-eb0b-416a-b427-a39d05f62f32?
+      event_mat <- event_mat[metadata_order[uuid %in% this_sample_cols, uuid], ]
 
-      event_sds_mod <- apply(event_mat, 2, function(x) {
-        x_non_na <- x[!is.na(x)]
-        sqrt(sum((x_non_na - mean(x_non_na))^2) / (length(x) - 1))
-      })
-      event_sds <- apply(event_mat, 2, sd, na.rm = TRUE)
-      n_na <- apply(event_mat, 2, function(x) sum(is.na(x)))
-      cor(cbind(n_na, event_sds, event_sds_mod), method = "pearson")
-      cor(cbind(n_na, event_sds, event_sds_mod), method = "spearman")
+      # event_sds_mod <- apply(event_mat, 2, function(x) {
+      #   x_non_na <- x[!is.na(x)]
+      #   sqrt(sum((x_non_na - mean(x_non_na))^2) / (length(x) - 1))
+      # })
+      # event_sds <- apply(event_mat, 2, sd, na.rm = TRUE)
+      # n_na <- apply(event_mat, 2, function(x) sum(is.na(x)))
+      # cor(cbind(n_na, event_sds, event_sds_mod), method = "pearson")
+      # cor(cbind(n_na, event_sds, event_sds_mod), method = "spearman")
 
-      dist_matrix <- dist(event_sds_mod, method = "euclidean")
-      event_var_clust <- seriation:::reorder.hclust(
-        hclust(dist_matrix, method = "ward.D2"),
-        dist = dist_matrix,
-        method = "OLO"
-      )
+      # dist_matrix <- dist(event_sds_mod, method = "euclidean")
+      # event_var_clust <- seriation:::reorder.hclust(
+      #   hclust(dist_matrix, method = "ward.D2"),
+      #   dist = dist_matrix,
+      #   method = "OLO"
+      # )
 
-      row_anno <-
-        as.data.frame(metadata_order[uuid %in% rownames(event_mat), .(
-          epirr_id_without_version,
-          annotation = get(ontology_column),
-          experiment_type,
-          uuid
-        )])
-      rownames(row_anno) <- row_anno$uuid
-      row_anno$uuid <- NULL
-      clust_list <- list(
-        variability = event_var_clust,
-        distribution = event_clust
-      )
-      for (i in names(clust_list)) {
-        col_clust <- clust_list[[i]]
-        pheatmap::pheatmap(
-          main = paste(this_title, i),
-          event_mat,
-          cluster_cols = col_clust,
-          cutree_cols = 5,
-          cutree_rows = 2,
-          show_colnames = FALSE,
-          clustering_method = "ward.D2",
-          show_rownames = FALSE,
-          annotation_row = row_anno,
-          na_col = "white"
-        )
-      }
+      # row_anno <-
+      #   as.data.frame(metadata_order[uuid %in% rownames(event_mat), .(
+      #     epirr_id_without_version,
+      #     annotation = get(ontology_column),
+      #     experiment_type,
+      #     uuid
+      #   )])
+      # rownames(row_anno) <- row_anno$uuid
+      # row_anno$uuid <- NULL
+      # clust_list <- list(
+      #   variability = event_var_clust,
+      #   distribution = event_clust
+      # )
+      # for (i in names(clust_list)) {
+      #   col_clust <- clust_list[[i]]
+      #   pheatmap::pheatmap(
+      #     main = paste(this_title, i),
+      #     event_mat,
+      #     cluster_cols = col_clust,
+      #     cutree_cols = 5,
+      #     cutree_rows = 2,
+      #     show_colnames = FALSE,
+      #     clustering_method = "ward.D2",
+      #     show_rownames = FALSE,
+      #     annotation_row = row_anno,
+      #     na_col = "white"
+      #   )
+      # }
 
       # mean impute per experiment_type for PCA
       for (subset in split(metadata_order[uuid %in% this_sample_cols], by = "experiment_type")) {
@@ -246,26 +530,48 @@ for (this_event in to_analyze) {
         }
       }
 
-      event_pca <- rsvd::rpca(event_mat, 3)
+      n_event_pcs <- get_n_pca_components(event_mat, max_components = n_pcs_max, min_components = n_pcs_min)
+      event_pca <- rsvd::rpca(event_mat, n_event_pcs)
       rsvd::ggscreeplot(event_pca)
       variance <- event_pca$sdev^2
       explained_variance_ratio <-
         round(variance / event_pca$var, 3) * 100
       plot_dt <- as.data.table(event_pca$x, keep.rownames = "uuid")
-      setnames(plot_dt, c("V1", "V2"), c("PC1", "PC2"))
+      setnames(
+        plot_dt,
+        old = setdiff(names(plot_dt), "uuid"),
+        new = paste0("PC", seq_len(ncol(plot_dt) - 1L))
+      )
       plot_dt[file_metadata[assay_type == "RNA-Seq"], on = .NATURAL, c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)]
       plot_dt[qc_dt, on = .NATURAL, (qc_cols) := mget(qc_cols)]
       plot_dt <- merge(plot_dt, metadata)
       setorder(plot_dt, EpiRR_ordering, uuid)
       stopifnot(rownames(event_pca$x) == plot_dt$uuid)
+      event_sep <- summarize_pca_separation(
+        pca_obj = event_pca,
+        plot_dt = plot_dt,
+        label = paste("psi", this_title, sep = "_"),
+        ontology_col = ontology_column,
+        max_pcs = n_pcs_max,
+        min_pcs = n_pcs_min,
+        variance_cutoff = separation_variance_cutoff,
+        permutations = separation_permutations,
+        seed = separation_seed
+      )
+      if (!is.null(event_sep)) {
+        separation_results[[event_sep$label]] <- event_sep
+        cat("\n--- Separation metrics:", event_sep$label, "---\n")
+        cat("Model:", event_sep$method, "| Samples:", event_sep$n_samples, "| PCs:", event_sep$n_pcs, "| Cumulative variance:", round(100 * event_sep$cumulative_variance, 2), "%\n")
+        print(event_sep$model_stats)
+        print(event_sep$silhouette_stats)
+        print(event_sep$dispersion_summary)
+      }
       title_string <-
         paste(
           "PCA of",
-          this_transcript_filter,
-          "events; filtered",
-          identical(this_filter, keep_rows_manual),
-          "; ",
-          this_method
+          this_title
+          # "; ",
+          # this_method
         )
       print(Reduce(`+`, lapply(qc_cols, function(color_col) {
         ggplot(plot_dt, aes(
@@ -312,6 +618,8 @@ for (this_event in to_analyze) {
     }
   }
 }
+
+saveRDS(separation_results, file.path("processed_data", "pca_separation_metrics.rds"))
 ```
 
 # TODO variability or clustering:

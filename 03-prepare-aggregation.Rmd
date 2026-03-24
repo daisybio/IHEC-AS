@@ -21,7 +21,7 @@ metadata <- metadata[epirr_id_without_version %in% file_metadata[, unique(epirr_
 # metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
 rmats_command_file <- "data/rmats_split_post_commands.tsv"
 command_dt <- fread(rmats_command_file)
-# bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
+bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
 ```
 
 ```{r, filter_events_per_method, eval = FALSE, fig.width=16, fig.height=12}
@@ -397,8 +397,8 @@ rmats_event_dir <- "splicing_analysis/rmats"
 transcript_filters <- c("transcripts", "tsl_filtered", "biotype_filtered")
 id_col <- "event_id"
 
-# transcript_filter <- "biotype_filtered" # "transcripts" #
-# event_type <- "SE"
+transcript_filter <- "biotype_filtered" # "transcripts" #
+event_type <- "SE"
 
 event_res <- sapply(transcript_filters, function(transcript_filter) {
   sapply(to_analyze # as_events
@@ -576,19 +576,29 @@ event_res <- sapply(transcript_filters, function(transcript_filter) {
         event_dt[, event_cluster := comp$membership]
         # get number of NAs per row in the sample columns
         event_dt[, n_na := rowSums(is.na(.SD)), .SDcols = sample_cols]
-        # compute the sd per row in the sample columns
+
+        # clip PSI to avoid 0/1 issues for logit
+        eps <- 1e-4
+        psi_clipped_dt <- event_dt[, lapply(.SD, function(x) pmin(pmax(x, eps), 1 - eps)), .SDcols = sample_cols]
+
+        # logit transform
+        psi_logit_dt <- psi_clipped_dt[, lapply(.SD, function(x) log(x / (1 - x)))]
+
+        # compute variability on logit scale (robust)
+        event_dt[, mad_logit := apply(psi_logit_dt, 1, mad, na.rm = TRUE)]
+        event_dt[, iqr_logit := apply(psi_logit_dt, 1, IQR, na.rm = TRUE)]
+
+        # keep sd for reference (optional, still on raw scale)
         event_dt[, sd := apply(.SD, 1, sd, na.rm = TRUE), .SDcols = sample_cols]
-        # compute the iqr per row in the sample columns
-        event_dt[, iqr := apply(.SD, 1, IQR, na.rm = TRUE), .SDcols = sample_cols]
-        # get the representative of each cluster, which is the one with the lowest number of NAs, highest iqr, then highest sd, in that order
-        event_dt[, cluster_representative := event_id == .SD[order(n_na, -iqr, -sd)[1], event_id], by = event_cluster]
+        # get the representative of each cluster, which is the one with the lowest number of NAs, highest iqr_logit, then highest mad_logit, in that order
+        event_dt[, cluster_representative := event_id == .SD[order(n_na, -mad_logit, -iqr_logit)[1], event_id], by = event_cluster]
         # note whether on autoposomes or gonosomes
         event_dt[, is_autosome := !seqnames %in% c("chrX", "chrY")]
         event_dt[, transcript_filter := transcript_filter]
         return(list(
           event_dt = event_dt[
             ,
-            c("event_id", "gene_id", "seqnames", "strand", "Event Type", "transcript_filter", "event_cluster", "cluster_representative", "n_na", "iqr", "sd", "is_autosome", ..sample_cols)
+            c("event_id", "gene_id", "seqnames", "strand", "Event Type", "transcript_filter", "event_cluster", "cluster_representative", "n_na", "iqr_logit", "mad_logit", "sd", "is_autosome", ..sample_cols)
           ],
           # dt with event info
           event_gr = event_gr,
@@ -717,7 +727,8 @@ writeXStringSet(ss5up, filepath = ss5up_file)
 up3ss <- promoters(event_gr, upstream = 20, downstream = 3)
 # for the downstream 3ss, we flip the strand and use promoter on the downstream intron, because we want the 3ss of the downstream intron, which is the skipping ss for SE
 down3ss <- promoters(GRanges(seqnames = seqnames(downstream_gr), ranges = ranges(downstream_gr), strand = ifelse(strand(downstream_gr) == "-", "+", "-")),
-                     upstream = 3, downstream = 20)
+  upstream = 3, downstream = 20
+)
 
 event3ss <- promoters(downstream_gr, upstream = 20, downstream = 3)
 se3ss_ranges <- up3ss[is_se]
@@ -750,6 +761,10 @@ ss3_file <- sprintf("processed_data/3ss.fasta")
 writeXStringSet(ss3, filepath = ss3_file)
 ss3down_file <- sprintf("processed_data/3ss_down.fasta")
 writeXStringSet(ss3down, filepath = ss3down_file)
+
+# clean all DNAStringSet objects to free memory
+rm(genome, ss3, ss3down, ss5, ss5up)
+gc()
 
 # define the ss3 and ss5 score files
 ss3_score_file <-
@@ -918,9 +933,10 @@ event_dt[agg_annotations, on = merge_cols, (new_anno_cols) := mget(new_anno_cols
 
 # rethink cluster_representative: shouldn't this be one with annotated transcript info?
 event_dt[, cluster_representative_annotated :=
-           event_id == .SD[order(sapply(tr_ids, function(x) length(x) == 0), n_na, -iqr, -sd)[1], event_id], 
-         by = .(`Event Type`, transcript_filter, event_cluster)]
-event_dt[cluster_representative_annotated == TRUE & sapply(tr_ids, function(x) length(x) == 0)] 
+  event_id == .SD[order(sapply(tr_ids, function(x) length(x) == 0), n_na, -mad_logit, -iqr_logit)[1], event_id],
+by = .(`Event Type`, transcript_filter, event_cluster)
+]
+event_dt[cluster_representative_annotated == TRUE & sapply(tr_ids, function(x) length(x) == 0)]
 
 # get min transcript start and max transcript end for each event depending on the strand, because we want to compute the distance to TSS and TES
 event_dt[, closest_tr_start := mapply(tr_starts, strand, FUN = function(starts, strand) {
@@ -1029,6 +1045,21 @@ three_prime_down <- make_window(downstream_gr, window_size = 200, fix = "start",
 ```
 
 ```{r, load-ChromHMM}
+library(mclust)
+event_dt[,
+  Variability := {
+    fit <- mclust::Mclust(.SD[is_autosome & cluster_representative_annotated, .(mad_logit, iqr_logit)], G = 2)
+    means <- fit$parameters$mean
+    class_mapping <- c("Low", "High")
+    if (means[1, 1] > means[2, 1]) {
+      class_mapping <- rev(class_mapping)
+    }
+    class_mapping[predict(fit, .SD[, .(mad_logit, iqr_logit)])$classification]
+  },
+  by = .(transcript_filter, `Event Type`)
+]
+event_dt[, table(Variability, is_autosome & cluster_representative_annotated, transcript_filter, `Event Type`)]
+
 # define rows to keep
 keep_rows_manual <- event_dt[is_autosome & cluster_representative_annotated, ID]
 # load ChromHMM states
@@ -1046,7 +1077,7 @@ chromhmm_hits <-
     ignore.strand = TRUE
   )
 chromhmm_in_vicinity <-
-  sort(unique(to(chromhmm_hits))) #[from(chromhmm_hits) %in% keep_rows_manual]))
+  sort(unique(to(chromhmm_hits))) # [from(chromhmm_hits) %in% keep_rows_manual]))
 
 # give the alternative and adjacent regions names for the bed file
 # event_gr$name <- event_dt[, ID]

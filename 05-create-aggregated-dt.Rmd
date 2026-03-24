@@ -5,30 +5,31 @@ output: html_document
 
 ```{r, load-data}
 # load the image
-load('processed_data/aggregating.rda')
+load("processed_data/aggregating.rda")
 # load the files table
 # file_table <- fread('processed_data/file_table.csv.gz')
 # locate
-file_metadata[, local_file := file.path(sample_dt_dir, paste0(basename(file_path), '.tab.gz'))]
+file_metadata[, local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))]
 stopifnot(file_metadata[assay_type == "ChIP-Seq", all(file.exists(local_file))])
 
-setkey(file_metadata, 'local_file')
+setkey(file_metadata, "local_file")
 # write table back to file
-fwrite(file_metadata, 'processed_data/file_table.csv.gz')
+fwrite(file_metadata, "processed_data/file_table.csv.gz")
 
 # # we only need ChIP-Seq data, since WGBS has been aggregated via the matrices
 # file_table <- file_table[assay_type == "ChIP-Seq"]
 
 # load WGBS data
-wgbs_agg <- fread(file.path(sample_dt_dir, 'WGBS_agg.csv.gz'))
-wgbs_agg <- wgbs_agg[!startsWith(name, 'chromhmm')]
-wgbs_agg <- melt(wgbs_agg, 
-                 id.vars = c("ID", "ihec", "name"), 
-                 value.name = "score", 
-                 variable.name = "experiment_type", 
-                 measure.vars = c("score", "n"))
-wgbs_agg[experiment_type == "score", experiment_type:='DNAm']
-wgbs_agg[experiment_type == "n", experiment_type:='CpGs']
+wgbs_agg <- fread(file.path(sample_dt_dir, "WGBS_agg.csv.gz"))
+wgbs_agg <- wgbs_agg[!startsWith(name, "chromhmm")]
+wgbs_agg <- melt(wgbs_agg,
+  id.vars = c("ID", "ihec", "name"),
+  value.name = "score",
+  variable.name = "experiment_type",
+  measure.vars = c("score", "n")
+)
+wgbs_agg[experiment_type == "score", experiment_type := "DNAm"]
+wgbs_agg[experiment_type == "n", experiment_type := "CpGs"]
 
 wgbs_agg[, ihec := sub("\\.[0-9]+$", "", ihec)]
 
@@ -39,19 +40,19 @@ histone_dt <- rbindlist(
       dt <-
         fread(file)
       names(dt) <-
-        c('name', 'size', 'covered', 'sum', 'mean0', 'mean', 'min', 'max')
-      dt[!startsWith(name, 'chromhmm')]
+        c("name", "size", "covered", "sum", "mean0", "mean", "min", "max")
+      dt[!startsWith(name, "chromhmm")]
     },
-    file = file_table[, local_file],
+    file = file_metadata[assay_type == "ChIP-Seq", local_file],
     USE.NAMES = TRUE,
     SIMPLIFY = FALSE
   ),
-  idcol = 'local_file'
+  idcol = "local_file"
 )
 # some mapping for ids and histone marks
 histone_dt[, c("ihec", "experiment_type") := file_metadata[local_file, .(epirr_id_without_version, experiment_type)]]
-# histone_dt[, experiment_type:=file_table[local_file, experiment_type]]
-setnames(histone_dt, old = 'mean', new = 'score')
+# histone_dt[, experiment_type:=file_metadata[local_file, experiment_type]]
+setnames(histone_dt, old = "mean", new = "score")
 
 # find common cols and rows
 common_ihec <- intersect(histone_dt[, unique(ihec)], wgbs_agg[, unique(ihec)])
@@ -61,82 +62,177 @@ common_cols <- intersect(names(histone_dt), names(wgbs_agg))
 
 ```{r, build-aggregated-dt}
 # bind histone and WGBS data
-aggregated_dt <- rbindlist(list(histone_dt[ihec %in% common_ihec, ..common_cols], 
-                                wgbs_agg[ihec %in% common_ihec, ..common_cols]))
+aggregated_dt <- rbindlist(list(
+  histone_dt[ihec %in% common_ihec, ..common_cols],
+  wgbs_agg[ihec %in% common_ihec, ..common_cols]
+))
 
-# some data wrangling to prepare the data for putting into wide format 
-aggregated_dt[, c("position", "ID"):=tstrsplit(name, "_", fixed=TRUE)]
+# some data wrangling to prepare the data for putting into wide format
+aggregated_dt[, c("position", "ID") := tstrsplit(name, "_", fixed = TRUE)]
 # there is an ID for all of them, so remove this line
 # aggregated_dt[is.na(ID), c("position", "ID"):=list('event_name', position)]
 # aggregated_dt[position=="up", position:="upstream_other_region"]
 # aggregated_dt[position=="down", position:="downstream_other_region"]
-aggregated_dt[, experiment_type:=droplevels(experiment_type)]
-aggregated_dt[, ihec:=as.factor(ihec)]
-aggregated_dt[, ID:=as.integer(ID)]
+aggregated_dt[, experiment_type := droplevels(experiment_type)]
+aggregated_dt[, ihec := as.factor(ihec)]
+aggregated_dt[, ID := as.integer(ID)]
 # from long to wide
 aggregated_dt <- dcast(aggregated_dt, ihec + ID ~ experiment_type + position, value.var = "score", sep = ";")
-setnames(aggregated_dt, old = 'ihec', new = 'IHEC')
+setnames(aggregated_dt, old = "ihec", new = "IHEC")
 # write full table to disk
-fwrite(aggregated_dt, 'processed_data/aggregated_dt.csv.gz')
+fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
 ```
 
 
 ```{r, melt-psi}
 # bring PSI values to long format for compatibility with the aggregated table
-melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = c('ID', 'Event Type', 'gene_id'), variable.name = 'uuid', value.name = 'PSI', variable.factor = FALSE)
+melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = c("ID", "Event Type", "transcript_filter", "gene_id"), variable.name = "uuid", value.name = "PSI", variable.factor = FALSE)
 melted_psi <- melted_psi[!is.na(PSI)]
 # merge on uuid to get ihec from the file_metadata
-melted_psi[file_metadata, on=.(uuid), IHEC := epirr_id_without_version]
+melted_psi[file_metadata, on = .(uuid), IHEC := epirr_id_without_version]
 ```
 
 
 ```{r, expand-aggregated-dt}
-# add PSI to the aggregated table
-aggregated_dt[melted_psi[ID %in% keep_rows_manual & !is.na(PSI)], on=.(ID, IHEC), c("uuid", "PSI"):=.(uuid, PSI)]
+# merge PSI on the aggregated table
+aggregated_dt <- merge(aggregated_dt, melted_psi[ID %in% keep_rows_manual & !is.na(PSI), .(ID, IHEC, uuid, PSI, transcript_filter)], by = c("ID", "IHEC"))
+aggregated_dt[melted_psi[ID %in% keep_rows_manual & !is.na(PSI)], on = .(ID, IHEC), c("uuid", "PSI", "transcript_filter") := .(uuid, PSI, transcript_filter)]
 # remove NA PSIs
 aggregated_dt <- aggregated_dt[!is.na(PSI)]
+# NA for columns starting with CpGs can be replaced by 0
+for (i in grep("^CpGs", names(aggregated_dt))) {
+  set(aggregated_dt, i = which(is.na(aggregated_dt[[i]])), j = i, value = 0)
+}
 
 # gather the intrinsic features
-cols_to_add <- c('gene_id', 'distance_TSS', 'distance_TES', 'distance_gene_start', 'distance_gene_end', 'width;upstream_other_region', 'width;event_name', 'width;downstream_other_region', 'Event Type', '3ss', '3ssdown', '5ss', '5ssup'
-                 # , 'Variability'
-                 )
+cols_to_add <- c(
+  "3ss", "3ssdown", "5ss", "5ssup", "distance_TSS", "distance_TES", "distance_gene_start", "distance_gene_end", "width;upstream_other_region", "width;event_name", "width;downstream_other_region", "Event Type", "gene_id", "seqnames", "Variability"
+)
 
 # add the intrinsic features
-aggregated_dt[event_dt, on=.(ID), (cols_to_add):=mget(cols_to_add)]
+aggregated_dt[event_dt, on = .(ID), (cols_to_add) := mget(cols_to_add)]
+# also add the protocol
+aggregated_dt[file_metadata, on = .(uuid), protocol := experiment_type]
+# add the ontology term
+aggregated_dt[
+  metadata,
+  on = c(IHEC = "epirr_id_without_version"),
+  ontology := factor(
+    harmonized_sample_ontology_term_high_order_fig1
+  )
+]
 
-# read the gene expression
-gene_quants <- readRDS('suppa_analysis/gene_expressions.rds')
+
+# load transcript ids per filter
+filtered_transcript_ids <- readRDS("splicing_analysis/filtered_transcript_ids.rds")
+# load isoform quantifications
+isoform_quants <- fread("splicing_analysis/isoform_quantifications_subset.tsv.gz")
+# compute gene-level quantifications
+gene_quants <- rbindlist(sapply(transcript_filters, function(this_transcript_filter) {
+  # subset the isoform quantifications to the samples we want to use
+  this_filtered_transcripts <- filtered_transcript_ids[[this_transcript_filter]]
+
+  # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
+  isoform_quants_filtered <- copy(isoform_quants[transcript_id %in% this_filtered_transcripts])
+  isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
+  isoform_quants_filtered[, TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
+  isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
+  isoform_quants_filtered[, TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE), .(uuid, epirr_id_without_version)]
+}, simplify = FALSE), idcol = "transcript_filter")
+
 
 # manually change gene_id for ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13 from the manual ids that were kept
-aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
-aggregated_dt[gene_quants, on=c(gene_id='gene_id', IHEC='epirr_id_without_version'), gene_expression:=gene_tpm]
+# aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
+aggregated_dt[gene_quants, on = .(transcript_filter, uuid, gene_id), gene_expression := TPM_scale]
 
-# make sure all of the gene_expression values are at least one:
-stopifnot(all(aggregated_dt[, gene_expression >= 1]))
-# log the expression
-aggregated_dt[, gene_expression:=log2(gene_expression)]
+# make sure all of the gene_expression values are at least one: (deprecated because we don't have the suppa tpm filter anymore)
+# stopifnot(all(aggregated_dt[, gene_expression >= 1]))
+# log the expression, we do that later
+# aggregated_dt[, gene_expression := log2(gene_expression)]
 
 # remove the gene_id version
-aggregated_dt[, gene_id:=gsub(pattern = '.\\d+$', '', gene_id)]
-# get the epirrs for which there is observed H3K27ac because only they have max_promoter and summed_enhancer
-ihec_of_interest <- file_metadata[experiment_type == 'H3K27ac' & uuid != "imputed", .(IHEC=epirr_id_without_version, uuid)]
+aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
 
-# read the max promoter
-max_promoter <- fread('data/GeneMaxPromoterSignal.txt.gz') # from /IHEC/post_processed_data/Analysis/IHEC_gABC_Interactions/GeneMaxPromoterSignal.txt.gz
-promoter_melt <- melt(max_promoter, id.vars = 'Ensembl ID', variable.name = 'uuid', value.name = 'max_promoter', variable.factor = FALSE)
-promoter_merged <- promoter_melt[ihec_of_interest, on=.(uuid)][, .(IHEC, uuid, gene_id=`Ensembl ID`, max_promoter)]
+# max promoter and summed enhancer are not used anymore
+# # get the epirrs for which there is observed H3K27ac because only they have max_promoter and summed_enhancer
+# ihec_of_interest <- file_metadata[experiment_type == "H3K27ac" & uuid != "imputed", .(IHEC = epirr_id_without_version, uuid)]
 
-# read the summed enhancer
-summed_enhancer <- fread('data/gABC_GeneSummedEnhancer.txt.gz') # from /IHEC/post_processed_data/Analysis/IHEC_gABC_Interactions/gABC_GeneSummedEnhancer.txt.gz
-enhancer_melt <- melt(summed_enhancer, id.vars = 'Ensembl ID', variable.name = 'uuid', value.name = 'summed_enhancer', variable.factor = FALSE)
-promoter_merged[enhancer_melt, on=c(uuid='uuid', gene_id='Ensembl ID'), summed_enhancer:=summed_enhancer]
+# # read the max promoter
+# max_promoter <- fread("data/GeneMaxPromoterSignal.txt.gz") # from /IHEC/post_processed_data/Analysis/IHEC_gABC_Interactions/GeneMaxPromoterSignal.txt.gz
+# promoter_melt <- melt(max_promoter, id.vars = "Ensembl ID", variable.name = "uuid", value.name = "max_promoter", variable.factor = FALSE)
+# promoter_merged <- promoter_melt[ihec_of_interest, on = .(uuid)][, .(IHEC, uuid, gene_id = `Ensembl ID`, max_promoter)]
 
-# add the max promoter and summed enhancer to the aggregated table
-aggregated_dt[promoter_merged, on=.(IHEC, gene_id), c('summed_enhancer', 'max_promoter'):=.(summed_enhancer, max_promoter)]
+# # read the summed enhancer
+# summed_enhancer <- fread("data/gABC_GeneSummedEnhancer.txt.gz") # from /IHEC/post_processed_data/Analysis/IHEC_gABC_Interactions/gABC_GeneSummedEnhancer.txt.gz
+# enhancer_melt <- melt(summed_enhancer, id.vars = "Ensembl ID", variable.name = "uuid", value.name = "summed_enhancer", variable.factor = FALSE)
+# promoter_merged[enhancer_melt, on = c(uuid = "uuid", gene_id = "Ensembl ID"), summed_enhancer := summed_enhancer]
+
+# # add the max promoter and summed enhancer to the aggregated table
+# aggregated_dt[promoter_merged, on = .(IHEC, gene_id), c("summed_enhancer", "max_promoter") := .(summed_enhancer, max_promoter)]
 ```
 
+```{r plot features, eval = FALSE}
+library(patchwork)
+library(ggcorrplot)
+
+# TODO: for each transcript filter, plot the distribution of the features, for each event type, and for the different positions (upstream_other_region, event_name, downstream_other_region)
+long_features <- melt(aggregated_dt, id.vars = c("Event Type", "transcript_filter", "IHEC", "uuid", "ID", "gene_id", "Variability"), variable.name = "feature")
+long_features[, c("mark", "position") := tstrsplit(feature, ";", fixed = TRUE)]
+feature_mapping <- data.table(feature = levels(long_features$feature))
+feature_mapping[, c("mark", "position") := tstrsplit(feature, ";", fixed = TRUE)]
+feature_mapping[startsWith(feature, "distance"), c("position") := sub("distance_", "", feature)]
+feature_mapping[startsWith(feature, "distance"), mark := "distance"]
+feature_mapping[feature == "3ss", c("mark", "position") := list("ss", "3prime")]
+feature_mapping[feature == "5ss", c("mark", "position") := list("ss", "5prime")]
+feature_mapping[feature == "3ssdown", c("mark", "position") := list("ss", "3prime_downstream")]
+feature_mapping[feature == "5ssup", c("mark", "position") := list("ss", "5prime_upstream")]
+long_features[feature_mapping, on = "feature", c("mark", "position") := .(mark, position)]
+
+this_transcript_filter <- transcript_filters[1]
+this_event_type <- to_analyze[1]
+
+for (this_transcript_filter in transcript_filters) {
+  for (this_event_type in to_analyze) {
+    # make a correlation plot of the features for this transcript filter and event type
+    feature_cols <- feature_mapping[, feature]
+    cor_mat <- cor(aggregated_dt[transcript_filter == this_transcript_filter &
+      `Event Type` == this_event_type, ..feature_cols], method = "spearman", use = "pairwise")
+    cor_plot <- ggcorrplot(cor_mat, hc.order = TRUE, title = paste(this_transcript_filter, this_event_type))
+    print(cor_plot)
+
+    # plot the distributions of the features for this transcript filter and event type, faceted by mark and position
+    histone_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
+      `Event Type` == this_event_type &
+      mark %in% histone_marks], aes(x = value, color = mark)) +
+      geom_density() +
+      facet_grid(mark ~ position, scales = "free") +
+      labs(title = paste(this_transcript_filter, this_event_type)) +
+      scale_x_log10()
+    DNAm_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
+      `Event Type` == this_event_type &
+      mark %in% c("DNAm", "CpGs")], aes(x = value, color = mark)) +
+      geom_density() +
+      facet_grid(mark ~ position, scales = "free") +
+      labs(title = paste(this_transcript_filter, this_event_type))
+    intrinsic_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
+      `Event Type` == this_event_type &
+      mark %in% c("distance", "width", "gene_expression")], aes(x = value, color = mark)) +
+      geom_density() +
+      facet_wrap(mark ~ position, scales = "free") +
+      labs(title = paste(this_transcript_filter, this_event_type)) +
+      scale_x_log10()
+    ss_psi <- ggplot(long_features[transcript_filter == this_transcript_filter &
+      `Event Type` == this_event_type &
+      mark %in% c("ss", "PSI")], aes(x = value, color = mark)) +
+      geom_density() +
+      facet_wrap(mark ~ position, scales = "free") +
+      labs(title = paste(this_transcript_filter, this_event_type))
+    print((histone_plot / DNAm_plot) | (ss_psi / intrinsic_plot))
+  }
+}
+```
 
 ```{r, write-filtered}
 # write the filtered and augmented table to file
-fwrite(aggregated_dt, 'processed_data/aggregated_dt_filtered.csv.gz')
+fwrite(aggregated_dt, "processed_data/aggregated_dt_filtered.csv.gz")
 ```

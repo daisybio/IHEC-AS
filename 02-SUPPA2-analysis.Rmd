@@ -38,6 +38,17 @@ ggplot(tpms, aes(x = tpm, fill = experiment_type)) +
 
 fwrite(isoform_quants, "splicing_analysis/isoform_quantifications.tsv.gz", sep = "\t")
 
+# also write subset of samples for which we have both RNA-Seq and epigenomic data
+rna_to_use <- download_metadata[
+  assay_type == "RNA-Seq" &
+    epirr_id_without_version %in% download_metadata[,
+      if (.N >= 8) .SD,
+      by = epirr_id_without_version
+    ][, epirr_id_without_version],
+  uuid
+]
+fwrite(isoform_quants[uuid %in% rna_to_use], "splicing_analysis/isoform_quantifications_subset.tsv.gz", sep = "\t")
+
 # bring tpms to wide format
 tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ uuid, value.var = "TPM", fill = 0)
 
@@ -55,57 +66,63 @@ unfiltered_annotation <- rtracklayer::import("splicing_analysis/gencode.v29.anno
 
 confidence_tsls <- c("1", "2")
 polyA_biotypes <- c(
-  "protein_coding","retained_intron"
-  #"lincRNA", "processed_transcript",
-  #"antisense", "sense_intronic", "sense_overlapping", "transcribed_unprocessed_pseudogene"
+  "protein_coding", "retained_intron"
+  # "lincRNA", "processed_transcript",
+  # "antisense", "sense_intronic", "sense_overlapping", "transcribed_unprocessed_pseudogene"
 )
 
 tx_filter <- unfiltered_annotation$type == "transcript"
 tsl_tx_filter <- tx_filter & unfiltered_annotation$transcript_support_level %in% confidence_tsls
 biotype_tx_filter <- tsl_tx_filter & unfiltered_annotation$transcript_type %in% polyA_biotypes
 
-filter_list <- list(transcripts = tx_filter, 
-                    tsl_filtered = tsl_tx_filter, 
-                    biotype_filtered = biotype_tx_filter)
+filter_list <- list(
+  transcripts = tx_filter,
+  tsl_filtered = tsl_tx_filter,
+  biotype_filtered = biotype_tx_filter
+)
 
-for(tx_filter_name in names(filter_list)) {
-  
+saveRDS(sapply(names(filter_list), function(tx_filter_name) {
+  unfiltered_annotation[filter_list[[tx_filter_name]]]$transcript_id
+}, simplify = FALSE), "splicing_analysis/filtered_transcript_ids.rds")
+
+for (tx_filter_name in names(filter_list)) {
   this_filter <- filter_list[[tx_filter_name]]
   # filter the annotation
   annotation <- unfiltered_annotation[
     unfiltered_annotation$transcript_id %in% unfiltered_annotation[this_filter]$transcript_id |
-      (unfiltered_annotation$type == "gene" & unfiltered_annotation$gene_id %in% unfiltered_annotation[this_filter]$gene_id)]
+      (unfiltered_annotation$type == "gene" & unfiltered_annotation$gene_id %in% unfiltered_annotation[this_filter]$gene_id)
+  ]
   # filter autosomes
   # standard_chroms <- paste0("chr", c(1:22))
   # annotation <- annotation[seqnames(annotation) %in% standard_chroms]
   # export filtered annotation
   gtf_file <- paste0("gencode.v29.", tx_filter_name, ".gtf")
   rtracklayer::export(annotation, file.path("splicing_analysis", gtf_file))
-  
+
   # # filter for transcripts
   # isoform_quants_filtered <- isoform_quants[transcript_id %in% annotation$transcript_id]
   # print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
   #   geom_histogram() +
   #   labs(title = tx_filter_name))
-  # 
+  #
   # # recompute TPM values on the transcripts
   # isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
   # isoform_quants_filtered[, TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
   # isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
   # isoform_quants_filtered[, TPM_scale := 1000000 * TPM/sum(TPM, na.rm = TRUE), .(uuid, epirr_id_without_version)]
-  # 
+  #
   # print(ggplot(isoform_quants_filtered[, .(tpm = sum(TPM_rec)), by = .(uuid, epirr_id_without_version, experiment_type)], aes(x = tpm, fill = experiment_type)) +
   #   geom_histogram() +
   #   labs(title = tx_filter_name))
-  
+
   # compute and export the gene expression in TPM by summing up transcript TPMS
   # gene_quants <- isoform_quants_filtered[, .(gene_tpm = sum(TPM, na.rm = TRUE)), by = .(uuid, epirr_id_without_version, gene_id)]
   # gene_expr_file <- paste0("suppa_analysis/gene_expressions_", tx_filter_name, ".rds")
   # saveRDS(gene_quants, gene_expr_file)
-  # 
+  #
   # # bring tpms to wide format
   # tpm_dt <- data.table::dcast(isoform_quants_filtered, transcript_id ~ uuid, value.var = "TPM", fill = 0)
-  # 
+  #
   # # export expression for analysis with suppa
   # suppa_expr_filename <- paste0("suppa_analysis/tpm_expressions_", tx_filter_name, ".tsv")
   # fileConn <- file(suppa_expr_filename)
