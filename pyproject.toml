@@ -1,0 +1,28 @@
+[project]
+name = "splicing-ml"
+version = "0.1.0"
+description = "Nested-CV sklearn pipeline for splicing prediction from epigenomic features"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scikit-learn>=1.2",
+  "scipy>=1.9",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+xgboost = ["xgboost>=1.7"]
+statsmodels = ["statsmodels>=0.14"]
+wandb = ["wandb>=0.16"]
+polars = ["polars>=0.19"]
+all = [
+  "xgboost>=1.7",
+  "statsmodels>=0.14",
+  "wandb>=0.16",
+  "polars>=0.19",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
