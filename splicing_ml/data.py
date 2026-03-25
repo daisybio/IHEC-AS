@@ -284,12 +284,23 @@ def build_targets(
     For regression, optionally applies logit transform to model PSI on unbounded scale.
     """
     if task == "regression":
+        y_raw = df["PSI"].astype(float)
+        keep = (y_raw > low_thr) & (y_raw < high_thr)
+        df = df.loc[keep].copy()
         y = df["PSI"].astype(float).to_numpy()
         if use_logit:
             y = _logit_transform(y)
-            vlog(verbose, f"Built regression target (logit-scale) with n={y.size}")
+            vlog(
+                verbose,
+                f"Built regression target (logit-scale) with thresholds=({low_thr:.4f}, {high_thr:.4f}), "
+                f"kept_n={y.size}",
+            )
         else:
-            vlog(verbose, f"Built regression target with n={y.size}")
+            vlog(
+                verbose,
+                f"Built regression target with thresholds=({low_thr:.4f}, {high_thr:.4f}), "
+                f"kept_n={y.size}",
+            )
         return df, y
 
     y_raw = df["PSI"].astype(float)

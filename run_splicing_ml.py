@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """CLI shim for running the splicing ML pipeline package."""
 
 from splicing_ml.pipeline import main

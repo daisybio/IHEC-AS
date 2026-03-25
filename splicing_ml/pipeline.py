@@ -125,23 +125,23 @@ def run_single_configuration(
         pre_smoke_rows = int(sdf.shape[0])
         pre_smoke_groups = int(sdf[cfg.group_col].nunique())
         # Balanced per-outer-group sampling keeps smoke-mode representative.
-        sdf = (
-            sdf.groupby(cfg.group_col, group_keys=False)
-            .apply(
-                lambda g: g.sample(
-                    n=min(
-                        len(g),
-                        max(
-                            1,
-                            run_cfg.smoke_max_rows
-                            // max(1, sdf[cfg.group_col].nunique()),
-                        ),
-                    ),
+        per_group_target = max(
+            1,
+            run_cfg.smoke_max_rows // max(1, pre_smoke_groups),
+        )
+        sampled_parts: list[pd.DataFrame] = []
+        for group_name, group_df in sdf.groupby(cfg.group_col, sort=False):
+            group_df_local = group_df
+            if cfg.group_col not in group_df_local.columns:
+                # pandas groupby behavior changed across versions; keep the key.
+                group_df_local = group_df_local.assign(**{cfg.group_col: group_name})
+            sampled_parts.append(
+                group_df_local.sample(
+                    n=min(len(group_df_local), per_group_target),
                     random_state=run_cfg.random_seed,
                 )
             )
-            .reset_index(drop=True)
-        )
+        sdf = pd.concat(sampled_parts, ignore_index=True)
         _, y = build_targets(
             sdf,
             task,
@@ -203,6 +203,7 @@ def run_single_configuration(
         groups_outer,
         n_splits=n_outer_splits,
         seed=run_cfg.random_seed,
+        y=y if task == "classification" else None,
     )
     # Validate outer splits: ensure they partition the data without overlap.
     total_outer_idx = set()
@@ -440,14 +441,10 @@ def run_single_configuration(
             "psi_sample": psi_response_full[:20000].tolist(),
             "psi_sample_size": int(min(20000, psi_response_full.shape[0])),
             "psi_total_size": int(psi_response_full.shape[0]),
-            "binarization_thresholds": (
-                [
-                    float(run_cfg.psi_low_threshold),
-                    float(run_cfg.psi_high_threshold),
-                ]
-                if task == "classification"
-                else None
-            ),
+            "binarization_thresholds": [
+                float(run_cfg.psi_low_threshold),
+                float(run_cfg.psi_high_threshold),
+            ],
             "label_distribution": (
                 {
                     "0": int(np.sum(y == 0)) if task == "classification" else None,
@@ -603,9 +600,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--only-group",
-        default=None,
+        default="seqnames",
         choices=["seqnames", "ontology"],
-        help="Optional filter to run only one grouping variable; default runs both.",
+        help="Filter on which grouping variable to use; default runs seqnames/chromosomes (unseen events).",
     )
     p.add_argument(
         "--models",

@@ -60,21 +60,30 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
         Upper bound on total dense-matrix elements (rows × cols).
     max_train_rows : int
         Random subset size used when training data exceeds this limit.
+    adaptive_maxiter : bool
+        If True, retries with larger iteration budgets when convergence
+        risk is medium/high.
+    maxiter_cap : int
+        Upper cap for adaptive iteration retries.
     """
 
     def __init__(
         self,
         epsilon: float = 1e-7,
-        maxiter: int = 200,
+        maxiter: int = 800,
         max_sparse_columns: int = 2000,
         max_dense_elements: int = 30_000_000,
         max_train_rows: int = 5000,
+        adaptive_maxiter: bool = True,
+        maxiter_cap: int = 1200,
     ):
         self.epsilon = float(epsilon)
         self.maxiter = int(maxiter)
         self.max_sparse_columns = int(max_sparse_columns)
         self.max_dense_elements = int(max_dense_elements)
         self.max_train_rows = int(max_train_rows)
+        self.adaptive_maxiter = bool(adaptive_maxiter)
+        self.maxiter_cap = int(maxiter_cap)
 
     # ------------------------------------------------------------------
     # Private helpers — each handles one step of fit()
@@ -151,7 +160,76 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
 
         return x_use, feature_mask, qr_keep_idx
 
-    def _optimize_model(self, x_design: np.ndarray, y_clipped: np.ndarray) -> Any:
+    def _build_iter_schedule(self, risk_level: str) -> list[int]:
+        """Return optimization iteration budgets based on convergence risk."""
+        base = max(20, int(self.maxiter))
+        cap = max(base, int(self.maxiter_cap))
+
+        if not bool(self.adaptive_maxiter):
+            return [base]
+
+        if risk_level == "high":
+            candidates = [base, min(cap, base * 2), min(cap, base * 4)]
+        elif risk_level == "medium":
+            candidates = [base, min(cap, base * 2)]
+        else:
+            candidates = [base]
+
+        # Preserve order while deduplicating.
+        schedule: list[int] = []
+        for n_iter in candidates:
+            if n_iter not in schedule:
+                schedule.append(n_iter)
+        return schedule
+
+    def _estimate_convergence_risk(
+        self, x_use: np.ndarray, y_clipped: np.ndarray
+    ) -> dict[str, float | str | int]:
+        """Heuristic pre-check for likely beta-optimizer instability."""
+        n_obs = int(x_use.shape[0])
+        n_feat = int(x_use.shape[1])
+        p_over_n = float(n_feat / max(1, n_obs))
+
+        y_std = float(np.std(y_clipped))
+        boundary_eps = max(1e-5, self.epsilon * 100.0)
+        boundary_frac = float(
+            np.mean((y_clipped <= boundary_eps) | (y_clipped >= (1.0 - boundary_eps)))
+        )
+
+        try:
+            cond_number = float(np.linalg.cond(x_use))
+        except Exception:
+            cond_number = float("nan")
+
+        risk = "low"
+        if (
+            p_over_n > 0.20
+            or y_std < 0.04
+            or boundary_frac > 0.08
+            or (np.isfinite(cond_number) and cond_number > 1e8)
+        ):
+            risk = "high"
+        elif (
+            p_over_n > 0.12
+            or y_std < 0.07
+            or boundary_frac > 0.03
+            or (np.isfinite(cond_number) and cond_number > 1e6)
+        ):
+            risk = "medium"
+
+        return {
+            "level": risk,
+            "n_obs": n_obs,
+            "n_feat": n_feat,
+            "p_over_n": p_over_n,
+            "y_std": y_std,
+            "boundary_frac": boundary_frac,
+            "cond_number": cond_number,
+        }
+
+    def _optimize_model(
+        self, x_design: np.ndarray, y_clipped: np.ndarray, iter_schedule: list[int]
+    ) -> Any:
         """Fit BetaModel trying multiple optimisers and covariance types.
 
         Raises RuntimeError if all attempts fail.
@@ -172,36 +250,43 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
 
         # Strict beta-only policy: retry with multiple optimizers but never
         # fall back to a non-beta estimator.
-        for method in ("bfgs", "lbfgs", "newton"):
-            for fit_kw in fit_kw_variants:
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        result = BetaModel(endog=y_clipped, exog=x_design).fit(
-                            method=method,
-                            maxiter=self.maxiter,
-                            disp=False,
-                            **fit_kw,
+        for n_iter in iter_schedule:
+            for method in ("bfgs", "lbfgs", "newton"):
+                for fit_kw in fit_kw_variants:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            result = BetaModel(endog=y_clipped, exog=x_design).fit(
+                                method=method,
+                                maxiter=n_iter,
+                                disp=False,
+                                **fit_kw,
+                            )
+                        self.fit_backend_ = (
+                            f"beta:{method}:{'+'.join(sorted(fit_kw.keys()))}:maxiter={n_iter}"
+                            if fit_kw
+                            else f"beta:{method}:default:maxiter={n_iter}"
                         )
-                    self.fit_backend_ = (
-                        f"beta:{method}:{'+'.join(sorted(fit_kw.keys()))}"
-                        if fit_kw
-                        else f"beta:{method}:default"
-                    )
-                    return result
-                except TypeError:
-                    # Older statsmodels may not accept newer fit kwargs.
-                    continue
-                except Exception as exc:
-                    fit_errors.append(f"{method}/{fit_kw}: {exc}")
-            else:
-                continue
-            break  # noqa: SIM105 — explicit loop break after inner match
+                        return result
+                    except TypeError:
+                        # Older statsmodels may not accept newer fit kwargs.
+                        continue
+                    except Exception as exc:
+                        fit_errors.append(f"iter={n_iter}:{method}/{fit_kw}: {exc}")
 
+        risk = getattr(self, "convergence_risk_", {})
+        risk_summary = ""
+        if isinstance(risk, dict):
+            risk_summary = (
+                ", risk="
+                f"{risk.get('level')}/p_over_n={risk.get('p_over_n'):.3f}"
+                f"/y_std={risk.get('y_std'):.4f}"
+                f"/boundary_frac={risk.get('boundary_frac'):.3f}"
+            )
         raise RuntimeError(
             "beta regression failed to converge "
             f"(n={y_clipped.shape[0]}, p={x_design.shape[1]}). "
-            f"attempts={'; '.join(fit_errors)}"
+            f"attempts={'; '.join(fit_errors)}{risk_summary}"
         )
 
     # ------------------------------------------------------------------
@@ -252,8 +337,13 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
             self._remove_degenerate_columns(x_arr)
         )
 
+        self.convergence_risk_ = self._estimate_convergence_risk(x_use, y_arr)
+        iter_schedule = self._build_iter_schedule(
+            str(self.convergence_risk_.get("level", "low"))
+        )
+
         x_design = add_constant(x_use, has_constant="skip")
-        self._beta_result_ = self._optimize_model(x_design, y_arr)
+        self._beta_result_ = self._optimize_model(x_design, y_arr, iter_schedule)
         self.n_features_in_ = x_arr.shape[1]
         return self
 
@@ -265,7 +355,9 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
             raise RuntimeError("BetaRegressor is not fitted")
 
         x_in = x
-        if getattr(self, "_sparse_keep_idx_", None) is not None and hasattr(x_in, "shape"):
+        if getattr(self, "_sparse_keep_idx_", None) is not None and hasattr(
+            x_in, "shape"
+        ):
             x_in = x_in[:, self._sparse_keep_idx_]
 
         x_arr = self._as_dense_2d(x_in)

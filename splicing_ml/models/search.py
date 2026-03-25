@@ -16,18 +16,21 @@ strategy helpers based on model type:
 
 import math
 from typing import Any
+import warnings
 
 import numpy as np
 import pandas as pd
+from joblib import parallel_backend
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LassoCV
+from sklearn.exceptions import FitFailedWarning
 from sklearn.model_selection import GridSearchCV, cross_validate
 from sklearn.pipeline import Pipeline
 
 from ..config import RNG_SEED
 from ..metrics import regression_metrics
-from ..utils import sanitize_best_params, vlog
+from ..utils import safe_json, sanitize_best_params, vlog
 from .beta import BetaRegressor, _inverse_logit
 from .grids import build_param_candidates, _use_lhs_strategy
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference, xgb_gpu_available
@@ -61,6 +64,7 @@ def _fit_lasso_cv(
     preprocessor: ColumnTransformer,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
     param_grid_size: int,
+    max_cores: int,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit LassoCV — which handles alpha selection via its own built-in CV.
@@ -78,7 +82,8 @@ def _fit_lasso_cv(
                     random_state=RNG_SEED,
                     max_iter=20000,
                     cv=inner_cv,
-                    alphas=np.logspace(-6, -1, num=alpha_count),
+                    alphas=np.logspace(-6, -2, num=alpha_count),
+                    n_jobs=max_cores,
                 ),
             ),
         ]
@@ -119,6 +124,7 @@ def _fit_beta(
     y_train: np.ndarray,
     preprocessor: ColumnTransformer,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    max_cores: int,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit BetaRegressor — no hyperparameters, so CV is used only for scoring.
@@ -136,17 +142,67 @@ def _fit_beta(
     pipe = Pipeline(steps=[("prep", preprocessor), ("model", BetaRegressor())])
 
     # cross_validate scores the pipeline on each inner fold without leakage.
-    cv_results = cross_validate(
-        clone(pipe),
-        x_train,
-        y_train_beta,
-        cv=inner_cv,
-        scoring=scorer_name(task),
-    )
-    best_score = float(np.mean(cv_results["test_score"]))
+    best_score = float("nan")
+    try:
+        with warnings.catch_warnings():
+            # Beta can fail on some folds; keep only finite fold scores.
+            warnings.simplefilter("ignore", FitFailedWarning)
+            cv_results = cross_validate(
+                clone(pipe),
+                x_train,
+                y_train_beta,
+                cv=inner_cv,
+                scoring=scorer_name(task),
+                error_score=np.nan,
+                n_jobs=max_cores,
+            )
+
+        fold_scores = np.asarray(cv_results["test_score"], dtype=float)
+        finite_scores = fold_scores[np.isfinite(fold_scores)]
+        if finite_scores.size:
+            best_score = float(np.mean(finite_scores))
+        else:
+            vlog(
+                verbose,
+                "beta inner CV produced no finite scores; continuing with full-fit beta",
+            )
+    except Exception as exc:
+        # Inner CV is for scoring only (beta has no tuned hyperparameters).
+        compact = (
+            str(exc).strip().splitlines()[0]
+            if str(exc).strip()
+            else exc.__class__.__name__
+        )
+        vlog(
+            verbose,
+            f"beta inner CV failed ({compact}); continuing with full-fit beta",
+            level="info",
+        )
 
     # Refit on the full training fold with PSI-scale targets.
-    pipe.fit(x_train, y_train_beta)
+    try:
+        pipe.fit(x_train, y_train_beta)
+    except Exception as exc:
+        compact = (
+            str(exc).strip().splitlines()[0]
+            if str(exc).strip()
+            else exc.__class__.__name__
+        )
+        raise RuntimeError(f"beta full-fit failed: {compact}") from exc
+
+    beta_model = pipe.named_steps.get("model")
+    beta_risk = getattr(beta_model, "convergence_risk_", None)
+    if isinstance(beta_risk, dict):
+        vlog(
+            verbose,
+            "beta convergence precheck: "
+            f"level={beta_risk.get('level')} "
+            f"n={beta_risk.get('n_obs')} p={beta_risk.get('n_feat')} "
+            f"p_over_n={beta_risk.get('p_over_n', float('nan')):.3f} "
+            f"y_std={beta_risk.get('y_std', float('nan')):.4f} "
+            f"boundary_frac={beta_risk.get('boundary_frac', float('nan')):.3f}",
+            level="debug",
+        )
 
     vlog(
         verbose,
@@ -156,6 +212,7 @@ def _fit_beta(
     return pipe, {
         "best_params": sanitize_best_params({"model": pipe.named_steps["model"]}),
         "best_score": best_score,
+        "beta_convergence_risk": safe_json(beta_risk),
     }
 
 
@@ -181,6 +238,7 @@ def _build_grid_search(
     lhs_scale_mode: str,
     xgb_use_gpu: bool | None,
     verbose: bool,
+    model_n_jobs: int = 1,
 ) -> GridSearchCV:
     """Construct a GridSearchCV object with the appropriate candidate list."""
     candidates = build_param_candidates(
@@ -193,6 +251,7 @@ def _build_grid_search(
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
         verbose=verbose,
+        model_n_jobs=model_n_jobs,
     )
     return GridSearchCV(
         estimator=pipe,
@@ -200,6 +259,7 @@ def _build_grid_search(
         scoring=scorer_name(task),
         cv=inner_cv,
         n_jobs=search_n_jobs,
+        pre_dispatch=search_n_jobs,
         refit=True,
         error_score="raise",
     )
@@ -228,7 +288,19 @@ def _fit_grid_search(
       budget, the final estimator is re-trained with a larger tree budget.
     """
     # Limit concurrent GPU jobs to avoid VRAM contention.
-    search_n_jobs = 1 if (model_name == "xgb" and bool(xgb_use_gpu)) else max_cores
+    # For RF, split cores between search-level and tree-level parallelism:
+    # model_n_jobs gets sqrt(max_cores) cores per forest; search_n_jobs gets the rest.
+    if model_name == "xgb" and bool(xgb_use_gpu):
+        search_n_jobs = 1
+        model_n_jobs = 1
+    elif model_name in {"rf", "xgb"} and max_cores > 1:
+        # Split budget between search-level and model-level parallelism.
+        # RF uses joblib tree-building threads; XGB CPU uses its own thread pool.
+        model_n_jobs = max(1, int(max_cores ** 0.5))
+        search_n_jobs = max(1, max_cores // model_n_jobs)
+    else:
+        search_n_jobs = max_cores
+        model_n_jobs = 1
 
     search = _build_grid_search(
         pipe=pipe,
@@ -243,14 +315,27 @@ def _fit_grid_search(
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
         verbose=verbose,
+        model_n_jobs=model_n_jobs,
     )
 
+    def _fit_search(search_obj: GridSearchCV) -> None:
+        if search_n_jobs > 1:
+            # Thread backend avoids occasional loky worker-stop warnings.
+            with parallel_backend("threading", n_jobs=search_n_jobs):
+                search_obj.fit(x_train, y_train)
+            return
+        search_obj.fit(x_train, y_train)
+
     try:
-        search.fit(x_train, y_train)
+        _fit_search(search)
     except Exception as exc:
         # On GPU failure, rebuild the search with CPU and retry once.
         if model_name == "xgb" and bool(xgb_use_gpu) and _looks_like_gpu_failure(exc):
-            vlog(verbose, f"XGB GPU training failed; retrying on CPU ({exc})", level="info")
+            vlog(
+                verbose,
+                f"XGB GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
             search = _build_grid_search(
                 pipe=pipe,
                 model_name=model_name,
@@ -265,7 +350,7 @@ def _fit_grid_search(
                 xgb_use_gpu=False,  # force CPU
                 verbose=verbose,
             )
-            search.fit(x_train, y_train)
+            _fit_search(search)
         else:
             raise
 
@@ -367,6 +452,7 @@ def fit_best_estimator(
             preprocessor=preprocessor,
             inner_cv=inner_cv,
             param_grid_size=param_grid_size,
+            max_cores=max_cores,
             verbose=verbose,
         )
 
@@ -378,6 +464,7 @@ def fit_best_estimator(
             y_train=y_train,
             preprocessor=preprocessor,
             inner_cv=inner_cv,
+            max_cores=max_cores,
             verbose=verbose,
         )
 

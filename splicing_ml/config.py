@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 __all__ = [
     "RNG_SEED",
+    "PSI_LOW_BOUNDARY",
+    "PSI_HIGH_BOUNDARY",
     "REQUIRED_COLUMNS",
     "METADATA_COLUMNS",
     "ALL_MODEL_TYPES",
@@ -21,6 +23,12 @@ __all__ = [
 
 
 RNG_SEED = 42
+
+# PSI boundaries shared by both tasks:
+# - classification keeps extreme ranges (PSI <= low or PSI >= high)
+# - regression keeps mid-range (low < PSI < high)
+PSI_LOW_BOUNDARY: float = 0.2
+PSI_HIGH_BOUNDARY: float = 0.8
 
 # Required columns validated on load.
 REQUIRED_COLUMNS = {
@@ -206,8 +214,8 @@ class RunConfig:
     include_models: tuple[str, ...] = ALL_MODEL_TYPES
     run_regression: bool = True
     run_classification: bool = True
-    psi_low_threshold: float = 1.0 / 3.0
-    psi_high_threshold: float = 2.0 / 3.0
+    psi_low_threshold: float = PSI_LOW_BOUNDARY
+    psi_high_threshold: float = PSI_HIGH_BOUNDARY
     categorical_missing_strategy: str = "missing_token"
     categorical_missing_token: str = "__MISSING__"
     generate_html_reports: bool = True

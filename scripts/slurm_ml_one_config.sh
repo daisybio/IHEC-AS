@@ -5,12 +5,22 @@
 #SBATCH -p shared-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --qos=limitgpus
-#SBATCH -c 8
-#SBATCH --mem 12G
+#SBATCH -c 12
+#SBATCH --mem 24G
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=quirin.manz@tum.de
-#SBATCH -t 1-00:00:00
+#SBATCH -t 0-12:00:00
 #SBATCH --array=0-0%20
+#
+# Resource tiers (submit_ml_config_array.sh overrides -c/--mem/--time per tier):
+#   Tier L  SE + both variability    : --mem=40G  -c 16  --time=0-24:00:00
+#   Tier M  SE + High/Low | RI + both: --mem=24G  -c 12  --time=0-12:00:00  (defaults above)
+#   Tier S  RI + High/Low            : --mem=16G  -c  8  --time=0-06:00:00
+#
+# Rationale:
+#   Every job loads the full dataset (~6.4 GB pandas RSS).  Larger subsets add
+#   up to ~1.4 GB of feature matrix which gets copied ~3-4x during nested CV.
+#   SE/both configs reach 3.9 M rows; RI/High configs stay under 130 K rows.
 
 set -euo pipefail
 

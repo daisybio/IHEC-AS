@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """Generate plotting/evaluation HTML from pretrained run artifacts.
 
 This entrypoint does not retrain models. It reads existing pipeline results
@@ -17,12 +18,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--results-file",
-        default="processed_data/ml_splicing_outputs/splicing_ml_results.json.gz",
+        default="splicing_ml/output/ml_splicing_outputs/splicing_ml_results.json.gz",
         help="Path to existing results artifact (.json.gz or .json)",
     )
     p.add_argument(
         "--output-dir",
-        default="processed_data/ml_splicing_outputs_pretrained_report",
+        default="splicing_ml/output/ml_splicing_outputs",
         help="Directory where HTML reports will be written",
     )
     p.add_argument("--verbose", action="store_true")

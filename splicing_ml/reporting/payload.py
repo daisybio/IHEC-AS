@@ -153,9 +153,29 @@ def _safe_empty_payload(
         "best_threshold": None,
         "confusion_matrix": None,
         "confusion_by_model": {},
-        "response_distribution": task_result.get("response_distribution", {}),
+        "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }
+
+
+# ---------------------------------------------------------------------------
+# Response-distribution helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_thresholds(task_result: dict[str, Any]) -> dict[str, Any]:
+    """Return response_distribution with binarization_thresholds always populated.
+
+    Older result JSONs store ``null`` for regression. Fall back to
+    ``reproducibility.psi_thresholds`` (always written by the pipeline) so
+    the HTML report can shade excluded regions for both tasks.
+    """
+    dist = dict(task_result.get("response_distribution", {}))
+    if not dist.get("binarization_thresholds"):
+        fallback = (task_result.get("reproducibility") or {}).get("psi_thresholds")
+        if fallback:
+            dist["binarization_thresholds"] = fallback
+    return dist
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +474,6 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "best_threshold": best_threshold,
         "confusion_matrix": None,
         "confusion_by_model": confusion_by_model,
-        "response_distribution": task_result.get("response_distribution", {}),
+        "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }

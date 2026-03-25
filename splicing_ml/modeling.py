@@ -91,6 +91,7 @@ def balanced_group_split_indices(
     groups: pd.Series,
     n_splits: int,
     seed: int = RNG_SEED,
+    y: np.ndarray | pd.Series | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Create grouped CV splits balanced by number of observations.
 
@@ -98,6 +99,13 @@ def balanced_group_split_indices(
     (bin-packing) so each fold has approximately balanced observation counts.
     Group exclusivity is enforced: an entire group is always in either train
     or test, never both.
+
+    Parameters
+    ----------
+    y : array-like of int, optional
+        Class labels for stratification. When provided, fold assignment uses a
+        combined score that prefers class-ratio balance (primary) and size
+        balance (secondary). Only meaningful for classification tasks.
     """
     g = groups.reset_index(drop=True)
     unique_groups = g.dropna().unique().tolist()
@@ -107,6 +115,26 @@ def balanced_group_split_indices(
     n_splits = bounded_group_splits(n_splits, len(unique_groups), max_splits=10)
     group_counts = g.value_counts().to_dict()
 
+    # Pre-compute per-group class counts when stratifying.
+    y_arr: np.ndarray | None = None
+    n_classes: int = 0
+    group_class_counts: dict[Any, np.ndarray] = {}
+    global_class_ratios: np.ndarray = np.array([])
+    if y is not None:
+        y_arr = np.asarray(y)
+        classes = np.unique(y_arr)
+        n_classes = len(classes)
+        class_index = {c: i for i, c in enumerate(classes)}
+        g_vals = g.to_numpy()
+        for grp in unique_groups:
+            mask = g_vals == grp
+            counts = np.zeros(n_classes, dtype=float)
+            for label in y_arr[mask]:
+                counts[class_index[label]] += 1
+            group_class_counts[grp] = counts
+        total_counts = sum(group_class_counts.values())
+        global_class_ratios = total_counts / total_counts.sum()
+
     rng = np.random.default_rng(seed)
     shuffled = list(unique_groups)
     rng.shuffle(shuffled)
@@ -115,12 +143,32 @@ def balanced_group_split_indices(
 
     fold_groups: list[list[Any]] = [[] for _ in range(n_splits)]
     fold_sizes = [0 for _ in range(n_splits)]
+    fold_class_counts: list[np.ndarray] = [np.zeros(n_classes, dtype=float) for _ in range(n_splits)]
 
-    # Greedy bin-packing: assign each group to the fold with the fewest rows.
+    # Greedy bin-packing: assign each group to the fold with the fewest rows,
+    # or (when stratifying) the fold where adding this group best preserves the
+    # global class ratio (ties broken by fold size).
     for grp in shuffled:
-        target_fold = int(np.argmin(fold_sizes))
+        if y_arr is None:
+            target_fold = int(np.argmin(fold_sizes))
+        else:
+            gc = group_class_counts[grp]
+            best_fold = 0
+            best_score: tuple[float, int] = (float("inf"), fold_sizes[0])
+            for f in range(n_splits):
+                new_counts = fold_class_counts[f] + gc
+                new_total = fold_sizes[f] + gc.sum()
+                ratio_dev = float(np.sum((new_counts / new_total - global_class_ratios) ** 2)) if new_total > 0 else 0.0
+                score: tuple[float, int] = (ratio_dev, fold_sizes[f])
+                if score < best_score:
+                    best_score = score
+                    best_fold = f
+            target_fold = best_fold
+
         fold_groups[target_fold].append(grp)
         fold_sizes[target_fold] += int(group_counts.get(grp, 0))
+        if y_arr is not None:
+            fold_class_counts[target_fold] += group_class_counts[grp]
 
     all_idx = np.arange(g.shape[0])
     splits: list[tuple[np.ndarray, np.ndarray]] = []

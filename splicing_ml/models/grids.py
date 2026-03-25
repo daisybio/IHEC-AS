@@ -119,6 +119,7 @@ def build_param_candidates(
     xgb_use_gpu: bool | None = None,
     cv: list[tuple[Any, Any]] | None = None,
     verbose: bool = False,
+    model_n_jobs: int = 1,
 ) -> list[dict[str, Any]]:
     """Return a GridSearchCV-compatible candidate list for the given model.
 
@@ -159,6 +160,7 @@ def build_param_candidates(
             scale_mode=lhs_scale_mode,
             cv=cv,
             verbose=verbose,
+            model_n_jobs=model_n_jobs,
         )
     return choose_param_grid(
         model_name=model_name,
@@ -170,6 +172,7 @@ def build_param_candidates(
         xgb_use_gpu=xgb_use_gpu,
         cv=cv,
         verbose=verbose,
+        model_n_jobs=model_n_jobs,
     )
 
 
@@ -198,6 +201,7 @@ def choose_param_grid(
     xgb_use_gpu: bool | None = None,
     cv: list[tuple[Any, Any]] | None = None,
     verbose: bool = False,
+    model_n_jobs: int = 1,
 ) -> list[dict[str, Any]]:
     """Build heuristic fixed-grid parameter candidates for GridSearchCV.
 
@@ -242,7 +246,6 @@ def choose_param_grid(
                         max_iter=5000,
                         class_weight="balanced",
                         random_state=RNG_SEED,
-                        n_jobs=1,
                     )
                 ],
                 "model__C": c_grid,
@@ -268,9 +271,8 @@ def choose_param_grid(
                         max_iter=5000,
                         class_weight="balanced",
                         random_state=RNG_SEED,
-                        penalty="l1",
+                        l1_ratio=1.0,
                         solver="saga",
-                        n_jobs=1,
                     )
                 ],
                 "model__C": c_grid,
@@ -307,7 +309,7 @@ def choose_param_grid(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -1, num=alpha_count),
+                        alphas=np.logspace(-6, -2, num=alpha_count),
                     )
                 ],
             }
@@ -341,7 +343,7 @@ def choose_param_grid(
                     "model": [
                         RandomForestClassifier(
                             random_state=RNG_SEED,
-                            n_jobs=1,
+                            n_jobs=model_n_jobs,
                             class_weight="balanced",
                         )
                     ],
@@ -353,7 +355,7 @@ def choose_param_grid(
             ]
         return [
             {
-                "model": [RandomForestRegressor(random_state=RNG_SEED, n_jobs=1)],
+                "model": [RandomForestRegressor(random_state=RNG_SEED, n_jobs=model_n_jobs)],
                 "model__n_estimators": n_estimators,
                 "model__max_depth": max_depth,
                 "model__max_features": max_features,
@@ -369,7 +371,6 @@ def choose_param_grid(
 
         use_gpu = bool(xgb_use_gpu) if xgb_use_gpu is not None else xgb_gpu_available()
         common = {
-            "n_estimators": 100 if not small else 60,  # reduced for tuning speed
             "random_state": RNG_SEED,
             "n_jobs": 1,
             "tree_method": "hist",
@@ -377,7 +378,8 @@ def choose_param_grid(
         }
         n_points = max(1, int(grid_size))
         depth_low, depth_high = (2, 8) if small else (3, 10)
-        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
+        n_est_low, n_est_high = (60, 200) if small else (100, 500)
+        unit = _lhs_unit(n_points=n_points, n_dims=5, seed=RNG_SEED)
         base_model = (
             XGBClassifier(eval_metric="logloss", **common)
             if task == "classification"
@@ -388,11 +390,24 @@ def choose_param_grid(
             out.append(
                 {
                     "model": [base_model],
-                    "model__max_depth": [
+                    "model__n_estimators": [
                         int(
                             round(
                                 _map_with_scale(
                                     float(row[0]),
+                                    n_est_low,
+                                    n_est_high,
+                                    "linear",
+                                    default_scale="linear",
+                                )
+                            )
+                        )
+                    ],
+                    "model__max_depth": [
+                        int(
+                            round(
+                                _map_with_scale(
+                                    float(row[1]),
                                     depth_low,
                                     depth_high,
                                     "linear",
@@ -403,17 +418,17 @@ def choose_param_grid(
                     ],
                     "model__learning_rate": [
                         _map_with_scale(
-                            float(row[1]), 0.01, 0.3, "log", default_scale="log"
+                            float(row[2]), 0.01, 0.3, "log", default_scale="log"
                         )
                     ],
                     "model__subsample": [
                         _map_with_scale(
-                            float(row[2]), 0.6, 1.0, "linear", default_scale="linear"
+                            float(row[3]), 0.6, 1.0, "linear", default_scale="linear"
                         )
                     ],
                     "model__colsample_bytree": [
                         _map_with_scale(
-                            float(row[3]), 0.6, 1.0, "linear", default_scale="linear"
+                            float(row[4]), 0.6, 1.0, "linear", default_scale="linear"
                         )
                     ],
                 }
@@ -438,6 +453,7 @@ def choose_param_lhs_candidates(
     scale_mode: str = "auto",
     cv: list[tuple[Any, Any]] | None = None,
     verbose: bool = False,
+    model_n_jobs: int = 1,
 ) -> list[dict[str, list[Any]]]:
     """Build a space-filling LHS candidate set for GridSearchCV.
 
@@ -471,13 +487,17 @@ def choose_param_lhs_candidates(
         c_low, c_high = c_base / 100.0, c_base * 100.0
         unit = _lhs_unit(n_points=n_points, n_dims=1, seed=RNG_SEED)
         model = LogisticRegression(
-            max_iter=5000, class_weight="balanced", random_state=RNG_SEED, n_jobs=1
+            max_iter=5000,
+            class_weight="balanced",
+            random_state=RNG_SEED,
         )
         return [
             {
                 "model": [model],
                 "model__C": [
-                    _map_with_scale(float(row[0]), c_low, c_high, scale_mode, default_scale="log")
+                    _map_with_scale(
+                        float(row[0]), c_low, c_high, scale_mode, default_scale="log"
+                    )
                 ],
                 "model__solver": ["lbfgs"],
             }
@@ -492,15 +512,16 @@ def choose_param_lhs_candidates(
             max_iter=5000,
             class_weight="balanced",
             random_state=RNG_SEED,
-            penalty="l1",
+            l1_ratio=1.0,
             solver="saga",
-            n_jobs=1,
         )
         return [
             {
                 "model": [model],
                 "model__C": [
-                    _map_with_scale(float(row[0]), c_low, c_high, scale_mode, default_scale="log")
+                    _map_with_scale(
+                        float(row[0]), c_low, c_high, scale_mode, default_scale="log"
+                    )
                 ],
             }
             for row in unit
@@ -517,7 +538,13 @@ def choose_param_lhs_candidates(
                     {
                         "model": [Ridge(random_state=RNG_SEED)],
                         "model__alpha": [
-                            _map_with_scale(float(row[1]), 1e-5, 1e2, scale_mode, default_scale="log")
+                            _map_with_scale(
+                                float(row[1]),
+                                1e-5,
+                                1e2,
+                                scale_mode,
+                                default_scale="log",
+                            )
                         ],
                     }
                 )
@@ -526,7 +553,13 @@ def choose_param_lhs_candidates(
                     {
                         "model": [Lasso(random_state=RNG_SEED, max_iter=10000)],
                         "model__alpha": [
-                            _map_with_scale(float(row[1]), 1e-6, 1e-1, scale_mode, default_scale="log")
+                            _map_with_scale(
+                                float(row[1]),
+                                1e-6,
+                                1e-1,
+                                scale_mode,
+                                default_scale="log",
+                            )
                         ],
                     }
                 )
@@ -541,7 +574,7 @@ def choose_param_lhs_candidates(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -1, num=alpha_count),
+                        alphas=np.logspace(-6, -2, num=alpha_count),
                     )
                 ],
             }
@@ -558,10 +591,10 @@ def choose_param_lhs_candidates(
         n_est_low, n_est_high = (80, 350) if small else (120, 640)
         base_model = (
             RandomForestClassifier(
-                random_state=RNG_SEED, n_jobs=1, class_weight="balanced"
+                random_state=RNG_SEED, n_jobs=model_n_jobs, class_weight="balanced"
             )
             if task == "classification"
-            else RandomForestRegressor(random_state=RNG_SEED, n_jobs=1)
+            else RandomForestRegressor(random_state=RNG_SEED, n_jobs=model_n_jobs)
         )
         unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
         out: list[dict[str, list[Any]]] = []
@@ -573,7 +606,11 @@ def choose_param_lhs_candidates(
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[0]), n_est_low, n_est_high, scale_mode, default_scale="linear"
+                                    float(row[0]),
+                                    n_est_low,
+                                    n_est_high,
+                                    scale_mode,
+                                    default_scale="linear",
                                 )
                             )
                         )
@@ -582,7 +619,11 @@ def choose_param_lhs_candidates(
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[1]), depth_low, depth_high, scale_mode, default_scale="linear"
+                                    float(row[1]),
+                                    depth_low,
+                                    depth_high,
+                                    scale_mode,
+                                    default_scale="linear",
                                 )
                             )
                         )
@@ -591,7 +632,11 @@ def choose_param_lhs_candidates(
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[2]), 1.0, 12.0, scale_mode, default_scale="linear"
+                                    float(row[2]),
+                                    1.0,
+                                    12.0,
+                                    scale_mode,
+                                    default_scale="linear",
                                 )
                             )
                         )
@@ -609,7 +654,6 @@ def choose_param_lhs_candidates(
 
         use_gpu = bool(xgb_use_gpu) if xgb_use_gpu is not None else xgb_gpu_available()
         common = {
-            "n_estimators": 100 if not small else 60,  # reduced for tuning speed
             "random_state": RNG_SEED,
             "n_jobs": 1,
             "tree_method": "hist",
@@ -621,29 +665,53 @@ def choose_param_lhs_candidates(
             else XGBRegressor(eval_metric="rmse", **common)
         )
         depth_low, depth_high = (2, 8) if small else (3, 10)
-        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
+        n_est_low, n_est_high = (60, 200) if small else (100, 500)
+        unit = _lhs_unit(n_points=n_points, n_dims=5, seed=RNG_SEED)
         out: list[dict[str, list[Any]]] = []
         for row in unit:
             out.append(
                 {
                     "model": [base_model],
+                    "model__n_estimators": [
+                        int(
+                            round(
+                                _map_with_scale(
+                                    float(row[0]),
+                                    n_est_low,
+                                    n_est_high,
+                                    scale_mode,
+                                    default_scale="linear",
+                                )
+                            )
+                        )
+                    ],
                     "model__max_depth": [
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[0]), depth_low, depth_high, scale_mode, default_scale="linear"
+                                    float(row[1]),
+                                    depth_low,
+                                    depth_high,
+                                    scale_mode,
+                                    default_scale="linear",
                                 )
                             )
                         )
                     ],
                     "model__learning_rate": [
-                        _map_with_scale(float(row[1]), 0.01, 0.3, scale_mode, default_scale="log")
+                        _map_with_scale(
+                            float(row[2]), 0.01, 0.3, scale_mode, default_scale="log"
+                        )
                     ],
                     "model__subsample": [
-                        _map_with_scale(float(row[2]), 0.6, 1.0, scale_mode, default_scale="linear")
+                        _map_with_scale(
+                            float(row[3]), 0.6, 1.0, scale_mode, default_scale="linear"
+                        )
                     ],
                     "model__colsample_bytree": [
-                        _map_with_scale(float(row[3]), 0.6, 1.0, scale_mode, default_scale="linear")
+                        _map_with_scale(
+                            float(row[4]), 0.6, 1.0, scale_mode, default_scale="linear"
+                        )
                     ],
                 }
             )

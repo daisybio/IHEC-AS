@@ -324,7 +324,16 @@ def write_subset_html_report(
 
           const dist    = tr.response_distribution || {{}};
           const psiVals = dist.psi_sample || [];
-          plotPsiHistogram(p4.id, psiVals, 'Response (PSI) distribution', []);
+          const thr = dist.binarization_thresholds || [];
+          const regShapes = (thr.length === 2) ? [
+            {{ type: 'rect', x0: 0, x1: thr[0], y0: 0, y1: 1, yref: 'paper',
+               fillcolor: 'rgba(180,0,0,0.10)', line: {{ width: 0 }},
+               layer: 'below' }},
+            {{ type: 'rect', x0: thr[1], x1: 1, y0: 0, y1: 1, yref: 'paper',
+               fillcolor: 'rgba(180,0,0,0.10)', line: {{ width: 0 }},
+               layer: 'below' }}
+          ] : [];
+          plotPsiHistogram(p4.id, psiVals, 'Response (PSI) distribution (shaded = excluded extremes)', regShapes);
 
         }} else {{
           // Classification: predicted probability histograms + threshold lines.
@@ -388,10 +397,13 @@ def write_subset_html_report(
           const psiVals = dist.psi_sample || [];
           const thr  = dist.binarization_thresholds || [];
           const shapes = (thr.length === 2) ? [
+            {{ type: 'rect', x0: thr[0], x1: thr[1], y0: 0, y1: 1, yref: 'paper',
+               fillcolor: 'rgba(180,0,0,0.10)', line: {{ width: 0 }},
+               layer: 'below' }},
             {{ type: 'line', x0: thr[0], x1: thr[0], y0: 0, y1: 1, yref: 'paper', line: {{ color: '#c00', width: 2, dash: 'dash' }} }},
             {{ type: 'line', x0: thr[1], x1: thr[1], y0: 0, y1: 1, yref: 'paper', line: {{ color: '#c00', width: 2, dash: 'dash' }} }}
           ] : [];
-          plotPsiHistogram(p4.id, psiVals, 'Response (PSI) distribution with binarization thresholds', shapes);
+          plotPsiHistogram(p4.id, psiVals, 'Response (PSI) distribution (shaded = excluded mid-range)', shapes);
         }}
       }}
     }}
