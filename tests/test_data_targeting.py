@@ -11,7 +11,7 @@ class TestBuildTargets:
     """Test target construction for regression and classification."""
 
     def test_regression_target_preserves_psi(self):
-        """Verify regression target is raw PSI values."""
+        """Verify regression target uses raw PSI (no logit) for kept rows."""
         df = pd.DataFrame(
             {
                 "PSI": [0.1, 0.5, 0.9, 0.3, 0.7],
@@ -22,10 +22,10 @@ class TestBuildTargets:
             df, "regression", low_thr=1 / 3, high_thr=2 / 3, use_logit=False
         )
 
+        # Only PSI=0.5 is in (1/3, 2/3); y should equal the raw PSI of kept rows.
         assert (
-            y == df["PSI"].astype(float).to_numpy()
-        ).all(), "regression target does not match raw PSI"
-        assert len(df_out) == len(df), "dataframe shrunk unexpectedly"
+            y == df_out["PSI"].astype(float).to_numpy()
+        ).all(), "regression target does not match raw PSI of kept rows"
 
     def test_classification_binarization(self):
         """Verify classification creates correct binary labels."""
@@ -91,8 +91,8 @@ class TestBuildTargets:
         assert len(df_out) == 0, "expected empty dataframe"
         assert len(y) == 0, "expected empty labels"
 
-    def test_regression_all_rows_kept(self):
-        """Verify regression uses all rows regardless of PSI value."""
+    def test_regression_filters_to_middle_zone(self):
+        """Verify regression keeps only rows with low_thr < PSI < high_thr."""
         df = pd.DataFrame(
             {
                 "PSI": [0.1, 0.5, 0.9, 0.05, 0.95],
@@ -100,8 +100,9 @@ class TestBuildTargets:
         )
         df_out, y = build_targets(df, "regression", low_thr=1 / 3, high_thr=2 / 3)
 
-        assert len(df_out) == len(df), "regression should keep all rows"
-        assert len(y) == len(df), "regression should have labels for all rows"
+        # Only PSI=0.5 is strictly inside (1/3, 2/3).
+        assert len(df_out) == 1, f"expected 1 row in middle zone, got {len(df_out)}"
+        assert len(y) == 1, "y length should match filtered rows"
 
     def test_nan_psi_values(self):
         """Verify NaN PSI values are handled."""
