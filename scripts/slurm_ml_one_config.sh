@@ -2,8 +2,8 @@
 #SBATCH -J ML_CFG
 #SBATCH --error splicing_ml/output/ml_error_logs/%x.%A_%a.%N.%j.txt
 #SBATCH --output splicing_ml/output/ml_logs/%x.%A_%a.%N.%j.txt
-#SBATCH -p shared-gpu
-#SBATCH --gres=gpu:1
+#SBATCH -p shared-cpu
+#####SBATCH --gres=gpu:1
 #SBATCH --qos=limitgpus
 #SBATCH -c 12
 #SBATCH --mem 24G
@@ -40,12 +40,11 @@ ENV_NAME="${4:-}"
 WANDB_PROJECT="${5:-}"
 
 if [[ -n "$ENV_NAME" ]]; then
-  if ! command -v mamba >/dev/null 2>&1; then
-    echo "[ERROR] mamba command not found on compute node while ENV_NAME was provided" >&2
-    exit 127
-  fi
-  eval "$(mamba shell hook --shell bash)"
-  mamba activate "$ENV_NAME"
+  # SLURM does not source .bashrc, so load the environment module that
+  # provides mamba before trying to activate the conda environment.
+  module load miniforge3/24.7.1
+  eval "$(conda shell.bash hook)"
+  conda activate "$ENV_NAME"
 fi
 
 readarray -t CONFIG_LINES < "$CONFIG_TSV"

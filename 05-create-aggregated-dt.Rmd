@@ -113,12 +113,13 @@ cols_to_add <- c(
 aggregated_dt[event_dt, on = .(ID), (cols_to_add) := mget(cols_to_add)]
 # also add the protocol
 aggregated_dt[file_metadata, on = .(uuid), protocol := experiment_type]
-# add the ontology term
+# add the ontology term and the project
 aggregated_dt[
   metadata,
   on = c(IHEC = "epirr_id_without_version"),
-  ontology := factor(
-    harmonized_sample_ontology_term_high_order_fig1
+  c("ontology", "project") := .(
+    factor(harmonized_sample_ontology_term_high_order_fig1),
+    factor(project)
   )
 ]
 
@@ -169,67 +170,6 @@ aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
 
 # # add the max promoter and summed enhancer to the aggregated table
 # aggregated_dt[promoter_merged, on = .(IHEC, gene_id), c("summed_enhancer", "max_promoter") := .(summed_enhancer, max_promoter)]
-```
-
-```{r plot features, eval = FALSE}
-library(patchwork)
-library(ggcorrplot)
-
-# TODO: for each transcript filter, plot the distribution of the features, for each event type, and for the different positions (upstream_other_region, event_name, downstream_other_region)
-long_features <- melt(aggregated_dt, id.vars = c("Event Type", "transcript_filter", "IHEC", "uuid", "ID", "gene_id", "Variability"), variable.name = "feature")
-long_features[, c("mark", "position") := tstrsplit(feature, ";", fixed = TRUE)]
-feature_mapping <- data.table(feature = levels(long_features$feature))
-feature_mapping[, c("mark", "position") := tstrsplit(feature, ";", fixed = TRUE)]
-feature_mapping[startsWith(feature, "distance"), c("position") := sub("distance_", "", feature)]
-feature_mapping[startsWith(feature, "distance"), mark := "distance"]
-feature_mapping[feature == "3ss", c("mark", "position") := list("ss", "3prime")]
-feature_mapping[feature == "5ss", c("mark", "position") := list("ss", "5prime")]
-feature_mapping[feature == "3ssdown", c("mark", "position") := list("ss", "3prime_downstream")]
-feature_mapping[feature == "5ssup", c("mark", "position") := list("ss", "5prime_upstream")]
-long_features[feature_mapping, on = "feature", c("mark", "position") := .(mark, position)]
-
-this_transcript_filter <- transcript_filters[1]
-this_event_type <- to_analyze[1]
-
-for (this_transcript_filter in transcript_filters) {
-  for (this_event_type in to_analyze) {
-    # make a correlation plot of the features for this transcript filter and event type
-    feature_cols <- feature_mapping[, feature]
-    cor_mat <- cor(aggregated_dt[transcript_filter == this_transcript_filter &
-      `Event Type` == this_event_type, ..feature_cols], method = "spearman", use = "pairwise")
-    cor_plot <- ggcorrplot(cor_mat, hc.order = TRUE, title = paste(this_transcript_filter, this_event_type))
-    print(cor_plot)
-
-    # plot the distributions of the features for this transcript filter and event type, faceted by mark and position
-    histone_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
-      `Event Type` == this_event_type &
-      mark %in% histone_marks], aes(x = value, color = mark)) +
-      geom_density() +
-      facet_grid(mark ~ position, scales = "free") +
-      labs(title = paste(this_transcript_filter, this_event_type)) +
-      scale_x_log10()
-    DNAm_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
-      `Event Type` == this_event_type &
-      mark %in% c("DNAm", "CpGs")], aes(x = value, color = mark)) +
-      geom_density() +
-      facet_grid(mark ~ position, scales = "free") +
-      labs(title = paste(this_transcript_filter, this_event_type))
-    intrinsic_plot <- ggplot(long_features[transcript_filter == this_transcript_filter &
-      `Event Type` == this_event_type &
-      mark %in% c("distance", "width", "gene_expression")], aes(x = value, color = mark)) +
-      geom_density() +
-      facet_wrap(mark ~ position, scales = "free") +
-      labs(title = paste(this_transcript_filter, this_event_type)) +
-      scale_x_log10()
-    ss_psi <- ggplot(long_features[transcript_filter == this_transcript_filter &
-      `Event Type` == this_event_type &
-      mark %in% c("ss", "PSI")], aes(x = value, color = mark)) +
-      geom_density() +
-      facet_wrap(mark ~ position, scales = "free") +
-      labs(title = paste(this_transcript_filter, this_event_type))
-    print((histone_plot / DNAm_plot) | (ss_psi / intrinsic_plot))
-  }
-}
 ```
 
 ```{r, write-filtered}

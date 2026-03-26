@@ -18,7 +18,9 @@ class TestBuildTargets:
                 "other": [1, 2, 3, 4, 5],
             }
         )
-        df_out, y = build_targets(df, "regression", low_thr=1 / 3, high_thr=2 / 3)
+        df_out, y = build_targets(
+            df, "regression", low_thr=1 / 3, high_thr=2 / 3, use_logit=False
+        )
 
         assert (
             y == df["PSI"].astype(float).to_numpy()
@@ -65,17 +67,17 @@ class TestBuildTargets:
         df = pd.DataFrame(
             {
                 "PSI": [
-                    1 / 3,  # exactly low_thr: kept (via >= high_thr check)
+                    1 / 3,  # exactly low_thr: kept (inclusive lower boundary)
                     2 / 3,  # exactly high_thr: kept
                 ],
             }
         )
         df_out, y = build_targets(df, "classification", low_thr=1 / 3, high_thr=2 / 3)
 
-        # At exact boundaries: low_thr is not included in high-class,
-        # high_thr is included in high-class.
-        assert len(df_out) == 1, "expected 1 row at exact threshold"
-        assert y[0] == 1, "exact high_thr should be class 1"
+        # At exact boundaries: both are kept (inclusive boundaries).
+        # PSI=1/3 <= low_thr gets class 0, PSI=2/3 >= high_thr gets class 1.
+        assert len(df_out) == 2, "expected 2 rows at exact thresholds"
+        assert (y == np.array([0, 1])).all(), "labels should be [0, 1]"
 
     def test_empty_classification_input(self):
         """Verify handling of data with no extreme values."""
