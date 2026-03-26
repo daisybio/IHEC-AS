@@ -55,7 +55,7 @@ METADATA_COLUMNS = {
 }
 
 # Central model registry used by parser defaults/choices and runtime validation.
-ALL_MODEL_TYPES: tuple[str, ...] = ("linear", "lasso", "rf", "xgb", "beta")
+ALL_MODEL_TYPES: tuple[str, ...] = ("linear", "elasticnet", "rf", "xgb", "beta")
 # Smoke mode covers all available model types.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
 

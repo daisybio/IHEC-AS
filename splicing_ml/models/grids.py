@@ -30,7 +30,17 @@ __all__ = [
     "_map_with_scale",
     "_axis_count_from_budget",
     "_pick_evenly_spaced",
+    # Shared regularisation grids (alpha and C are reciprocals of each other).
+    "_ALPHA_GRID",
+    "_C_GRID",
+    "_L1_RATIO_GRID",
 ]
+
+# Shared regularisation grids used by both ElasticNetCV (regression) and
+# LogisticRegressionCV (classification).  C = 1 / alpha.
+_ALPHA_GRID: np.ndarray = np.logspace(-6, 2, num=100)
+_C_GRID: np.ndarray = 1.0 / _ALPHA_GRID
+_L1_RATIO_GRID: list[float] = [0.0, 0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +140,7 @@ def build_param_candidates(
     Parameters
     ----------
     model_name : str
-        One of: "linear", "lasso", "beta", "rf", "xgb".
+        One of: "linear", "elasticnet", "beta", "rf", "xgb".
     task : str
         "regression" or "classification".
     n_samples, n_features : int
@@ -210,19 +220,16 @@ def choose_param_grid(
     """
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.linear_model import (
-        Lasso,
-        LassoCV,
+        ElasticNetCV,
         LinearRegression,
         LogisticRegression,
         LogisticRegressionCV,
-        Ridge,
     )
 
     from .beta import BetaRegressor
     from .xgb_utils import xgb_gpu_available
 
     small = n_samples < 5000
-    high_dim = n_features > n_samples
     vlog(
         verbose,
         f"Choosing param grid for model={model_name}, task={task}, "
@@ -231,39 +238,28 @@ def choose_param_grid(
     )
 
     if model_name == "linear" and task == "classification":
-        c_base = max(0.01, min(10.0, n_samples / 1000.0))
-        c_candidates = [
-            c_base / 30.0,
-            c_base / 10.0,
-            c_base,
-            c_base * 10.0,
-            c_base * 30.0,
-        ]
-        c_grid = _pick_evenly_spaced(c_candidates, max(1, min(grid_size, 5)))
         return [
             {
                 "model": [
                     LogisticRegression(
+                        C=np.inf,
                         max_iter=5000,
                         class_weight="balanced",
                         random_state=RNG_SEED,
                     )
                 ],
-                "model__C": c_grid,
-                "model__solver": ["lbfgs"],
             }
         ]
 
-    if model_name == "lasso" and task == "classification":
-        # Lasso-equivalent for classification: L1-regularised logistic regression.
-        # LogisticRegressionCV sweeps 100 C values internally (one fit), analogous
-        # to LassoCV for regression.
+    if model_name == "elasticnet" and task == "classification":
+        # ElasticNet-equivalent for classification: LogisticRegressionCV with
+        # elastic-net penalty, sweeping C and l1_ratio via built-in CV.
         return [
             {
                 "model": [
                     LogisticRegressionCV(
-                        Cs=100,
-                        l1_ratios=(1,),
+                        Cs=_C_GRID,
+                        l1_ratios=_L1_RATIO_GRID,
                         solver="saga",
                         max_iter=5000,
                         class_weight="balanced",
@@ -276,35 +272,18 @@ def choose_param_grid(
         ]
 
     if model_name == "linear" and task == "regression":
-        if high_dim:
-            ridge_alpha = _pick_evenly_spaced(
-                [0.01, 0.1, 1.0, 10.0, 100.0], max(1, min(grid_size, 5))
-            )
-            lasso_alpha = _pick_evenly_spaced(
-                [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1],
-                max(1, min(grid_size, 8)),
-            )
-            return [
-                {
-                    "model": [Ridge(random_state=RNG_SEED)],
-                    "model__alpha": ridge_alpha,
-                },
-                {
-                    "model": [Lasso(random_state=RNG_SEED, max_iter=10000)],
-                    "model__alpha": lasso_alpha,
-                },
-            ]
         return [{"model": [LinearRegression(n_jobs=1)]}]
 
-    if model_name == "lasso" and task == "regression":
+    if model_name == "elasticnet" and task == "regression":
         return [
             {
                 "model": [
-                    LassoCV(
+                    ElasticNetCV(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -2, num=100),
+                        alphas=_ALPHA_GRID,
+                        l1_ratio=_L1_RATIO_GRID,
                     )
                 ],
             }
@@ -457,12 +436,10 @@ def choose_param_lhs_candidates(
     """
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.linear_model import (
-        Lasso,
-        LassoCV,
+        ElasticNetCV,
         LinearRegression,
         LogisticRegression,
         LogisticRegressionCV,
-        Ridge,
     )
 
     from .beta import BetaRegressor
@@ -470,7 +447,6 @@ def choose_param_lhs_candidates(
 
     n_points = max(1, int(budget))
     small = n_samples < 5000
-    high_dim = n_features > n_samples
     vlog(
         verbose,
         f"Choosing LHS candidate space model={model_name}, task={task}, "
@@ -479,36 +455,28 @@ def choose_param_lhs_candidates(
     )
 
     if model_name == "linear" and task == "classification":
-        c_base = max(0.01, min(10.0, n_samples / 1000.0))
-        c_low, c_high = c_base / 100.0, c_base * 100.0
-        unit = _lhs_unit(n_points=n_points, n_dims=1, seed=RNG_SEED)
-        model = LogisticRegression(
-            max_iter=5000,
-            class_weight="balanced",
-            random_state=RNG_SEED,
-        )
         return [
             {
-                "model": [model],
-                "model__C": [
-                    _map_with_scale(
-                        float(row[0]), c_low, c_high, scale_mode, default_scale="log"
+                "model": [
+                    LogisticRegression(
+                        C=np.inf,
+                        max_iter=5000,
+                        class_weight="balanced",
+                        random_state=RNG_SEED,
                     )
                 ],
-                "model__solver": ["lbfgs"],
             }
-            for row in unit
         ]
 
-    if model_name == "lasso" and task == "classification":
-        # LogisticRegressionCV sweeps 100 C values internally (one fit), analogous
-        # to LassoCV for regression — no LHS sampling needed.
+    if model_name == "elasticnet" and task == "classification":
+        # LogisticRegressionCV sweeps C and l1_ratio values internally (one fit)
+        # — no LHS sampling needed.
         return [
             {
                 "model": [
                     LogisticRegressionCV(
-                        Cs=100,
-                        l1_ratios=(1,),
+                        Cs=_C_GRID,
+                        l1_ratios=_L1_RATIO_GRID,
                         solver="saga",
                         max_iter=5000,
                         class_weight="balanced",
@@ -521,52 +489,18 @@ def choose_param_lhs_candidates(
         ]
 
     if model_name == "linear" and task == "regression":
-        if not high_dim:
-            return [{"model": [LinearRegression(n_jobs=1)]}]
-        unit = _lhs_unit(n_points=n_points, n_dims=2, seed=RNG_SEED)
-        out: list[dict[str, list[Any]]] = []
-        for row in unit:
-            if float(row[0]) < 0.5:
-                out.append(
-                    {
-                        "model": [Ridge(random_state=RNG_SEED)],
-                        "model__alpha": [
-                            _map_with_scale(
-                                float(row[1]),
-                                1e-5,
-                                1e2,
-                                scale_mode,
-                                default_scale="log",
-                            )
-                        ],
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "model": [Lasso(random_state=RNG_SEED, max_iter=10000)],
-                        "model__alpha": [
-                            _map_with_scale(
-                                float(row[1]),
-                                1e-6,
-                                1e-1,
-                                scale_mode,
-                                default_scale="log",
-                            )
-                        ],
-                    }
-                )
-        return out
+        return [{"model": [LinearRegression(n_jobs=1)]}]
 
-    if model_name == "lasso" and task == "regression":
+    if model_name == "elasticnet" and task == "regression":
         return [
             {
                 "model": [
-                    LassoCV(
+                    ElasticNetCV(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -2, num=100),
+                        alphas=_ALPHA_GRID,
+                        l1_ratio=_L1_RATIO_GRID,
                     )
                 ],
             }

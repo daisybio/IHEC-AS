@@ -108,6 +108,7 @@ class WandbTracker:
         task: str,
         x_train: Any,
         x_test: Any,
+        train_scores: dict[str, float] | None = None,
     ) -> None:
         if self._child_run is None:
             return
@@ -119,6 +120,11 @@ class WandbTracker:
             if isinstance(v, (int, float)) and np.isfinite(float(v))
         }
         payload[f"{model_name}/fold_id"] = int(fold_id)
+        # Log training scores (prefixed train/) to expose overfitting gap.
+        if train_scores:
+            for k, v in train_scores.items():
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                    payload[f"{model_name}/train_{k}"] = float(v)
         self._child_run.log(payload)
 
         with contextlib.suppress(Exception):

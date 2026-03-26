@@ -154,6 +154,7 @@ def _safe_empty_payload(
         "confusion_matrix": None,
         "confusion_by_model": {},
         "roc_by_model": {},
+        "pr_by_model": {},
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }
@@ -285,6 +286,42 @@ def _build_roc_payload(
             "auc": auc_val,
         }
     return roc_by_model
+
+
+def _build_pr_payload(
+    fold_rows: list[dict[str, Any]],
+    model_order: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Build per-model PR curve data by pooling predictions across folds.
+
+    Returns a dict keyed by model name, each value containing
+    ``precision``, ``recall`` (lists), and ``avg_precision`` (float).
+    Models with fewer than two classes in the pooled labels are skipped.
+    """
+    from sklearn.metrics import average_precision_score, precision_recall_curve
+
+    pr_by_model: dict[str, dict[str, Any]] = {}
+    for model_name in model_order:
+        m_rows = [r for r in fold_rows if str(r.get("model_name", "")) == model_name]
+        all_y_true: list[float] = []
+        all_y_pred: list[float] = []
+        for r in m_rows:
+            all_y_true.extend(r.get("y_true", []))
+            all_y_pred.extend(r.get("y_pred", []))
+        if not all_y_true:
+            continue
+        yt = np.asarray(all_y_true, dtype=int)
+        yp = np.asarray(all_y_pred, dtype=float)
+        if len(np.unique(yt)) < 2:
+            continue
+        precision, recall, _ = precision_recall_curve(yt, yp)
+        ap = float(average_precision_score(yt, yp))
+        pr_by_model[model_name] = {
+            "precision": precision.tolist(),
+            "recall": recall.tolist(),
+            "avg_precision": ap,
+        }
+    return pr_by_model
 
 
 def _build_classification_threshold_payload(
@@ -491,6 +528,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
             )
         )
         roc_by_model = _build_roc_payload(fold_rows, model_order)
+        pr_by_model = _build_pr_payload(fold_rows, model_order)
 
     return {
         "task": task,
@@ -514,6 +552,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "confusion_matrix": None,
         "confusion_by_model": confusion_by_model,
         "roc_by_model": roc_by_model,
+        "pr_by_model": pr_by_model,
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }

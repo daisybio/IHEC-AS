@@ -5,13 +5,14 @@ from __future__ import annotations
 Public entry point: ``fit_best_estimator`` — dispatches to one of three
 strategy helpers based on model type:
 
-- ``_fit_lasso_cv``   : LassoCV self-selects alpha via its own internal CV.
-- ``_fit_beta``       : BetaRegressor has no hyperparameters; uses
-                        ``sklearn.model_selection.cross_validate`` to score
-                        then refits on the full training fold.
-- ``_fit_grid_search``: All other models use GridSearchCV (or LHS-based
-                        GridSearchCV) with optional GPU retry and XGBoost
-                        post-search refit.
+- ``_fit_elasticnet_cv``  : ElasticNetCV / LogisticRegressionCV self-select
+                            alpha (or C) and l1_ratio via built-in CV.
+- ``_fit_beta``           : BetaRegressor has no hyperparameters; uses
+                            ``sklearn.model_selection.cross_validate`` to score
+                            then refits on the full training fold.
+- ``_fit_grid_search``    : All other models use GridSearchCV (or LHS-based
+                            GridSearchCV) with optional GPU retry and XGBoost
+                            post-search refit.
 """
 
 import math
@@ -23,7 +24,7 @@ import pandas as pd
 from joblib import parallel_backend
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import ElasticNetCV
 from sklearn.exceptions import FitFailedWarning
 from sklearn.model_selection import GridSearchCV, cross_validate
 from sklearn.pipeline import Pipeline
@@ -32,7 +33,7 @@ from ..config import RNG_SEED
 from ..metrics import regression_metrics
 from ..utils import safe_json, sanitize_best_params, vlog
 from .beta import BetaRegressor, _inverse_logit
-from .grids import build_param_candidates, _use_lhs_strategy
+from .grids import build_param_candidates, _use_lhs_strategy, _ALPHA_GRID, _C_GRID, _L1_RATIO_GRID
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference, xgb_gpu_available
 
 __all__ = ["fit_best_estimator"]
@@ -57,7 +58,7 @@ def metric_key(task: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _fit_lasso_cv(
+def _fit_elasticnet_cv(
     task: str,
     x_train: pd.DataFrame,
     y_train: np.ndarray,
@@ -66,22 +67,23 @@ def _fit_lasso_cv(
     max_cores: int,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
-    """Fit LassoCV — which handles alpha selection via its own built-in CV.
+    """Fit ElasticNetCV — alpha and l1_ratio selection via built-in CV.
 
     The same grouped inner-fold splits used by all other models are passed
-    directly to LassoCV so fold assignments are consistent across models.
-    Always sweeps 100 alphas on a log scale.
+    directly to ElasticNetCV so fold assignments are consistent across models.
+    Always sweeps _ALPHA_GRID alphas and _L1_RATIO_GRID l1_ratios.
     """
     estimator = Pipeline(
         steps=[
             ("prep", preprocessor),
             (
                 "model",
-                LassoCV(
+                ElasticNetCV(
                     random_state=RNG_SEED,
                     max_iter=20000,
                     cv=inner_cv,
-                    alphas=np.logspace(-6, -2, num=100),
+                    alphas=_ALPHA_GRID,
+                    l1_ratio=_L1_RATIO_GRID,
                     n_jobs=max_cores,
                 ),
             ),
@@ -90,7 +92,7 @@ def _fit_lasso_cv(
     estimator.fit(x_train, y_train)
     model = estimator.named_steps["model"]
 
-    # Extract cross-validated RMSE from the MSE path produced by LassoCV.
+    # Extract cross-validated RMSE from the MSE path produced by ElasticNetCV.
     mse_path = np.asarray(getattr(model, "mse_path_", np.array([])))
     best_score = float("nan")
     if mse_path.size:
@@ -98,26 +100,28 @@ def _fit_lasso_cv(
         best_score = -float(np.sqrt(best_mse))
 
     alpha = float(getattr(model, "alpha_", np.nan))
+    l1_ratio = float(getattr(model, "l1_ratio_", np.nan))
     n_alphas = int(np.asarray(getattr(model, "alphas_", np.array([]))).size)
     vlog(
         verbose,
-        f"Search complete model=lasso, task={task}, strategy=lassocv, "
-        f"candidates={n_alphas if n_alphas > 0 else 100}, best_score={best_score:.6f}",
+        f"Search complete model=elasticnet, task={task}, strategy=elasticnetcv, "
+        f"candidates={n_alphas if n_alphas > 0 else len(_ALPHA_GRID)}, best_score={best_score:.6f}",
     )
     return estimator, {
         "best_params": sanitize_best_params(
             {
                 "model": model,
                 "model__alpha": alpha,
+                "model__l1_ratio": l1_ratio,
                 "model__cv_folds": int(len(inner_cv)),
-                "model__alpha_count": 100,
+                "model__alpha_count": len(_ALPHA_GRID),
             }
         ),
         "best_score": best_score,
     }
 
 
-def _fit_logistic_lasso_cv(
+def _fit_logistic_elasticnet_cv(
     task: str,
     x_train: pd.DataFrame,
     y_train: np.ndarray,
@@ -126,11 +130,12 @@ def _fit_logistic_lasso_cv(
     max_cores: int,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
-    """Fit LogisticRegressionCV — C selection via its own built-in CV.
+    """Fit LogisticRegressionCV — C and l1_ratio selection via built-in CV.
 
-    Mirrors the regression LassoCV path: the same grouped inner-fold splits
+    Mirrors the regression ElasticNetCV path: the same grouped inner-fold splits
     are passed directly so fold assignments are consistent across models, and
-    n_jobs is set to max_cores.  Always sweeps 100 C values on a log scale.
+    n_jobs is set to max_cores.  Sweeps _C_GRID C values and _L1_RATIO_GRID
+    l1_ratios (C = 1 / alpha, reciprocal of _ALPHA_GRID).
     """
     from sklearn.linear_model import LogisticRegressionCV
 
@@ -140,8 +145,8 @@ def _fit_logistic_lasso_cv(
             (
                 "model",
                 LogisticRegressionCV(
-                    Cs=100,
-                    l1_ratios=(1,),
+                    Cs=_C_GRID,
+                    l1_ratios=_L1_RATIO_GRID,
                     solver="saga",
                     max_iter=5000,
                     class_weight="balanced",
@@ -156,8 +161,9 @@ def _fit_logistic_lasso_cv(
     estimator.fit(x_train, y_train)
     model = estimator.named_steps["model"]
 
-    # Best C: scalar float with use_legacy_attributes=False.
+    # Best C and l1_ratio: scalar floats with use_legacy_attributes=False.
     best_c = float(np.asarray(getattr(model, "C_", np.nan)).ravel()[0])
+    l1_ratio = float(np.asarray(getattr(model, "l1_ratio_", np.nan)).ravel()[0])
     n_cs = int(np.asarray(getattr(model, "Cs_", np.array([]))).size)
 
     # Best CV score: scores_ is dict {class: array(n_folds, n_Cs)} (legacy) or
@@ -177,16 +183,17 @@ def _fit_logistic_lasso_cv(
 
     vlog(
         verbose,
-        f"Search complete model=lasso, task={task}, strategy=logisticcv, "
-        f"candidates={n_cs if n_cs > 0 else 100}, best_score={best_score:.6f}",
+        f"Search complete model=elasticnet, task={task}, strategy=logisticelasticnetcv, "
+        f"candidates={n_cs if n_cs > 0 else len(_C_GRID)}, best_score={best_score:.6f}",
     )
     return estimator, {
         "best_params": sanitize_best_params(
             {
                 "model": model,
                 "model__C": best_c,
+                "model__l1_ratio": l1_ratio,
                 "model__cv_folds": int(len(inner_cv)),
-                "model__Cs_count": 100,
+                "model__Cs_count": len(_C_GRID),
             }
         ),
         "best_score": best_score,
@@ -354,7 +361,7 @@ def _fit_grid_search(
     xgb_use_gpu: bool | None,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
-    """Fit all non-Lasso, non-Beta models via GridSearchCV.
+    """Fit all non-ElasticNet, non-Beta models via GridSearchCV.
 
     Handles:
     - Parallelism: limits XGBoost GPU jobs to 1 to avoid VRAM contention.
@@ -508,7 +515,7 @@ def fit_best_estimator(
     """Tune hyperparameters via grouped inner CV and return the best estimator.
 
     Dispatches to one of three strategies based on model_name:
-    - "lasso" (regression): LassoCV self-selects alpha.
+    - "elasticnet": ElasticNetCV / LogisticRegressionCV self-select alpha (C) and l1_ratio.
     - "beta": no hyperparameters; cross_validate + refit.
     - All others: GridSearchCV with grid or LHS candidates.
 
@@ -518,10 +525,10 @@ def fit_best_estimator(
         best_estimator is a fitted sklearn Pipeline ready for outer-fold eval.
         tuning_info contains best_params, best_score, and model-specific extras.
     """
-    # LassoCV / LogisticRegressionCV: self-select regularisation via built-in CV;
+    # ElasticNetCV / LogisticRegressionCV: self-select regularisation via built-in CV;
     # bypass GridSearchCV and pass grouped inner splits + n_jobs directly.
-    if task == "regression" and model_name == "lasso":
-        return _fit_lasso_cv(
+    if task == "regression" and model_name == "elasticnet":
+        return _fit_elasticnet_cv(
             task=task,
             x_train=x_train,
             y_train=y_train,
@@ -531,8 +538,8 @@ def fit_best_estimator(
             verbose=verbose,
         )
 
-    if task == "classification" and model_name == "lasso":
-        return _fit_logistic_lasso_cv(
+    if task == "classification" and model_name == "elasticnet":
+        return _fit_logistic_elasticnet_cv(
             task=task,
             x_train=x_train,
             y_train=y_train,

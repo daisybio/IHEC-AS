@@ -129,33 +129,61 @@ _PLOTLY_JS_HELPERS = """
         );
     }
 
-    // ── ROC curve ────────────────────────────────────────────────────────────
-    function plotRocCurve(divId, rocByModel, palette) {
+    // ── ROC + PR combined panel (shared legend) ────────────────────────────
+    function plotRocPrCurves(divId, rocByModel, prByModel, palette) {
         const el = document.getElementById(divId);
         if (!el) return;
-        const models = Object.keys(rocByModel || {});
-        if (!models.length) { el.innerHTML = '<p>No ROC data available.</p>'; return; }
-        const traces = models.map((m, i) => {
-            const d = rocByModel[m];
-            const c = palette[i % palette.length];
-            return {
-                x: d.fpr, y: d.tpr, mode: 'lines', type: 'scatter',
-                name: `${m} (AUC=${d.auc.toFixed(3)})`,
-                line: { color: c, width: 2 }
-            };
-        });
-        traces.push({
-            x: [0, 1], y: [0, 1], mode: 'lines', type: 'scatter',
-            name: 'Random', line: { color: '#999', width: 1, dash: 'dot' },
-            hoverinfo: 'skip', showlegend: false
-        });
+      const roc = rocByModel || {};
+      const pr = prByModel || {};
+      const modelSet = new Set([...Object.keys(roc), ...Object.keys(pr)]);
+      const models = Array.from(modelSet);
+      if (!models.length) { el.innerHTML = '<p>No ROC/PR data available.</p>'; return; }
+
+      const traces = [];
+      models.forEach((m, i) => {
+        const c = palette[i % palette.length];
+        const rocD = roc[m];
+        const prD = pr[m];
+        if (rocD && (rocD.fpr || []).length && (rocD.tpr || []).length) {
+          traces.push({
+            x: rocD.fpr, y: rocD.tpr, mode: 'lines', type: 'scatter',
+            name: `${m} (AUC=${rocD.auc.toFixed(3)})`,
+            legendgroup: m, showlegend: true,
+            line: { color: c, width: 2 },
+            xaxis: 'x', yaxis: 'y'
+          });
+        }
+        if (prD && (prD.recall || []).length && (prD.precision || []).length) {
+          traces.push({
+            x: prD.recall, y: prD.precision, mode: 'lines', type: 'scatter',
+            name: `${m} (AP=${prD.avg_precision.toFixed(3)})`,
+            legendgroup: m, showlegend: false,
+            line: { color: c, width: 2 },
+            xaxis: 'x2', yaxis: 'y2'
+          });
+        }
+      });
+
+      traces.push({
+        x: [0, 1], y: [0, 1], mode: 'lines', type: 'scatter',
+        name: 'Random', line: { color: '#999', width: 1, dash: 'dot' },
+        hoverinfo: 'skip', showlegend: false,
+        xaxis: 'x', yaxis: 'y'
+      });
+
         Plotly.newPlot(
             divId, traces,
             {
-                title: 'ROC curve (pooled across folds)',
-                xaxis: { title: 'False positive rate', range: [0, 1] },
-                yaxis: { title: 'True positive rate', range: [0, 1], scaleanchor: 'x', scaleratio: 1 },
-                legend: { x: 0.6, y: 0.1 }
+          margin: { l: 56, r: 20, t: 56, b: 90 },
+          xaxis: { domain: [0.0, 0.46], title: 'False positive rate', range: [0, 1], constrain: 'domain' },
+          yaxis: { title: 'True positive rate', range: [0, 1], scaleanchor: 'x', scaleratio: 1, constrain: 'domain' },
+          xaxis2: { domain: [0.54, 1.0], title: 'Recall', range: [0, 1], constrain: 'domain' },
+          yaxis2: { title: 'Precision', range: [0, 1], scaleanchor: 'x2', scaleratio: 1, constrain: 'domain' },
+          legend: { orientation: 'h', x: 0.5, y: -0.18, xanchor: 'center' },
+          annotations: [
+            { text: 'ROC curve (pooled across folds)', x: 0.23, y: 1.08, xref: 'paper', yref: 'paper', showarrow: false, font: { size: 14 } },
+            { text: 'Precision-Recall curve (pooled across folds)', x: 0.77, y: 1.08, xref: 'paper', yref: 'paper', showarrow: false, font: { size: 14 } }
+          ]
             },
             { responsive: true }
         );
@@ -221,6 +249,11 @@ def write_subset_html_report(
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border: 1px solid #ddd; padding: 6px; text-align: left; font-size: 0.9rem; }}
     th {{ background: #f6f6f6; }}
+    .curves-row {{ display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 12px; align-items: start; }}
+    .curve-panel {{ min-width: 0; height: 400px; }}
+    @media (max-width: 900px) {{
+      .curves-row {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
@@ -256,7 +289,7 @@ def write_subset_html_report(
         const p0 = document.createElement('div'); p0.id = `p0_${{tr.task}}`; p0.style.height = '420px';
         const p1 = document.createElement('div'); p1.id = `p1_${{tr.task}}`; p1.style.height = '320px';
         const p2 = document.createElement('div'); p2.id = `p2_${{tr.task}}`; p2.style.height = 'auto';
-        const p3 = document.createElement('div'); p3.id = `p3_${{tr.task}}`; p3.style.height = '400px';
+        const p3 = document.createElement('div'); p3.id = `p3_${{tr.task}}`; p3.style.height = '520px';
         const p4 = document.createElement('div'); p4.id = `p4_${{tr.task}}`; p4.style.height = '360px';
         card.appendChild(p0); card.appendChild(p1); card.appendChild(p2); card.appendChild(p3); card.appendChild(p4);
 
@@ -426,8 +459,8 @@ def write_subset_html_report(
             plotConfusionMatrix(cmDiv.id, confByModel[modelName], modelName);
           }}
 
-          // ROC curves.
-          plotRocCurve(p3.id, tr.roc_by_model || {{}}, palette);
+          // ROC + PR curves with shared legend in one combined panel.
+          plotRocPrCurves(p3.id, tr.roc_by_model || {{}}, tr.pr_by_model || {{}}, palette);
 
           // PSI distribution with binarization threshold markers.
           const dist = tr.response_distribution || {{}};

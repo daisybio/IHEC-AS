@@ -349,12 +349,48 @@ def run_single_configuration(
                         baseline_pred = baseline_pipe.predict(x_test)
                         baseline_scores = regression_metrics(y_test, baseline_pred)
 
+                # Compute training scores to detect overfitting.
+                fitted_estimator = ev.get("estimator")
+                train_scores: dict[str, float] = {}
+                if fitted_estimator is not None:
+                    try:
+                        if task == "classification":
+                            y_train_prob = fitted_estimator.predict_proba(x_train)[:, 1]
+                            train_scores = classification_metrics(
+                                y_train, y_train_prob, threshold=ev.get("threshold", 0.5)
+                            )
+                        else:
+                            from .models.beta import _inverse_logit, _logit_transform
+                            y_train_arr = np.asarray(y_train, dtype=float)
+                            y_train_pred = np.asarray(
+                                fitted_estimator.predict(x_train), dtype=float
+                            )
+                            # Mirror evaluator scale logic: convert to PSI scale if needed.
+                            is_logit = bool(
+                                np.any(y_train_arr < 0.0) or np.any(y_train_arr > 1.0)
+                            )
+                            if is_logit:
+                                y_train_orig = _inverse_logit(y_train_arr)
+                                from .models.evaluator import _model_outputs_psi_scale
+                                y_train_pred_orig = (
+                                    np.clip(y_train_pred, 0.0, 1.0)
+                                    if _model_outputs_psi_scale(fitted_estimator)
+                                    else _inverse_logit(y_train_pred)
+                                )
+                            else:
+                                y_train_orig = y_train_arr
+                                y_train_pred_orig = y_train_pred
+                            train_scores = regression_metrics(y_train_orig, y_train_pred_orig)
+                    except Exception:
+                        pass
+
                 pkey = metric_key(task)
                 pscore = float(ev["scores"][pkey])
 
                 fold_result = {
                     "model_name": model_name,
                     "scores": ev["scores"],
+                    "train_scores": train_scores,
                     "threshold": ev["threshold"],
                     "tuning": tuning_info,
                     "baseline_scores": baseline_scores,
@@ -407,10 +443,13 @@ def run_single_configuration(
                     task=task,
                     x_train=x_train,
                     x_test=x_test,
+                    train_scores=result.get("train_scores", {}),
                 )
+                train_primary = result.get("train_scores", {}).get(metric_key(task))
+                train_str = f", train_{metric_key(task)}={train_primary:.6f}" if train_primary is not None else ""
                 vlog(
                     run_cfg.verbose,
-                    f"Completed fold={fold_id}, model={result['model_name']}, primary_metric={metric_key(task)}={pscore:.6f}",
+                    f"Completed fold={fold_id}, model={result['model_name']}, primary_metric={metric_key(task)}={pscore:.6f}{train_str}",
                 )
 
     if not fold_results:
