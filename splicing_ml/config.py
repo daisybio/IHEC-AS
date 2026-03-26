@@ -223,6 +223,7 @@ class RunConfig:
     smoke_mode: bool = False
     smoke_max_rows: int = 20000
     calibrate_classifiers: bool = True
+    tune_threshold: bool = False
     output_level: str = "diagnostics"
     log_level: str = "info"
     use_wandb: bool = False

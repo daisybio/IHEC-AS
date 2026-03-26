@@ -25,15 +25,19 @@
 set -euo pipefail
 
 # Usage (must be run inside environment with splicing_ml installed):
-# sbatch --array=0-(N-1)%20 scripts/slurm_ml_one_config.sh <config_tsv> <data_path> <output_root> [env_name]
+# sbatch --array=0-(N-1)%20 scripts/slurm_ml_one_config.sh <config_tsv> <data_path> <output_root> [env_name] [wandb_project]
 #
 # config_tsv format (tab-separated, no header):
 #   event_type\ttranscript_filter\tvariability\tgroup_col
+#
+# Pass a wandb_project name to enable W&B tracking. WANDB_API_KEY must be
+# set in the environment (export it before calling sbatch or add it to ~/.bashrc).
 
 CONFIG_TSV="${1:?missing config TSV path}"
 DATA_PATH="${2:?missing data path}"
 OUTPUT_ROOT="${3:?missing output root}"
 ENV_NAME="${4:-}"
+WANDB_PROJECT="${5:-}"
 
 if [[ -n "$ENV_NAME" ]]; then
   if ! command -v mamba >/dev/null 2>&1; then
@@ -76,6 +80,14 @@ if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${SLURM_CPUS_PER_TASK}" -gt 1 ]]; then
   MAX_CORES=$((SLURM_CPUS_PER_TASK - 1))
   CMD+=(--max-cores "$MAX_CORES")
   echo "[SLURM] max_cores=${MAX_CORES} (from SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK})"
+fi
+
+if [[ -n "$WANDB_PROJECT" ]]; then
+  if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    echo "[WARN] WANDB_PROJECT set but WANDB_API_KEY is unset — W&B logging may fail" >&2
+  fi
+  CMD+=(--wandb --wandb-project "$WANDB_PROJECT")
+  echo "[SLURM] W&B enabled: project=${WANDB_PROJECT}"
 fi
 
 echo "[SLURM] running: ${CMD[*]}"

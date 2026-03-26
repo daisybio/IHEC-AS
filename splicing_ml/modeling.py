@@ -154,12 +154,12 @@ def balanced_group_split_indices(
         else:
             gc = group_class_counts[grp]
             best_fold = 0
-            best_score: tuple[float, int] = (float("inf"), fold_sizes[0])
+            best_score: tuple[float, float] = (float("inf"), float("inf"))
             for f in range(n_splits):
                 new_counts = fold_class_counts[f] + gc
                 new_total = fold_sizes[f] + gc.sum()
                 ratio_dev = float(np.sum((new_counts / new_total - global_class_ratios) ** 2)) if new_total > 0 else 0.0
-                score: tuple[float, int] = (ratio_dev, fold_sizes[f])
+                score: tuple[int, float] = (fold_sizes[f], ratio_dev)
                 if score < best_score:
                     best_score = score
                     best_fold = f

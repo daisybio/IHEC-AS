@@ -214,6 +214,7 @@ def choose_param_grid(
         LassoCV,
         LinearRegression,
         LogisticRegression,
+        LogisticRegressionCV,
         Ridge,
     )
 
@@ -255,27 +256,22 @@ def choose_param_grid(
 
     if model_name == "lasso" and task == "classification":
         # Lasso-equivalent for classification: L1-regularised logistic regression.
-        c_base = max(0.01, min(10.0, n_samples / 1000.0))
-        c_candidates = [
-            c_base / 30.0,
-            c_base / 10.0,
-            c_base,
-            c_base * 10.0,
-            c_base * 30.0,
-        ]
-        c_grid = _pick_evenly_spaced(c_candidates, max(1, min(grid_size, 5)))
+        # LogisticRegressionCV sweeps 100 C values internally (one fit), analogous
+        # to LassoCV for regression.
         return [
             {
                 "model": [
-                    LogisticRegression(
+                    LogisticRegressionCV(
+                        Cs=100,
+                        l1_ratios=(1,),
+                        solver="saga",
                         max_iter=5000,
                         class_weight="balanced",
                         random_state=RNG_SEED,
-                        l1_ratio=1.0,
-                        solver="saga",
+                        cv=5,
+                        n_jobs=1,
                     )
                 ],
-                "model__C": c_grid,
             }
         ]
 
@@ -301,7 +297,6 @@ def choose_param_grid(
         return [{"model": [LinearRegression(n_jobs=1)]}]
 
     if model_name == "lasso" and task == "regression":
-        alpha_count = max(2, int(grid_size))
         return [
             {
                 "model": [
@@ -309,7 +304,7 @@ def choose_param_grid(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -2, num=alpha_count),
+                        alphas=np.logspace(-6, -2, num=100),
                     )
                 ],
             }
@@ -466,6 +461,7 @@ def choose_param_lhs_candidates(
         LassoCV,
         LinearRegression,
         LogisticRegression,
+        LogisticRegressionCV,
         Ridge,
     )
 
@@ -505,26 +501,23 @@ def choose_param_lhs_candidates(
         ]
 
     if model_name == "lasso" and task == "classification":
-        c_base = max(0.01, min(10.0, n_samples / 1000.0))
-        c_low, c_high = c_base / 100.0, c_base * 100.0
-        unit = _lhs_unit(n_points=n_points, n_dims=1, seed=RNG_SEED)
-        model = LogisticRegression(
-            max_iter=5000,
-            class_weight="balanced",
-            random_state=RNG_SEED,
-            l1_ratio=1.0,
-            solver="saga",
-        )
+        # LogisticRegressionCV sweeps 100 C values internally (one fit), analogous
+        # to LassoCV for regression — no LHS sampling needed.
         return [
             {
-                "model": [model],
-                "model__C": [
-                    _map_with_scale(
-                        float(row[0]), c_low, c_high, scale_mode, default_scale="log"
+                "model": [
+                    LogisticRegressionCV(
+                        Cs=100,
+                        l1_ratios=(1,),
+                        solver="saga",
+                        max_iter=5000,
+                        class_weight="balanced",
+                        random_state=RNG_SEED,
+                        cv=5,
+                        n_jobs=1,
                     )
                 ],
             }
-            for row in unit
         ]
 
     if model_name == "linear" and task == "regression":
@@ -566,7 +559,6 @@ def choose_param_lhs_candidates(
         return out
 
     if model_name == "lasso" and task == "regression":
-        alpha_count = max(2, int(budget))
         return [
             {
                 "model": [
@@ -574,7 +566,7 @@ def choose_param_lhs_candidates(
                         random_state=RNG_SEED,
                         max_iter=20000,
                         cv=5,
-                        alphas=np.logspace(-6, -2, num=alpha_count),
+                        alphas=np.logspace(-6, -2, num=100),
                     )
                 ],
             }

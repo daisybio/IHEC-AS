@@ -153,6 +153,7 @@ def _safe_empty_payload(
         "best_threshold": None,
         "confusion_matrix": None,
         "confusion_by_model": {},
+        "roc_by_model": {},
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }
@@ -248,6 +249,42 @@ def _build_predictions_payload(
         y_pred = [y_pred[i] for i in idx]
 
     return y_true, y_pred, thresholds, prediction_by_model, prediction_by_model_scale
+
+
+def _build_roc_payload(
+    fold_rows: list[dict[str, Any]],
+    model_order: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Build per-model ROC curve data by pooling predictions across folds.
+
+    Returns a dict keyed by model name, each value containing
+    ``fpr``, ``tpr`` (lists), and ``auc`` (float).  Models with
+    fewer than two classes in the pooled labels are skipped.
+    """
+    from sklearn.metrics import auc, roc_curve
+
+    roc_by_model: dict[str, dict[str, Any]] = {}
+    for model_name in model_order:
+        m_rows = [r for r in fold_rows if str(r.get("model_name", "")) == model_name]
+        all_y_true: list[float] = []
+        all_y_pred: list[float] = []
+        for r in m_rows:
+            all_y_true.extend(r.get("y_true", []))
+            all_y_pred.extend(r.get("y_pred", []))
+        if not all_y_true:
+            continue
+        yt = np.asarray(all_y_true, dtype=int)
+        yp = np.asarray(all_y_pred, dtype=float)
+        if len(np.unique(yt)) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(yt, yp)
+        auc_val = float(auc(fpr, tpr))
+        roc_by_model[model_name] = {
+            "fpr": fpr.tolist(),
+            "tpr": tpr.tolist(),
+            "auc": auc_val,
+        }
+    return roc_by_model
 
 
 def _build_classification_threshold_payload(
@@ -446,12 +483,14 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
     confusion_by_model: dict[str, list[list[int]]] = {}
     threshold_summary: list[dict[str, Any]] = []
     best_threshold: dict[str, Any] | None = None
+    roc_by_model: dict[str, dict[str, Any]] = {}
     if task == "classification":
         confusion_by_model, threshold_summary, best_threshold = (
             _build_classification_threshold_payload(
                 fold_rows, model_order, primary_metric
             )
         )
+        roc_by_model = _build_roc_payload(fold_rows, model_order)
 
     return {
         "task": task,
@@ -474,6 +513,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "best_threshold": best_threshold,
         "confusion_matrix": None,
         "confusion_by_model": confusion_by_model,
+        "roc_by_model": roc_by_model,
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }

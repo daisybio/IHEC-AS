@@ -18,3 +18,4 @@ images
 rmats_out*
 rmats_mapping/
 splicing_analysis
+splicing_ml/**/__pycache__/

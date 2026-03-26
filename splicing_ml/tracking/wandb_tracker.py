@@ -119,23 +119,50 @@ class WandbTracker:
             if isinstance(v, (int, float)) and np.isfinite(float(v))
         }
         payload[f"{model_name}/fold_id"] = int(fold_id)
-        self._child_run.log(payload, step=int(fold_id))
+        self._child_run.log(payload)
 
         with contextlib.suppress(Exception):
-            self._child_run.log(
-                {f"{model_name}/tuning": tuning_info}, step=int(fold_id)
-            )
+            self._child_run.log({f"{model_name}/tuning": tuning_info})
 
         # Optional sklearn diagnostics; never fail pipeline execution.
-        with contextlib.suppress(Exception):
-            sklearn_plot = self._wandb.sklearn
-            if task == "classification":
-                hard = (np.asarray(y_pred, dtype=float) >= 0.5).astype(int)
-                sklearn_plot.plot_confusion_matrix(np.asarray(y_true), hard)
-            if task == "classification":
-                sklearn_plot.plot_calibration_curve(
-                    np.asarray(y_true), np.asarray(y_pred)
+        if task == "classification":
+            yt = np.asarray(y_true, dtype=int)
+            yp = np.asarray(y_pred, dtype=float)
+            # wandb.sklearn functions expect full predict_proba output (n, 2).
+            y_probas = np.column_stack([1.0 - yp, yp])
+            labels = ["0", "1"]
+
+            with contextlib.suppress(Exception):
+                hard = (yp >= 0.5).astype(int)
+                self._child_run.log(
+                    {
+                        f"{model_name}/confusion_matrix": self._wandb.plot.confusion_matrix(
+                            y_true=yt.tolist(),
+                            preds=hard.tolist(),
+                            class_names=labels,
+                        )
+                    }
                 )
+
+            with contextlib.suppress(Exception):
+                if len(np.unique(yt)) >= 2:
+                    self._child_run.log(
+                        {
+                            f"{model_name}/roc": self._wandb.plot.roc_curve(
+                                yt, y_probas, labels
+                            )
+                        }
+                    )
+
+            with contextlib.suppress(Exception):
+                if len(np.unique(yt)) >= 2:
+                    self._child_run.log(
+                        {
+                            f"{model_name}/pr_curve": self._wandb.plot.pr_curve(
+                                yt, y_probas, labels
+                            )
+                        }
+                    )
 
         with contextlib.suppress(Exception):
             model = estimator.named_steps.get("model", estimator)

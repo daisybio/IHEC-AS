@@ -327,6 +327,7 @@ def run_single_configuration(
                     inner_splits=inner_splits,
                     max_cores=run_cfg.max_cores,
                     calibrate=run_cfg.calibrate_classifiers,
+                    tune_threshold=run_cfg.tune_threshold,
                     verbose=run_cfg.verbose,
                 )
 
@@ -546,17 +547,42 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
     if run_cfg.generate_html_reports:
         generate_html_reports(results, out_dir, verbose=run_cfg.verbose)
 
+    # Save per-task artifacts so classification and regression can be loaded
+    # and reported independently.
+    results_by_task: dict[str, list[dict[str, Any]]] = {
+        "classification": [],
+        "regression": [],
+    }
+    for r in results:
+        t = r.get("task", "")
+        if t in results_by_task:
+            results_by_task[t].append(r)
+
+    for task_name, task_results in results_by_task.items():
+        if not task_results:
+            continue
+        task_bundle = {"run_config": asdict(run_cfg), "results": task_results}
+        pkl_path = out_dir / f"splicing_ml_results_{task_name}.pkl.gz"
+        json_path = out_dir / f"splicing_ml_results_{task_name}.json.gz"
+        save_pickle_gz(task_bundle, pkl_path)
+        save_json_gz(task_bundle, json_path)
+        tracker.log_artifact(
+            pkl_path,
+            name=f"splicing-ml-results-{task_name}-pkl",
+            artifact_type="results",
+        )
+        tracker.log_artifact(
+            json_path,
+            name=f"splicing-ml-results-{task_name}-json",
+            artifact_type="results",
+        )
+        vlog(
+            run_cfg.verbose,
+            f"Saved {task_name} artifacts: {pkl_path.name}, {json_path.name}",
+            level="info",
+        )
+
     bundle = {"run_config": asdict(run_cfg), "results": results}
-    pkl_path = out_dir / "splicing_ml_results.pkl.gz"
-    json_path = out_dir / "splicing_ml_results.json.gz"
-    save_pickle_gz(bundle, pkl_path)
-    save_json_gz(bundle, json_path)
-    tracker.log_artifact(
-        pkl_path, name="splicing-ml-results-pkl", artifact_type="results"
-    )
-    tracker.log_artifact(
-        json_path, name="splicing-ml-results-json", artifact_type="results"
-    )
     tracker.finish_run(results)
     vlog(run_cfg.verbose, f"Artifacts written to {out_dir}", level="info")
     return bundle
@@ -648,6 +674,11 @@ def parse_args() -> argparse.Namespace:
         "--calibration",
         action="store_true",
         help="Enable classifier calibration (disabled by default for speed)",
+    )
+    p.add_argument(
+        "--tune-threshold",
+        action="store_true",
+        help="Enable decision threshold tuning on inner-fold predictions (default: fixed at 0.5)",
     )
     p.add_argument(
         "--output-level",
@@ -773,6 +804,7 @@ def main() -> None:
         smoke_mode=args.smoke,
         smoke_max_rows=args.smoke_max_rows,
         calibrate_classifiers=args.calibration,
+        tune_threshold=args.tune_threshold,
         output_level=args.output_level,
         log_level=("debug" if args.debug else "info"),
         use_wandb=args.wandb,

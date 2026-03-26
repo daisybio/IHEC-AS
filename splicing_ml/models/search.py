@@ -63,7 +63,6 @@ def _fit_lasso_cv(
     y_train: np.ndarray,
     preprocessor: ColumnTransformer,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
-    param_grid_size: int,
     max_cores: int,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
@@ -71,8 +70,8 @@ def _fit_lasso_cv(
 
     The same grouped inner-fold splits used by all other models are passed
     directly to LassoCV so fold assignments are consistent across models.
+    Always sweeps 100 alphas on a log scale.
     """
-    alpha_count = max(2, int(param_grid_size))
     estimator = Pipeline(
         steps=[
             ("prep", preprocessor),
@@ -82,7 +81,7 @@ def _fit_lasso_cv(
                     random_state=RNG_SEED,
                     max_iter=20000,
                     cv=inner_cv,
-                    alphas=np.logspace(-6, -2, num=alpha_count),
+                    alphas=np.logspace(-6, -2, num=100),
                     n_jobs=max_cores,
                 ),
             ),
@@ -103,7 +102,7 @@ def _fit_lasso_cv(
     vlog(
         verbose,
         f"Search complete model=lasso, task={task}, strategy=lassocv, "
-        f"candidates={n_alphas if n_alphas > 0 else 1}, best_score={best_score:.6f}",
+        f"candidates={n_alphas if n_alphas > 0 else 100}, best_score={best_score:.6f}",
     )
     return estimator, {
         "best_params": sanitize_best_params(
@@ -111,7 +110,83 @@ def _fit_lasso_cv(
                 "model": model,
                 "model__alpha": alpha,
                 "model__cv_folds": int(len(inner_cv)),
-                "model__alpha_count": int(alpha_count),
+                "model__alpha_count": 100,
+            }
+        ),
+        "best_score": best_score,
+    }
+
+
+def _fit_logistic_lasso_cv(
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    preprocessor: ColumnTransformer,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    max_cores: int,
+    verbose: bool,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit LogisticRegressionCV — C selection via its own built-in CV.
+
+    Mirrors the regression LassoCV path: the same grouped inner-fold splits
+    are passed directly so fold assignments are consistent across models, and
+    n_jobs is set to max_cores.  Always sweeps 100 C values on a log scale.
+    """
+    from sklearn.linear_model import LogisticRegressionCV
+
+    estimator = Pipeline(
+        steps=[
+            ("prep", preprocessor),
+            (
+                "model",
+                LogisticRegressionCV(
+                    Cs=100,
+                    l1_ratios=(1,),
+                    solver="saga",
+                    max_iter=5000,
+                    class_weight="balanced",
+                    random_state=RNG_SEED,
+                    cv=inner_cv,
+                    n_jobs=max_cores,
+                    use_legacy_attributes=False,
+                ),
+            ),
+        ]
+    )
+    estimator.fit(x_train, y_train)
+    model = estimator.named_steps["model"]
+
+    # Best C: scalar float with use_legacy_attributes=False.
+    best_c = float(np.asarray(getattr(model, "C_", np.nan)).ravel()[0])
+    n_cs = int(np.asarray(getattr(model, "Cs_", np.array([]))).size)
+
+    # Best CV score: scores_ is dict {class: array(n_folds, n_Cs)} (legacy) or
+    # array(n_folds, n_Cs) (new API). Handle both defensively.
+    best_score = float("nan")
+    raw_scores = getattr(model, "scores_", None)
+    if raw_scores is not None:
+        try:
+            if isinstance(raw_scores, dict):
+                class_scores = next(iter(raw_scores.values()))
+            else:
+                class_scores = raw_scores
+            mean_per_c = np.mean(np.asarray(class_scores, dtype=float), axis=0)
+            best_score = float(np.max(mean_per_c))
+        except Exception:
+            pass
+
+    vlog(
+        verbose,
+        f"Search complete model=lasso, task={task}, strategy=logisticcv, "
+        f"candidates={n_cs if n_cs > 0 else 100}, best_score={best_score:.6f}",
+    )
+    return estimator, {
+        "best_params": sanitize_best_params(
+            {
+                "model": model,
+                "model__C": best_c,
+                "model__cv_folds": int(len(inner_cv)),
+                "model__Cs_count": 100,
             }
         ),
         "best_score": best_score,
@@ -443,7 +518,8 @@ def fit_best_estimator(
         best_estimator is a fitted sklearn Pipeline ready for outer-fold eval.
         tuning_info contains best_params, best_score, and model-specific extras.
     """
-    # LassoCV: has its own CV-based alpha selection; bypass GridSearchCV.
+    # LassoCV / LogisticRegressionCV: self-select regularisation via built-in CV;
+    # bypass GridSearchCV and pass grouped inner splits + n_jobs directly.
     if task == "regression" and model_name == "lasso":
         return _fit_lasso_cv(
             task=task,
@@ -451,7 +527,17 @@ def fit_best_estimator(
             y_train=y_train,
             preprocessor=preprocessor,
             inner_cv=inner_cv,
-            param_grid_size=param_grid_size,
+            max_cores=max_cores,
+            verbose=verbose,
+        )
+
+    if task == "classification" and model_name == "lasso":
+        return _fit_logistic_lasso_cv(
+            task=task,
+            x_train=x_train,
+            y_train=y_train,
+            preprocessor=preprocessor,
+            inner_cv=inner_cv,
             max_cores=max_cores,
             verbose=verbose,
         )

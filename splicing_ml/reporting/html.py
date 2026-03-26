@@ -129,6 +129,38 @@ _PLOTLY_JS_HELPERS = """
         );
     }
 
+    // ── ROC curve ────────────────────────────────────────────────────────────
+    function plotRocCurve(divId, rocByModel, palette) {
+        const el = document.getElementById(divId);
+        if (!el) return;
+        const models = Object.keys(rocByModel || {});
+        if (!models.length) { el.innerHTML = '<p>No ROC data available.</p>'; return; }
+        const traces = models.map((m, i) => {
+            const d = rocByModel[m];
+            const c = palette[i % palette.length];
+            return {
+                x: d.fpr, y: d.tpr, mode: 'lines', type: 'scatter',
+                name: `${m} (AUC=${d.auc.toFixed(3)})`,
+                line: { color: c, width: 2 }
+            };
+        });
+        traces.push({
+            x: [0, 1], y: [0, 1], mode: 'lines', type: 'scatter',
+            name: 'Random', line: { color: '#999', width: 1, dash: 'dot' },
+            hoverinfo: 'skip', showlegend: false
+        });
+        Plotly.newPlot(
+            divId, traces,
+            {
+                title: 'ROC curve (pooled across folds)',
+                xaxis: { title: 'False positive rate', range: [0, 1] },
+                yaxis: { title: 'True positive rate', range: [0, 1], scaleanchor: 'x', scaleratio: 1 },
+                legend: { x: 0.6, y: 0.1 }
+            },
+            { responsive: true }
+        );
+    }
+
     // ── Confusion matrix heatmap ─────────────────────────────────────────────
     function plotConfusionMatrix(divId, cm, modelName) {
         Plotly.newPlot(
@@ -224,8 +256,9 @@ def write_subset_html_report(
         const p0 = document.createElement('div'); p0.id = `p0_${{tr.task}}`; p0.style.height = '420px';
         const p1 = document.createElement('div'); p1.id = `p1_${{tr.task}}`; p1.style.height = '320px';
         const p2 = document.createElement('div'); p2.id = `p2_${{tr.task}}`; p2.style.height = 'auto';
+        const p3 = document.createElement('div'); p3.id = `p3_${{tr.task}}`; p3.style.height = '400px';
         const p4 = document.createElement('div'); p4.id = `p4_${{tr.task}}`; p4.style.height = '360px';
-        card.appendChild(p0); card.appendChild(p1); card.appendChild(p2); card.appendChild(p4);
+        card.appendChild(p0); card.appendChild(p1); card.appendChild(p2); card.appendChild(p3); card.appendChild(p4);
 
         const h3 = document.createElement('h3'); h3.textContent = 'Important parameters'; card.appendChild(h3);
         const ptab = document.createElement('div'); ptab.innerHTML = createParamsTable(tr.important_params); card.appendChild(ptab);
@@ -233,6 +266,7 @@ def write_subset_html_report(
 
         // ── Metric heatmap(s) ────────────────────────────────────────────────
         if (tr.task === 'regression') {{
+          p3.style.display = 'none';
           p0.style.height = '760px';
           const hmOrig  = tr.metric_heatmap_original || {{ models: [], metrics: [], z: [], sd: [], text: [] }};
           const hmLogit = tr.metric_heatmap_logit    || {{ models: [], metrics: [], z: [], sd: [], text: [] }};
@@ -391,6 +425,9 @@ def write_subset_html_report(
             confWrap.appendChild(cmDiv);
             plotConfusionMatrix(cmDiv.id, confByModel[modelName], modelName);
           }}
+
+          // ROC curves.
+          plotRocCurve(p3.id, tr.roc_by_model || {{}}, palette);
 
           // PSI distribution with binarization threshold markers.
           const dist = tr.response_distribution || {{}};

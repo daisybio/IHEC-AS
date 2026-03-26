@@ -71,18 +71,23 @@ def _eval_classification(
     inner_splits: list[tuple[np.ndarray, np.ndarray]],
     max_cores: int,
     calibrate: bool,
+    tune_threshold: bool,
     verbose: bool,
 ) -> dict[str, Any]:
     """Evaluate a classifier on one outer fold.
 
-    Tunes the decision threshold on inner validation predictions (never on
-    outer test data), optionally calibrates probabilities with Platt scaling,
-    and returns all classification metrics.
+    Optionally tunes the decision threshold on inner validation predictions
+    (never on outer test data), optionally calibrates probabilities with Platt
+    scaling, and returns all classification metrics.
     """
-    threshold = tune_threshold_balanced_accuracy(
-        best_estimator, x_train, y_train, inner_splits
-    )
-    vlog(verbose, f"Threshold tuning selected threshold={threshold:.4f}")
+    if tune_threshold:
+        threshold = tune_threshold_balanced_accuracy(
+            best_estimator, x_train, y_train, inner_splits
+        )
+        vlog(verbose, f"Threshold tuning selected threshold={threshold:.4f}")
+    else:
+        threshold = 0.5
+        vlog(verbose, "Threshold tuning disabled; using fixed threshold=0.5000")
 
     if calibrate:
         # Fit Platt-scaled calibration using the inner splits as CV folds.
@@ -189,6 +194,7 @@ def evaluate_outer_fold(
     inner_splits: list[tuple[np.ndarray, np.ndarray]],
     max_cores: int,
     calibrate: bool = True,
+    tune_threshold: bool = True,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a tuned estimator on one outer fold.
@@ -202,6 +208,9 @@ def evaluate_outer_fold(
     calibrate
         Whether to apply Platt probability calibration for classifiers.
         Calibration is slower but generally recommended.
+    tune_threshold
+        Whether to search for the optimal decision threshold on inner-fold
+        predictions.  When False, threshold is fixed at 0.5.
     """
     if task == "classification":
         return _eval_classification(
@@ -213,6 +222,7 @@ def evaluate_outer_fold(
             inner_splits=inner_splits,
             max_cores=max_cores,
             calibrate=calibrate,
+            tune_threshold=tune_threshold,
             verbose=verbose,
         )
     return _eval_regression(
