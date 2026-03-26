@@ -222,7 +222,11 @@ run_one <- function(this_transcript_filter, this_event_type, this_variability, p
 
   ggsave(
     filename = sprintf(file.path(plot_dir, "feature_umap_pca/%s_%s_%s.pdf"), this_event_type, this_transcript_filter, this_variability),
-    plot = fig, height = 297, width = 420, units = "mm"
+    plot = fig, height = 210, width = 297, units = "mm"
+  )
+  ggsave(
+    filename = sprintf(file.path(plot_dir, "feature_umap_pca/%s_%s_%s.png"), this_event_type, this_transcript_filter, this_variability),
+    plot = fig, height = 210, width = 297, units = "mm"
   )
   invisible(NULL)
 }
