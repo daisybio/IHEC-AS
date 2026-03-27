@@ -41,9 +41,10 @@ def generate_html_reports_from_results_file(
         raise ValueError("Unsupported results file type; expected .json or .json.gz")
     payload = load_json_gz(p)
     all_results = payload.get("results", [])
+    run_datetime = payload.get("run_datetime")
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    generate_html_reports(all_results, out_dir, verbose=verbose)
+    generate_html_reports(all_results, out_dir, verbose=verbose, run_datetime=run_datetime)
 
 
 def generate_html_reports_from_task_dir(
@@ -70,6 +71,7 @@ def generate_html_reports_from_task_dir(
     tasks = ["classification", "regression"] if task == "both" else [task]
     out_dir = Path(output_dir)
     all_results: list = []
+    run_datetime: str | None = None
     for t in tasks:
         p = out_dir / f"splicing_ml_results_{t}.json.gz"
         if not p.exists():
@@ -78,6 +80,8 @@ def generate_html_reports_from_task_dir(
             continue
         payload = load_json_gz(p)
         all_results.extend(payload.get("results", []))
+        if run_datetime is None:
+            run_datetime = payload.get("run_datetime")
         if verbose:
             print(f"[reporting] Loaded {len(payload.get('results', []))} {t} results from {p.name}")
 
@@ -89,4 +93,4 @@ def generate_html_reports_from_task_dir(
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    generate_html_reports(all_results, out_dir, verbose=verbose)
+    generate_html_reports(all_results, out_dir, verbose=verbose, run_datetime=run_datetime)
