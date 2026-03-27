@@ -6,6 +6,7 @@ output: html_document
 ```{r, load-data}
 # load the data
 aggregated_dt <- fread("processed_data/aggregated_dt_filtered.csv.gz")
+source("05zz-feature-preprocessing.R")
 ```
 
 ```{r, create umap}
@@ -35,6 +36,7 @@ feature_cols <- setdiff(names(aggregated_dt), meta_cols)
 transcript_filters <- aggregated_dt[, unique(transcript_filter)]
 to_analyze        <- aggregated_dt[, unique(`Event Type`)]
 variability_levels <- aggregated_dt[, unique(Variability)]
+COMBINED_VARIABILITY_LABEL <- "Both"
 
 # --- validate sample_hex_colors ----------------------------------------------
 stopifnot("sample_hex_colors must have unique colors" = !anyDuplicated(sample_hex_colors))
@@ -56,12 +58,19 @@ combo_seed <- function(...) {
 }
 
 run_one <- function(this_transcript_filter, this_event_type, this_variability, print_plot = FALSE) {
-  sub_dt <- aggregated_dt[
-    transcript_filter == this_transcript_filter &
-      `Event Type`    == this_event_type &
-      Variability     == this_variability
-  ]
-  if (nrow(sub_dt) < 10) return(invisible(NULL))
+  if (identical(this_variability, COMBINED_VARIABILITY_LABEL)) {
+    sub_dt <- aggregated_dt[
+      transcript_filter == this_transcript_filter &
+        `Event Type`    == this_event_type
+    ]
+  } else {
+    sub_dt <- aggregated_dt[
+      transcript_filter == this_transcript_filter &
+        `Event Type`    == this_event_type &
+        Variability     == this_variability
+    ]
+  }
+  # if (nrow(sub_dt) < 10) return(invisible(NULL))
 
   # downsample very large groups for faster PCA/UMAP plotting while
   # approximately preserving composition across selected strata
@@ -100,32 +109,14 @@ run_one <- function(this_transcript_filter, this_event_type, this_variability, p
   }
 
   # --- build feature matrix --------------------------------------------------
-  feat_mat <- as.matrix(sub_dt[, ..feature_cols])
-
-  # drop columns with > 50 % NAs or zero variance
-  keep_cols <- colMeans(is.na(feat_mat)) < 0.5
-  feat_mat  <- feat_mat[, keep_cols, drop = FALSE]
-  col_var   <- apply(feat_mat, 2, var, na.rm = TRUE)
-  feat_mat  <- feat_mat[, col_var > 0, drop = FALSE]
+  preprocessed <- preprocess_feature_matrix(
+    feat_mat = as.matrix(sub_dt[, ..feature_cols]),
+    histone_marks = histone_marks,
+    mode = "embedding",
+    drop_sparse = FALSE
+  )
+  feat_mat <- preprocessed$feat_mat
   if (ncol(feat_mat) < 2) return(invisible(NULL))
-
-  # clip histone mark columns at their 99th percentile (-log10 p-values can
-  # have extreme outliers from highly enriched peaks)
-  hist_cols <- grepl(paste0("^(", paste(histone_marks, collapse = "|"), ");"), colnames(feat_mat))
-  q99 <- apply(feat_mat[, hist_cols, drop = FALSE], 2, quantile, probs = 0.99, na.rm = TRUE)
-  feat_mat[, hist_cols] <- t(pmin(t(feat_mat[, hist_cols, drop = FALSE]), q99))
-
-  # log1p-transform features on original linear scale that are right-skewed:
-  # widths (bp), distances (bp), gene_expression (TPM).
-  # Histone marks are already -log10(p-values) so no further transform.
-  # DNAm ([0,1]), CpGs (linear counts) and splice-site scores (can be
-  # negative) are also left as-is.
-  log_cols <- grepl("^width;|^distance_|^gene_expression$", colnames(feat_mat))
-  feat_mat[, log_cols] <- log1p(feat_mat[, log_cols])
-
-  # scale, then impute NAs as 0 (= column mean in scaled space)
-  feat_mat <- scale(feat_mat)
-  feat_mat[is.na(feat_mat)] <- 0
 
   title_str <- paste(this_event_type, this_transcript_filter, this_variability, sep = " | ")
 
@@ -179,9 +170,9 @@ run_one <- function(this_transcript_filter, this_event_type, this_variability, p
     p
   }
 
-  # --- UMAP on top PCs -------------------------------------------------------
-  pc_scores <- sweep(pca_res$u, 2, pca_res$d, `*`)  # n x k score matrix
-  umap_res  <- uwot::umap(pc_scores, n_neighbors = UMAP_NEIGHBORS, min_dist = UMAP_MIN_DIST,
+  # --- UMAP on original features -------------------------------------------------------
+  # pc_scores <- sweep(pca_res$u, 2, pca_res$d, `*`)  # n x k score matrix
+  umap_res  <- uwot::umap(feat_mat, n_neighbors = UMAP_NEIGHBORS, min_dist = UMAP_MIN_DIST,
                           metric = UMAP_METRIC, n_threads = 2L, seed = UMAP_SEED)
   umap_df   <- data.table(
     U1       = umap_res[, 1],
@@ -234,13 +225,13 @@ run_one <- function(this_transcript_filter, this_event_type, this_variability, p
 combos <- expand.grid(
   transcript_filter = transcript_filters,
   event_type        = to_analyze,
-  variability       = variability_levels,
+  variability       = c(variability_levels, COMBINED_VARIABILITY_LABEL),
   stringsAsFactors  = FALSE
 )
 
 # pin BLAS to 1 thread per worker — rsvd uses BLAS internally and forked
 # workers would otherwise each spawn multiple BLAS threads (oversubscription)
-RhpcBLASctl::blas_set_num_threads(1L)
+# RhpcBLASctl::blas_set_num_threads(1L)
 
 pbmcapply::pbmcmapply(
   run_one,
