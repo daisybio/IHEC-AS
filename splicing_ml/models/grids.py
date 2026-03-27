@@ -127,6 +127,7 @@ def build_param_candidates(
     cuml_use_gpu: bool | None = None,
     verbose: bool = False,
     model_n_jobs: int = 1,
+    scale_pos_weight: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return a GridSearchCV-compatible candidate list for the given model.
 
@@ -168,6 +169,7 @@ def build_param_candidates(
             scale_mode=lhs_scale_mode,
             verbose=verbose,
             model_n_jobs=model_n_jobs,
+            scale_pos_weight=scale_pos_weight,
         )
     return choose_param_grid(
         model_name=model_name,
@@ -179,6 +181,7 @@ def build_param_candidates(
         cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
+        scale_pos_weight=scale_pos_weight,
     )
 
 
@@ -207,13 +210,13 @@ def choose_param_grid(
     cuml_use_gpu: bool | None = None,
     verbose: bool = False,
     model_n_jobs: int = 1,
+    scale_pos_weight: float | None = None,
 ) -> list[dict[str, Any]]:
     """Build heuristic fixed-grid parameter candidates for GridSearchCV.
 
     Each returned dict maps pipeline parameter names to lists of candidate
     values. The "model" key holds the estimator instance(s) to try.
     """
-    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.linear_model import LinearRegression, LogisticRegression
 
     from .xgb_utils import xgb_gpu_available
@@ -225,25 +228,42 @@ def choose_param_grid(
         f"n_samples={n_samples}, n_features={n_features}, grid_size={grid_size}",
     )
 
-    if model_name == "linear" and task == "classification":
-        return [
-            {
-                "model": [
-                    LogisticRegression(
-                        C=np.inf,
-                        solver="lbfgs",
-                        max_iter=5000,
-                        class_weight="balanced",
-                        random_state=RNG_SEED,
-                    )
-                ],
-            }
-        ]
+    if model_name == "linear":
+        from .cuml_utils import cuml_gpu_available, get_cuml_linear
 
-    if model_name == "linear" and task == "regression":
+        use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        if use_gpu:
+            return [{"model": [get_cuml_linear(task)]}]
+        if task == "classification":
+            return [
+                {
+                    "model": [
+                        LogisticRegression(
+                            C=np.inf,
+                            solver="lbfgs",
+                            max_iter=5000,
+                            class_weight="balanced",
+                            random_state=RNG_SEED,
+                        )
+                    ],
+                }
+            ]
         return [{"model": [LinearRegression(n_jobs=1)]}]
 
     if model_name == "rf":
+        try:
+            from xgboost import XGBRFClassifier, XGBRFRegressor
+        except Exception as exc:
+            raise RuntimeError("xgboost requested but not installed") from exc
+
+        use_gpu = bool(xgb_use_gpu) if xgb_use_gpu is not None else xgb_gpu_available()
+        common = {
+            "random_state": RNG_SEED,
+            "n_jobs": 1,
+            "tree_method": "hist",
+            "device": "cuda" if use_gpu else "cpu",
+            "subsample": 0.8,
+        }
         depth_base = max(3, int(np.log2(max(n_samples, 2))))
         axis_count = _axis_count_from_budget(grid_size, n_dims=4)
         n_estimators_pool = [80, 120, 180, 250] if small else [120, 200, 320, 480]
@@ -254,35 +274,27 @@ def choose_param_grid(
             max(2, depth_base - 1),
             depth_base,
         ]
-        min_leaf_pool = [4, 8, 16, 32]
-        max_features_pool = ["sqrt", "log2"]
+        colsample_pool = [0.3, 0.5, 0.7, 1.0]
+        min_child_pool = [1, 3, 10, 30]
         n_estimators = _pick_evenly_spaced(n_estimators_pool, axis_count)
         max_depth = _pick_evenly_spaced(depth_pool, axis_count)
-        min_leaf = _pick_evenly_spaced(min_leaf_pool, axis_count)
-        max_features = _pick_evenly_spaced(max_features_pool, axis_count)
+        colsample = _pick_evenly_spaced(colsample_pool, axis_count)
+        min_child = _pick_evenly_spaced(min_child_pool, axis_count)
         if task == "classification":
-            return [
-                {
-                    "model": [
-                        RandomForestClassifier(
-                            random_state=RNG_SEED,
-                            n_jobs=model_n_jobs,
-                            class_weight="balanced",
-                        )
-                    ],
-                    "model__n_estimators": n_estimators,
-                    "model__max_depth": max_depth,
-                    "model__max_features": max_features,
-                    "model__min_samples_leaf": min_leaf,
-                }
-            ]
+            base_model = XGBRFClassifier(
+                eval_metric="logloss",
+                scale_pos_weight=scale_pos_weight,
+                **common,
+            )
+        else:
+            base_model = XGBRFRegressor(eval_metric="rmse", **common)
         return [
             {
-                "model": [RandomForestRegressor(random_state=RNG_SEED, n_jobs=model_n_jobs)],
+                "model": [base_model],
                 "model__n_estimators": n_estimators,
                 "model__max_depth": max_depth,
-                "model__max_features": max_features,
-                "model__min_samples_leaf": min_leaf,
+                "model__colsample_bynode": colsample,
+                "model__min_child_weight": min_child,
             }
         ]
 
@@ -361,21 +373,25 @@ def choose_param_grid(
     if model_name == "svm":
         from .cuml_utils import cuml_gpu_available, get_cuml_svm
 
-        use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        use_gpu = (
+            bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        )
         if use_gpu:
             base_model = get_cuml_svm(task)
         else:
-            from sklearn.svm import LinearSVC, LinearSVR
+            from sklearn.svm import SVC, SVR
 
             base_model = (
-                LinearSVC(dual="auto", class_weight="balanced", max_iter=5000)
+                SVC(kernel="rbf", class_weight="balanced", probability=True, max_iter=5000)
                 if task == "classification"
-                else LinearSVR(dual="auto", epsilon=0.0, max_iter=5000)
+                else SVR(kernel="rbf", max_iter=5000)
             )
-        _C_SVM = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-        axis_count = _axis_count_from_budget(grid_size, n_dims=1)
+        _C_SVM = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+        _GAMMA_SVM = [0.0001, 0.001, 0.01, 0.1, 1.0]
+        axis_count = _axis_count_from_budget(grid_size, n_dims=2)
         c_vals = _pick_evenly_spaced(_C_SVM, max(3, axis_count))
-        return [{"model": [base_model], "model__C": c_vals}]
+        gamma_vals = _pick_evenly_spaced(_GAMMA_SVM, max(2, axis_count))
+        return [{"model": [base_model], "model__C": c_vals, "model__gamma": gamma_vals}]
 
     if model_name == "mlp":
         from .deep import MLPClassifier, MLPRegressor
@@ -434,13 +450,13 @@ def choose_param_lhs_candidates(
     scale_mode: str = "auto",
     verbose: bool = False,
     model_n_jobs: int = 1,
+    scale_pos_weight: float | None = None,
 ) -> list[dict[str, list[Any]]]:
     """Build a space-filling LHS candidate set for GridSearchCV.
 
     Returns a list of singleton dicts compatible with
     ``GridSearchCV(param_grid=<result>)``.
     """
-    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.linear_model import LinearRegression, LogisticRegression
 
     from .xgb_utils import xgb_gpu_available
@@ -454,35 +470,53 @@ def choose_param_lhs_candidates(
         f"budget={n_points}, scale_mode={scale_mode}",
     )
 
-    if model_name == "linear" and task == "classification":
-        return [
-            {
-                "model": [
-                    LogisticRegression(
-                        C=np.inf,
-                        solver="lbfgs",
-                        max_iter=5000,
-                        class_weight="balanced",
-                        random_state=RNG_SEED,
-                    )
-                ],
-            }
-        ]
+    if model_name == "linear":
+        from .cuml_utils import cuml_gpu_available, get_cuml_linear
 
-    if model_name == "linear" and task == "regression":
+        use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        if use_gpu:
+            return [{"model": [get_cuml_linear(task)]}]
+        if task == "classification":
+            return [
+                {
+                    "model": [
+                        LogisticRegression(
+                            C=np.inf,
+                            solver="lbfgs",
+                            max_iter=5000,
+                            class_weight="balanced",
+                            random_state=RNG_SEED,
+                        )
+                    ],
+                }
+            ]
         return [{"model": [LinearRegression(n_jobs=1)]}]
 
     if model_name == "rf":
+        try:
+            from xgboost import XGBRFClassifier, XGBRFRegressor
+        except Exception as exc:
+            raise RuntimeError("xgboost requested but not installed") from exc
+
+        use_gpu = bool(xgb_use_gpu) if xgb_use_gpu is not None else xgb_gpu_available()
+        common = {
+            "random_state": RNG_SEED,
+            "n_jobs": 1,
+            "tree_method": "hist",
+            "device": "cuda" if use_gpu else "cpu",
+            "subsample": 0.8,
+        }
         depth_base = max(3, int(np.log2(max(n_samples, 2))))
         depth_low, depth_high = max(2, depth_base - 4), depth_base
         n_est_low, n_est_high = (80, 350) if small else (120, 640)
-        base_model = (
-            RandomForestClassifier(
-                random_state=RNG_SEED, n_jobs=model_n_jobs, class_weight="balanced"
+        if task == "classification":
+            base_model = XGBRFClassifier(
+                eval_metric="logloss",
+                scale_pos_weight=scale_pos_weight,
+                **common,
             )
-            if task == "classification"
-            else RandomForestRegressor(random_state=RNG_SEED, n_jobs=model_n_jobs)
-        )
+        else:
+            base_model = XGBRFRegressor(eval_metric="rmse", **common)
         unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
         out: list[dict[str, list[Any]]] = []
         for row in unit:
@@ -515,20 +549,28 @@ def choose_param_lhs_candidates(
                             )
                         )
                     ],
-                    "model__min_samples_leaf": [
+                    "model__colsample_bynode": [
+                        _map_with_scale(
+                            float(row[2]),
+                            0.3,
+                            1.0,
+                            scale_mode,
+                            default_scale="linear",
+                        )
+                    ],
+                    "model__min_child_weight": [
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[2]),
-                                    4.0,
-                                    32.0,
+                                    float(row[3]),
+                                    1.0,
+                                    30.0,
                                     scale_mode,
                                     default_scale="log",
                                 )
                             )
                         )
                     ],
-                    "model__max_features": ["sqrt" if float(row[3]) < 0.5 else "log2"],
                 }
             )
         return out
@@ -604,7 +646,11 @@ def choose_param_lhs_candidates(
                         int(
                             round(
                                 _map_with_scale(
-                                    float(row[5]), 1.0, 20.0, scale_mode, default_scale="log"
+                                    float(row[5]),
+                                    1.0,
+                                    20.0,
+                                    scale_mode,
+                                    default_scale="log",
                                 )
                             )
                         )
@@ -616,24 +662,29 @@ def choose_param_lhs_candidates(
     if model_name == "svm":
         from .cuml_utils import cuml_gpu_available, get_cuml_svm
 
-        use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        use_gpu = (
+            bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+        )
         if use_gpu:
             base_model = get_cuml_svm(task)
         else:
-            from sklearn.svm import LinearSVC, LinearSVR
+            from sklearn.svm import SVC, SVR
 
             base_model = (
-                LinearSVC(dual="auto", class_weight="balanced", max_iter=5000)
+                SVC(kernel="rbf", class_weight="balanced", probability=True, max_iter=5000)
                 if task == "classification"
-                else LinearSVR(dual="auto", epsilon=0.0, max_iter=5000)
+                else SVR(kernel="rbf", max_iter=5000)
             )
-        # 1 LHS dim: C on log scale — same range for both tasks
-        unit = _lhs_unit(n_points=n_points, n_dims=1, seed=RNG_SEED)
+        # 2 LHS dims: C and gamma on log scale
+        unit = _lhs_unit(n_points=n_points, n_dims=2, seed=RNG_SEED)
         return [
             {
                 "model": [base_model],
                 "model__C": [
-                    _map_with_scale(float(row[0]), 0.001, 100.0, scale_mode, default_scale="log")
+                    _map_with_scale(float(row[0]), 0.01, 1000.0, scale_mode, default_scale="log")
+                ],
+                "model__gamma": [
+                    _map_with_scale(float(row[1]), 0.0001, 1.0, scale_mode, default_scale="log")
                 ],
             }
             for row in unit
@@ -665,7 +716,9 @@ def choose_param_lhs_candidates(
         unit = _lhs_unit(n_points=n_points, n_dims=5, seed=RNG_SEED)
         out: list[dict[str, list[Any]]] = []
         for row in unit:
-            hidden_idx = min(int(float(row[0]) * len(_HIDDEN_PRESETS)), len(_HIDDEN_PRESETS) - 1)
+            hidden_idx = min(
+                int(float(row[0]) * len(_HIDDEN_PRESETS)), len(_HIDDEN_PRESETS) - 1
+            )
             bs_idx = min(int(float(row[4]) * len(_BATCH_SIZES)), len(_BATCH_SIZES) - 1)
             out.append(
                 {
@@ -673,7 +726,11 @@ def choose_param_lhs_candidates(
                     "model__hidden_sizes": [_HIDDEN_PRESETS[hidden_idx]],
                     "model__dropout_rate": [
                         _map_with_scale(
-                            float(row[1]), 0.05, 0.50, scale_mode, default_scale="linear"
+                            float(row[1]),
+                            0.05,
+                            0.50,
+                            scale_mode,
+                            default_scale="linear",
                         )
                     ],
                     "model__learning_rate": [

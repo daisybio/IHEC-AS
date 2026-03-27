@@ -21,9 +21,12 @@ __all__ = [
     "r2_from_rss",
     "concordance_correlation_coefficient",
     "regression_metrics",
+    "regression_metrics_by_psi_bin",
     "classification_metrics",
     "bootstrap_ci",
 ]
+
+_N_PSI_BINS: int = 3  # number of equal-width sub-bins within the regression PSI range
 
 
 def r2_from_rss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -75,6 +78,59 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
         "r2_rss": r2_rss,
         "ccc": ccc,
     }
+
+
+def regression_metrics_by_psi_bin(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    psi_low: float = 0.2,
+    psi_high: float = 0.8,
+    n_bins: int = _N_PSI_BINS,
+) -> dict[str, dict[str, float | int]]:
+    """Compute regression metrics per equal-width PSI sub-bin.
+
+    Bins are derived from the actual regression PSI range [psi_low, psi_high]
+    so they always match the data that was passed to the model.
+
+    Parameters
+    ----------
+    y_true
+        True PSI values (on the original [0, 1] scale).
+    y_pred
+        Predicted PSI values.
+    psi_low, psi_high
+        The PSI range used when building regression targets. Bin edges are
+        computed as ``np.linspace(psi_low, psi_high, n_bins + 1)``.
+    n_bins
+        Number of equal-width sub-bins to create within [psi_low, psi_high].
+
+    Returns
+    -------
+    dict
+        Keys are ``bin_<lo>_<hi>`` (e.g. ``bin_0.2_0.4``); values are dicts
+        with ``n`` (sample count) plus the same metrics as
+        ``regression_metrics()`` (rmse, mad, r2_rss, ccc). Bins with fewer
+        than 2 samples have NaN metric values.
+    """
+    bin_edges = np.linspace(psi_low, psi_high, n_bins + 1).tolist()
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    result: dict[str, dict[str, float | int]] = {}
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (y_true >= lo) & (y_true < hi)
+        n = int(mask.sum())
+        label = f"bin_{lo:.2f}_{hi:.2f}"
+        if n >= 2:
+            result[label] = {"n": n, **regression_metrics(y_true[mask], y_pred[mask])}
+        else:
+            result[label] = {
+                "n": n,
+                "rmse": float("nan"),
+                "mad": float("nan"),
+                "r2_rss": float("nan"),
+                "ccc": float("nan"),
+            }
+    return result
 
 
 def classification_metrics(

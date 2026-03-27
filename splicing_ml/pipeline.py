@@ -34,8 +34,11 @@ from .data import (
     benchmark_data_readers,
     build_targets,
     data_reader_startup_warnings,
+    estimate_filter_fraction_for_path,
     generate_subset_configs,
     load_dataset,
+    recommend_auto_data_reader_backend,
+    recommend_polars_max_threads,
     subset_dataframe,
 )
 from .io_utils import save_json_gz, save_pickle_gz
@@ -318,6 +321,7 @@ def run_single_configuration(
                     xgb_use_gpu=run_cfg.xgb_use_gpu,
                     cuml_use_gpu=run_cfg.cuml_use_gpu,
                     verbose=run_cfg.verbose,
+                    debug_grid_progress=run_cfg.log_level == "debug",
                 )
 
                 ev = evaluate_outer_fold(
@@ -332,6 +336,8 @@ def run_single_configuration(
                     calibrate=run_cfg.calibrate_classifiers,
                     tune_threshold=run_cfg.tune_threshold,
                     verbose=run_cfg.verbose,
+                    psi_low=run_cfg.psi_low_threshold,
+                    psi_high=run_cfg.psi_high_threshold,
                 )
 
                 # Speed optimization: skip baseline in compact mode (3-5% faster)
@@ -353,6 +359,7 @@ def run_single_configuration(
                         # Mirror evaluate_outer_fold dual-scale logic so baseline_scores
                         # has original_/logit_ prefixed keys matching regular model scores.
                         from .models.beta import _inverse_logit, _logit_transform
+
                         _bp = np.asarray(baseline_pred, dtype=float)
                         _yt = np.asarray(y_test, dtype=float)
                         _is_logit = bool(np.any(_yt < 0.0) or np.any(_yt > 1.0))
@@ -380,10 +387,13 @@ def run_single_configuration(
                         if task == "classification":
                             y_train_prob = fitted_estimator.predict_proba(x_train)[:, 1]
                             train_scores = classification_metrics(
-                                y_train, y_train_prob, threshold=ev.get("threshold", 0.5)
+                                y_train,
+                                y_train_prob,
+                                threshold=ev.get("threshold", 0.5),
                             )
                         else:
                             from .models.beta import _inverse_logit, _logit_transform
+
                             y_train_arr = np.asarray(y_train, dtype=float)
                             y_train_pred = np.asarray(
                                 fitted_estimator.predict(x_train), dtype=float
@@ -395,6 +405,7 @@ def run_single_configuration(
                             if is_logit:
                                 y_train_orig = _inverse_logit(y_train_arr)
                                 from .models.evaluator import _model_outputs_psi_scale
+
                                 y_train_pred_orig = (
                                     np.clip(y_train_pred, 0.0, 1.0)
                                     if _model_outputs_psi_scale(fitted_estimator)
@@ -403,7 +414,9 @@ def run_single_configuration(
                             else:
                                 y_train_orig = y_train_arr
                                 y_train_pred_orig = y_train_pred
-                            train_scores = regression_metrics(y_train_orig, y_train_pred_orig)
+                            train_scores = regression_metrics(
+                                y_train_orig, y_train_pred_orig
+                            )
                     except Exception:
                         pass
 
@@ -428,6 +441,7 @@ def run_single_configuration(
                     "outer_test_groups": groups_outer.iloc[te_idx].tolist(),
                     "inner_splits_global": inner_splits_global,
                     "primary_score": pscore,
+                    "psi_bin_metrics": ev.get("psi_bin_metrics", {}),
                 }
                 # Include predictions only in diagnostics mode.
                 if run_cfg.output_level == "diagnostics":
@@ -471,9 +485,16 @@ def run_single_configuration(
                     x_train=x_train,
                     x_test=x_test,
                     train_scores=result.get("train_scores", {}),
+                    primary_metric=metric_key(task),
+                    baseline_scores=result.get("baseline_scores", {}),
+                    delta_vs_baseline=result.get("delta_vs_baseline", {}),
                 )
                 train_primary = result.get("train_scores", {}).get(metric_key(task))
-                train_str = f", train_{metric_key(task)}={train_primary:.6f}" if train_primary is not None else ""
+                train_str = (
+                    f", train_{metric_key(task)}={train_primary:.6f}"
+                    if train_primary is not None
+                    else ""
+                )
                 vlog(
                     run_cfg.verbose,
                     f"Completed fold={fold_id}, model={result['model_name']}, primary_metric={metric_key(task)}={pscore:.6f}{train_str}",
@@ -554,20 +575,29 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
     tracker = make_tracker(run_cfg)
     tracker.start_run(run_cfg)
 
-    # Speed optimization: prefer polars for loading (20-40% faster) unless explicitly disabled
+    # Choose loader backend with memory-aware guardrails.
     backend = run_cfg.data_reader_backend
     if backend == "auto":
-        try:
-            import polars as pl  # noqa: F401
-
-            backend = "polars"
-        except Exception:
-            backend = "pandas"
+        backend, backend_reason = recommend_auto_data_reader_backend(
+            path=run_cfg.data_path,
+            max_cores=run_cfg.max_cores,
+            filter_event_type=run_cfg.only_event_type,
+            filter_transcript_filter=run_cfg.only_transcript_filter,
+            filter_variability=run_cfg.only_variability,
+        )
+        vlog(
+            run_cfg.verbose,
+            f"Auto data reader selected {backend}: {backend_reason}",
+            level="info",
+        )
 
     df = load_dataset(
         run_cfg.data_path,
         verbose=run_cfg.verbose,
         reader_backend=backend,
+        filter_event_type=run_cfg.only_event_type,
+        filter_transcript_filter=run_cfg.only_transcript_filter,
+        filter_variability=run_cfg.only_variability,
     )
     configs = generate_subset_configs(df, verbose=run_cfg.verbose)
     if run_cfg.only_event_type is not None:
@@ -612,7 +642,9 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
         )
 
     if run_cfg.generate_html_reports:
-        generate_html_reports(results, out_dir, verbose=run_cfg.verbose, run_datetime=run_datetime)
+        generate_html_reports(
+            results, out_dir, verbose=run_cfg.verbose, run_datetime=run_datetime
+        )
 
     # Save per-task artifacts so classification and regression can be loaded
     # and reported independently.
@@ -628,7 +660,11 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
     for task_name, task_results in results_by_task.items():
         if not task_results:
             continue
-        task_bundle = {"run_datetime": run_datetime, "run_config": asdict(run_cfg), "results": task_results}
+        task_bundle = {
+            "run_datetime": run_datetime,
+            "run_config": asdict(run_cfg),
+            "results": task_results,
+        }
         pkl_path = out_dir / f"splicing_ml_results_{task_name}.pkl.gz"
         json_path = out_dir / f"splicing_ml_results_{task_name}.json.gz"
         save_pickle_gz(task_bundle, pkl_path)
@@ -649,7 +685,11 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
             level="info",
         )
 
-    bundle = {"run_datetime": run_datetime, "run_config": asdict(run_cfg), "results": results}
+    bundle = {
+        "run_datetime": run_datetime,
+        "run_config": asdict(run_cfg),
+        "results": results,
+    }
     tracker.finish_run(results)
     vlog(run_cfg.verbose, f"Artifacts written to {out_dir}", level="info")
     return bundle
@@ -762,7 +802,75 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="splicing-ml")
     p.add_argument("--wandb-entity", default=None)
+    p.add_argument(
+        "--wandb-no-require-auth",
+        action="store_true",
+        help="Allow fallback to NullTracker when W&B auth is missing or invalid",
+    )
+    p.add_argument(
+        "--wandb-no-fold-table",
+        action="store_true",
+        help="Disable fold-level comparison tables in W&B child runs",
+    )
+    p.add_argument(
+        "--wandb-no-tuning-details",
+        action="store_true",
+        help="Disable structured tuning detail logging in W&B",
+    )
+    p.add_argument(
+        "--wandb-no-baseline-metrics",
+        action="store_true",
+        help="Disable baseline and delta metric logging in W&B",
+    )
+    p.add_argument(
+        "--wandb-fold-subruns",
+        action="store_true",
+        help="Create optional per-fold W&B sub-runs (higher run/API volume)",
+    )
+    p.add_argument(
+        "--check-gpu",
+        action="store_true",
+        help="Print GPU availability for each backend and exit",
+    )
     return p.parse_args()
+
+
+def _run_gpu_check() -> None:
+    """Print GPU availability for XGBoost, cuML, and PyTorch, then exit."""
+    # XGBoost
+    try:
+        from splicing_ml.models.xgb_utils import xgb_gpu_available
+
+        xgb_ok = xgb_gpu_available()
+        print(f"XGBoost : {'cuda' if xgb_ok else 'cpu (no GPU)'}")
+    except Exception as e:
+        print(f"XGBoost : error ({e})")
+
+    # cuML SVM
+    try:
+        from splicing_ml.models.cuml_utils import cuml_gpu_available
+
+        cuml_ok = cuml_gpu_available()
+        print(f"cuML SVM: {'cuda' if cuml_ok else 'cpu (no GPU)'}")
+    except Exception as e:
+        print(f"cuML SVM: error ({e})")
+
+    # PyTorch / MLP
+    try:
+        import torch as _torch
+
+        device = "cpu"
+        try:
+            if _torch.accelerator.is_available():
+                device = str(_torch.accelerator.current_accelerator())
+        except AttributeError:
+            if _torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                device = "mps"
+        print(f"PyTorch : {device}")
+    except ImportError:
+        print("PyTorch : not installed")
 
 
 def main() -> None:
@@ -774,10 +882,48 @@ def main() -> None:
 
     set_log_level("debug" if args.debug else ("info" if args.verbose else "none"))
 
+    if args.check_gpu:
+        _run_gpu_check()
+        return
+
     if args.smoke:
         args.data_path = "processed_data/aggregated_dt_filtered.validation300k.csv.gz"
         # Keep smoke runs lightweight regardless of user default grid size.
         args.param_grid_size = min(args.param_grid_size, 8)
+
+    # Must be configured before importing polars for the first time.
+    if args.data_reader_backend in {"auto", "polars"}:
+        if "POLARS_MAX_THREADS" not in os.environ:
+            filter_fraction = estimate_filter_fraction_for_path(
+                args.data_path,
+                filter_event_type=args.only_event_type,
+                filter_transcript_filter=args.only_transcript_filter,
+                filter_variability=args.only_variability,
+            )
+            polars_threads = recommend_polars_max_threads(
+                max_cores=max(1, args.max_cores),
+                filter_fraction=filter_fraction,
+            )
+            os.environ["POLARS_MAX_THREADS"] = str(polars_threads)
+            frac_msg = (
+                ""
+                if filter_fraction is None
+                else f", sampled_filter_fraction={filter_fraction:.3f}"
+            )
+            vlog(
+                args.verbose,
+                (
+                    "Configured POLARS_MAX_THREADS="
+                    f"{polars_threads} (memory-aware heuristic, max_cores={max(1, args.max_cores)}{frac_msg})"
+                ),
+                level="info",
+            )
+        else:
+            vlog(
+                args.verbose,
+                f"Using pre-set POLARS_MAX_THREADS={os.environ['POLARS_MAX_THREADS']}",
+                level="info",
+            )
 
     startup_warnings = data_reader_startup_warnings(args.data_reader_backend)
     for w in startup_warnings:
@@ -850,6 +996,7 @@ def main() -> None:
     if "mlp" in models:
         try:
             import torch as _torch
+
             _mlp_device = "cpu"
             try:
                 if _torch.accelerator.is_available():
@@ -857,7 +1004,10 @@ def main() -> None:
             except AttributeError:
                 if _torch.cuda.is_available():
                     _mlp_device = "cuda"
-                elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                elif (
+                    hasattr(_torch.backends, "mps")
+                    and _torch.backends.mps.is_available()
+                ):
                     _mlp_device = "mps"
         except ImportError:
             _mlp_device = "torch not installed"
@@ -907,6 +1057,11 @@ def main() -> None:
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
+        wandb_require_auth=not args.wandb_no_require_auth,
+        wandb_log_fold_table=not args.wandb_no_fold_table,
+        wandb_log_tuning_details=not args.wandb_no_tuning_details,
+        wandb_log_baseline_metrics=not args.wandb_no_baseline_metrics,
+        wandb_fold_subruns=args.wandb_fold_subruns,
     )
 
     # Validate configuration early.
@@ -931,6 +1086,19 @@ def main() -> None:
         f"log_level={run_cfg.log_level}",
         level="info",
     )
+    if run_cfg.use_wandb:
+        vlog(
+            args.verbose,
+            "W&B settings: "
+            f"project={run_cfg.wandb_project}, "
+            f"entity={run_cfg.wandb_entity}, "
+            f"require_auth={run_cfg.wandb_require_auth}, "
+            f"fold_table={run_cfg.wandb_log_fold_table}, "
+            f"tuning_details={run_cfg.wandb_log_tuning_details}, "
+            f"baseline_metrics={run_cfg.wandb_log_baseline_metrics}, "
+            f"fold_subruns={run_cfg.wandb_fold_subruns}",
+            level="info",
+        )
 
     # Configure parallelism guardrails to prevent thread oversubscription.
     thread_env = _configure_parallelism_guardrails(run_cfg.max_cores)

@@ -26,17 +26,79 @@ from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import ElasticNetCV
 from sklearn.exceptions import FitFailedWarning
-from sklearn.model_selection import GridSearchCV, cross_validate
+from sklearn.model_selection import GridSearchCV, ParameterGrid, cross_validate
 from sklearn.pipeline import Pipeline
 
 from ..config import RNG_SEED
 from ..metrics import regression_metrics
-from ..utils import safe_json, sanitize_best_params, vlog
+from ..utils import progress_iter, safe_json, sanitize_best_params, vlog
 from .beta import BetaRegressor, _inverse_logit
-from .grids import build_param_candidates, _use_lhs_strategy, _ALPHA_GRID, _C_GRID, _L1_RATIO_GRID
+from .grids import (
+    build_param_candidates,
+    _use_lhs_strategy,
+    _ALPHA_GRID,
+    _C_GRID,
+    _L1_RATIO_GRID,
+)
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference, xgb_gpu_available
 
 __all__ = ["fit_best_estimator"]
+
+
+class _ProgressGridSearchCV(GridSearchCV):
+    """GridSearchCV variant that can show candidate progress in debug runs.
+
+    When enabled, candidates are evaluated one-by-one so a progress bar can be
+    updated after each completed candidate. This is intended for debug
+    observability and is disabled by default.
+    """
+
+    def __init__(
+        self,
+        estimator,
+        param_grid,
+        *,
+        scoring=None,
+        n_jobs=None,
+        refit=True,
+        cv=None,
+        verbose=0,
+        pre_dispatch="2*n_jobs",
+        error_score=np.nan,
+        return_train_score=False,
+        progress_enabled: bool = False,
+        progress_desc: str | None = None,
+    ) -> None:
+        super().__init__(
+            estimator=estimator,
+            param_grid=param_grid,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )
+        # Keep sklearn BaseEstimator param introspection happy by storing
+        # constructor params under identical attribute names.
+        self.progress_enabled = bool(progress_enabled)
+        self.progress_desc = progress_desc
+
+    def _run_search(self, evaluate_candidates) -> None:  # type: ignore[override]
+        candidates = list(ParameterGrid(self.param_grid))
+        if not self.progress_enabled:
+            evaluate_candidates(candidates)
+            return
+
+        for candidate in progress_iter(
+            candidates,
+            total=len(candidates),
+            desc=self.progress_desc,
+            enabled=True,
+        ):
+            evaluate_candidates([candidate])
 
 
 def scorer_name(task: str) -> str:
@@ -66,13 +128,32 @@ def _fit_elasticnet_cv(
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
     max_cores: int,
     verbose: bool,
+    cuml_use_gpu: bool | None = None,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit ElasticNetCV — alpha and l1_ratio selection via built-in CV.
 
     The same grouped inner-fold splits used by all other models are passed
     directly to ElasticNetCV so fold assignments are consistent across models.
     Always sweeps _ALPHA_GRID alphas and _L1_RATIO_GRID l1_ratios.
+
+    When ``cuml_use_gpu`` is True (or auto-detected), uses cuML ElasticNet via
+    GridSearchCV over a coarser alpha grid.  cuML lacks a regularization-path
+    CV variant, so individual fits are done instead.
     """
+    from .cuml_utils import cuml_gpu_available
+
+    use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+
+    if use_gpu:
+        return _fit_cuml_elasticnet_cv(
+            task=task,
+            x_train=x_train,
+            y_train=y_train,
+            preprocessor=preprocessor,
+            inner_cv=inner_cv,
+            verbose=verbose,
+        )
+
     estimator = Pipeline(
         steps=[
             ("prep", preprocessor),
@@ -121,6 +202,115 @@ def _fit_elasticnet_cv(
     }
 
 
+# Coarser alpha grid for cuML ElasticNet: individual fits instead of path.
+# 15 log-spaced values cover the same range as _ALPHA_GRID without the 100-point expense.
+_CUML_ALPHA_GRID: np.ndarray = np.logspace(-6, 2, num=15)
+
+
+def _fit_cuml_elasticnet_cv(
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    preprocessor: ColumnTransformer,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    verbose: bool,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit cuML ElasticNet via GridSearchCV over a coarser alpha/l1_ratio grid.
+
+    cuML ElasticNet has the same alpha and l1_ratio parameters as sklearn but
+    no CV-path variant.  GridSearchCV drives the search (n_jobs=1 for GPU).
+    """
+    from .cuml_utils import get_cuml_elasticnet
+
+    pipe = Pipeline(
+        steps=[
+            ("prep", preprocessor),
+            ("model", get_cuml_elasticnet()),
+        ]
+    )
+    candidates = [
+        {"model__alpha": [float(a)], "model__l1_ratio": [float(r)]}
+        for a in _CUML_ALPHA_GRID
+        for r in _L1_RATIO_GRID
+    ]
+    search = GridSearchCV(
+        estimator=pipe,
+        param_grid=candidates,
+        scoring=scorer_name(task),
+        cv=inner_cv,
+        n_jobs=1,
+        refit=True,
+        error_score="raise",
+    )
+    try:
+        search.fit(x_train, y_train)
+    except Exception as exc:
+        if _looks_like_gpu_failure(exc):
+            vlog(
+                verbose,
+                f"cuML ElasticNet GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            # Fall back to the CPU ElasticNetCV path.
+            from sklearn.linear_model import ElasticNetCV as _ElasticNetCV
+
+            cpu_est = Pipeline(
+                steps=[
+                    ("prep", preprocessor),
+                    (
+                        "model",
+                        _ElasticNetCV(
+                            random_state=RNG_SEED,
+                            max_iter=20000,
+                            cv=inner_cv,
+                            alphas=_ALPHA_GRID,
+                            l1_ratio=_L1_RATIO_GRID,
+                            n_jobs=1,
+                        ),
+                    ),
+                ]
+            )
+            cpu_est.fit(x_train, y_train)
+            cpu_model = cpu_est.named_steps["model"]
+            mse_path = np.asarray(getattr(cpu_model, "mse_path_", np.array([])))
+            best_score = float("nan")
+            if mse_path.size:
+                best_mse = float(np.min(np.mean(mse_path, axis=1)))
+                best_score = -float(np.sqrt(best_mse))
+            alpha = float(getattr(cpu_model, "alpha_", np.nan))
+            l1_ratio = float(getattr(cpu_model, "l1_ratio_", np.nan))
+            vlog(
+                verbose,
+                f"Search complete model=elasticnet, task={task}, strategy=elasticnetcv_cpu_fallback, "
+                f"candidates={len(_ALPHA_GRID)}, best_score={best_score:.6f}",
+            )
+            return cpu_est, {
+                "best_params": sanitize_best_params(
+                    {
+                        "model": cpu_model,
+                        "model__alpha": alpha,
+                        "model__l1_ratio": l1_ratio,
+                        "model__cv_folds": int(len(inner_cv)),
+                        "model__alpha_count": len(_ALPHA_GRID),
+                    }
+                ),
+                "best_score": best_score,
+            }
+        raise
+
+    best_params = search.best_params_
+    total_candidates = len(_CUML_ALPHA_GRID) * len(_L1_RATIO_GRID)
+    vlog(
+        verbose,
+        f"Search complete model=elasticnet, task={task}, strategy=cuml_elasticnet_grid, "
+        f"candidates={total_candidates}, best_score={float(search.best_score_):.6f}",
+    )
+    return search.best_estimator_, {
+        "best_params": sanitize_best_params(best_params),
+        "best_score": float(search.best_score_),
+    }
+
+
 def _fit_logistic_elasticnet_cv(
     task: str,
     x_train: pd.DataFrame,
@@ -129,6 +319,7 @@ def _fit_logistic_elasticnet_cv(
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
     max_cores: int,
     verbose: bool,
+    cuml_use_gpu: bool | None = None,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit LogisticRegressionCV — C and l1_ratio selection via built-in CV.
 
@@ -136,7 +327,24 @@ def _fit_logistic_elasticnet_cv(
     are passed directly so fold assignments are consistent across models, and
     n_jobs is set to max_cores.  Sweeps _C_GRID C values and _L1_RATIO_GRID
     l1_ratios (C = 1 / alpha, reciprocal of _ALPHA_GRID).
+
+    When ``cuml_use_gpu`` is True (or auto-detected), uses cuML LogisticRegression
+    via GridSearchCV over a coarser C/l1_ratio grid.
     """
+    from .cuml_utils import cuml_gpu_available
+
+    use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
+
+    if use_gpu:
+        return _fit_cuml_logistic_elasticnet_cv(
+            task=task,
+            x_train=x_train,
+            y_train=y_train,
+            preprocessor=preprocessor,
+            inner_cv=inner_cv,
+            verbose=verbose,
+        )
+
     from sklearn.linear_model import LogisticRegressionCV
 
     estimator = Pipeline(
@@ -197,6 +405,125 @@ def _fit_logistic_elasticnet_cv(
             }
         ),
         "best_score": best_score,
+    }
+
+
+# Coarser C grid for cuML LogisticRegression: individual fits instead of path.
+# 15 log-spaced values on the same range as _C_GRID (= 1 / _ALPHA_GRID).
+_CUML_C_GRID: np.ndarray = np.logspace(-6, 2, num=15)[::-1]  # high→low (descending C)
+
+
+def _fit_cuml_logistic_elasticnet_cv(
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    preprocessor: ColumnTransformer,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    verbose: bool,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit cuML LogisticRegression via GridSearchCV over a coarser C/l1_ratio grid.
+
+    cuML LogisticRegression supports penalty="elasticnet", class_weight="balanced",
+    C, and l1_ratio with the same semantics as sklearn.  No CV-path variant exists,
+    so GridSearchCV drives the search (n_jobs=1 for GPU).
+    """
+    from .cuml_utils import get_cuml_logistic_elasticnet
+
+    pipe = Pipeline(
+        steps=[
+            ("prep", preprocessor),
+            ("model", get_cuml_logistic_elasticnet()),
+        ]
+    )
+    candidates = [
+        {"model__C": [float(c)], "model__l1_ratio": [float(r)]}
+        for c in _CUML_C_GRID
+        for r in _L1_RATIO_GRID
+    ]
+    search = GridSearchCV(
+        estimator=pipe,
+        param_grid=candidates,
+        scoring=scorer_name(task),
+        cv=inner_cv,
+        n_jobs=1,
+        refit=True,
+        error_score="raise",
+    )
+    try:
+        search.fit(x_train, y_train)
+    except Exception as exc:
+        if _looks_like_gpu_failure(exc):
+            vlog(
+                verbose,
+                f"cuML LogisticRegression GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            from sklearn.linear_model import LogisticRegressionCV as _LogisticRegressionCV
+
+            cpu_est = Pipeline(
+                steps=[
+                    ("prep", preprocessor),
+                    (
+                        "model",
+                        _LogisticRegressionCV(
+                            Cs=_C_GRID,
+                            l1_ratios=_L1_RATIO_GRID,
+                            solver="saga",
+                            max_iter=20000,
+                            class_weight="balanced",
+                            random_state=RNG_SEED,
+                            cv=inner_cv,
+                            n_jobs=1,
+                            use_legacy_attributes=False,
+                        ),
+                    ),
+                ]
+            )
+            cpu_est.fit(x_train, y_train)
+            cpu_model = cpu_est.named_steps["model"]
+            best_c = float(np.asarray(getattr(cpu_model, "C_", np.nan)).ravel()[0])
+            l1_ratio = float(np.asarray(getattr(cpu_model, "l1_ratio_", np.nan)).ravel()[0])
+            best_score = float("nan")
+            raw_scores = getattr(cpu_model, "scores_", None)
+            if raw_scores is not None:
+                try:
+                    scores_arr = (
+                        next(iter(raw_scores.values()))
+                        if isinstance(raw_scores, dict)
+                        else raw_scores
+                    )
+                    best_score = float(np.max(np.mean(np.asarray(scores_arr, dtype=float), axis=0)))
+                except Exception:
+                    pass
+            vlog(
+                verbose,
+                f"Search complete model=elasticnet, task={task}, strategy=logisticelasticnetcv_cpu_fallback, "
+                f"candidates={len(_C_GRID)}, best_score={best_score:.6f}",
+            )
+            return cpu_est, {
+                "best_params": sanitize_best_params(
+                    {
+                        "model": cpu_model,
+                        "model__C": best_c,
+                        "model__l1_ratio": l1_ratio,
+                        "model__cv_folds": int(len(inner_cv)),
+                        "model__Cs_count": len(_C_GRID),
+                    }
+                ),
+                "best_score": best_score,
+            }
+        raise
+
+    best_params = search.best_params_
+    total_candidates = len(_CUML_C_GRID) * len(_L1_RATIO_GRID)
+    vlog(
+        verbose,
+        f"Search complete model=elasticnet, task={task}, strategy=cuml_logistic_elasticnet_grid, "
+        f"candidates={total_candidates}, best_score={float(search.best_score_):.6f}",
+    )
+    return search.best_estimator_, {
+        "best_params": sanitize_best_params(best_params),
+        "best_score": float(search.best_score_),
     }
 
 
@@ -322,8 +649,15 @@ def _build_grid_search(
     cuml_use_gpu: bool | None,
     verbose: bool,
     model_n_jobs: int = 1,
+    debug_grid_progress: bool = False,
 ) -> GridSearchCV:
     """Construct a GridSearchCV object with the appropriate candidate list."""
+    scale_pos_weight = None
+    if model_name == "rf" and task == "classification":
+        n_pos = int(np.sum(y_train == 1))
+        n_neg = int(np.sum(y_train == 0))
+        scale_pos_weight = float(n_neg) / max(1, n_pos)
+
     candidates = build_param_candidates(
         model_name=model_name,
         task=task,
@@ -336,8 +670,9 @@ def _build_grid_search(
         cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
+        scale_pos_weight=scale_pos_weight,
     )
-    return GridSearchCV(
+    return _ProgressGridSearchCV(
         estimator=pipe,
         param_grid=candidates,
         scoring=scorer_name(task),
@@ -346,6 +681,8 @@ def _build_grid_search(
         pre_dispatch=search_n_jobs,
         refit=True,
         error_score="raise",
+        progress_enabled=debug_grid_progress,
+        progress_desc=f"grid {model_name} [{task}]",
     )
 
 
@@ -363,6 +700,7 @@ def _fit_grid_search(
     xgb_use_gpu: bool | None,
     cuml_use_gpu: bool | None,
     verbose: bool,
+    debug_grid_progress: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit all non-ElasticNet, non-Beta models via GridSearchCV.
 
@@ -380,6 +718,7 @@ def _fit_grid_search(
         _mlp_has_gpu = False
         try:
             import torch as _torch
+
             _mlp_has_gpu = _torch.cuda.is_available()
             try:
                 _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
@@ -393,7 +732,7 @@ def _fit_grid_search(
         # across parallel GridSearchCV workers.
         search_n_jobs = 1 if _mlp_has_gpu else max_cores
         model_n_jobs = 1
-    elif (model_name == "xgb" and bool(xgb_use_gpu)) or (
+    elif (model_name in {"xgb", "rf"} and bool(xgb_use_gpu)) or (
         model_name == "svm" and bool(cuml_use_gpu)
     ):
         search_n_jobs = 1
@@ -401,7 +740,7 @@ def _fit_grid_search(
     elif model_name in {"rf", "xgb"} and max_cores > 1:
         # Split budget between search-level and model-level parallelism.
         # RF uses joblib tree-building threads; XGB CPU uses its own thread pool.
-        model_n_jobs = max(1, int(max_cores ** 0.5))
+        model_n_jobs = max(1, int(max_cores**0.5))
         search_n_jobs = max(1, max_cores // model_n_jobs)
     else:
         search_n_jobs = max_cores
@@ -422,6 +761,7 @@ def _fit_grid_search(
         cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
+        debug_grid_progress=debug_grid_progress,
     )
 
     def _fit_search(search_obj: GridSearchCV) -> None:
@@ -444,10 +784,14 @@ def _fit_grid_search(
         _fit_search(search)
     except Exception as exc:
         # On GPU failure, rebuild the search with CPU and retry once.
-        if model_name == "xgb" and bool(xgb_use_gpu) and _looks_like_gpu_failure(exc):
+        if (
+            model_name in {"xgb", "rf"}
+            and bool(xgb_use_gpu)
+            and _looks_like_gpu_failure(exc)
+        ):
             vlog(
                 verbose,
-                f"XGB GPU training failed; retrying on CPU ({exc})",
+                f"{model_name.upper()} GPU training failed; retrying on CPU ({exc})",
                 level="info",
             )
             search = _build_grid_search(
@@ -464,9 +808,12 @@ def _fit_grid_search(
                 xgb_use_gpu=False,  # force CPU
                 cuml_use_gpu=cuml_use_gpu,
                 verbose=verbose,
+                debug_grid_progress=debug_grid_progress,
             )
             _fit_search(search)
-        elif model_name == "svm" and bool(cuml_use_gpu) and _looks_like_gpu_failure(exc):
+        elif (
+            model_name == "svm" and bool(cuml_use_gpu) and _looks_like_gpu_failure(exc)
+        ):
             vlog(
                 verbose,
                 f"cuML SVM GPU training failed; retrying on CPU ({exc})",
@@ -486,6 +833,7 @@ def _fit_grid_search(
                 xgb_use_gpu=xgb_use_gpu,
                 cuml_use_gpu=False,  # force sklearn CPU path
                 verbose=verbose,
+                debug_grid_progress=debug_grid_progress,
             )
             _fit_search(search)
         else:
@@ -567,6 +915,7 @@ def fit_best_estimator(
     xgb_use_gpu: bool | None,
     cuml_use_gpu: bool | None = None,
     verbose: bool = False,
+    debug_grid_progress: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Tune hyperparameters via grouped inner CV and return the best estimator.
 
@@ -592,6 +941,7 @@ def fit_best_estimator(
             inner_cv=inner_cv,
             max_cores=max_cores,
             verbose=verbose,
+            cuml_use_gpu=cuml_use_gpu,
         )
 
     if task == "classification" and model_name == "elasticnet":
@@ -603,6 +953,7 @@ def fit_best_estimator(
             inner_cv=inner_cv,
             max_cores=max_cores,
             verbose=verbose,
+            cuml_use_gpu=cuml_use_gpu,
         )
 
     # BetaRegressor: no external hyperparameters; use cross_validate for scoring.
@@ -635,4 +986,5 @@ def fit_best_estimator(
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
+        debug_grid_progress=debug_grid_progress,
     )

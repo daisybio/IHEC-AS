@@ -472,26 +472,87 @@ def write_subset_html_report(
 
           const thresholdShapes = [];
           const thresholdAnn    = [];
+          const thresholdPoints = [];
           for (let i = 0; i < thresholdRows.length; i++) {{
             const row = thresholdRows[i];
             const thr = Number(row.mean_threshold);
-            if (Number.isFinite(thr)) {{
-              const modelName = String(row.model_name || 'model');
-              const c = colorByModel[modelName] || '#111';
-              thresholdShapes.push({{ type: 'line', x0: thr, x1: thr, y0: 0, y1: 1, yref: 'paper', line: {{ color: c, width: 2, dash: 'dot' }} }});
-              thresholdAnn.push({{
-                x: thr, y: 1.02 + (0.045 * (i % 2)), yref: 'paper',
-                text: `${{modelName}} thr=${{thr.toFixed(3)}}`,
-                showarrow: false, xanchor: 'left', font: {{ size: 10, color: c }}
-              }});
+            if (!Number.isFinite(thr)) continue;
+            const modelName = String(row.model_name || 'model');
+            const c = colorByModel[modelName] || '#111';
+            thresholdPoints.push({{
+              modelName,
+              color: c,
+              rawThreshold: thr,
+              displayThreshold: thr
+            }});
+          }}
+
+          // Cluster nearby thresholds and apply small deterministic jitter so
+          // per-model markers remain distinguishable without changing ordering.
+          thresholdPoints.sort((a, b) => a.rawThreshold - b.rawThreshold);
+          const CLUSTER_EPS = 0.012;
+          const JITTER_STEP = 0.006;
+          const MIN_X = 0.001;
+          const MAX_X = 0.999;
+          const clusters = [];
+          for (const pt of thresholdPoints) {{
+            const last = clusters[clusters.length - 1];
+            if (!last || Math.abs(pt.rawThreshold - last[last.length - 1].rawThreshold) > CLUSTER_EPS) {{
+              clusters.push([pt]);
+            }} else {{
+              last.push(pt);
             }}
+          }}
+          for (const cluster of clusters) {{
+            const n = cluster.length;
+            for (let i = 0; i < n; i++) {{
+              const centered = i - ((n - 1) / 2);
+              const jittered = cluster[i].rawThreshold + (centered * JITTER_STEP);
+              cluster[i].displayThreshold = Math.max(MIN_X, Math.min(MAX_X, jittered));
+            }}
+          }}
+
+          const MAX_LABEL_TIERS = 4;
+          for (let i = 0; i < thresholdPoints.length; i++) {{
+            const pt = thresholdPoints[i];
+            const tier = i % MAX_LABEL_TIERS;
+            const labelAy = -26 - (tier * 15);
+            const xAnchor = (pt.displayThreshold > 0.9) ? 'right' : ((pt.displayThreshold < 0.1) ? 'left' : 'center');
+            thresholdShapes.push({{
+              type: 'line',
+              x0: pt.displayThreshold,
+              x1: pt.displayThreshold,
+              y0: 0,
+              y1: 1,
+              yref: 'paper',
+              line: {{ color: pt.color, width: 2, dash: 'dot' }}
+            }});
+            thresholdAnn.push({{
+              x: pt.displayThreshold,
+              y: 1,
+              yref: 'paper',
+              text: `${{pt.modelName}} thr=${{pt.rawThreshold.toFixed(3)}}`,
+              showarrow: true,
+              arrowhead: 2,
+              arrowsize: 1,
+              arrowwidth: 1,
+              arrowcolor: pt.color,
+              ax: 0,
+              ay: labelAy,
+              xanchor: xAnchor,
+              yanchor: 'bottom',
+              font: {{ size: 10, color: pt.color }}
+            }});
           }}
           Plotly.newPlot(
             p2.id, probTraces,
             {{
               title: 'Predicted probability distribution by model (model thresholds shown)',
               xaxis: {{ title: 'P(class=1)' }}, yaxis: {{ title: 'Count' }},
-              barmode: 'overlay', shapes: thresholdShapes, annotations: thresholdAnn
+              barmode: 'overlay',
+              margin: {{ l: 60, r: 20, t: 95, b: 55 }},
+              shapes: thresholdShapes,
+              annotations: thresholdAnn
             }},
             {{ responsive: true }}
           );

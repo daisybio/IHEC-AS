@@ -2,8 +2,8 @@
 #SBATCH -J ML_CFG
 #SBATCH --error splicing_ml/output/ml_error_logs/%x.%A_%a.%N.%j.txt
 #SBATCH --output splicing_ml/output/ml_logs/%x.%A_%a.%N.%j.txt
-#SBATCH -p shared-cpu
-#####SBATCH --gres=gpu:1
+#SBATCH -p shared-gpu
+#SBATCH --gres=gpu:1
 #SBATCH --qos=limitgpus
 #SBATCH -c 12
 #SBATCH --mem 24G
@@ -32,8 +32,14 @@ set -euo pipefail
 #
 # task: classification | regression | both (default: both)
 #
-# Pass a wandb_project name to enable W&B tracking. WANDB_API_KEY must be
-# set in the environment (export it before calling sbatch or add it to ~/.bashrc).
+# Pass a wandb_project name to enable W&B tracking. The script will call
+# `wandb login` so stored credentials are loaded in the job environment.
+# Optional env toggles:
+#   WANDB_REQUIRE_AUTH=0           -> add --wandb-no-require-auth
+#   WANDB_FOLD_SUBRUNS=1           -> add --wandb-fold-subruns
+#   WANDB_NO_FOLD_TABLE=1          -> add --wandb-no-fold-table
+#   WANDB_NO_TUNING_DETAILS=1      -> add --wandb-no-tuning-details
+#   WANDB_NO_BASELINE_METRICS=1    -> add --wandb-no-baseline-metrics
 
 CONFIG_TSV="${1:?missing config TSV path}"
 DATA_PATH="${2:?missing data path}"
@@ -93,10 +99,24 @@ if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${SLURM_CPUS_PER_TASK}" -gt 1 ]]; then
 fi
 
 if [[ -n "$WANDB_PROJECT" ]]; then
-  if [[ -z "${WANDB_API_KEY:-}" ]]; then
-    echo "[WARN] WANDB_PROJECT set but WANDB_API_KEY is unset — W&B logging may fail" >&2
-  fi
+  echo "[SLURM] Loading W&B stored credentials"
+  wandb login >/dev/null
   CMD+=(--wandb --wandb-project "$WANDB_PROJECT")
+  if [[ "${WANDB_REQUIRE_AUTH:-1}" == "0" ]]; then
+    CMD+=(--wandb-no-require-auth)
+  fi
+  if [[ "${WANDB_FOLD_SUBRUNS:-0}" == "1" ]]; then
+    CMD+=(--wandb-fold-subruns)
+  fi
+  if [[ "${WANDB_NO_FOLD_TABLE:-0}" == "1" ]]; then
+    CMD+=(--wandb-no-fold-table)
+  fi
+  if [[ "${WANDB_NO_TUNING_DETAILS:-0}" == "1" ]]; then
+    CMD+=(--wandb-no-tuning-details)
+  fi
+  if [[ "${WANDB_NO_BASELINE_METRICS:-0}" == "1" ]]; then
+    CMD+=(--wandb-no-baseline-metrics)
+  fi
   echo "[SLURM] W&B enabled: project=${WANDB_PROJECT}"
 fi
 

@@ -55,7 +55,15 @@ METADATA_COLUMNS = {
 }
 
 # Central model registry used by parser defaults/choices and runtime validation.
-ALL_MODEL_TYPES: tuple[str, ...] = ("linear", "elasticnet", "rf", "xgb", "beta", "svm", "mlp")
+ALL_MODEL_TYPES: tuple[str, ...] = (
+    "linear",
+    "elasticnet",
+    "rf",
+    "xgb",
+    "beta",
+    "svm",
+    "mlp",
+)
 # Smoke mode covers all available model types.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
 
@@ -230,3 +238,8 @@ class RunConfig:
     use_wandb: bool = False
     wandb_project: str = "splicing-ml"
     wandb_entity: str | None = None
+    wandb_require_auth: bool = True
+    wandb_log_fold_table: bool = True
+    wandb_log_tuning_details: bool = True
+    wandb_log_baseline_metrics: bool = True
+    wandb_fold_subruns: bool = False

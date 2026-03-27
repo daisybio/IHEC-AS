@@ -7,6 +7,7 @@ from splicing_ml.metrics import (
     bootstrap_ci,
     classification_metrics,
     regression_metrics,
+    regression_metrics_by_psi_bin,
     r2_from_rss,
     concordance_correlation_coefficient,
 )
@@ -68,6 +69,48 @@ class TestRegressionMetrics:
         metrics = regression_metrics(y_true, y_pred)
 
         assert metrics["r2_rss"] == 0.0, "R² should be 0 for constant mean prediction"
+
+
+class TestRegressionMetricsByPsiBin:
+    """Tests for per-PSI-bin regression metrics."""
+
+    def test_bin_keys_match_range(self):
+        rng = np.random.default_rng(0)
+        y = rng.uniform(0.2, 0.8, 300)
+        result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
+        assert len(result) == 3
+        assert "bin_0.20_0.40" in result
+        assert "bin_0.40_0.60" in result
+        assert "bin_0.60_0.80" in result
+
+    def test_perfect_prediction_gives_zero_rmse(self):
+        rng = np.random.default_rng(1)
+        y = rng.uniform(0.2, 0.8, 300)
+        result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
+        for bin_metrics in result.values():
+            assert bin_metrics["rmse"] == pytest.approx(0.0, abs=1e-10)
+
+    def test_sparse_bin_returns_nan(self):
+        # Only one sample in [0.2, 0.4)
+        y_true = np.array([0.25, 0.5, 0.5, 0.5, 0.7])
+        y_pred = np.array([0.30, 0.5, 0.5, 0.5, 0.7])
+        result = regression_metrics_by_psi_bin(y_true, y_pred, psi_low=0.2, psi_high=0.8)
+        assert result["bin_0.20_0.40"]["n"] == 1
+        assert np.isnan(result["bin_0.20_0.40"]["rmse"])
+
+    def test_n_counts_sum_to_total(self):
+        rng = np.random.default_rng(2)
+        y = rng.uniform(0.2, 0.8, 200)
+        result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
+        total_n = sum(v["n"] for v in result.values())
+        assert total_n == len(y)
+
+    def test_custom_psi_range(self):
+        rng = np.random.default_rng(3)
+        y = rng.uniform(0.1, 0.9, 300)
+        result = regression_metrics_by_psi_bin(y, y, psi_low=0.1, psi_high=0.9, n_bins=4)
+        assert len(result) == 4
+        assert "bin_0.10_0.30" in result
 
 
 class TestClassificationMetrics:

@@ -16,7 +16,11 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.pipeline import Pipeline
 
-from ..metrics import classification_metrics, regression_metrics
+from ..metrics import (
+    classification_metrics,
+    regression_metrics,
+    regression_metrics_by_psi_bin,
+)
 from ..utils import vlog
 from .beta import BetaRegressor, _inverse_logit, _logit_transform
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference
@@ -124,6 +128,8 @@ def _eval_regression(
     x_test: pd.DataFrame,
     y_test: np.ndarray,
     verbose: bool,
+    psi_low: float = 0.2,
+    psi_high: float = 0.8,
 ) -> dict[str, Any]:
     """Evaluate a regressor on one outer fold.
 
@@ -173,6 +179,10 @@ def _eval_regression(
     for k, v in scores_logit.items():
         scores[f"logit_{k}"] = float(v)
 
+    psi_bin_metrics = regression_metrics_by_psi_bin(
+        y_test_original, y_pred_original, psi_low=psi_low, psi_high=psi_high
+    )
+
     return {
         "scores": scores,
         "threshold": None,
@@ -181,6 +191,7 @@ def _eval_regression(
         "y_true_logit": y_test_logit,
         "y_pred_logit": y_pred_logit,
         "estimator": best_estimator,
+        "psi_bin_metrics": psi_bin_metrics,
     }
 
 
@@ -196,6 +207,8 @@ def evaluate_outer_fold(
     calibrate: bool = True,
     tune_threshold: bool = True,
     verbose: bool = False,
+    psi_low: float = 0.2,
+    psi_high: float = 0.8,
 ) -> dict[str, Any]:
     """Evaluate a tuned estimator on one outer fold.
 
@@ -232,4 +245,6 @@ def evaluate_outer_fold(
         x_test=x_test,
         y_test=y_test,
         verbose=verbose,
+        psi_low=psi_low,
+        psi_high=psi_high,
     )

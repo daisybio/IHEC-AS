@@ -89,7 +89,7 @@ def _probe_cuda_runtime() -> bool:
             )
 
         cfg_text = str(booster.save_config()).lower()
-        if '"device":"cuda"' not in cfg_text:
+        if '"device":"cuda' not in cfg_text and '"device": "cuda' not in cfg_text:
             return False
     except Exception:
         return False

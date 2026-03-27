@@ -17,19 +17,14 @@ set -euo pipefail
 #   bash scripts/submit_ml_config_array.sh [data_path] [output_root] [env_name] [max_parallel] [wandb_project]
 #
 # Omit wandb_project (or pass "") to disable W&B tracking.
-# When provided, WANDB_API_KEY must be exported in the current shell so that
-# SLURM jobs inherit it (default SLURM behaviour exports all env vars).
+# When provided, this script runs `wandb login` after activating the
+# environment so stored credentials are loaded.
 
 DATA_PATH="${1:-processed_data/aggregated_dt_filtered.csv.gz}"
 OUTPUT_ROOT="${2:-processed_data/slurm_ml_outputs}"
 ENV_NAME="${3:-ihec-as}"
 MAX_PARALLEL="${4:-20}"
 WANDB_PROJECT="${5:-}"
-
-if [[ -n "$WANDB_PROJECT" && -z "${WANDB_API_KEY:-}" ]]; then
-  echo "[WARN] WANDB_PROJECT='${WANDB_PROJECT}' but WANDB_API_KEY is not set." >&2
-  echo "[WARN] Export WANDB_API_KEY before running this script, or jobs will fail to log." >&2
-fi
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -46,6 +41,11 @@ fi
 
 eval "$(mamba shell hook --shell bash)"
 mamba activate "$ENV_NAME"
+
+if [[ -n "$WANDB_PROJECT" ]]; then
+  echo "[W&B] Loading stored credentials for project '${WANDB_PROJECT}'"
+  wandb login >/dev/null
+fi
 
 export DATA_PATH CONFIG_L CONFIG_M CONFIG_S
 
@@ -99,6 +99,7 @@ submit_tier() {
   echo "[SUBMIT] Tier ${tier_label}: ${n_cfg} configs, array=${array_spec}, mem=${mem}, cpus=${cpus}, time=${walltime}"
 
   sbatch \
+    --export=ALL \
     --mem="${mem}" \
     -c "${cpus}" \
     --time="${walltime}" \
