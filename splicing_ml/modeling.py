@@ -33,6 +33,7 @@ from .models.grids import (
     choose_param_grid,
     choose_param_lhs_candidates,
 )
+from .models.cuml_utils import cuml_gpu_available
 from .models.search import fit_best_estimator
 from .models.xgb_utils import (
     _set_xgb_cpu_predictor_for_inference,
@@ -63,6 +64,7 @@ __all__ = [
     "choose_param_grid",
     "choose_param_lhs_candidates",
     "fit_best_estimator",
+    "cuml_gpu_available",
     "_set_xgb_cpu_predictor_for_inference",
     "_unwrap_model_step",
     "xgb_gpu_available",

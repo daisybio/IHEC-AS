@@ -13,6 +13,7 @@ implementation details are delegated to specialized sibling modules:
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import os
@@ -43,6 +44,7 @@ from .modeling import (
     balanced_group_split_indices,
     build_baseline,
     bounded_group_splits,
+    cuml_gpu_available,
     evaluate_outer_fold,
     fit_best_estimator,
     metric_key,
@@ -314,6 +316,7 @@ def run_single_configuration(
                     search_strategy=run_cfg.search_strategy,
                     lhs_scale_mode=run_cfg.lhs_scale_mode,
                     xgb_use_gpu=run_cfg.xgb_use_gpu,
+                    cuml_use_gpu=run_cfg.cuml_use_gpu,
                     verbose=run_cfg.verbose,
                 )
 
@@ -347,7 +350,27 @@ def run_single_configuration(
                         )
                     else:
                         baseline_pred = baseline_pipe.predict(x_test)
-                        baseline_scores = regression_metrics(y_test, baseline_pred)
+                        # Mirror evaluate_outer_fold dual-scale logic so baseline_scores
+                        # has original_/logit_ prefixed keys matching regular model scores.
+                        from .models.beta import _inverse_logit, _logit_transform
+                        _bp = np.asarray(baseline_pred, dtype=float)
+                        _yt = np.asarray(y_test, dtype=float)
+                        _is_logit = bool(np.any(_yt < 0.0) or np.any(_yt > 1.0))
+                        if _is_logit:
+                            _yt_orig = _inverse_logit(_yt)
+                            _bp_orig = _inverse_logit(_bp)
+                        else:
+                            _yt_orig = _yt
+                            _bp_orig = _bp
+                        _scores_orig = regression_metrics(_yt_orig, _bp_orig)
+                        _yt_logit = _logit_transform(_yt_orig)
+                        _bp_logit = _logit_transform(_bp_orig)
+                        _scores_logit = regression_metrics(_yt_logit, _bp_logit)
+                        baseline_scores = dict(_scores_orig)
+                        for _k, _v in _scores_orig.items():
+                            baseline_scores[f"original_{_k}"] = float(_v)
+                        for _k, _v in _scores_logit.items():
+                            baseline_scores[f"logit_{_k}"] = float(_v)
 
                 # Compute training scores to detect overfitting.
                 fitted_estimator = ev.get("estimator")
@@ -410,6 +433,10 @@ def run_single_configuration(
                 if run_cfg.output_level == "diagnostics":
                     fold_result["y_true"] = ev["y_true"].tolist()
                     fold_result["y_pred"] = ev["y_pred"].tolist()
+                    if task == "classification":
+                        fold_result["baseline_y_pred"] = baseline_prob.tolist()
+                    else:
+                        fold_result["baseline_y_pred"] = baseline_pred.tolist()
                 fold_result["_estimator"] = ev.get("estimator")
 
                 return fold_result
@@ -521,6 +548,7 @@ def run_single_configuration(
 
 def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
     """Run all subset/task combinations and persist outputs."""
+    run_datetime = datetime.now(timezone.utc).isoformat()
     np.random.seed(run_cfg.random_seed)
     vlog(run_cfg.verbose, "Starting full run_all_configurations", level="info")
     tracker = make_tracker(run_cfg)
@@ -584,7 +612,7 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
         )
 
     if run_cfg.generate_html_reports:
-        generate_html_reports(results, out_dir, verbose=run_cfg.verbose)
+        generate_html_reports(results, out_dir, verbose=run_cfg.verbose, run_datetime=run_datetime)
 
     # Save per-task artifacts so classification and regression can be loaded
     # and reported independently.
@@ -600,7 +628,7 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
     for task_name, task_results in results_by_task.items():
         if not task_results:
             continue
-        task_bundle = {"run_config": asdict(run_cfg), "results": task_results}
+        task_bundle = {"run_datetime": run_datetime, "run_config": asdict(run_cfg), "results": task_results}
         pkl_path = out_dir / f"splicing_ml_results_{task_name}.pkl.gz"
         json_path = out_dir / f"splicing_ml_results_{task_name}.json.gz"
         save_pickle_gz(task_bundle, pkl_path)
@@ -621,7 +649,7 @@ def run_all_configurations(run_cfg: RunConfig) -> dict[str, Any]:
             level="info",
         )
 
-    bundle = {"run_config": asdict(run_cfg), "results": results}
+    bundle = {"run_datetime": run_datetime, "run_config": asdict(run_cfg), "results": results}
     tracker.finish_run(results)
     vlog(run_cfg.verbose, f"Artifacts written to {out_dir}", level="info")
     return bundle
@@ -810,6 +838,35 @@ def main() -> None:
             level="info",
         )
 
+    cuml_use_gpu = None
+    if "svm" in models:
+        cuml_use_gpu = cuml_gpu_available()
+        vlog(
+            args.verbose,
+            f"cuML SVM runtime device check: {'cuda' if cuml_use_gpu else 'cpu'}",
+            level="info",
+        )
+
+    if "mlp" in models:
+        try:
+            import torch as _torch
+            _mlp_device = "cpu"
+            try:
+                if _torch.accelerator.is_available():
+                    _mlp_device = str(_torch.accelerator.current_accelerator())
+            except AttributeError:
+                if _torch.cuda.is_available():
+                    _mlp_device = "cuda"
+                elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                    _mlp_device = "mps"
+        except ImportError:
+            _mlp_device = "torch not installed"
+        vlog(
+            args.verbose,
+            f"MLP runtime device check: {_mlp_device}",
+            level="info",
+        )
+
     outer_splits = args.outer_splits
     if args.smoke:
         outer_splits = 3  # Exactly 3 outer folds in smoke mode for robust evaluation
@@ -832,6 +889,7 @@ def main() -> None:
         search_strategy=args.search_strategy,
         lhs_scale_mode=args.lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
+        cuml_use_gpu=cuml_use_gpu,
         verbose=args.verbose,
         include_models=models,
         run_regression=not args.skip_regression,

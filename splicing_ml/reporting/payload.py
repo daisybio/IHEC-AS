@@ -155,6 +155,7 @@ def _safe_empty_payload(
         "confusion_by_model": {},
         "roc_by_model": {},
         "pr_by_model": {},
+        "pr_prevalence": None,
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }
@@ -291,16 +292,22 @@ def _build_roc_payload(
 def _build_pr_payload(
     fold_rows: list[dict[str, Any]],
     model_order: list[str],
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], float | None]:
     """Build per-model PR curve data by pooling predictions across folds.
 
-    Returns a dict keyed by model name, each value containing
-    ``precision``, ``recall`` (lists), and ``avg_precision`` (float).
+    Returns a tuple of:
+    - dict keyed by model name, each value containing ``precision``,
+      ``recall`` (lists), and ``avg_precision`` (AUPR float).
+      Includes a "Baseline (prior)" entry when ``baseline_y_pred`` is available.
+    - prevalence (float) of the positive class across all folds, or None.
+
     Models with fewer than two classes in the pooled labels are skipped.
     """
-    from sklearn.metrics import average_precision_score, precision_recall_curve
+    from sklearn.metrics import auc, precision_recall_curve
 
     pr_by_model: dict[str, dict[str, Any]] = {}
+    all_y_true_pooled: list[float] = []
+
     for model_name in model_order:
         m_rows = [r for r in fold_rows if str(r.get("model_name", "")) == model_name]
         all_y_true: list[float] = []
@@ -310,18 +317,47 @@ def _build_pr_payload(
             all_y_pred.extend(r.get("y_pred", []))
         if not all_y_true:
             continue
+        if not all_y_true_pooled:
+            all_y_true_pooled = all_y_true
         yt = np.asarray(all_y_true, dtype=int)
         yp = np.asarray(all_y_pred, dtype=float)
         if len(np.unique(yt)) < 2:
             continue
         precision, recall, _ = precision_recall_curve(yt, yp)
-        ap = float(average_precision_score(yt, yp))
+        aupr = float(auc(recall, precision))
         pr_by_model[model_name] = {
             "precision": precision.tolist(),
             "recall": recall.tolist(),
-            "avg_precision": ap,
+            "avg_precision": aupr,
         }
-    return pr_by_model
+
+    prevalence: float | None = (
+        float(np.mean(np.asarray(all_y_true_pooled, dtype=int)))
+        if all_y_true_pooled
+        else None
+    )
+
+    # Baseline model (DummyClassifier prior) PR curve.
+    baseline_yt: list[float] = []
+    baseline_yp: list[float] = []
+    for r in fold_rows:
+        bpred = r.get("baseline_y_pred", [])
+        yt_row = r.get("y_true", [])
+        if bpred and yt_row:
+            baseline_yt.extend(yt_row)
+            baseline_yp.extend(bpred)
+    if baseline_yt and len(np.unique(np.asarray(baseline_yt, dtype=int))) >= 2:
+        byt = np.asarray(baseline_yt, dtype=int)
+        byp = np.asarray(baseline_yp, dtype=float)
+        precision, recall, _ = precision_recall_curve(byt, byp)
+        aupr = float(auc(recall, precision))
+        pr_by_model["Baseline (prior)"] = {
+            "precision": precision.tolist(),
+            "recall": recall.tolist(),
+            "avg_precision": aupr,
+        }
+
+    return pr_by_model, prevalence
 
 
 def _build_classification_threshold_payload(
@@ -413,6 +449,29 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
     # Edge case: no fold results at all.
     if not fold_rows:
         return _safe_empty_payload(task_result, None, "No fold results available")
+
+    # Inject synthetic baseline fold rows so the baseline appears in the
+    # metric heatmap and scatter plots. One row per outer fold, derived from
+    # the first available model row for that fold.
+    _baseline_label = "Baseline (mean)" if task == "regression" else "Baseline (prior)"
+    _seen_folds: set[int] = set()
+    for r in list(fold_rows):
+        fid = int(r.get("outer_fold", -1))
+        if fid in _seen_folds:
+            continue
+        bs = r.get("baseline_scores", {})
+        if not bs:
+            continue
+        _seen_folds.add(fid)
+        fold_rows = list(fold_rows) + [
+            {
+                "model_name": _baseline_label,
+                "scores": bs,
+                "outer_fold": fid,
+                "y_true": r.get("y_true", []),
+                "y_pred": r.get("baseline_y_pred", []),
+            }
+        ]
 
     # Build model-fold long-format rows (skip NaN primary scores).
     model_fold_points = []
@@ -521,6 +580,8 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
     threshold_summary: list[dict[str, Any]] = []
     best_threshold: dict[str, Any] | None = None
     roc_by_model: dict[str, dict[str, Any]] = {}
+    pr_by_model: dict[str, dict[str, Any]] = {}
+    pr_prevalence: float | None = None
     if task == "classification":
         confusion_by_model, threshold_summary, best_threshold = (
             _build_classification_threshold_payload(
@@ -528,7 +589,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
             )
         )
         roc_by_model = _build_roc_payload(fold_rows, model_order)
-        pr_by_model = _build_pr_payload(fold_rows, model_order)
+        pr_by_model, pr_prevalence = _build_pr_payload(fold_rows, model_order)
 
     return {
         "task": task,
@@ -553,6 +614,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "confusion_by_model": confusion_by_model,
         "roc_by_model": roc_by_model,
         "pr_by_model": pr_by_model,
+        "pr_prevalence": pr_prevalence,
         "response_distribution": _ensure_thresholds(task_result),
         "important_params": important_params_table_rows(task_result),
     }

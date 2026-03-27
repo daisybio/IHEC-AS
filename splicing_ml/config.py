@@ -55,7 +55,7 @@ METADATA_COLUMNS = {
 }
 
 # Central model registry used by parser defaults/choices and runtime validation.
-ALL_MODEL_TYPES: tuple[str, ...] = ("linear", "elasticnet", "rf", "xgb", "beta")
+ALL_MODEL_TYPES: tuple[str, ...] = ("linear", "elasticnet", "rf", "xgb", "beta", "svm", "mlp")
 # Smoke mode covers all available model types.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
 
@@ -210,6 +210,7 @@ class RunConfig:
     search_strategy: str = "hybrid"
     lhs_scale_mode: str = "auto"
     xgb_use_gpu: bool | None = None
+    cuml_use_gpu: bool | None = None
     verbose: bool = False
     include_models: tuple[str, ...] = ALL_MODEL_TYPES
     run_regression: bool = True

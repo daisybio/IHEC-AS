@@ -16,6 +16,7 @@ independently auditable.
 
 import html
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -130,17 +131,23 @@ _PLOTLY_JS_HELPERS = """
     }
 
     // ── ROC + PR combined panel (shared legend) ────────────────────────────
-    function plotRocPrCurves(divId, rocByModel, prByModel, palette) {
+    function plotRocPrCurves(divId, rocByModel, prByModel, prevalence, palette) {
         const el = document.getElementById(divId);
         if (!el) return;
       const roc = rocByModel || {};
       const pr = prByModel || {};
-      const modelSet = new Set([...Object.keys(roc), ...Object.keys(pr)]);
-      const models = Array.from(modelSet);
-      if (!models.length) { el.innerHTML = '<p>No ROC/PR data available.</p>'; return; }
+      const BASELINE_KEY = 'Baseline (prior)';
+      // Separate regular models from the baseline entry so we can assign
+      // deterministic colours and render the baseline last with a fixed style.
+      const regularModels = Array.from(
+        new Set([...Object.keys(roc), ...Object.keys(pr)])
+      ).filter(m => m !== BASELINE_KEY);
+      if (!regularModels.length && !pr[BASELINE_KEY] && !roc[BASELINE_KEY]) {
+        el.innerHTML = '<p>No ROC/PR data available.</p>'; return;
+      }
 
       const traces = [];
-      models.forEach((m, i) => {
+      regularModels.forEach((m, i) => {
         const c = palette[i % palette.length];
         const rocD = roc[m];
         const prD = pr[m];
@@ -156,29 +163,63 @@ _PLOTLY_JS_HELPERS = """
         if (prD && (prD.recall || []).length && (prD.precision || []).length) {
           traces.push({
             x: prD.recall, y: prD.precision, mode: 'lines', type: 'scatter',
-            name: `${m} (AP=${prD.avg_precision.toFixed(3)})`,
-            legendgroup: m, showlegend: false,
-            line: { color: c, width: 2 },
+            name: `${m} (AUPR=${prD.avg_precision.toFixed(3)})`,
+            legendgroup: m, showlegend: true,
+            line: { color: c, width: 2, dash: 'dash' },
             xaxis: 'x2', yaxis: 'y2'
           });
         }
       });
 
+      // Baseline model (DummyClassifier prior) — grey dotted, own legend group.
+      const bPrD = pr[BASELINE_KEY];
+      const bRocD = roc[BASELINE_KEY];
+      if (bRocD && (bRocD.fpr || []).length && (bRocD.tpr || []).length) {
+        traces.push({
+          x: bRocD.fpr, y: bRocD.tpr, mode: 'lines', type: 'scatter',
+          name: `${BASELINE_KEY} (AUC=${bRocD.auc.toFixed(3)})`,
+          legendgroup: BASELINE_KEY, showlegend: true,
+          line: { color: '#888', width: 2, dash: 'dot' },
+          xaxis: 'x', yaxis: 'y'
+        });
+      }
+      if (bPrD && (bPrD.recall || []).length && (bPrD.precision || []).length) {
+        traces.push({
+          x: bPrD.recall, y: bPrD.precision, mode: 'lines', type: 'scatter',
+          name: `${BASELINE_KEY} (AUPR=${bPrD.avg_precision.toFixed(3)})`,
+          legendgroup: BASELINE_KEY, showlegend: true,
+          line: { color: '#888', width: 2, dash: 'dashdot' },
+          xaxis: 'x2', yaxis: 'y2'
+        });
+      }
+
+      // ROC random diagonal.
       traces.push({
         x: [0, 1], y: [0, 1], mode: 'lines', type: 'scatter',
-        name: 'Random', line: { color: '#999', width: 1, dash: 'dot' },
+        name: 'Random (ROC)', line: { color: '#bbb', width: 1, dash: 'dot' },
         hoverinfo: 'skip', showlegend: false,
         xaxis: 'x', yaxis: 'y'
       });
+
+      // PR random baseline: horizontal line at prevalence.
+      if (prevalence != null) {
+        traces.push({
+          x: [0, 1], y: [prevalence, prevalence], mode: 'lines', type: 'scatter',
+          name: `Random PR (prevalence=${prevalence.toFixed(3)})`,
+          line: { color: '#bbb', width: 1, dash: 'dot' },
+          hoverinfo: 'skip', showlegend: true,
+          xaxis: 'x2', yaxis: 'y2'
+        });
+      }
 
         Plotly.newPlot(
             divId, traces,
             {
           margin: { l: 56, r: 20, t: 56, b: 90 },
-          xaxis: { domain: [0.0, 0.46], title: 'False positive rate', range: [0, 1], constrain: 'domain' },
-          yaxis: { title: 'True positive rate', range: [0, 1], scaleanchor: 'x', scaleratio: 1, constrain: 'domain' },
-          xaxis2: { domain: [0.54, 1.0], title: 'Recall', range: [0, 1], constrain: 'domain' },
-          yaxis2: { title: 'Precision', range: [0, 1], scaleanchor: 'x2', scaleratio: 1, constrain: 'domain' },
+          xaxis: { domain: [0.0, 0.46], title: 'False positive rate', range: [0, 1] },
+          yaxis: { title: 'True positive rate', range: [0, 1] },
+          xaxis2: { domain: [0.54, 1.0], title: 'Recall', range: [0, 1], anchor: 'y2' },
+          yaxis2: { title: 'Precision', range: [0, 1], anchor: 'x2' },
           legend: { orientation: 'h', x: 0.5, y: -0.18, xanchor: 'center' },
           annotations: [
             { text: 'ROC curve (pooled across folds)', x: 0.23, y: 1.08, xref: 'paper', yref: 'paper', showarrow: false, font: { size: 14 } },
@@ -218,6 +259,7 @@ def write_subset_html_report(
     config: tuple[str, str, str, str],
     task_results: list[dict[str, Any]],
     output_path: Path,
+    run_datetime: str | None = None,
 ) -> None:
     """Write one standalone HTML report for a subset configuration.
 
@@ -231,6 +273,9 @@ def write_subset_html_report(
         f"transcript_filter={transcript_filter}, variability={variability}, "
         f"group_col={group_col}"
     )
+    html_generated_at = datetime.now(timezone.utc).isoformat()
+    run_datetime_display = html.escape(run_datetime) if run_datetime else "N/A"
+    html_generated_display = html.escape(html_generated_at)
     payload = [build_task_plot_payload(tr) for tr in task_results]
     payload_path = output_path.with_suffix(".json")
     payload_path.write_text(json.dumps(safe_json(payload)), encoding="utf-8")
@@ -258,6 +303,10 @@ def write_subset_html_report(
 </head>
 <body>
   <h1>{html.escape(title)}</h1>
+  <p style="color:#666;font-size:0.85rem;margin:4px 0 16px;">
+    Results generated: <strong>{run_datetime_display}</strong> &nbsp;|&nbsp;
+    Report rendered: <strong>{html_generated_display}</strong>
+  </p>
   <div id="reports"></div>
   <script>
 {_PLOTLY_JS_HELPERS}
@@ -460,7 +509,7 @@ def write_subset_html_report(
           }}
 
           // ROC + PR curves with shared legend in one combined panel.
-          plotRocPrCurves(p3.id, tr.roc_by_model || {{}}, tr.pr_by_model || {{}}, palette);
+          plotRocPrCurves(p3.id, tr.roc_by_model || {{}}, tr.pr_by_model || {{}}, tr.pr_prevalence ?? null, palette);
 
           // PSI distribution with binarization threshold markers.
           const dist = tr.response_distribution || {{}};
@@ -500,7 +549,10 @@ def write_subset_html_report(
 
 
 def generate_html_reports(
-    all_results: list[dict[str, Any]], out_dir: Path, verbose: bool = False
+    all_results: list[dict[str, Any]],
+    out_dir: Path,
+    verbose: bool = False,
+    run_datetime: str | None = None,
 ) -> None:
     """Generate one HTML report per subset configuration."""
     import collections
@@ -516,5 +568,7 @@ def generate_html_reports(
 
     for key, task_results in grouped.items():
         report_path = reports_dir / f"subset_report_{slugify_config_key(key)}.html"
-        write_subset_html_report(key, task_results, report_path)
+        write_subset_html_report(
+            key, task_results, report_path, run_datetime=run_datetime
+        )
         vlog(verbose, f"Wrote HTML report: {report_path}", level="info")

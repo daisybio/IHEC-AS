@@ -28,7 +28,9 @@ set -euo pipefail
 # sbatch --array=0-(N-1)%20 scripts/slurm_ml_one_config.sh <config_tsv> <data_path> <output_root> [env_name] [wandb_project]
 #
 # config_tsv format (tab-separated, no header):
-#   event_type\ttranscript_filter\tvariability\tgroup_col
+#   event_type\ttranscript_filter\tvariability\tgroup_col\t[task]
+#
+# task: classification | regression | both (default: both)
 #
 # Pass a wandb_project name to enable W&B tracking. WANDB_API_KEY must be
 # set in the environment (export it before calling sbatch or add it to ~/.bashrc).
@@ -49,7 +51,8 @@ fi
 
 readarray -t CONFIG_LINES < "$CONFIG_TSV"
 CFG_LINE="${CONFIG_LINES[${SLURM_ARRAY_TASK_ID}]}"
-IFS=$'\t' read -r EVENT_TYPE TRANSCRIPT_FILTER VARIABILITY GROUP_COL <<< "$CFG_LINE"
+IFS=$'\t' read -r EVENT_TYPE TRANSCRIPT_FILTER VARIABILITY GROUP_COL TASK <<< "$CFG_LINE"
+TASK="${TASK:-both}"
 
 if [[ -z "${GROUP_COL:-}" ]]; then
   echo "[ERROR] Missing group_col in config TSV line for task ${SLURM_ARRAY_TASK_ID}" >&2
@@ -59,7 +62,7 @@ fi
 OUT_DIR="${OUTPUT_ROOT}/${EVENT_TYPE}_${TRANSCRIPT_FILTER}_${VARIABILITY}_${GROUP_COL}"
 mkdir -p "$OUT_DIR"
 
-echo "[SLURM] task=${SLURM_ARRAY_TASK_ID} config=${EVENT_TYPE}/${TRANSCRIPT_FILTER}/${VARIABILITY}/${GROUP_COL}"
+echo "[SLURM] task=${SLURM_ARRAY_TASK_ID} config=${EVENT_TYPE}/${TRANSCRIPT_FILTER}/${VARIABILITY}/${GROUP_COL} ml_task=${TASK}"
 echo "[SLURM] output=${OUT_DIR}"
 
 # Build command as an array to avoid line-continuation/comment parsing pitfalls.
@@ -73,6 +76,14 @@ CMD=(
   --only-variability "$VARIABILITY"
   --only-group "$GROUP_COL"
 )
+
+case "$TASK" in
+  classification) CMD+=(--skip-regression) ;;
+  regression)     CMD+=(--skip-classification) ;;
+  both)           ;;  # run both — no skip flag needed
+  *) echo "[ERROR] Unknown task '${TASK}'; expected classification|regression|both" >&2; exit 1 ;;
+esac
+echo "[SLURM] ml_task=${TASK} (skip flags applied if any)"
 
 # Use one fewer core than allocated to leave a small overhead margin.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${SLURM_CPUS_PER_TASK}" -gt 1 ]]; then

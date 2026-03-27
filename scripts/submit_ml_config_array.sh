@@ -75,8 +75,10 @@ for cfg in configs:
 for key, path in [("L", CONFIG_L), ("M", CONFIG_M), ("S", CONFIG_S)]:
     with open(path, "w", encoding="utf-8") as f:
         for cfg in buckets[key]:
-            f.write(f"{cfg.event_type}\t{cfg.transcript_filter}\t{cfg.variability}\t{cfg.group_col}\n")
-    print(f"Tier {key}: {len(buckets[key])} configs -> {path}")
+            for task in ("classification", "regression"):
+                f.write(f"{cfg.event_type}\t{cfg.transcript_filter}\t{cfg.variability}\t{cfg.group_col}\t{task}\n")
+    n_rows = len(buckets[key]) * 2
+    print(f"Tier {key}: {n_rows} jobs ({len(buckets[key])} configs x 2 tasks) -> {path}")
 PY
 
 submit_tier() {

@@ -148,7 +148,7 @@ def _fit_logistic_elasticnet_cv(
                     Cs=_C_GRID,
                     l1_ratios=_L1_RATIO_GRID,
                     solver="saga",
-                    max_iter=5000,
+                    max_iter=20000,
                     class_weight="balanced",
                     random_state=RNG_SEED,
                     cv=inner_cv,
@@ -319,6 +319,7 @@ def _build_grid_search(
     search_strategy: str,
     lhs_scale_mode: str,
     xgb_use_gpu: bool | None,
+    cuml_use_gpu: bool | None,
     verbose: bool,
     model_n_jobs: int = 1,
 ) -> GridSearchCV:
@@ -332,6 +333,7 @@ def _build_grid_search(
         strategy=search_strategy,
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
+        cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
     )
@@ -359,12 +361,13 @@ def _fit_grid_search(
     search_strategy: str,
     lhs_scale_mode: str,
     xgb_use_gpu: bool | None,
+    cuml_use_gpu: bool | None,
     verbose: bool,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit all non-ElasticNet, non-Beta models via GridSearchCV.
 
     Handles:
-    - Parallelism: limits XGBoost GPU jobs to 1 to avoid VRAM contention.
+    - Parallelism: limits XGBoost/cuML GPU jobs to 1 to avoid VRAM contention.
     - GPU retry: on CUDA failure, automatically falls back to CPU.
     - XGBoost post-search refit: after tuning with a reduced n_estimators
       budget, the final estimator is re-trained with a larger tree budget.
@@ -372,7 +375,27 @@ def _fit_grid_search(
     # Limit concurrent GPU jobs to avoid VRAM contention.
     # For RF, split cores between search-level and tree-level parallelism:
     # model_n_jobs gets sqrt(max_cores) cores per forest; search_n_jobs gets the rest.
-    if model_name == "xgb" and bool(xgb_use_gpu):
+    if model_name == "mlp":
+        # Detect any available accelerator to decide parallelism budget.
+        _mlp_has_gpu = False
+        try:
+            import torch as _torch
+            _mlp_has_gpu = _torch.cuda.is_available()
+            try:
+                _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
+            except AttributeError:
+                pass
+            if hasattr(_torch.backends, "mps"):
+                _mlp_has_gpu = _mlp_has_gpu or _torch.backends.mps.is_available()
+        except ImportError:
+            pass
+        # Single search job when a GPU is available to prevent VRAM contention
+        # across parallel GridSearchCV workers.
+        search_n_jobs = 1 if _mlp_has_gpu else max_cores
+        model_n_jobs = 1
+    elif (model_name == "xgb" and bool(xgb_use_gpu)) or (
+        model_name == "svm" and bool(cuml_use_gpu)
+    ):
         search_n_jobs = 1
         model_n_jobs = 1
     elif model_name in {"rf", "xgb"} and max_cores > 1:
@@ -396,17 +419,26 @@ def _fit_grid_search(
         search_strategy=search_strategy,
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
+        cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
     )
 
     def _fit_search(search_obj: GridSearchCV) -> None:
-        if search_n_jobs > 1:
-            # Thread backend avoids occasional loky worker-stop warnings.
-            with parallel_backend("threading", n_jobs=search_n_jobs):
-                search_obj.fit(x_train, y_train)
-            return
-        search_obj.fit(x_train, y_train)
+        # sklearn 1.8 internally converts C=np.inf → penalty=None and then
+        # warns about it, even though C=np.inf is their own recommended API.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Setting penalty=None will ignore the C and l1_ratio parameters",
+                category=UserWarning,
+            )
+            if search_n_jobs > 1:
+                # Thread backend avoids occasional loky worker-stop warnings.
+                with parallel_backend("threading", n_jobs=search_n_jobs):
+                    search_obj.fit(x_train, y_train)
+                return
+            search_obj.fit(x_train, y_train)
 
     try:
         _fit_search(search)
@@ -430,6 +462,29 @@ def _fit_grid_search(
                 search_strategy=search_strategy,
                 lhs_scale_mode=lhs_scale_mode,
                 xgb_use_gpu=False,  # force CPU
+                cuml_use_gpu=cuml_use_gpu,
+                verbose=verbose,
+            )
+            _fit_search(search)
+        elif model_name == "svm" and bool(cuml_use_gpu) and _looks_like_gpu_failure(exc):
+            vlog(
+                verbose,
+                f"cuML SVM GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            search = _build_grid_search(
+                pipe=pipe,
+                model_name=model_name,
+                task=task,
+                x_train=x_train,
+                y_train=y_train,
+                inner_cv=inner_cv,
+                search_n_jobs=max_cores,
+                param_grid_size=param_grid_size,
+                search_strategy=search_strategy,
+                lhs_scale_mode=lhs_scale_mode,
+                xgb_use_gpu=xgb_use_gpu,
+                cuml_use_gpu=False,  # force sklearn CPU path
                 verbose=verbose,
             )
             _fit_search(search)
@@ -510,6 +565,7 @@ def fit_best_estimator(
     search_strategy: str,
     lhs_scale_mode: str,
     xgb_use_gpu: bool | None,
+    cuml_use_gpu: bool | None = None,
     verbose: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Tune hyperparameters via grouped inner CV and return the best estimator.
@@ -577,5 +633,6 @@ def fit_best_estimator(
         search_strategy=search_strategy,
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
+        cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
     )
