@@ -27,6 +27,7 @@ from splicing_ml.reporting import (
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser(
         description="Generate reports from pretrained run outputs"
     )
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the command-line entrypoint."""
     args = parse_args()
 
     if args.results_file is not None:

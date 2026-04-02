@@ -145,7 +145,7 @@ def _adaptive_c_grid(n_samples: int) -> tuple[list[float], list[float]]:
     elif n_samples < 600_000:
         n_cs, l1_ratios = 25, [0.1, 0.5, 0.9, 1.0]
     else:
-        n_cs, l1_ratios = 15, [0.1, 0.9, 1.0]
+        n_cs, l1_ratios = 25, [0.1, 0.9, 1.0]
     c_grid = (1.0 / np.logspace(-6, 2, num=n_cs)).tolist()
     return c_grid, l1_ratios
 
@@ -446,6 +446,8 @@ def _fit_logistic_elasticnet_cv(
     # Large-run spread (~62-83 min near 1.57M samples) indicates cluster-load
     # variance, so keep a mildly conservative central estimate.
     # Model: (10 + n_samples/11_000) * (n_Cs/100) min/batch.
+    # NOTE: For very large datasets (>600k), SAGA solver overhead causes real times to
+    # be 1.5-2.3× the estimate. Multiply estimate by 1.8 for best-effort accuracy.
     _n_cv_tasks = len(l1_grid) * len(inner_cv)
     _n_batches = math.ceil(_n_cv_tasks / max(1, max_cores))
     _est_min = _n_batches * (10.0 + x_train.shape[0] / 11_000) * (len(c_grid) / 100)
@@ -505,7 +507,11 @@ def _fit_logistic_elasticnet_cv(
             mean_per_c = np.mean(np.asarray(class_scores, dtype=float), axis=0)
             best_score = float(np.max(mean_per_c))
         except Exception as exc:
-            vlog(verbose, f"elasticnet best_score extraction failed: {exc}", level="debug")
+            vlog(
+                verbose,
+                f"elasticnet best_score extraction failed: {exc}",
+                level="debug",
+            )
 
     vlog(
         verbose,
@@ -661,7 +667,11 @@ def _fit_cuml_logistic_elasticnet_cv(
                         np.max(np.mean(np.asarray(scores_arr, dtype=float), axis=0))
                     )
                 except Exception as exc:
-                    vlog(verbose, f"elasticnet cpu_fallback best_score extraction failed: {exc}", level="debug")
+                    vlog(
+                        verbose,
+                        f"elasticnet cpu_fallback best_score extraction failed: {exc}",
+                        level="debug",
+                    )
             vlog(
                 verbose,
                 f"Search complete model=elasticnet, task={task}, strategy=logisticelasticnetcv_cpu_fallback, "
@@ -865,9 +875,7 @@ class _ContextAwareCV:
                 _es_raw_val_context.X_val = (
                     X.iloc[es_val_idx] if hasattr(X, "iloc") else X[es_val_idx]
                 )
-                _es_raw_val_context.y_val = (
-                    y[es_val_idx] if y is not None else None
-                )
+                _es_raw_val_context.y_val = y[es_val_idx] if y is not None else None
                 yield es_train_idx, val_idx
             else:
                 yield train_idx, val_idx
@@ -946,7 +954,11 @@ class _ESPipeline(Pipeline):
                     **fit_params,
                 )
             except Exception as exc:
-                vlog(True, f"XGB early stopping failed, falling back to standard fit: {exc}", level="debug")
+                vlog(
+                    True,
+                    f"XGB early stopping failed, falling back to standard fit: {exc}",
+                    level="debug",
+                )
                 model.fit(Xt, y, **fit_params)
         elif X_val_pp is not None and y_val is not None and self.model_name == "mlp":
             _es_pp_val_context.X_val_pp = X_val_pp
@@ -1199,7 +1211,11 @@ def _fit_tree_early_stopping(
                     )
                     optimal_n = max(_TREE_ES_N_MIN, int(model_final.best_iteration) + 1)
                 except Exception as exc:
-                    vlog(verbose, f"XGB post-search early stopping failed, falling back: {exc}", level="debug")
+                    vlog(
+                        verbose,
+                        f"XGB post-search early stopping failed, falling back: {exc}",
+                        level="debug",
+                    )
                     model_final.fit(X_final_train_t, y_final_train)
                     optimal_n = _TREE_ES_N_MAX
             else:
@@ -1324,7 +1340,11 @@ def _fit_grid_search(
             try:
                 _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
             except AttributeError:
-                vlog(verbose, "torch.accelerator not available (older torch); using cuda/mps only", level="debug")
+                vlog(
+                    verbose,
+                    "torch.accelerator not available (older torch); using cuda/mps only",
+                    level="debug",
+                )
             if hasattr(_torch.backends, "mps"):
                 _mlp_has_gpu = _mlp_has_gpu or _torch.backends.mps.is_available()
         except ImportError:
@@ -1583,7 +1603,11 @@ def _fit_optuna_search(
             try:
                 _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
             except AttributeError:
-                vlog(verbose, "torch.accelerator not available (older torch); using cuda/mps only", level="debug")
+                vlog(
+                    verbose,
+                    "torch.accelerator not available (older torch); using cuda/mps only",
+                    level="debug",
+                )
             if hasattr(_torch.backends, "mps"):
                 _mlp_has_gpu = _mlp_has_gpu or _torch.backends.mps.is_available()
         except ImportError:
@@ -1843,7 +1867,11 @@ def _fit_optuna_search(
                         f"MLP early stopping: n_epochs_trained={mlp_model.n_epochs_trained_}",
                     )
         except Exception as exc:
-            vlog(verbose, f"MLP n_epochs_trained_ extraction failed: {exc}", level="debug")
+            vlog(
+                verbose,
+                f"MLP n_epochs_trained_ extraction failed: {exc}",
+                level="debug",
+            )
 
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
 

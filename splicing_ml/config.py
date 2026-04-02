@@ -65,12 +65,14 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
     "nysvm",
     "mlp",
 )
-# Default production runs exclude SVM (O(n²), unusable at SE scale) and
-# nysvm (OOM-killed on SE; worst-performing model at all scales).
+# Default production runs exclude:
+# - svm (O(n²), unusable at SE scale)
+# - nysvm (OOM-killed on SE; worst-performing model at all scales)
+# - elasticnet (slower than linear, competitive only with linear/beta; not justified by performance gain)
 # MLP was optimized with batch-size scaling, mixed precision, and early
 # stopping and is now fast enough for routine production runs.
 DEFAULT_MODEL_TYPES: tuple[str, ...] = tuple(
-    m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm"}
+    m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm", "elasticnet"}
 )
 # Smoke mode covers all available model types including MLP.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
