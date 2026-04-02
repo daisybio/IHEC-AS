@@ -24,24 +24,31 @@ class NullTracker:
     """No-op tracker matching the W&B tracker interface."""
 
     def start_run(self, *args: Any, **kwargs: Any) -> None:
+        """Start run."""
         return None
 
     def start_config_task(self, *args: Any, **kwargs: Any) -> None:
+        """Start config task."""
         return None
 
     def log_fold_result(self, *args: Any, **kwargs: Any) -> None:
+        """Log fold result."""
         return None
 
     def log_config_task_summary(self, *args: Any, **kwargs: Any) -> None:
+        """Log config task summary."""
         return None
 
     def log_artifact(self, *args: Any, **kwargs: Any) -> None:
+        """Log artifact."""
         return None
 
     def finish_config_task(self, *args: Any, **kwargs: Any) -> None:
+        """Finish config task."""
         return None
 
     def finish_run(self, *args: Any, **kwargs: Any) -> None:
+        """Finish run."""
         return None
 
 
@@ -53,6 +60,7 @@ class WandbTracker:
     """
 
     def __init__(self, wandb_module: Any, run_cfg: Any):
+        """Initialize a WandbTracker instance."""
         self._wandb = wandb_module
         self._project = str(getattr(run_cfg, "wandb_project", "splicing-ml"))
         self._entity = getattr(run_cfg, "wandb_entity", None)
@@ -61,9 +69,11 @@ class WandbTracker:
         self._child_run = None
         self._child_context: dict[str, Any] = {}
         self._fold_rows: list[dict[str, Any]] = []
+        self._cv_results_by_model: dict[str, list[dict[str, Any]]] = {}
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:
+        """Internal helper for safe float."""
         if not isinstance(value, (int, float)):
             return None
         fval = float(value)
@@ -72,6 +82,7 @@ class WandbTracker:
         return fval
 
     def _extract_tuning_summary(self, tuning_info: dict[str, Any]) -> dict[str, Any]:
+        """Internal helper for extract tuning summary."""
         best_score = self._safe_float(tuning_info.get("best_score"))
         best_params = tuning_info.get("best_params", {})
         if not isinstance(best_params, dict):
@@ -83,12 +94,12 @@ class WandbTracker:
             "best_param_keys": ",".join(param_keys),
             "best_params_json": json.dumps(best_params, sort_keys=True, default=str),
         }
-        if "xgb_refit_applied" in tuning_info:
-            summary["xgb_refit_applied"] = bool(tuning_info.get("xgb_refit_applied"))
-        if "xgb_final_n_estimators" in tuning_info:
-            n_estimators = tuning_info.get("xgb_final_n_estimators")
+        if "tree_es_applied" in tuning_info:
+            summary["tree_es_applied"] = bool(tuning_info.get("tree_es_applied"))
+        if "tree_es_n_estimators" in tuning_info:
+            n_estimators = tuning_info.get("tree_es_n_estimators")
             if isinstance(n_estimators, (int, float)):
-                summary["xgb_final_n_estimators"] = int(n_estimators)
+                summary["tree_es_n_estimators"] = int(n_estimators)
         if "beta_convergence_risk" in tuning_info:
             summary["beta_convergence_risk"] = json.dumps(
                 tuning_info.get("beta_convergence_risk"),
@@ -100,6 +111,7 @@ class WandbTracker:
     def _log_fold_subrun(
         self, payload: dict[str, Any], fold_row: dict[str, Any]
     ) -> None:
+        """Internal helper for log fold subrun."""
         if not bool(getattr(self._run_cfg, "wandb_fold_subruns", False)):
             return
         if self._child_run is None:
@@ -136,6 +148,7 @@ class WandbTracker:
             subrun.finish()
 
     def _log_fold_table(self) -> None:
+        """Internal helper for log fold table."""
         if self._child_run is None:
             return
         if not bool(getattr(self._run_cfg, "wandb_log_fold_table", True)):
@@ -183,6 +196,7 @@ class WandbTracker:
             self._child_run.log({"folds/by_model": table})
 
     def start_run(self, run_cfg: Any) -> None:
+        """Start run."""
         tags = ["splicing-ml", "orchestrator"]
         if bool(getattr(run_cfg, "smoke_mode", False)):
             tags.append("smoke")
@@ -204,6 +218,7 @@ class WandbTracker:
         n_samples: int,
         prep_details: dict[str, Any],
     ) -> None:
+        """Start config task."""
         group = getattr(self._parent_run, "name", None)
         run_name = (
             f"{cfg.event_type}-{cfg.transcript_filter}-{cfg.variability}-"
@@ -244,6 +259,7 @@ class WandbTracker:
             "task": str(task),
         }
         self._fold_rows = []
+        self._cv_results_by_model = {}
         with contextlib.suppress(Exception):
             prep_table = self._wandb.Table(columns=["key", "value"])
             for key, value in prep_details.items():
@@ -261,12 +277,12 @@ class WandbTracker:
         estimator: Any,
         task: str,
         x_train: Any,
-        x_test: Any,
         train_scores: dict[str, float] | None = None,
         primary_metric: str | None = None,
         baseline_scores: dict[str, float] | None = None,
         delta_vs_baseline: dict[str, float] | None = None,
     ) -> None:
+        """Log fold result."""
         if self._child_run is None:
             return
 
@@ -341,6 +357,12 @@ class WandbTracker:
             "delta_vs_baseline_primary": delta_primary,
         }
         self._fold_rows.append(fold_row)
+        cv_results = (
+            tuning_info.get("cv_results") if isinstance(tuning_info, dict) else None
+        )
+        if cv_results and isinstance(cv_results, dict):
+            entry = {"outer_fold": int(fold_id), **cv_results}
+            self._cv_results_by_model.setdefault(model_name, []).append(entry)
         self._log_fold_subrun(payload, fold_row)
 
         # Optional sklearn diagnostics; never fail pipeline execution.
@@ -392,7 +414,97 @@ class WandbTracker:
                     feature_names = prep.get_feature_names_out()
                 self._wandb.sklearn.plot_feature_importances(model, feature_names)
 
+    def _log_model_comparison(self, primary_metric: str) -> None:
+        """Log outer-fold model comparison: bar chart (mean) + fold-detail table."""
+        if self._child_run is None or not self._fold_rows:
+            return
+        from collections import defaultdict
+
+        scores_by_model: dict[str, list[float]] = defaultdict(list)
+        for row in self._fold_rows:
+            v = row.get("primary_metric_value")
+            if v is not None:
+                scores_by_model[str(row["model_name"])].append(float(v))
+        if not scores_by_model:
+            return
+
+        summary_table = self._wandb.Table(columns=["model", "mean", "std", "n_folds"])
+        for model_name, vals in sorted(scores_by_model.items()):
+            summary_table.add_data(
+                model_name,
+                float(np.mean(vals)),
+                float(np.std(vals)),
+                len(vals),
+            )
+
+        detail_table = self._wandb.Table(columns=["model", "fold_id", "score"])
+        for row in self._fold_rows:
+            v = row.get("primary_metric_value")
+            if v is not None:
+                detail_table.add_data(
+                    str(row["model_name"]),
+                    int(row["fold_id"]),
+                    float(v),
+                )
+
+        with contextlib.suppress(Exception):
+            self._child_run.log(
+                {
+                    "comparison/model_summary": summary_table,
+                    "comparison/model_fold_detail": detail_table,
+                    "comparison/bar_chart": self._wandb.plot.bar(
+                        summary_table,
+                        "model",
+                        "mean",
+                        title=f"Model comparison — mean {primary_metric} (outer folds)",
+                    ),
+                }
+            )
+
+    def _log_cv_result_tables(self) -> None:
+        """Log one aggregated inner-CV results Table per model (across all outer folds)."""
+        if self._child_run is None or not self._cv_results_by_model:
+            return
+        for model_name, fold_entries in self._cv_results_by_model.items():
+            with contextlib.suppress(Exception):
+                # Determine split column names from first entry.
+                split_keys: list[str] = []
+                for entry in fold_entries:
+                    split_keys = entry.get("split_keys", [])
+                    if split_keys:
+                        break
+                columns = [
+                    "outer_fold",
+                    "rank",
+                    "mean_score",
+                    "std_score",
+                    "params",
+                ] + split_keys
+                table = self._wandb.Table(columns=columns)
+                for entry in fold_entries:
+                    outer_fold = entry["outer_fold"]
+                    ranks = entry.get("rank_test_score", [])
+                    means = entry.get("mean_test_score", [])
+                    stds = entry.get("std_test_score", [])
+                    params = entry.get("params_json", [])
+                    split_scores = entry.get("split_scores", {})
+                    n = entry.get("n_candidates", len(means))
+                    for i in range(n):
+                        split_vals = [
+                            split_scores.get(k, [None] * n)[i] for k in split_keys
+                        ]
+                        table.add_data(
+                            outer_fold,
+                            ranks[i] if i < len(ranks) else None,
+                            means[i] if i < len(means) else None,
+                            stds[i] if i < len(stds) else None,
+                            params[i] if i < len(params) else None,
+                            *split_vals,
+                        )
+                self._child_run.log({f"{model_name}/cv_results": table})
+
     def log_config_task_summary(self, result: dict[str, Any]) -> None:
+        """Log config task summary."""
         if self._child_run is None:
             return
         with contextlib.suppress(Exception):
@@ -412,8 +524,13 @@ class WandbTracker:
             )
         with contextlib.suppress(Exception):
             self._log_fold_table()
+        with contextlib.suppress(Exception):
+            self._log_model_comparison(str(result.get("primary_metric", "")))
+        with contextlib.suppress(Exception):
+            self._log_cv_result_tables()
 
     def log_artifact(self, path: str | Path, name: str, artifact_type: str) -> None:
+        """Log artifact."""
         if self._parent_run is None:
             return
         p = Path(path)
@@ -425,15 +542,18 @@ class WandbTracker:
             self._parent_run.log_artifact(artifact)
 
     def finish_config_task(self) -> None:
+        """Finish config task."""
         if self._child_run is None:
             return
         with contextlib.suppress(Exception):
             self._child_run.finish()
         self._child_run = None
         self._fold_rows = []
+        self._cv_results_by_model = {}
         self._child_context = {}
 
     def finish_run(self, all_results: list[dict[str, Any]]) -> None:
+        """Finish run."""
         if self._parent_run is None:
             return
         with contextlib.suppress(Exception):

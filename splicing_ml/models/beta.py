@@ -77,6 +77,7 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
         adaptive_maxiter: bool = True,
         maxiter_cap: int = 1200,
     ):
+        """Initialize a BetaRegressor instance."""
         self.epsilon = float(epsilon)
         self.maxiter = int(maxiter)
         self.max_sparse_columns = int(max_sparse_columns)
@@ -342,7 +343,11 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
             str(self.convergence_risk_.get("level", "low"))
         )
 
-        x_design = add_constant(x_use, has_constant="skip")
+        # Always add an explicit intercept to keep design width stable across
+        # folds. With has_constant="skip", predict-time batches that contain a
+        # constant feature can silently drop the intercept and cause shape
+        # mismatch against fitted params.
+        x_design = add_constant(x_use, has_constant="add")
         self._beta_result_ = self._optimize_model(x_design, y_arr, iter_schedule)
         self.n_features_in_ = x_arr.shape[1]
         return self
@@ -353,6 +358,9 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
 
         if not hasattr(self, "_beta_result_"):
             raise RuntimeError("BetaRegressor is not fitted")
+
+        # Store original feature count for diagnostics
+        x_orig_features = self._as_dense_2d(x).shape[1]
 
         x_in = x
         if getattr(self, "_sparse_keep_idx_", None) is not None and hasattr(
@@ -368,6 +376,20 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
         if getattr(self, "_qr_keep_idx_", None) is not None:
             x_use = x_use[:, self._qr_keep_idx_]
 
-        x_design = add_constant(x_use, has_constant="skip")
+        x_design = add_constant(x_use, has_constant="add")
+
+        # Validate full design width (including intercept) against fitted model.
+        expected_design_cols = int(self._beta_result_.model.exog.shape[1])
+        actual_design_cols = int(x_design.shape[1])
+        if actual_design_cols != expected_design_cols:
+            raise ValueError(
+                f"BetaRegressor design width mismatch during predict: "
+                f"model expects {expected_design_cols} columns (including intercept), "
+                f"but received {actual_design_cols}. "
+                f"Feature columns before intercept: {x_use.shape[1]}. "
+                f"Original input features: {x_orig_features}, "
+                f"features after masking/filtering: {x_use.shape[1]}."
+            )
+
         pred = np.asarray(self._beta_result_.predict(x_design), dtype=float)
         return np.clip(pred, self.epsilon, 1.0 - self.epsilon)

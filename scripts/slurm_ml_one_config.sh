@@ -3,24 +3,32 @@
 #SBATCH --error splicing_ml/output/ml_error_logs/%x.%A_%a.%N.%j.txt
 #SBATCH --output splicing_ml/output/ml_logs/%x.%A_%a.%N.%j.txt
 #SBATCH -p shared-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a40:1
 #SBATCH --qos=limitgpus
-#SBATCH -c 12
+# QOS limitgpus limits: gres/gpu=4, cpu=80 across all running jobs.
+# Effective per-tier concurrency (CPU-bound): L=2 (2x32=64), M=3 (3x24=72), S=4 (4x16=64, GPU-bound).
+#SBATCH -c 24
 #SBATCH --mem 24G
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=quirin.manz@tum.de
-#SBATCH -t 0-12:00:00
+#SBATCH -t 0-08:00:00
 #SBATCH --array=0-0%20
 #
-# Resource tiers (submit_ml_config_array.sh overrides -c/--mem/--time per tier):
-#   Tier L  SE + both variability    : --mem=40G  -c 16  --time=0-24:00:00
-#   Tier M  SE + High/Low | RI + both: --mem=24G  -c 12  --time=0-12:00:00  (defaults above)
-#   Tier S  RI + High/Low            : --mem=16G  -c  8  --time=0-06:00:00
+# Resource tiers (submit_ml_config_array.sh overrides -c/--mem/--gres/--time per tier):
+#   Tier L  SE + both variability    : --mem=40G  -c 32  --gres=gpu:a40:1  --time=0-12:00:00
+#   Tier M  SE + High/Low | RI + both: --mem=24G  -c 24  --gres=gpu:a40:1  --time=0-08:00:00  (defaults above)
+#   Tier S  RI + High/Low            : --mem=16G  -c 16  --gres=gpu:a40:1  --time=0-06:00:00
+# Note: only A40 (48 GB VRAM) is used; Titan GPUs on gpu01 have ~12 GB VRAM and 92 GB node RAM,
+# which is insufficient for cuML SVM on even the smallest tier's dataset sizes.
+# (outer_splits=10 original estimates: L=2-00:00:00, M=1-12:00:00, S=1-00:00:00)
 #
 # Rationale:
 #   Every job loads the full dataset (~6.4 GB pandas RSS).  Larger subsets add
 #   up to ~1.4 GB of feature matrix which gets copied ~3-4x during nested CV.
 #   SE/both configs reach 3.9 M rows; RI/High configs stay under 130 K rows.
+#   Walltime driven by LogisticRegressionCV (elasticnet, CPU-only): with
+#   outer_splits=5 (inner_splits=4, 5 l1_ratios -> 20 tasks) ~10 min/fold at 16c.
+#   MLP excluded from default models.
 
 set -euo pipefail
 
@@ -75,6 +83,8 @@ echo "[SLURM] output=${OUT_DIR}"
 CMD=(
   python -u run_splicing_ml.py
   --debug
+  --tune-threshold
+  --optuna
   --data-path "$DATA_PATH"
   --output-dir "$OUT_DIR"
   --only-event-type "$EVENT_TYPE"
@@ -93,7 +103,7 @@ echo "[SLURM] ml_task=${TASK} (skip flags applied if any)"
 
 # Use one fewer core than allocated to leave a small overhead margin.
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${SLURM_CPUS_PER_TASK}" -gt 1 ]]; then
-  MAX_CORES=$((SLURM_CPUS_PER_TASK - 1))
+  MAX_CORES="${SLURM_CPUS_PER_TASK}" #((SLURM_CPUS_PER_TASK - 1))
   CMD+=(--max-cores "$MAX_CORES")
   echo "[SLURM] max_cores=${MAX_CORES} (from SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK})"
 fi

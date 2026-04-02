@@ -25,6 +25,38 @@ from ..utils import safe_json
 __all__ = ["build_task_plot_payload", "important_params_table_rows"]
 
 
+MAX_GLOBAL_POINTS = 8000
+MAX_PER_MODEL_POINTS = 2000
+MAX_PSI_SAMPLE_POINTS = 30000
+MAX_CURVE_POINTS = 3000
+
+
+def _downsample_pair(
+    x_vals: list[float], y_vals: list[float], max_points: int
+) -> tuple[list[float], list[float]]:
+    """Downsample paired vectors using evenly spaced deterministic indices."""
+    n = min(len(x_vals), len(y_vals))
+    if n <= max_points:
+        return x_vals[:n], y_vals[:n]
+    idx = np.linspace(0, n - 1, num=max_points, dtype=int)
+    return [x_vals[i] for i in idx], [y_vals[i] for i in idx]
+
+
+def _downsample_list(vals: list[float], max_points: int) -> list[float]:
+    """Downsample one vector using evenly spaced deterministic indices."""
+    if len(vals) <= max_points:
+        return vals
+    idx = np.linspace(0, len(vals) - 1, num=max_points, dtype=int)
+    return [vals[i] for i in idx]
+
+
+def _downsample_curve(
+    x_vals: list[float], y_vals: list[float], max_points: int
+) -> tuple[list[float], list[float]]:
+    """Downsample curve points while preserving paired x/y ordering."""
+    return _downsample_pair(x_vals, y_vals, max_points)
+
+
 def _safe_logit(values: list[float], epsilon: float = 1e-7) -> list[float]:
     """Convert PSI-like values to logit scale with epsilon clipping."""
     if not values:
@@ -174,6 +206,9 @@ def _ensure_thresholds(task_result: dict[str, Any]) -> dict[str, Any]:
     the HTML report can shade excluded regions for both tasks.
     """
     dist = dict(task_result.get("response_distribution", {}))
+    psi_sample = dist.get("psi_sample")
+    if isinstance(psi_sample, list):
+        dist["psi_sample"] = _downsample_list(psi_sample, MAX_PSI_SAMPLE_POINTS)
     if not dist.get("binarization_thresholds"):
         fallback = (task_result.get("reproducibility") or {}).get("psi_thresholds")
         if fallback:
@@ -221,9 +256,9 @@ def _build_predictions_payload(
 
         # Compute logit-scale values on the fly if not stored (older artifacts).
         if task == "regression":
-            if not row_y_true_logit and row_y_true:
+            if len(row_y_true_logit) == 0 and row_y_true:
                 row_y_true_logit = _safe_logit(row_y_true)
-            if not row_y_pred_logit and row_y_pred:
+            if len(row_y_pred_logit) == 0 and row_y_pred:
                 row_y_pred_logit = _safe_logit(row_y_pred)
 
         y_true.extend(row_y_true)
@@ -239,16 +274,45 @@ def _build_predictions_payload(
             prediction_by_model[row_model]["thresholds"].append(thr_val)
 
         if row_model in prediction_by_model_scale:
-            prediction_by_model_scale[row_model]["original"]["y_true"].extend(row_y_true)
-            prediction_by_model_scale[row_model]["original"]["y_pred"].extend(row_y_pred)
-            prediction_by_model_scale[row_model]["logit"]["y_true"].extend(row_y_true_logit)
-            prediction_by_model_scale[row_model]["logit"]["y_pred"].extend(row_y_pred_logit)
+            prediction_by_model_scale[row_model]["original"]["y_true"].extend(
+                row_y_true
+            )
+            prediction_by_model_scale[row_model]["original"]["y_pred"].extend(
+                row_y_pred
+            )
+            prediction_by_model_scale[row_model]["logit"]["y_true"].extend(
+                row_y_true_logit
+            )
+            prediction_by_model_scale[row_model]["logit"]["y_pred"].extend(
+                row_y_pred_logit
+            )
 
-    # Down-sample to keep HTML lightweight for large runs.
-    if len(y_true) > 8000:
-        idx = np.linspace(0, len(y_true) - 1, num=8000, dtype=int)
-        y_true = [y_true[i] for i in idx]
-        y_pred = [y_pred[i] for i in idx]
+    # Down-sample to keep HTML payload lightweight for large runs.
+    y_true, y_pred = _downsample_pair(y_true, y_pred, MAX_GLOBAL_POINTS)
+
+    for model_name in model_order:
+        model_pred = prediction_by_model.get(model_name, {})
+        ds_true, ds_pred = _downsample_pair(
+            model_pred.get("y_true", []),
+            model_pred.get("y_pred", []),
+            MAX_PER_MODEL_POINTS,
+        )
+        model_pred["y_true"] = ds_true
+        model_pred["y_pred"] = ds_pred
+        prediction_by_model[model_name] = model_pred
+
+        model_scales = prediction_by_model_scale.get(model_name, {})
+        for scale_name in ("original", "logit"):
+            scale_vals = model_scales.get(scale_name, {"y_true": [], "y_pred": []})
+            s_true, s_pred = _downsample_pair(
+                scale_vals.get("y_true", []),
+                scale_vals.get("y_pred", []),
+                MAX_PER_MODEL_POINTS,
+            )
+            scale_vals["y_true"] = s_true
+            scale_vals["y_pred"] = s_pred
+            model_scales[scale_name] = scale_vals
+        prediction_by_model_scale[model_name] = model_scales
 
     return y_true, y_pred, thresholds, prediction_by_model, prediction_by_model_scale
 
@@ -280,10 +344,13 @@ def _build_roc_payload(
         if len(np.unique(yt)) < 2:
             continue
         fpr, tpr, _ = roc_curve(yt, yp)
+        fpr_list, tpr_list = _downsample_curve(
+            fpr.tolist(), tpr.tolist(), MAX_CURVE_POINTS
+        )
         auc_val = float(auc(fpr, tpr))
         roc_by_model[model_name] = {
-            "fpr": fpr.tolist(),
-            "tpr": tpr.tolist(),
+            "fpr": fpr_list,
+            "tpr": tpr_list,
             "auc": auc_val,
         }
     return roc_by_model
@@ -324,10 +391,13 @@ def _build_pr_payload(
         if len(np.unique(yt)) < 2:
             continue
         precision, recall, _ = precision_recall_curve(yt, yp)
+        recall_list, precision_list = _downsample_curve(
+            recall.tolist(), precision.tolist(), MAX_CURVE_POINTS
+        )
         aupr = float(auc(recall, precision))
         pr_by_model[model_name] = {
-            "precision": precision.tolist(),
-            "recall": recall.tolist(),
+            "precision": precision_list,
+            "recall": recall_list,
             "avg_precision": aupr,
         }
 
@@ -350,10 +420,13 @@ def _build_pr_payload(
         byt = np.asarray(baseline_yt, dtype=int)
         byp = np.asarray(baseline_yp, dtype=float)
         precision, recall, _ = precision_recall_curve(byt, byp)
+        recall_list, precision_list = _downsample_curve(
+            recall.tolist(), precision.tolist(), MAX_CURVE_POINTS
+        )
         aupr = float(auc(recall, precision))
         pr_by_model["Baseline (prior)"] = {
-            "precision": precision.tolist(),
-            "recall": recall.tolist(),
+            "precision": precision_list,
+            "recall": recall_list,
             "avg_precision": aupr,
         }
 
@@ -379,7 +452,9 @@ def _build_classification_threshold_payload(
         m_rows = [r for r in fold_rows if str(r.get("model_name", "")) == model_name]
 
         for r in m_rows:
-            thr = float(r.get("threshold", 0.5) if r.get("threshold") is not None else 0.5)
+            thr = float(
+                r.get("threshold", 0.5) if r.get("threshold") is not None else 0.5
+            )
             model_thresholds.append(thr)
             yt = np.asarray(r.get("y_true", []), dtype=int)
             yp = np.asarray(r.get("y_pred", []), dtype=float)
@@ -424,7 +499,11 @@ def _build_classification_threshold_payload(
                 else max(metric_by_model, key=metric_by_model.get)
             )
             best_threshold = next(
-                (r for r in threshold_summary if str(r.get("model_name", "")) == best_model),
+                (
+                    r
+                    for r in threshold_summary
+                    if str(r.get("model_name", "")) == best_model
+                ),
                 None,
             )
 
@@ -537,7 +616,12 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
                         s[f"logit_{k}"] = float(v)
                     r["scores"] = s
             metric_names_all = sorted(
-                {str(k) for r in fold_rows for k in r.get("scores", {}).keys() if k is not None}
+                {
+                    str(k)
+                    for r in fold_rows
+                    for k in r.get("scores", {}).keys()
+                    if k is not None
+                }
             )
             logit_metric_names = sorted(
                 [m for m in metric_names_all if m.startswith("logit_")]
@@ -555,8 +639,8 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
     # Fold-connecting line segments.
     fold_line_rows: dict[int, dict[str, float]] = {}
     for row in model_fold_points:
-        fold_line_rows.setdefault(int(row["outer_fold"]), {})[row["model_name"]] = float(
-            row["primary_score"]
+        fold_line_rows.setdefault(int(row["outer_fold"]), {})[row["model_name"]] = (
+            float(row["primary_score"])
         )
     fold_lines = [
         {

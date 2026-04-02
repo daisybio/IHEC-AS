@@ -16,11 +16,14 @@ xgboost = ["xgboost>=1.7"]
 statsmodels = ["statsmodels>=0.14"]
 wandb = ["wandb>=0.16"]
 polars = ["polars>=0.19"]
+optuna = ["optuna>=3.4", "optuna-integration[sklearn,wandb]>=3.4"]
 all = [
   "xgboost>=1.7",
   "statsmodels>=0.14",
   "wandb>=0.16",
   "polars>=0.19",
+  "optuna>=3.4",
+  "optuna-integration[sklearn,wandb]>=3.4",
 ]
 
 [build-system]

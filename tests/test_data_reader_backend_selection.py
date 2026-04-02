@@ -1,9 +1,15 @@
 """Tests for memory-aware auto data-reader backend selection."""
 
-from splicing_ml.data import recommend_auto_data_reader_backend
+import pandas as pd
+
+from splicing_ml.data import (
+    estimate_filter_fraction_for_path,
+    recommend_auto_data_reader_backend,
+)
 
 
 def test_auto_backend_uses_pandas_when_memory_tight(monkeypatch, tmp_path) -> None:
+    """Test auto backend uses pandas when memory tight."""
     data_path = tmp_path / "big.csv.gz"
     data_path.write_bytes(b"x")
 
@@ -19,6 +25,7 @@ def test_auto_backend_uses_pandas_when_memory_tight(monkeypatch, tmp_path) -> No
 
 
 def test_auto_backend_uses_polars_when_memory_sufficient(monkeypatch, tmp_path) -> None:
+    """Test auto backend uses polars when memory sufficient."""
     data_path = tmp_path / "small.csv.gz"
     data_path.write_bytes(b"x")
 
@@ -36,6 +43,7 @@ def test_auto_backend_uses_polars_when_memory_sufficient(monkeypatch, tmp_path) 
 def test_auto_backend_without_polars_falls_back_to_pandas(
     monkeypatch, tmp_path
 ) -> None:
+    """Test auto backend without polars falls back to pandas."""
     data_path = tmp_path / "data.csv.gz"
     data_path.write_bytes(b"x")
 
@@ -47,6 +55,7 @@ def test_auto_backend_without_polars_falls_back_to_pandas(
 
 
 def test_auto_backend_filter_aware_can_select_polars(monkeypatch, tmp_path) -> None:
+    """Test auto backend filter aware can select polars."""
     data_path = tmp_path / "big.csv.gz"
     data_path.write_bytes(b"x")
 
@@ -68,3 +77,37 @@ def test_auto_backend_filter_aware_can_select_polars(monkeypatch, tmp_path) -> N
     )
     assert backend == "polars"
     assert "sampled_filter_fraction=0.020" in reason
+
+
+def test_filter_fraction_estimator_captures_tail_cluster(tmp_path) -> None:
+    """Test filter fraction estimator captures tail cluster."""
+    data_path = tmp_path / "tail_cluster.csv"
+    rows = []
+    for _ in range(600):
+        rows.append(
+            {
+                "Event Type": "SE",
+                "transcript_filter": "transcripts",
+                "Variability": "Low",
+            }
+        )
+    for _ in range(300):
+        rows.append(
+            {
+                "Event Type": "RI",
+                "transcript_filter": "transcripts",
+                "Variability": "Low",
+            }
+        )
+    pd.DataFrame(rows).to_csv(data_path, index=False)
+
+    frac = estimate_filter_fraction_for_path(
+        str(data_path),
+        filter_event_type="RI",
+        filter_transcript_filter="transcripts",
+        filter_variability="Low",
+        sample_rows=300,
+    )
+
+    assert frac is not None
+    assert frac > 0.1

@@ -50,7 +50,7 @@ def progress_iter(
     try:
         from tqdm.auto import tqdm
 
-        return tqdm(iterable, total=total, desc=desc, leave=False)
+        return tqdm(iterable, total=total, desc=desc, leave=True)
     except Exception:
         return iterable
 
@@ -71,9 +71,7 @@ def safe_json(value: Any) -> Any:
         return [safe_json(v) for v in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-    if hasattr(value, "__class__"):
-        return str(value)
-    return value
+    return str(value)
 
 
 def sanitize_best_params(params: dict[str, Any]) -> dict[str, Any]:

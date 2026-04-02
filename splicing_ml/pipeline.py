@@ -24,6 +24,7 @@ from sklearn.pipeline import Pipeline
 
 from .config import (
     ALL_MODEL_TYPES,
+    DEFAULT_MODEL_TYPES,
     RNG_SEED,
     RunConfig,
     SMOKE_MODEL_TYPES,
@@ -53,6 +54,7 @@ from .modeling import (
     metric_key,
     xgb_gpu_available,
 )
+from .ontology_hierarchy import map_ontology_to_supergroups
 from .preprocessing import add_protocol_expression_interactions, build_preprocessor
 from .reporting import generate_html_reports
 from .tracking import NullTracker, make_tracker
@@ -69,6 +71,10 @@ __all__ = [
 
 def _configure_parallelism_guardrails(max_cores: int) -> dict[str, str]:
     """Prevent thread oversubscription by limiting BLAS/MKL threads.
+
+    DEPRECATED: when running under SLURM, cgroup limits (set by -c N) already
+    constrain available CPUs, so this explicit env-var approach is redundant.
+    Retained for reference in case of non-SLURM deployments.
 
     Returns
     -------
@@ -126,20 +132,64 @@ def run_single_configuration(
         use_logit=(task == "regression" and run_cfg.use_logit_regression),
     )
 
+    # Nested-CV policy: outer_k uses one user-facing k with a minimum of 4.
+    requested_outer_k = max(4, int(run_cfg.outer_splits))
+
+    grouping_col = cfg.group_col
+    grouping_details: dict[str, Any] = {
+        "group_col": cfg.group_col,
+        "grouping_col_resolved": cfg.group_col,
+        "supergrouping_enabled": False,
+    }
+    if cfg.group_col == "ontology":
+        unique_ontology_n = int(
+            sdf["ontology"].astype(str).str.strip().str.lower().nunique()
+        )
+        ontology_requested_outer_k = max(4, requested_outer_k)
+        if unique_ontology_n >= 4:
+            target_supergroups = min(ontology_requested_outer_k, unique_ontology_n)
+            ontology_supergroups, hierarchy_diag = map_ontology_to_supergroups(
+                sdf["ontology"],
+                n_groups=target_supergroups,
+            )
+            sdf = sdf.assign(__group_outer=ontology_supergroups.to_numpy())
+            grouping_col = "__group_outer"
+            grouping_details.update(hierarchy_diag)
+            grouping_details["grouping_col_resolved"] = grouping_col
+            vlog(
+                run_cfg.verbose,
+                "Using dynamic hierarchical ontology grouping "
+                f"(requested_outer_splits={requested_outer_k}, ontology_requested_outer_splits={ontology_requested_outer_k}, unique_ontology={unique_ontology_n}, "
+                f"target_supergroups={target_supergroups})",
+                level="info",
+            )
+        else:
+            grouping_details["supergrouping_scheme"] = "original"
+            grouping_details["supergrouping_scheme_kind"] = (
+                "insufficient_unique_ontology"
+            )
+            grouping_details["original_ontology_total"] = unique_ontology_n
+            vlog(
+                run_cfg.verbose,
+                "Using original ontology groups: fewer than 4 unique ontology labels are available "
+                f"(unique_ontology={unique_ontology_n})",
+                level="info",
+            )
+
     if run_cfg.smoke_mode and sdf.shape[0] > run_cfg.smoke_max_rows:
         pre_smoke_rows = int(sdf.shape[0])
-        pre_smoke_groups = int(sdf[cfg.group_col].nunique())
+        pre_smoke_groups = int(sdf[grouping_col].nunique())
         # Balanced per-outer-group sampling keeps smoke-mode representative.
         per_group_target = max(
             1,
             run_cfg.smoke_max_rows // max(1, pre_smoke_groups),
         )
         sampled_parts: list[pd.DataFrame] = []
-        for group_name, group_df in sdf.groupby(cfg.group_col, sort=False):
+        for group_name, group_df in sdf.groupby(grouping_col, sort=False):
             group_df_local = group_df
-            if cfg.group_col not in group_df_local.columns:
+            if grouping_col not in group_df_local.columns:
                 # pandas groupby behavior changed across versions; keep the key.
-                group_df_local = group_df_local.assign(**{cfg.group_col: group_name})
+                group_df_local = group_df_local.assign(**{grouping_col: group_name})
             sampled_parts.append(
                 group_df_local.sample(
                     n=min(len(group_df_local), per_group_target),
@@ -163,9 +213,6 @@ def run_single_configuration(
             level="info",
         )
 
-    # Nested-CV policy: outer_k uses one user-facing k with a minimum of 3.
-    requested_outer_k = max(3, int(run_cfg.outer_splits))
-
     if sdf.empty or y.size < max(requested_outer_k, 10):
         return {
             "status": "skipped",
@@ -179,11 +226,15 @@ def run_single_configuration(
         verbose=run_cfg.verbose,
     )
 
-    groups_outer = sdf[cfg.group_col]
-    x = sdf.drop(columns=["PSI"])
+    groups_outer = sdf[grouping_col]
+    feature_drop_columns = ["PSI"]
+    if grouping_col not in {"seqnames", "ontology"} and grouping_col in sdf.columns:
+        # Keep derived grouping helpers out of model features.
+        feature_drop_columns.append(grouping_col)
+    x = sdf.drop(columns=feature_drop_columns)
 
     preprocessor, prep_details = build_preprocessor(
-        sdf,
+        x,
         categorical_missing_strategy=run_cfg.categorical_missing_strategy,
         categorical_missing_token=run_cfg.categorical_missing_token,
         verbose=run_cfg.verbose,
@@ -252,6 +303,7 @@ def run_single_configuration(
         y_train = y[tr_idx]
         x_test = x.iloc[te_idx]
         y_test = y[te_idx]
+        outer_test_group_set = set(groups_outer.iloc[te_idx].astype(str).tolist())
 
         # Inner CV policy: use exactly the other outer folds (no re-splitting).
         local_pos = {
@@ -284,6 +336,29 @@ def run_single_configuration(
                 }
             )
 
+            # Split-integrity checks: validation groups must be disjoint from
+            # both inner-train groups and current outer-test groups.
+            inner_train_global = tr_idx[inner_train_local]
+            inner_valid_global_arr = tr_idx[inner_valid_local]
+            inner_train_groups = set(
+                groups_outer.iloc[inner_train_global].astype(str).tolist()
+            )
+            inner_valid_groups = set(
+                groups_outer.iloc[inner_valid_global_arr].astype(str).tolist()
+            )
+            tv_overlap = inner_train_groups & inner_valid_groups
+            if tv_overlap:
+                raise ValueError(
+                    "split_integrity_error: inner train/validation group overlap "
+                    f"in outer fold {fold_id} (overlap_groups={sorted(tv_overlap)})"
+                )
+            test_val_overlap = outer_test_group_set & inner_valid_groups
+            if test_val_overlap:
+                raise ValueError(
+                    "split_integrity_error: inner validation/outer test group overlap "
+                    f"in outer fold {fold_id} (overlap_groups={sorted(test_val_overlap)})"
+                )
+
         inner_splits_count = len(inner_splits)
         if inner_splits_count < 2:
             warnings.append(
@@ -297,6 +372,66 @@ def run_single_configuration(
             f"Inner CV derived from outer folds: inner_splits={inner_splits_count} "
             f"(outer_k={n_outer_splits}, expected={max(0, n_outer_splits - 1)})",
         )
+        if run_cfg.log_level == "debug":
+
+            def _grp(idx_arr) -> str:
+                """Group-name:count summary for a list/array of global row indices."""
+                s = (
+                    groups_outer.iloc[idx_arr]
+                    .astype(str)
+                    .value_counts()
+                    .sort_index()
+                )
+                return ", ".join(f"{g}:{int(n)}" for g, n in s.items()) or "<empty>"
+
+            vlog(
+                run_cfg.verbose,
+                f"Fold {fold_id} outer TEST  (n={len(te_idx)}): {_grp(te_idx)}",
+                level="debug",
+            )
+            vlog(
+                run_cfg.verbose,
+                f"Fold {fold_id} outer TRAIN (n={len(tr_idx)}): {_grp(tr_idx)}",
+                level="debug",
+            )
+            n_inner = len(inner_splits_global)
+            # For each split, ES val = smallest scoring-val from any other split.
+            # ES train = split's train minus that borrowed val.
+            es_val_source: list[int] = []  # 1-based split number of the borrowed val
+            for i in range(n_inner):
+                es_src = min(
+                    (j for j in range(n_inner) if j != i),
+                    key=lambda j: len(inner_splits_global[j]["inner_valid_indices"]),
+                )
+                es_val_source.append(es_src + 1)  # convert to 1-based
+
+            for split_num, split_info in enumerate(inner_splits_global, start=1):
+                scoring_val_idx = split_info["inner_valid_indices"]
+                full_train_idx = split_info["inner_train_indices"]
+                # Borrow the smallest other split's val as ES hold-out
+                es_src_num = es_val_source[split_num - 1]
+                es_val_idx = inner_splits_global[es_src_num - 1]["inner_valid_indices"]
+                es_val_set = set(es_val_idx)
+                es_train_idx = [i for i in full_train_idx if i not in es_val_set]
+                vlog(
+                    run_cfg.verbose,
+                    f"Fold {fold_id} inner split{split_num} "
+                    f"SCORING_VAL (n={len(scoring_val_idx)}): {_grp(scoring_val_idx)}",
+                    level="debug",
+                )
+                vlog(
+                    run_cfg.verbose,
+                    f"Fold {fold_id} inner split{split_num} "
+                    f"ES_VAL      (n={len(es_val_idx)}, from split{es_src_num}): "
+                    f"{_grp(es_val_idx)}",
+                    level="debug",
+                )
+                vlog(
+                    run_cfg.verbose,
+                    f"Fold {fold_id} inner split{split_num} "
+                    f"ES_TRAIN    (n={len(es_train_idx)}): {_grp(es_train_idx)}",
+                    level="debug",
+                )
 
         # Use a single parallelism layer (inside sklearn search/calibration) to
         # keep max_cores as an effective upper bound.
@@ -322,6 +457,11 @@ def run_single_configuration(
                     cuml_use_gpu=run_cfg.cuml_use_gpu,
                     verbose=run_cfg.verbose,
                     debug_grid_progress=run_cfg.log_level == "debug",
+                    optuna_backend=run_cfg.optuna_backend,
+                    optuna_sampler=run_cfg.optuna_sampler,
+                    optuna_n_startup_trials=run_cfg.optuna_n_startup_trials,
+                    optuna_multivariate=run_cfg.optuna_multivariate,
+                    optuna_wandb_callback=run_cfg.optuna_wandb_callback,
                 )
 
                 ev = evaluate_outer_fold(
@@ -385,7 +525,14 @@ def run_single_configuration(
                 if fitted_estimator is not None:
                     try:
                         if task == "classification":
-                            y_train_prob = fitted_estimator.predict_proba(x_train)[:, 1]
+                            if hasattr(fitted_estimator, "predict_proba"):
+                                y_train_prob = fitted_estimator.predict_proba(x_train)[
+                                    :, 1
+                                ]
+                            else:
+                                _decision = fitted_estimator.decision_function(x_train)
+                                y_train_prob = 1.0 / (1.0 + np.exp(-_decision))
+
                             train_scores = classification_metrics(
                                 y_train,
                                 y_train_prob,
@@ -483,7 +630,6 @@ def run_single_configuration(
                     estimator=estimator,
                     task=task,
                     x_train=x_train,
-                    x_test=x_test,
                     train_scores=result.get("train_scores", {}),
                     primary_metric=metric_key(task),
                     baseline_scores=result.get("baseline_scores", {}),
@@ -544,7 +690,7 @@ def run_single_configuration(
         },
         "preprocessing": prep_details,
         "grouping": {
-            "group_col": cfg.group_col,
+            **grouping_details,
         },
         "primary_metric": metric_key(task),
         "primary_metric_mean": float(np.mean(primary_scores)),
@@ -740,7 +886,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--models",
         nargs="+",
-        default=list(ALL_MODEL_TYPES),
+        default=list(DEFAULT_MODEL_TYPES),
         choices=list(ALL_MODEL_TYPES),
     )
     p.add_argument("--seed", type=int, default=RNG_SEED)
@@ -759,7 +905,33 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "log", "linear"],
         help="Scale mapping for LHS candidates when search uses random/hybrid",
     )
-    p.add_argument("--outer-splits", type=int, default=10)
+    p.add_argument(
+        "--optuna",
+        action="store_true",
+        help="Use Optuna Bayesian optimisation (TPE/CMA-ES) instead of GridSearchCV",
+    )
+    p.add_argument(
+        "--optuna-sampler",
+        type=str,
+        default="tpe",
+        choices=["tpe", "cmaes"],
+        help="Optuna sampler: 'tpe' (Tree-structured Parzen Estimator) or 'cmaes'",
+    )
+    p.add_argument(
+        "--optuna-n-startup-trials",
+        type=int,
+        default=5,
+        help="Number of random trials before Optuna's surrogate model takes over",
+    )
+    p.add_argument(
+        "--optuna-wandb-callback",
+        action="store_true",
+        help="Log per-trial Optuna metrics to the active W&B run (requires --wandb)",
+    )
+    # Reduced from 10 → 5: inner_splits = outer_splits - 1, so 10 outer folds
+    # gives 9 inner folds → 63 LogisticRegressionCV tasks vs 28 at 5 outer folds.
+    # Original: default=10
+    p.add_argument("--outer-splits", type=int, default=5)
     p.add_argument("--skip-regression", action="store_true")
     p.add_argument("--skip-classification", action="store_true")
     p.add_argument("--verbose", action="store_true")
@@ -795,9 +967,9 @@ def parse_args() -> argparse.Namespace:
         help="'compact' stores aggregated metrics only; 'diagnostics' includes per-fold predictions",
     )
     p.add_argument(
-        "--disable-logit-regression",
+        "--logit-regression",
         action="store_true",
-        help="Disable logit transform for regression targets (model PSI on raw [0,1] scale)",
+        help="Apply logit transform to regression targets (model on log-odds scale instead of raw PSI)",
     )
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="splicing-ml")
@@ -889,7 +1061,35 @@ def main() -> None:
     if args.smoke:
         args.data_path = "processed_data/aggregated_dt_filtered.validation300k.csv.gz"
         # Keep smoke runs lightweight regardless of user default grid size.
-        args.param_grid_size = min(args.param_grid_size, 8)
+        args.param_grid_size = min(args.param_grid_size, 4)
+        # Always exercise the Optuna path in smoke so both search backends are covered.
+        args.optuna = True
+
+    requested_models = tuple(args.models)
+    if args.smoke:
+        # extract all available models in smoke mode for comprehensive testing, regardless of user default
+        requested_models = SMOKE_MODEL_TYPES
+
+    vlog(
+        args.verbose,
+        f"Requested run args: max_cores={max(1, args.max_cores)}, "
+        f"param_grid_size={max(1, args.param_grid_size)}, "
+        f"search_strategy={args.search_strategy}, "
+        f"lhs_scale_mode={args.lhs_scale_mode}, "
+        f"xgb_device={'auto' if 'xgb' in requested_models else 'n/a'}, "
+        f"data_reader_backend={args.data_reader_backend}, "
+        f"data_path={args.data_path}, "
+        f"group_filter={args.only_group}, "
+        f"logit_regression={args.logit_regression}, "
+        f"outer_splits={args.outer_splits}, inner_splits=derived_from_outer, "
+        f"calibrate_classifiers={args.calibration}, "
+        f"output_level={args.output_level}, "
+        f"log_level={'debug' if args.debug else 'info'}, "
+        f"optuna_backend={args.optuna}, "
+        f"optuna_sampler={args.optuna_sampler if args.optuna else 'n/a'}, "
+        f"models={list(requested_models)}",
+        level="info",
+    )
 
     # Must be configured before importing polars for the first time.
     if args.data_reader_backend in {"auto", "polars"}:
@@ -1019,7 +1219,7 @@ def main() -> None:
 
     outer_splits = args.outer_splits
     if args.smoke:
-        outer_splits = 3  # Exactly 3 outer folds in smoke mode for robust evaluation
+        outer_splits = 4
     # Inner CV is always derived from outer folds: one inner fold per remaining outer fold.
     inner_splits = max(2, outer_splits - 1)
 
@@ -1038,13 +1238,17 @@ def main() -> None:
         param_grid_size=max(1, args.param_grid_size),
         search_strategy=args.search_strategy,
         lhs_scale_mode=args.lhs_scale_mode,
+        optuna_backend=args.optuna,
+        optuna_sampler=args.optuna_sampler,
+        optuna_n_startup_trials=args.optuna_n_startup_trials,
+        optuna_wandb_callback=args.optuna_wandb_callback,
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
         verbose=args.verbose,
         include_models=models,
         run_regression=not args.skip_regression,
         run_classification=not args.skip_classification,
-        use_logit_regression=not args.disable_logit_regression,
+        use_logit_regression=args.logit_regression,
         categorical_missing_strategy=args.categorical_missing_strategy,
         categorical_missing_token=args.categorical_missing_token,
         generate_html_reports=not args.no_html_reports,
@@ -1083,7 +1287,10 @@ def main() -> None:
         f"outer_splits={run_cfg.outer_splits}, inner_splits={run_cfg.inner_splits}, "
         f"calibrate_classifiers={run_cfg.calibrate_classifiers}, "
         f"output_level={run_cfg.output_level}, "
-        f"log_level={run_cfg.log_level}",
+        f"log_level={run_cfg.log_level}, "
+        f"optuna_backend={run_cfg.optuna_backend}, "
+        f"optuna_sampler={run_cfg.optuna_sampler if run_cfg.optuna_backend else 'n/a'}, "
+        f"models={list(run_cfg.include_models)}",
         level="info",
     )
     if run_cfg.use_wandb:
@@ -1100,9 +1307,11 @@ def main() -> None:
             level="info",
         )
 
-    # Configure parallelism guardrails to prevent thread oversubscription.
-    thread_env = _configure_parallelism_guardrails(run_cfg.max_cores)
-    vlog(args.verbose, f"Parallelism guardrails: {thread_env}", level="info")
+    # Thread limits are enforced by SLURM cgroups (-c N); no explicit guardrails needed.
+    # UNUSED: Legacy explicit thread guardrail wiring kept as reference.
+    # TODO: remove this dead block if cgroup-only scheduling remains the project default.
+    # thread_env = _configure_parallelism_guardrails(run_cfg.max_cores)
+    # vlog(args.verbose, f"Parallelism guardrails: {thread_env}", level="info")
 
     bundle = run_all_configurations(run_cfg)
     vlog(

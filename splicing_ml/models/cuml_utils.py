@@ -55,9 +55,17 @@ def cuml_gpu_available() -> bool:
 
     try:
         import cuml  # noqa: F401
+        import cupy as cp
+    except ImportError:
+        _CUML_GPU_AVAILABLE_CACHE = False
+        return False
 
+    try:
+        cp.array([1.0])  # force CUDA device initialisation; raises on driver mismatch
         _CUML_GPU_AVAILABLE_CACHE = True
-    except Exception:
+    except (RuntimeError, OSError):
+        # cupy.cuda.runtime.CUDARuntimeError subclasses RuntimeError (driver version
+        # mismatch, no device, etc.).  OSError covers missing CUDA shared libraries.
         _CUML_GPU_AVAILABLE_CACHE = False
 
     return _CUML_GPU_AVAILABLE_CACHE
@@ -72,8 +80,8 @@ def get_cuml_svm(task: str) -> Any:
     from cuml.svm import SVC, SVR
 
     if task == "classification":
-        return SVC(kernel="rbf", class_weight="balanced", probability=True)
-    return SVR(kernel="rbf")
+        return SVC(kernel="rbf", class_weight="balanced", probability=True, max_iter=2000, tol=1e-2)
+    return SVR(kernel="rbf", max_iter=2000, tol=1e-2)
 
 
 def get_cuml_linear(task: str) -> Any:
@@ -86,7 +94,7 @@ def get_cuml_linear(task: str) -> Any:
     if task == "classification":
         from cuml.linear_model import LogisticRegression
 
-        return LogisticRegression(C=1e6, class_weight="balanced", max_iter=5000)
+        return LogisticRegression(C=1e6, class_weight="balanced", max_iter=5000, verbose=False)
     from cuml.linear_model import LinearRegression
 
     return LinearRegression()
@@ -101,7 +109,7 @@ def get_cuml_elasticnet() -> Any:
     """
     from cuml.linear_model import ElasticNet
 
-    return ElasticNet(max_iter=20000)
+    return ElasticNet(max_iter=20000, verbose=False)
 
 
 def get_cuml_logistic_elasticnet() -> Any:
@@ -118,6 +126,7 @@ def get_cuml_logistic_elasticnet() -> Any:
         penalty="elasticnet",
         class_weight="balanced",
         max_iter=5000,
+        verbose=False,
     )
 
 

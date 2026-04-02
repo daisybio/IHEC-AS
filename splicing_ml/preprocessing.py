@@ -229,14 +229,17 @@ class PercentileClipper(BaseEstimator, TransformerMixin):
     """
 
     def __init__(self, upper_percentile: float = 99.0) -> None:
+        """Initialize a PercentileClipper instance."""
         self.upper_percentile = upper_percentile
 
     def fit(self, X: Any, y: Any = None) -> "PercentileClipper":
+        """Fit the model using the provided training data."""
         arr = np.asarray(X, dtype=float)
         self.clip_max_: np.ndarray = np.percentile(arr, self.upper_percentile, axis=0)
         return self
 
     def transform(self, X: Any, y: Any = None) -> np.ndarray:
+        """Transform input features using the fitted state."""
         arr = np.asarray(X, dtype=float)
         return np.clip(arr, None, self.clip_max_)
 
@@ -252,11 +255,25 @@ def _log1p_dataframe(x: Any) -> Any:
 
 
 def _make_one_hot_encoder() -> OneHotEncoder:
-    """Construct OneHotEncoder compatible with older/newer sklearn versions."""
+    """Construct OneHotEncoder compatible with older/newer sklearn versions.
+
+    Uses sparse_output=False to ensure consistent feature counts across different
+    data subsets (e.g., train/test folds with different category distributions).
+    """
     try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+        # sparse_output=False ensures consistent dense output shape across folds
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False,
+            drop=None,  # Keep all categories to prevent shape variations
+        )
     except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=True)
+        # Older sklearn versions use sparse=True/False instead of sparse_output
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=False,
+            drop=None,
+        )
 
 
 def build_preprocessor(

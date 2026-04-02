@@ -299,6 +299,17 @@ def write_subset_html_report(
     @media (max-width: 900px) {{
       .curves-row {{ grid-template-columns: 1fr; }}
     }}
+    #spinner {{
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; padding: 60px 0; gap: 16px; color: #666;
+      font-size: 0.95rem;
+    }}
+    #spinner .spin {{
+      width: 48px; height: 48px; border-radius: 50%;
+      border: 5px solid #e0e0e0; border-top-color: #555;
+      animation: spin 0.8s linear infinite;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   </style>
 </head>
 <body>
@@ -307,6 +318,7 @@ def write_subset_html_report(
     Results generated: <strong>{run_datetime_display}</strong> &nbsp;|&nbsp;
     Report rendered: <strong>{html_generated_display}</strong>
   </p>
+  <div id="spinner"><div class="spin"></div><span>Loading report…</span></div>
   <div id="reports"></div>
   <script>
 {_PLOTLY_JS_HELPERS}
@@ -588,6 +600,7 @@ def write_subset_html_report(
       }}
     }}
 
+    const spinner = document.getElementById('spinner');
     loadPayload(payloadFile)
       .then(renderReports)
       .catch((err) => {{
@@ -595,7 +608,8 @@ def write_subset_html_report(
         msg.className = 'card';
         msg.innerHTML = `<h2>Report Load Error</h2><p>${{String(err)}}</p><p>If you opened this HTML via file://, serve the folder over HTTP so fetch() can read the JSON payload.</p>`;
         container.appendChild(msg);
-      }});
+      }})
+      .finally(() => {{ spinner.style.display = 'none'; }});
   </script>
 </body>
 </html>

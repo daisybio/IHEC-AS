@@ -34,6 +34,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.utils.validation import check_is_fitted
 
 from ..config import RNG_SEED
+from ._contexts import _mlp_val_indices_context, _es_pp_val_context
 
 __all__ = ["MLPRegressor", "MLPClassifier"]
 
@@ -52,7 +53,8 @@ class _EarlyStopping:
         Number of epochs without improvement before stopping.
     """
 
-    def __init__(self, patience: int = 15) -> None:
+    def __init__(self, patience: int = 5) -> None:
+        """Initialize a _EarlyStopping instance."""
         self.patience = patience
         self.best_loss: float = float("inf")
         self.counter: int = 0
@@ -80,14 +82,9 @@ class _EarlyStopping:
 # ---------------------------------------------------------------------------
 
 
-class _MLP:
-    """Placeholder so the module can be imported without torch at the top level.
-
-    The real ``_MLP`` class is created lazily inside ``_build_mlp`` below.
-    """
-
-
-def _build_mlp(n_features: int, hidden_sizes: Sequence[int], dropout_rate: float) -> Any:
+def _build_mlp(
+    n_features: int, hidden_sizes: Sequence[int], dropout_rate: float
+) -> Any:
     """Build and return a ``torch.nn.Module`` MLP.
 
     Architecture: Input → (Linear → BatchNorm1d → ReLU → Dropout) × N → Linear.
@@ -137,12 +134,13 @@ class _BaseMLP(BaseEstimator):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         batch_size: int = 128,
-        max_epochs: int = 200,
-        early_stopping_patience: int = 15,
+        max_epochs: int = 150,
+        early_stopping_patience: int = 5,
         val_fraction: float = 0.15,
         random_state: int = RNG_SEED,
     ) -> None:
         # All params stored exactly as received — required by sklearn convention.
+        """Initialize a _BaseMLP instance."""
         self.hidden_sizes = hidden_sizes
         self.dropout_rate = dropout_rate
         self.learning_rate = learning_rate
@@ -198,18 +196,21 @@ class _BaseMLP(BaseEstimator):
     # ------------------------------------------------------------------
 
     def _criterion(self) -> Any:
+        """Internal helper for criterion."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
-    def fit(self, X: Any, y: Any) -> "_BaseMLP":
+    def fit(self, X: Any, y: Any, val_indices: np.ndarray | None = None) -> "_BaseMLP":
         """Fit the MLP on *X* / *y*.
 
         Internally carves out ``val_fraction`` of the data as a validation
-        set for early stopping.  This split is independent of the outer/inner
-        CV folds managed by the pipeline.
+        set for early stopping. If ``val_indices`` is provided (e.g., from
+        cross-validation), uses those specific indices; otherwise uses a
+        sequential split at the end of the data to respect any implicit
+        grouping (e.g., seqnames or ontology clustering).
 
         Parameters
         ----------
@@ -217,6 +218,10 @@ class _BaseMLP(BaseEstimator):
             Feature matrix.  Scipy sparse matrices are accepted.
         y : array-like of shape (n_samples,)
             Target values (float for regression; 0/1 float for classification).
+        val_indices : array-like of int, optional
+            Indices of samples to use for validation (early stopping).
+            If provided, overrides ``val_fraction``. Typically passed from
+            GridSearchCV/OptunaSearchCV inner CV to avoid data leakage.
         """
         import torch
 
@@ -228,20 +233,49 @@ class _BaseMLP(BaseEstimator):
         n_samples, n_features = X_arr.shape
         self.n_features_in_ = n_features
 
-        # --- train / val split -------------------------------------------
-        val_size = max(2, int(n_samples * float(self.val_fraction)))
-        idx = rng.permutation(n_samples)
-        val_idx = idx[:val_size]
-        train_idx = idx[val_size:]
+        # --- train / val split ---
+        if val_indices is not None:
+            # Explicit indices take priority (e.g. final refit after search).
+            val_idx = np.asarray(val_indices, dtype=int)
+            train_idx = np.setdiff1d(np.arange(n_samples), val_idx)
+        elif (
+            hasattr(_es_pp_val_context, "X_val_pp")
+            and _es_pp_val_context.X_val_pp is not None
+        ):
+            # Preprocessed val data injected by _ESPipeline — use all X as train
+            X_tr, y_tr = X_arr, y_arr
+            X_va = self._to_numpy(_es_pp_val_context.X_val_pp)
+            y_va = np.asarray(_es_pp_val_context.y_val, dtype=np.float32).ravel()
+        elif (
+            hasattr(_mlp_val_indices_context, "indices")
+            and _mlp_val_indices_context.indices is not None
+        ):
+            # Legacy fallback (kept for backward compat; should not fire in pipeline)
+            val_idx = np.asarray(_mlp_val_indices_context.indices, dtype=int)
+            train_idx = np.setdiff1d(np.arange(n_samples), val_idx)
+        else:
+            # Standalone mode: sequential split respecting data order.
+            val_size = max(2, int(n_samples * float(self.val_fraction)))
+            train_idx = np.arange(n_samples - val_size)
+            val_idx = np.arange(n_samples - val_size, n_samples)
 
-        X_tr, y_tr = X_arr[train_idx], y_arr[train_idx]
-        X_va, y_va = X_arr[val_idx], y_arr[val_idx]
+        if val_indices is None and not (
+            hasattr(_es_pp_val_context, "X_val_pp")
+            and _es_pp_val_context.X_val_pp is not None
+        ):
+            X_tr, y_tr = X_arr[train_idx], y_arr[train_idx]
+            X_va, y_va = X_arr[val_idx], y_arr[val_idx]
 
         # --- model, optimiser, scheduler, criterion ----------------------
+        # hidden_sizes may arrive as a comma-separated string when sampled by
+        # Optuna (CategoricalDistribution requires scalar choices, not tuples).
+        _hidden = self.hidden_sizes
+        if isinstance(_hidden, str):
+            _hidden = tuple(int(x) for x in _hidden.split(",") if x.strip())
         device = self._get_device()
         net = _build_mlp(
             n_features=n_features,
-            hidden_sizes=self.hidden_sizes,
+            hidden_sizes=_hidden,
             dropout_rate=self.dropout_rate,
         ).to(device)
 
@@ -251,7 +285,7 @@ class _BaseMLP(BaseEstimator):
             weight_decay=float(self.weight_decay),
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
+            optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
         )
         criterion = self._criterion()
         stopper = _EarlyStopping(patience=int(self.early_stopping_patience))
@@ -264,6 +298,10 @@ class _BaseMLP(BaseEstimator):
 
         n_tr = X_tr_t.shape[0]
         bs = max(2, int(self.batch_size))  # ensure batch >= 2 for BatchNorm
+
+        # Mixed precision: ~1.5-2× speedup on CUDA with negligible accuracy cost.
+        use_amp = device.type == "cuda"
+        scaler = torch.amp.GradScaler(enabled=use_amp)
 
         # Per-epoch generator so shuffle is reproducible per epoch.
         gen = torch.Generator(device="cpu")
@@ -282,16 +320,19 @@ class _BaseMLP(BaseEstimator):
                 xb = X_tr_t[batch_idx]
                 yb = y_tr_t[batch_idx]
                 optimizer.zero_grad()
-                out = net(xb).squeeze(-1)
-                loss = criterion(out, yb)
-                loss.backward()
-                optimizer.step()
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    out = net(xb).squeeze(-1)
+                    loss = criterion(out, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
             # Validation pass — eval mode uses running BN statistics.
             net.eval()
             with torch.no_grad():
-                val_out = net(X_va_t).squeeze(-1)
-                val_loss = criterion(val_out, y_va_t).item()
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    val_out = net(X_va_t).squeeze(-1)
+                val_loss = criterion(val_out.float(), y_va_t).item()
 
             scheduler.step(val_loss)
 
@@ -302,6 +343,7 @@ class _BaseMLP(BaseEstimator):
         stopper.restore_best(net)
         self.model_ = net
         self.device_ = device
+        self.n_epochs_trained_ = epoch + 1  # Store for diagnostics
         return self
 
     # ------------------------------------------------------------------
@@ -326,12 +368,20 @@ class _BaseMLP(BaseEstimator):
 # ---------------------------------------------------------------------------
 
 
-class MLPRegressor(_BaseMLP, RegressorMixin):
+class MLPRegressor(RegressorMixin, _BaseMLP):
     """MLP regressor with PyTorch backend and sklearn interface.
 
     Predicts on the same (possibly logit-transformed) scale as the targets
     passed to ``fit``; the pipeline's ``evaluate_outer_fold`` handles any
     inverse transformation.
+
+    Attributes (set during fit)
+    ---------------------------
+    n_epochs_trained_ : int
+        Number of epochs completed before early stopping (or max_epochs if
+        no early stopping triggered). Use this to assess whether the epoch
+        budget is sufficient: if consistently equals max_epochs, consider
+        increasing it.
 
     Parameters
     ----------
@@ -345,9 +395,9 @@ class MLPRegressor(_BaseMLP, RegressorMixin):
         L2 penalty (Adam ``weight_decay``).
     batch_size : int, default 128
         Mini-batch size.  Clamped to >= 2 during training.
-    max_epochs : int, default 200
+    max_epochs : int, default 75
         Maximum training epochs.
-    early_stopping_patience : int, default 15
+    early_stopping_patience : int, default 5
         Stop after this many epochs without validation-loss improvement.
     val_fraction : float, default 0.15
         Fraction of training data reserved for early-stopping validation.
@@ -356,6 +406,7 @@ class MLPRegressor(_BaseMLP, RegressorMixin):
     """
 
     def _criterion(self) -> Any:
+        """Internal helper for criterion."""
         import torch.nn as nn
 
         return nn.MSELoss()
@@ -365,11 +416,19 @@ class MLPRegressor(_BaseMLP, RegressorMixin):
         return self._forward(X).ravel()
 
 
-class MLPClassifier(_BaseMLP, ClassifierMixin):
+class MLPClassifier(ClassifierMixin, _BaseMLP):
     """MLP binary classifier with PyTorch backend and sklearn interface.
 
     Outputs probabilities compatible with ``CalibratedClassifierCV`` and
     the pipeline's threshold-tuning logic.
+
+    Attributes (set during fit)
+    ---------------------------
+    n_epochs_trained_ : int
+        Number of epochs completed before early stopping (or max_epochs if
+        no early stopping triggered). Use this to assess whether the epoch
+        budget is sufficient: if consistently equals max_epochs, consider
+        increasing it.
 
     Parameters
     ----------
@@ -383,9 +442,9 @@ class MLPClassifier(_BaseMLP, ClassifierMixin):
         L2 penalty (Adam ``weight_decay``).
     batch_size : int, default 128
         Mini-batch size.  Clamped to >= 2 during training.
-    max_epochs : int, default 200
+    max_epochs : int, default 75
         Maximum training epochs.
-    early_stopping_patience : int, default 15
+    early_stopping_patience : int, default 5
         Stop after this many epochs without validation-loss improvement.
     val_fraction : float, default 0.15
         Fraction of training data reserved for early-stopping validation.
@@ -400,6 +459,7 @@ class MLPClassifier(_BaseMLP, ClassifierMixin):
         return super().fit(X, y_arr)
 
     def _criterion(self) -> Any:
+        """Internal helper for criterion."""
         import torch.nn as nn
 
         # Targets must be float32 in [0, 1]; the base fit() already converts y.

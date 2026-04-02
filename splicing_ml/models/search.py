@@ -15,6 +15,7 @@ strategy helpers based on model type:
                             post-search refit.
 """
 
+import json
 import math
 from typing import Any
 import warnings
@@ -30,9 +31,9 @@ from sklearn.model_selection import GridSearchCV, ParameterGrid, cross_validate
 from sklearn.pipeline import Pipeline
 
 from ..config import RNG_SEED
-from ..metrics import regression_metrics
 from ..utils import progress_iter, safe_json, sanitize_best_params, vlog
 from .beta import BetaRegressor, _inverse_logit
+from ._contexts import _es_raw_val_context, _es_pp_val_context
 from .grids import (
     build_param_candidates,
     _use_lhs_strategy,
@@ -69,6 +70,7 @@ class _ProgressGridSearchCV(GridSearchCV):
         progress_enabled: bool = False,
         progress_desc: str | None = None,
     ) -> None:
+        """Initialize a _ProgressGridSearchCV instance."""
         super().__init__(
             estimator=estimator,
             param_grid=param_grid,
@@ -87,6 +89,7 @@ class _ProgressGridSearchCV(GridSearchCV):
         self.progress_desc = progress_desc
 
     def _run_search(self, evaluate_candidates) -> None:  # type: ignore[override]
+        """Internal helper for run search."""
         candidates = list(ParameterGrid(self.param_grid))
         if not self.progress_enabled:
             evaluate_candidates(candidates)
@@ -103,16 +106,48 @@ class _ProgressGridSearchCV(GridSearchCV):
 
 def scorer_name(task: str) -> str:
     """Return the sklearn scorer name aligned with the primary optimization metric."""
-    return (
-        "balanced_accuracy"
-        if task == "classification"
-        else "neg_root_mean_squared_error"
-    )
+    # This is consumed by sklearn search APIs (GridSearchCV/cross_validate/OptunaSearchCV),
+    # so we must return sklearn scorer identifiers, including sign conventions.
+    return "roc_auc" if task == "classification" else "neg_root_mean_squared_error"
 
 
 def metric_key(task: str) -> str:
     """Return the primary metric name for a task."""
-    return "balanced_accuracy" if task == "classification" else "rmse"
+    # This key is used for internal result dictionaries/logging, not sklearn scorer names.
+    return "auroc" if task == "classification" else "rmse"
+
+
+def _elasticnet_budget_axes(
+    total_budget: int,
+    n_primary: int,
+    n_l1: int,
+) -> tuple[int, int]:
+    """Split a total candidate budget across primary regularization and l1_ratio axes."""
+    budget = max(1, int(total_budget))
+    l1_count = max(1, min(int(n_l1), int(round(budget**0.5))))
+    primary_count = max(
+        1, min(int(n_primary), int(math.ceil(budget / float(l1_count))))
+    )
+    return primary_count, l1_count
+
+
+def _adaptive_c_grid(n_samples: int) -> tuple[list[float], list[float]]:
+    """Return (C_grid, l1_ratio_grid) scaled to the training set size.
+
+    Fewer candidates for larger n_samples to maintain practical runtimes.
+    The C grid is always log-spaced over [1e-6, 1e2]; only its density changes.
+    l1_ratio grid is thinned for very large datasets.
+    """
+    if n_samples < 50_000:
+        n_cs, l1_ratios = 100, [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+    elif n_samples < 200_000:
+        n_cs, l1_ratios = 50, [0.1, 0.5, 0.9, 0.95, 1.0]
+    elif n_samples < 600_000:
+        n_cs, l1_ratios = 25, [0.1, 0.5, 0.9, 1.0]
+    else:
+        n_cs, l1_ratios = 15, [0.1, 0.9, 1.0]
+    c_grid = (1.0 / np.logspace(-6, 2, num=n_cs)).tolist()
+    return c_grid, l1_ratios
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +164,7 @@ def _fit_elasticnet_cv(
     max_cores: int,
     verbose: bool,
     cuml_use_gpu: bool | None = None,
+    debug_grid_progress: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit ElasticNetCV — alpha and l1_ratio selection via built-in CV.
 
@@ -136,24 +172,37 @@ def _fit_elasticnet_cv(
     directly to ElasticNetCV so fold assignments are consistent across models.
     Always sweeps _ALPHA_GRID alphas and _L1_RATIO_GRID l1_ratios.
 
-    When ``cuml_use_gpu`` is True (or auto-detected), uses cuML ElasticNet via
-    GridSearchCV over a coarser alpha grid.  cuML lacks a regularization-path
-    CV variant, so individual fits are done instead.
+    The cuML GPU path (_fit_cuml_elasticnet_cv) is intentionally bypassed:
+    ElasticNetCV uses warm-start coordinate descent, so sweeping 100 alphas costs
+    nearly the same as a small slice (one solver pass per l1_ratio with warm
+    starts).  Benchmarks on 477k samples showed CPU (32 cores) at ~20 min vs
+    GPU at ~30 min for 105 cold cuML fits, with GPU also scoring ~3% lower due
+    to float32 precision and max_iter=5000 non-convergence.
+    At 16 cores the wall times converge (~40 min CPU vs ~30 min GPU), but the
+    accuracy gap remains — so CPU is preferred unconditionally until a
+    regularization-path cuML variant becomes available.
     """
-    from .cuml_utils import cuml_gpu_available
+    # ElasticNetCV uses warm-start coordinate descent — sweeping the
+    # full alpha/l1_ratio grid costs nearly the same as a tiny slice.
+    c_grid, l1_grid = _adaptive_c_grid(x_train.shape[0])
+    # ElasticNetCV uses alpha, which is the reciprocal of C
+    alpha_grid = [float(1.0 / c) for c in c_grid]
+    l1_grid = [float(r) for r in l1_grid]
 
-    use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
-
-    if use_gpu:
-        return _fit_cuml_elasticnet_cv(
-            task=task,
-            x_train=x_train,
-            y_train=y_train,
-            preprocessor=preprocessor,
-            inner_cv=inner_cv,
-            verbose=verbose,
-        )
-
+    # ElasticNetCV parallelises over n_l1_ratios tasks (each task sweeps all
+    # alphas for all cv folds via warm-start coordinate descent).
+    # Empirical reference: ~10 min/batch at 477k samples and 100 alphas.
+    _n_batches = math.ceil(len(l1_grid) / max(1, max_cores))
+    _est_min = (
+        _n_batches * 10.0 * (x_train.shape[0] / 477_000) * (len(alpha_grid) / 100)
+    )
+    vlog(
+        verbose,
+        f"Fitting elasticnet (ElasticNetCV), task={task}, "
+        f"n_samples={x_train.shape[0]}, n_features={x_train.shape[1]}, "
+        f"n_alphas={len(alpha_grid)}, n_l1_ratios={len(l1_grid)}, "
+        f"batches={_n_batches} (cores={max_cores}), ~{_est_min:.0f} min est.",
+    )
     estimator = Pipeline(
         steps=[
             ("prep", preprocessor),
@@ -163,14 +212,21 @@ def _fit_elasticnet_cv(
                     random_state=RNG_SEED,
                     max_iter=20000,
                     cv=inner_cv,
-                    alphas=_ALPHA_GRID,
-                    l1_ratio=_L1_RATIO_GRID,
+                    alphas=alpha_grid,
+                    l1_ratio=l1_grid,
                     n_jobs=max_cores,
+                    verbose=1 if debug_grid_progress else 0,
                 ),
             ),
         ]
     )
-    estimator.fit(x_train, y_train)
+    # Non-convergence at extreme alpha values is expected during the warm-start
+    # path sweep and does not affect the selected optimum — suppress the noise.
+    from sklearn.exceptions import ConvergenceWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        estimator.fit(x_train, y_train)
     model = estimator.named_steps["model"]
 
     # Extract cross-validated RMSE from the MSE path produced by ElasticNetCV.
@@ -188,23 +244,44 @@ def _fit_elasticnet_cv(
         f"Search complete model=elasticnet, task={task}, strategy=elasticnetcv, "
         f"candidates={n_alphas if n_alphas > 0 else len(_ALPHA_GRID)}, best_score={best_score:.6f}",
     )
+
+    # Replace ElasticNetCV with a plain ElasticNet using the selected alpha and
+    # l1_ratio. ElasticNetCV.fit() always re-runs the full warm-start path sweep,
+    # so leaving it in place causes the evaluator's refit call to duplicate the
+    # search cost. ElasticNet.fit() is a single coordinate descent pass.
+    # Use cuML ElasticNet for the final fit when GPU is available — a single
+    # fixed-param fit avoids the float32/convergence issues that made the full
+    # CV sweep prefer CPU.
+    from .cuml_utils import cuml_gpu_available
+
+    if cuml_use_gpu is not False and cuml_gpu_available():
+        from cuml.linear_model import ElasticNet as _ElasticNet
+
+        fixed_model = _ElasticNet(
+            alpha=alpha, l1_ratio=l1_ratio, max_iter=20000, verbose=False
+        )
+    else:
+        from sklearn.linear_model import ElasticNet as _ElasticNet
+
+        fixed_model = _ElasticNet(
+            alpha=alpha, l1_ratio=l1_ratio, max_iter=20000, random_state=RNG_SEED
+        )
+    estimator = Pipeline(
+        steps=[("prep", estimator.named_steps["prep"]), ("model", fixed_model)]
+    )
+
     return estimator, {
         "best_params": sanitize_best_params(
             {
-                "model": model,
+                "model": fixed_model,
                 "model__alpha": alpha,
                 "model__l1_ratio": l1_ratio,
                 "model__cv_folds": int(len(inner_cv)),
-                "model__alpha_count": len(_ALPHA_GRID),
+                "model__alpha_count": len(alpha_grid),
             }
         ),
         "best_score": best_score,
     }
-
-
-# Coarser alpha grid for cuML ElasticNet: individual fits instead of path.
-# 15 log-spaced values cover the same range as _ALPHA_GRID without the 100-point expense.
-_CUML_ALPHA_GRID: np.ndarray = np.logspace(-6, 2, num=15)
 
 
 def _fit_cuml_elasticnet_cv(
@@ -213,12 +290,19 @@ def _fit_cuml_elasticnet_cv(
     y_train: np.ndarray,
     preprocessor: ColumnTransformer,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    alpha_grid: list[float],
+    l1_grid: list[float],
     verbose: bool,
+    debug_grid_progress: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit cuML ElasticNet via GridSearchCV over a coarser alpha/l1_ratio grid.
 
     cuML ElasticNet has the same alpha and l1_ratio parameters as sklearn but
     no CV-path variant.  GridSearchCV drives the search (n_jobs=1 for GPU).
+
+    DEPRECATED: not called by _fit_elasticnet_cv.  sklearn ElasticNetCV is faster
+    and more accurate (warm-start coordinate descent vs cold cuML float32 fits).
+    Retained for reference until a regularization-path cuML variant exists.
     """
     from .cuml_utils import get_cuml_elasticnet
 
@@ -230,10 +314,10 @@ def _fit_cuml_elasticnet_cv(
     )
     candidates = [
         {"model__alpha": [float(a)], "model__l1_ratio": [float(r)]}
-        for a in _CUML_ALPHA_GRID
-        for r in _L1_RATIO_GRID
+        for a in alpha_grid
+        for r in l1_grid
     ]
-    search = GridSearchCV(
+    search = _ProgressGridSearchCV(
         estimator=pipe,
         param_grid=candidates,
         scoring=scorer_name(task),
@@ -241,6 +325,8 @@ def _fit_cuml_elasticnet_cv(
         n_jobs=1,
         refit=True,
         error_score="raise",
+        progress_enabled=debug_grid_progress,
+        progress_desc=f"elasticnet [{task}]",
     )
     try:
         search.fit(x_train, y_train)
@@ -263,8 +349,8 @@ def _fit_cuml_elasticnet_cv(
                             random_state=RNG_SEED,
                             max_iter=20000,
                             cv=inner_cv,
-                            alphas=_ALPHA_GRID,
-                            l1_ratio=_L1_RATIO_GRID,
+                            alphas=alpha_grid,
+                            l1_ratio=l1_grid,
                             n_jobs=1,
                         ),
                     ),
@@ -282,7 +368,7 @@ def _fit_cuml_elasticnet_cv(
             vlog(
                 verbose,
                 f"Search complete model=elasticnet, task={task}, strategy=elasticnetcv_cpu_fallback, "
-                f"candidates={len(_ALPHA_GRID)}, best_score={best_score:.6f}",
+                f"candidates={len(alpha_grid) * len(l1_grid)}, best_score={best_score:.6f}",
             )
             return cpu_est, {
                 "best_params": sanitize_best_params(
@@ -291,7 +377,7 @@ def _fit_cuml_elasticnet_cv(
                         "model__alpha": alpha,
                         "model__l1_ratio": l1_ratio,
                         "model__cv_folds": int(len(inner_cv)),
-                        "model__alpha_count": len(_ALPHA_GRID),
+                        "model__alpha_count": len(alpha_grid),
                     }
                 ),
                 "best_score": best_score,
@@ -299,7 +385,7 @@ def _fit_cuml_elasticnet_cv(
         raise
 
     best_params = search.best_params_
-    total_candidates = len(_CUML_ALPHA_GRID) * len(_L1_RATIO_GRID)
+    total_candidates = len(alpha_grid) * len(l1_grid)
     vlog(
         verbose,
         f"Search complete model=elasticnet, task={task}, strategy=cuml_elasticnet_grid, "
@@ -320,6 +406,7 @@ def _fit_logistic_elasticnet_cv(
     max_cores: int,
     verbose: bool,
     cuml_use_gpu: bool | None = None,
+    debug_grid_progress: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit LogisticRegressionCV — C and l1_ratio selection via built-in CV.
 
@@ -328,33 +415,56 @@ def _fit_logistic_elasticnet_cv(
     n_jobs is set to max_cores.  Sweeps _C_GRID C values and _L1_RATIO_GRID
     l1_ratios (C = 1 / alpha, reciprocal of _ALPHA_GRID).
 
-    When ``cuml_use_gpu`` is True (or auto-detected), uses cuML LogisticRegression
-    via GridSearchCV over a coarser C/l1_ratio grid.
+    The cuML GPU path (_fit_cuml_logistic_elasticnet_cv) is intentionally bypassed:
+    LogisticRegressionCV parallelises over folds × l1_ratios (e.g. 5 × 7 = 35
+    tasks) and sweeps all Cs per task via warm-start.  Benchmarks on 477k samples:
+    CPU (32 cores) ~20 min / score 0.680 vs GPU 105 cold cuML fits ~30 min /
+    score 0.650.  The ~3% accuracy gap is driven by cuML's float32 default and
+    max_iter=5000 non-convergence.
+    At 16 cores CPU wall time rises to ~40 min (2 batches of 35/16 tasks) vs
+    GPU ~30 min, so the crossover is around 20-24 cores — but the accuracy gap
+    persists regardless of core count.  CPU is preferred unconditionally until a
+    regularization-path cuML variant (analogous to LogisticRegressionCV) exists.
     """
-    from .cuml_utils import cuml_gpu_available
-
-    use_gpu = bool(cuml_use_gpu) if cuml_use_gpu is not None else cuml_gpu_available()
-
-    if use_gpu:
-        return _fit_cuml_logistic_elasticnet_cv(
-            task=task,
-            x_train=x_train,
-            y_train=y_train,
-            preprocessor=preprocessor,
-            inner_cv=inner_cv,
-            verbose=verbose,
-        )
+    # LogisticRegressionCV uses warm-start path — sweeping the full
+    # C/l1_ratio grid costs nearly the same as a tiny slice.
+    c_grid, l1_grid = _adaptive_c_grid(x_train.shape[0])
+    c_grid = [float(c) for c in c_grid]
+    l1_grid = [float(r) for r in l1_grid]
 
     from sklearn.linear_model import LogisticRegressionCV
 
+    # Estimate wall time: LogisticRegressionCV parallelises over
+    # n_l1_ratios × inner_folds tasks.  Six-point empirical calibration on
+    # shared-gpu partition (CPU cores on GPU nodes are slower than CPU nodes):
+    #   12k samples,   50 Cs, 2 batches -> ~1.75 min  => ~0.9 min/batch @50Cs
+    #   353k samples,  50 Cs, 2 batches -> ~19 min    => ~9.5 min/batch @50Cs
+    #   1567k samples, 50 Cs, 1 batch  -> ~63 min     => ~63 min/batch @50Cs
+    #   1572k samples, 50 Cs, 1 batch  -> ~79 min     => ~79 min/batch @50Cs
+    #   1567k samples, 50 Cs, 1 batch  -> ~62 min     => ~62 min/batch @50Cs
+    #   1572k samples, 50 Cs, 1 batch  -> ~83 min     => ~83 min/batch @50Cs
+    # Large-run spread (~62-83 min near 1.57M samples) indicates cluster-load
+    # variance, so keep a mildly conservative central estimate.
+    # Model: (10 + n_samples/11_000) * (n_Cs/100) min/batch.
+    _n_cv_tasks = len(l1_grid) * len(inner_cv)
+    _n_batches = math.ceil(_n_cv_tasks / max(1, max_cores))
+    _est_min = _n_batches * (10.0 + x_train.shape[0] / 11_000) * (len(c_grid) / 100)
+    vlog(
+        verbose,
+        f"Fitting elasticnet (LogisticRegressionCV), task={task}, "
+        f"n_samples={x_train.shape[0]}, n_features={x_train.shape[1]}, "
+        f"n_Cs={len(c_grid)}, n_l1_ratios={len(l1_grid)}, "
+        f"cv_tasks={_n_cv_tasks}, batches={_n_batches} (cores={max_cores}), "
+        f"~{_est_min:.0f} min est.",
+    )
     estimator = Pipeline(
         steps=[
             ("prep", preprocessor),
             (
                 "model",
                 LogisticRegressionCV(
-                    Cs=_C_GRID,
-                    l1_ratios=_L1_RATIO_GRID,
+                    Cs=c_grid,
+                    l1_ratios=l1_grid,
                     solver="saga",
                     max_iter=20000,
                     class_weight="balanced",
@@ -362,11 +472,19 @@ def _fit_logistic_elasticnet_cv(
                     cv=inner_cv,
                     n_jobs=max_cores,
                     use_legacy_attributes=False,
+                    # Keep solver output quiet; debug progress is reported at a higher level.
+                    verbose=0,
                 ),
             ),
         ]
     )
-    estimator.fit(x_train, y_train)
+    # Non-convergence at extreme C values is expected during the warm-start path
+    # sweep and does not affect the selected optimum — suppress the noise.
+    from sklearn.exceptions import ConvergenceWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        estimator.fit(x_train, y_train)
     model = estimator.named_steps["model"]
 
     # Best C and l1_ratio: scalar floats with use_legacy_attributes=False.
@@ -386,31 +504,64 @@ def _fit_logistic_elasticnet_cv(
                 class_scores = raw_scores
             mean_per_c = np.mean(np.asarray(class_scores, dtype=float), axis=0)
             best_score = float(np.max(mean_per_c))
-        except Exception:
-            pass
+        except Exception as exc:
+            vlog(verbose, f"elasticnet best_score extraction failed: {exc}", level="debug")
 
     vlog(
         verbose,
         f"Search complete model=elasticnet, task={task}, strategy=logisticelasticnetcv, "
         f"candidates={n_cs if n_cs > 0 else len(_C_GRID)}, best_score={best_score:.6f}",
     )
+
+    # Replace LogisticRegressionCV with a plain LogisticRegression using the
+    # selected best_c and l1_ratio. LogisticRegressionCV.fit() always re-runs
+    # the full CV path sweep, so leaving it in place causes the evaluator's
+    # refit call to duplicate ~19 min of work. LogisticRegression.fit() is a
+    # single solver pass (~seconds).
+    # Use cuML LogisticRegression for the final fit when GPU is available — a
+    # single fixed-param fit avoids the precision/convergence issues that made
+    # the full CV sweep prefer CPU.
+    from .cuml_utils import cuml_gpu_available
+
+    if cuml_use_gpu is not False and cuml_gpu_available():
+        from cuml.linear_model import LogisticRegression as _LogisticRegression
+
+        fixed_model = _LogisticRegression(
+            C=best_c,
+            l1_ratio=l1_ratio,
+            penalty="elasticnet",
+            class_weight="balanced",
+            max_iter=20000,
+            verbose=False,
+        )
+    else:
+        from sklearn.linear_model import LogisticRegression as _LogisticRegression
+
+        fixed_model = _LogisticRegression(
+            C=best_c,
+            l1_ratio=l1_ratio,
+            penalty="elasticnet",
+            solver="saga",
+            max_iter=20000,
+            class_weight="balanced",
+            random_state=RNG_SEED,
+        )
+    estimator = Pipeline(
+        steps=[("prep", estimator.named_steps["prep"]), ("model", fixed_model)]
+    )
+
     return estimator, {
         "best_params": sanitize_best_params(
             {
-                "model": model,
+                "model": fixed_model,
                 "model__C": best_c,
                 "model__l1_ratio": l1_ratio,
                 "model__cv_folds": int(len(inner_cv)),
-                "model__Cs_count": len(_C_GRID),
+                "model__Cs_count": len(c_grid),
             }
         ),
         "best_score": best_score,
     }
-
-
-# Coarser C grid for cuML LogisticRegression: individual fits instead of path.
-# 15 log-spaced values on the same range as _C_GRID (= 1 / _ALPHA_GRID).
-_CUML_C_GRID: np.ndarray = np.logspace(-6, 2, num=15)[::-1]  # high→low (descending C)
 
 
 def _fit_cuml_logistic_elasticnet_cv(
@@ -419,13 +570,21 @@ def _fit_cuml_logistic_elasticnet_cv(
     y_train: np.ndarray,
     preprocessor: ColumnTransformer,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    c_grid: list[float],
+    l1_grid: list[float],
     verbose: bool,
+    debug_grid_progress: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit cuML LogisticRegression via GridSearchCV over a coarser C/l1_ratio grid.
 
     cuML LogisticRegression supports penalty="elasticnet", class_weight="balanced",
     C, and l1_ratio with the same semantics as sklearn.  No CV-path variant exists,
     so GridSearchCV drives the search (n_jobs=1 for GPU).
+
+    DEPRECATED: not called by _fit_logistic_elasticnet_cv.  sklearn
+    LogisticRegressionCV is faster and more accurate (warm-start path vs cold
+    cuML float32 fits; ~30 min / 0.650 GPU vs ~20 min / 0.680 CPU at 32 cores).
+    Retained for reference until a regularization-path cuML variant exists.
     """
     from .cuml_utils import get_cuml_logistic_elasticnet
 
@@ -437,10 +596,10 @@ def _fit_cuml_logistic_elasticnet_cv(
     )
     candidates = [
         {"model__C": [float(c)], "model__l1_ratio": [float(r)]}
-        for c in _CUML_C_GRID
-        for r in _L1_RATIO_GRID
+        for c in c_grid
+        for r in l1_grid
     ]
-    search = GridSearchCV(
+    search = _ProgressGridSearchCV(
         estimator=pipe,
         param_grid=candidates,
         scoring=scorer_name(task),
@@ -448,6 +607,8 @@ def _fit_cuml_logistic_elasticnet_cv(
         n_jobs=1,
         refit=True,
         error_score="raise",
+        progress_enabled=debug_grid_progress,
+        progress_desc=f"elasticnet [{task}]",
     )
     try:
         search.fit(x_train, y_train)
@@ -458,7 +619,9 @@ def _fit_cuml_logistic_elasticnet_cv(
                 f"cuML LogisticRegression GPU training failed; retrying on CPU ({exc})",
                 level="info",
             )
-            from sklearn.linear_model import LogisticRegressionCV as _LogisticRegressionCV
+            from sklearn.linear_model import (
+                LogisticRegressionCV as _LogisticRegressionCV,
+            )
 
             cpu_est = Pipeline(
                 steps=[
@@ -466,8 +629,8 @@ def _fit_cuml_logistic_elasticnet_cv(
                     (
                         "model",
                         _LogisticRegressionCV(
-                            Cs=_C_GRID,
-                            l1_ratios=_L1_RATIO_GRID,
+                            Cs=c_grid,
+                            l1_ratios=l1_grid,
                             solver="saga",
                             max_iter=20000,
                             class_weight="balanced",
@@ -482,7 +645,9 @@ def _fit_cuml_logistic_elasticnet_cv(
             cpu_est.fit(x_train, y_train)
             cpu_model = cpu_est.named_steps["model"]
             best_c = float(np.asarray(getattr(cpu_model, "C_", np.nan)).ravel()[0])
-            l1_ratio = float(np.asarray(getattr(cpu_model, "l1_ratio_", np.nan)).ravel()[0])
+            l1_ratio = float(
+                np.asarray(getattr(cpu_model, "l1_ratio_", np.nan)).ravel()[0]
+            )
             best_score = float("nan")
             raw_scores = getattr(cpu_model, "scores_", None)
             if raw_scores is not None:
@@ -492,13 +657,15 @@ def _fit_cuml_logistic_elasticnet_cv(
                         if isinstance(raw_scores, dict)
                         else raw_scores
                     )
-                    best_score = float(np.max(np.mean(np.asarray(scores_arr, dtype=float), axis=0)))
-                except Exception:
-                    pass
+                    best_score = float(
+                        np.max(np.mean(np.asarray(scores_arr, dtype=float), axis=0))
+                    )
+                except Exception as exc:
+                    vlog(verbose, f"elasticnet cpu_fallback best_score extraction failed: {exc}", level="debug")
             vlog(
                 verbose,
                 f"Search complete model=elasticnet, task={task}, strategy=logisticelasticnetcv_cpu_fallback, "
-                f"candidates={len(_C_GRID)}, best_score={best_score:.6f}",
+                f"candidates={len(c_grid) * len(l1_grid)}, best_score={best_score:.6f}",
             )
             return cpu_est, {
                 "best_params": sanitize_best_params(
@@ -507,7 +674,7 @@ def _fit_cuml_logistic_elasticnet_cv(
                         "model__C": best_c,
                         "model__l1_ratio": l1_ratio,
                         "model__cv_folds": int(len(inner_cv)),
-                        "model__Cs_count": len(_C_GRID),
+                        "model__Cs_count": len(c_grid),
                     }
                 ),
                 "best_score": best_score,
@@ -515,7 +682,7 @@ def _fit_cuml_logistic_elasticnet_cv(
         raise
 
     best_params = search.best_params_
-    total_candidates = len(_CUML_C_GRID) * len(_L1_RATIO_GRID)
+    total_candidates = len(c_grid) * len(l1_grid)
     vlog(
         verbose,
         f"Search complete model=elasticnet, task={task}, strategy=cuml_logistic_elasticnet_grid, "
@@ -634,6 +801,167 @@ def _looks_like_gpu_failure(exc: Exception) -> bool:
     )
 
 
+def _compute_es_splits(
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Compute per-fold early-stopping (ES) train/val index pairs.
+
+    For each inner fold i, the ES val is the smallest scoring-val from any
+    *other* inner fold — it is already inside fold i's train set (by
+    construction) and is disjoint from fold i's scoring val, so no leakage
+    between the ES signal and the CV score.  The ES train is fold i's train
+    minus the borrowed ES val, keeping training data as large as possible.
+
+    Returns a list of (es_train_idx, es_val_idx) arrays, one per fold.
+    """
+    n = len(inner_cv)
+    result: list[tuple[np.ndarray, np.ndarray]] = []
+    for i, (train_idx, _) in enumerate(inner_cv):
+        es_val_idx = min(
+            (inner_cv[j][1] for j in range(n) if j != i),
+            key=len,
+        )
+        es_val_set = set(es_val_idx.tolist())
+        es_train_idx = np.array(
+            [idx for idx in train_idx if idx not in es_val_set], dtype=int
+        )
+        result.append((es_train_idx, es_val_idx))
+    return result
+
+
+class _ContextAwareCV:
+    """CV splitter that injects a clean ES val before each fold.
+
+    For mlp / xgb, computes per-fold early-stopping splits via
+    _compute_es_splits:
+      - ES val: the smallest scoring-val from any *other* inner fold
+        (already inside the current fold's train; disjoint from the
+        scoring val, so no leakage between ES signal and CV score).
+      - ES train: current fold's train minus the borrowed ES val.
+
+    Stores (X_es_val_raw, y_es_val) in _es_raw_val_context so
+    _ESPipeline can preprocess and pass to the model for early stopping.
+    Yields (es_train_idx, scoring_val_idx) to sklearn so the scoring val
+    is never touched by early stopping.
+    """
+
+    def __init__(
+        self,
+        inner_cv: list[tuple[np.ndarray, np.ndarray]],
+        model_name: str,
+    ) -> None:
+        """Initialize a _ContextAwareCV instance."""
+        self._inner_cv = inner_cv
+        self._model_name = model_name
+        self._es_splits: list[tuple[np.ndarray, np.ndarray]] | None = None
+        if model_name in {"mlp", "xgb"} and len(inner_cv) >= 2:
+            self._es_splits = _compute_es_splits(inner_cv)
+
+    def split(self, X: Any, y: Any = None, groups: Any = None):  # type: ignore[override]
+        """Yield (es_train_idx, scoring_val_idx) for each fold."""
+        for i, (train_idx, val_idx) in enumerate(self._inner_cv):
+            if self._model_name in {"mlp", "xgb"} and self._es_splits is not None:
+                es_train_idx, es_val_idx = self._es_splits[i]
+                _es_raw_val_context.X_val = (
+                    X.iloc[es_val_idx] if hasattr(X, "iloc") else X[es_val_idx]
+                )
+                _es_raw_val_context.y_val = (
+                    y[es_val_idx] if y is not None else None
+                )
+                yield es_train_idx, val_idx
+            else:
+                yield train_idx, val_idx
+        # Clear after all folds to avoid stale state.
+        _es_raw_val_context.X_val = None
+        _es_raw_val_context.y_val = None
+
+    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
+        """Get n splits."""
+        return len(self._inner_cv)
+
+
+_TREE_ES_ROUNDS = 30  # patience for per-trial early stopping
+_TREE_ES_N_MAX = 500  # max n_estimators for post-search probe
+_TREE_ES_N_MIN = 50  # floor on optimal n_estimators
+
+
+class _ESPipeline(Pipeline):
+    """Pipeline subclass that enables per-fold early stopping for XGB/MLP.
+
+    When _es_raw_val_context holds raw val data (set by _ContextAwareCV),
+    _ESPipeline preprocesses it with the just-fitted preprocessor and:
+    - For XGB: passes eval_set + early_stopping_rounds to model.fit()
+    - For MLP: stores preprocessed val in _es_pp_val_context for the model to read
+
+    Falls back to standard Pipeline.fit() when no val data is available
+    (e.g. during OptunaSearchCV's final refit on all x_train).
+    """
+
+    def __init__(self, steps, *, model_name: str = "", **kwargs):
+        """Initialize a _ESPipeline instance."""
+        super().__init__(steps, **kwargs)
+        self.model_name = model_name
+        # Expose estimator type from final estimator
+        final_est = self._final_estimator
+        if hasattr(final_est, "_estimator_type"):
+            self._estimator_type = final_est._estimator_type
+
+    def fit(self, X, y=None, **params):
+        # Fit all intermediate steps (preprocessor) via sklearn's internal _fit().
+        # _fit() fits each step up to (not including) the last and returns Xt.
+        """Fit the model using the provided training data."""
+        routed_params = self._check_method_params(method="fit", props=params)
+        Xt = self._fit(X, y, routed_params, raw_params=params)
+
+        # Preprocess val data using the now-fitted preprocessor(s).
+        X_val_raw = getattr(_es_raw_val_context, "X_val", None)
+        y_val = getattr(_es_raw_val_context, "y_val", None)
+        X_val_pp = None
+        if X_val_raw is not None:
+            X_val_pp = X_val_raw
+            for _, _, transformer in self._iter(
+                with_final=False, filter_passthrough=False
+            ):
+                X_val_pp = transformer.transform(X_val_pp)
+
+        # Fit the final estimator with early stopping.
+        model = self._final_estimator
+        last_name = self.steps[-1][0]
+        last_params = self._get_metadata_for_step(
+            step_idx=len(self) - 1,
+            step_params=routed_params[last_name],
+            all_params=params,
+        )
+        fit_params = last_params.get("fit", {})
+
+        if X_val_pp is not None and y_val is not None and self.model_name == "xgb":
+            try:
+                # early_stopping_rounds is a constructor param in XGBoost >= 2.x.
+                model.set_params(early_stopping_rounds=_TREE_ES_ROUNDS)
+                model.fit(
+                    Xt,
+                    y,
+                    eval_set=[(X_val_pp, y_val)],
+                    verbose=False,
+                    **fit_params,
+                )
+            except Exception as exc:
+                vlog(True, f"XGB early stopping failed, falling back to standard fit: {exc}", level="debug")
+                model.fit(Xt, y, **fit_params)
+        elif X_val_pp is not None and y_val is not None and self.model_name == "mlp":
+            _es_pp_val_context.X_val_pp = X_val_pp
+            _es_pp_val_context.y_val = y_val
+            try:
+                model.fit(Xt, y, **fit_params)
+            finally:
+                _es_pp_val_context.X_val_pp = None
+                _es_pp_val_context.y_val = None
+        else:
+            model.fit(Xt, y, **fit_params)
+
+        return self
+
+
 def _build_grid_search(
     pipe: Pipeline,
     model_name: str,
@@ -672,17 +1000,290 @@ def _build_grid_search(
         model_n_jobs=model_n_jobs,
         scale_pos_weight=scale_pos_weight,
     )
+
+    # For XGB with early stopping, n_estimators is determined by ES — not by the
+    # search.  Fix it to _TREE_ES_N_MAX on every candidate's base model and remove
+    # it from the grid so the search only tunes the remaining hyperparameters.
+    if model_name == "xgb":
+        for c in candidates:
+            c.pop("model__n_estimators", None)
+            for m in c.get("model", []):
+                m.set_params(n_estimators=_TREE_ES_N_MAX)
+        vlog(
+            verbose,
+            f"XGB grid search: fixed n_estimators={_TREE_ES_N_MAX} (determined by ES); "
+            f"removed from search grid",
+            level="debug",
+        )
+
+    # Wrap the pipeline with _ESPipeline for models that need early stopping.
+    if model_name in {"xgb", "mlp"}:
+        pipe = _ESPipeline(pipe.steps, model_name=model_name)
+
+    # Activate _ContextAwareCV for models that need inner-fold validation data.
+    cv_splitter = inner_cv
+    if model_name in {"xgb", "mlp"}:
+        cv_splitter = _ContextAwareCV(inner_cv, model_name)
+
     return _ProgressGridSearchCV(
         estimator=pipe,
         param_grid=candidates,
         scoring=scorer_name(task),
-        cv=inner_cv,
+        cv=cv_splitter,
         n_jobs=search_n_jobs,
         pre_dispatch=search_n_jobs,
         refit=True,
         error_score="raise",
         progress_enabled=debug_grid_progress,
         progress_desc=f"grid {model_name} [{task}]",
+    )
+
+
+def _fit_mlp_search(
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    pipe: Pipeline,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    param_grid_size: int,
+    search_strategy: str,
+    lhs_scale_mode: str,
+    verbose: bool,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit MLP with validation indices from inner CV to prevent data leakage.
+
+    Uses GridSearchCV for the inner CV loop (which already respects fold structure),
+    then manually refits the best model on all training data with explicit validation
+    indices from the first inner fold.
+    """
+    from sklearn.base import clone as sk_clone
+    from .grids import build_param_candidates
+
+    # Build GridSearchCV normally to evaluate all candidates.
+    search = _build_grid_search(
+        pipe=pipe,
+        model_name="mlp",
+        task=task,
+        x_train=x_train,
+        y_train=y_train,
+        inner_cv=inner_cv,
+        search_n_jobs=1,  # Single job for GPU memory safety.
+        param_grid_size=param_grid_size,
+        search_strategy=search_strategy,
+        lhs_scale_mode=lhs_scale_mode,
+        xgb_use_gpu=None,
+        cuml_use_gpu=None,
+        verbose=verbose,
+        model_n_jobs=1,
+        debug_grid_progress=verbose,
+    )
+
+    # Fit normally (inner CV respects fold structure).
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Setting penalty=None will ignore the C and l1_ratio parameters",
+            category=UserWarning,
+        )
+        search.fit(x_train, y_train)
+
+    # Extract best params and refit on all data with validation indices.
+    best_params = search.best_params_
+    best_pipe = sk_clone(pipe)
+
+    # Set best hyperparameters.
+    best_pipe.set_params(**best_params)
+
+    # Get validation indices from first inner fold.
+    _, val_idx_inner = inner_cv[0]
+    val_indices = (
+        x_train.index[val_idx_inner].to_numpy()
+        if hasattr(x_train, "index")
+        else val_idx_inner
+    )
+
+    # Manually fit the MLP step with validation indices.
+    # First, fit the preprocessor.
+    if "prep" in best_pipe.named_steps:
+        best_pipe.named_steps["prep"].fit(x_train, y_train)
+        X_prep = best_pipe.named_steps["prep"].transform(x_train)
+    else:
+        X_prep = x_train.values if hasattr(x_train, "values") else x_train
+
+    # Fit MLP with val_indices.
+    best_pipe.named_steps["model"].fit(X_prep, y_train, val_indices=val_indices)
+
+    vlog(
+        verbose,
+        f"Search complete model=mlp, task={task}, "
+        f"strategy={'lhs' if _use_lhs_strategy(search_strategy, 'mlp') else 'grid'}, "
+        f"candidates={len(search.cv_results_['params'])}, best_score={search.best_score_:.6f}",
+    )
+
+    tuning_info: dict[str, Any] = {
+        "best_params": {k: v for k, v in best_params.items()},
+        "best_score": float(search.best_score_),
+    }
+
+    return best_pipe, tuning_info
+
+
+def _fit_tree_early_stopping(
+    model_name: str,
+    task: str,
+    fitted_pipe: Pipeline,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    verbose: bool,
+) -> tuple[Pipeline, bool, int | None]:
+    """Post-search refit with early stopping on final model (XGB and MLP only).
+
+    Uses the globally smallest inner-fold val as the ES hold-out, then trains
+    the probe model on ALL outer training data except that hold-out:
+      - ES val: the inner-fold val with fewest samples (smallest group).
+      - Probe train: all outer train indices minus ES val.
+    This maximises the probe training set so it best approximates the final fit,
+    while keeping the ES signal on a partition that was never the scoring val
+    for the same fold it was trained on.
+
+    Only applies early stopping to XGBoost and MLP (boosted models). RandomForest
+    (non-boosted) doesn't support early stopping with eval_set, so it just uses
+    standard fit with the n_estimators from the search.
+
+    For XGB: Uses eval_set with early_stopping_rounds.
+    For MLP: Stores validation data in _es_pp_val_context for the model to read.
+    For RF: Standard fit (no early stopping available for random forests).
+
+    Returns (pipe, applied, optimal_n).
+    """
+    try:
+        prep_fitted = fitted_pipe.named_steps["prep"]
+        best_model = fitted_pipe.named_steps["model"]
+
+        # Use the globally smallest inner-fold val as ES hold-out, then train the
+        # probe on ALL outer training data except that hold-out.  This maximises
+        # the probe training set (best approximation of the final fit) while
+        # keeping the ES signal on a clean, separate partition.
+        es_val_idx = min((val_idx for _, val_idx in inner_cv), key=len)
+        es_val_set = set(es_val_idx.tolist())
+        all_train_idx = np.arange(len(x_train))
+        probe_tr_idx = all_train_idx[
+            np.array([i not in es_val_set for i in all_train_idx])
+        ]
+        X_final_train_t = prep_fitted.transform(x_train.iloc[probe_tr_idx])
+        X_final_val_t = prep_fitted.transform(x_train.iloc[es_val_idx])
+        y_final_train = y_train[probe_tr_idx]
+        y_final_val = y_train[es_val_idx]
+
+        model_final = clone(best_model)
+        optimal_n = None
+
+        if model_name == "xgb":
+            # XGBoost (boosted): try early stopping, fall back to standard fit if unsupported
+            model_final.set_params(n_estimators=_TREE_ES_N_MAX)
+            if y_final_val is not None:
+                vlog(
+                    verbose,
+                    f"XGB post-search ES: probe_train_n={len(X_final_train_t)}, es_val_n={len(X_final_val_t)}",
+                    level="debug",
+                )
+                try:
+                    # early_stopping_rounds is a constructor param in XGBoost >= 2.x.
+                    model_final.set_params(early_stopping_rounds=_TREE_ES_ROUNDS)
+                    model_final.fit(
+                        X_final_train_t,
+                        y_final_train,
+                        eval_set=[(X_final_val_t, y_final_val)],
+                        verbose=False,
+                    )
+                    optimal_n = max(_TREE_ES_N_MIN, int(model_final.best_iteration) + 1)
+                except Exception as exc:
+                    vlog(verbose, f"XGB post-search early stopping failed, falling back: {exc}", level="debug")
+                    model_final.fit(X_final_train_t, y_final_train)
+                    optimal_n = _TREE_ES_N_MAX
+            else:
+                model_final.fit(X_final_train_t, y_final_train)
+                optimal_n = _TREE_ES_N_MAX
+        elif model_name == "mlp":
+            # MLP: store validation data in context for early stopping
+            if y_final_val is not None:
+                _es_pp_val_context.X_val_pp = X_final_val_t
+                _es_pp_val_context.y_val = y_final_val
+                vlog(
+                    verbose,
+                    f"MLP post-search ES: probe_train_n={len(X_final_train_t)}, es_val_n={len(X_final_val_t)}",
+                    level="debug",
+                )
+                try:
+                    model_final.fit(X_final_train_t, y_final_train)
+                finally:
+                    _es_pp_val_context.X_val_pp = None
+                    _es_pp_val_context.y_val = None
+            else:
+                model_final.fit(X_final_train_t, y_final_train)
+            # MLP early stopping tracks epochs; use n_epochs_trained_ as proxy for "n_estimators"
+            optimal_n = max(
+                _TREE_ES_N_MIN,
+                min(
+                    _TREE_ES_N_MAX,
+                    int(getattr(model_final, "n_epochs_trained_", _TREE_ES_N_MAX)),
+                ),
+            )
+        else:
+            # Fallback for unknown model types
+            model_final.fit(X_final_train_t, y_final_train)
+            optimal_n = _TREE_ES_N_MAX
+
+        # Refit final model on all training data with optimal n_estimators.
+        # Reset early_stopping_rounds so the final fit runs for exactly optimal_n
+        # rounds without requiring an eval_set.
+        if optimal_n is not None and model_name == "xgb":
+            model_final.set_params(n_estimators=optimal_n, early_stopping_rounds=None)
+        X_all_train_t = prep_fitted.transform(x_train)
+        model_final.fit(X_all_train_t, y_train)
+
+        pipe_final = Pipeline([("prep", prep_fitted), ("model", model_final)])
+
+        vlog(
+            verbose,
+            f"{model_name.upper()} post-search ES: optimal_n={optimal_n} "
+            f"(final-fold validation)",
+        )
+        return pipe_final, True, optimal_n
+
+    except Exception as exc:
+        vlog(
+            verbose, f"{model_name.upper()} post-search ES failed ({exc})", level="info"
+        )
+        return fitted_pipe, False, None
+
+
+def _log_early_stopping_fold_sizes(
+    model_name: str,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    *,
+    verbose: bool,
+) -> None:
+    """Log a compact summary of early-stopping fold sizes once per search.
+
+    Shows three sizes per fold:
+      es_train_n   – samples the model trains on (fold train minus ES val)
+      scoring_val_n – held-out samples used for CV scoring (untouched by ES)
+      es_val_n     – borrowed hold-out used only for early stopping
+    """
+    if model_name not in {"xgb", "mlp"} or not inner_cv:
+        return
+
+    es_splits = _compute_es_splits(inner_cv)
+    fold_summaries = "; ".join(
+        f"split{i} es_train_n={len(es_tr)}, scoring_val_n={len(inner_cv[i - 1][1])}, es_val_n={len(es_va)}"
+        for i, (es_tr, es_va) in enumerate(es_splits, start=1)
+    )
+    vlog(
+        verbose,
+        f"{model_name.upper()} early stopping fold sizes: {fold_summaries}",
+        level="debug",
     )
 
 
@@ -723,11 +1324,11 @@ def _fit_grid_search(
             try:
                 _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
             except AttributeError:
-                pass
+                vlog(verbose, "torch.accelerator not available (older torch); using cuda/mps only", level="debug")
             if hasattr(_torch.backends, "mps"):
                 _mlp_has_gpu = _mlp_has_gpu or _torch.backends.mps.is_available()
         except ImportError:
-            pass
+            vlog(verbose, "torch not installed; MLP will run on CPU", level="debug")
         # Single search job when a GPU is available to prevent VRAM contention
         # across parallel GridSearchCV workers.
         search_n_jobs = 1 if _mlp_has_gpu else max_cores
@@ -767,6 +1368,7 @@ def _fit_grid_search(
     def _fit_search(search_obj: GridSearchCV) -> None:
         # sklearn 1.8 internally converts C=np.inf → penalty=None and then
         # warns about it, even though C=np.inf is their own recommended API.
+        """Internal helper for fit search."""
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -780,6 +1382,7 @@ def _fit_grid_search(
                 return
             search_obj.fit(x_train, y_train)
 
+    _log_early_stopping_fold_sizes(model_name, inner_cv, verbose=verbose)
     try:
         _fit_search(search)
     except Exception as exc:
@@ -839,30 +1442,20 @@ def _fit_grid_search(
         else:
             raise
 
-    # XGBoost: tune with reduced n_estimators for speed, then refit with full budget.
-    xgb_refit_applied = False
-    xgb_final_n_estimators: int | None = None
+    # XGBoost (boosted): Use post-search early stopping to find optimal n_estimators.
+    tree_es_applied = False
+    tree_es_n_estimators: int | None = None
     if model_name == "xgb":
-        try:
-            best_params = search.best_params_.copy()
-            n_est_full = 300 if x_train.shape[0] >= 5000 else 180
-            best_params["model__n_estimators"] = n_est_full
-            if bool(xgb_use_gpu):
-                # Refit on CPU to prevent post-search GPU OOM.
-                best_params["model__device"] = "cpu"
-            pipe_final = clone(pipe)
-            pipe_final.set_params(**best_params)
-            pipe_final.fit(x_train, y_train)
-            search.best_estimator_ = pipe_final
-            xgb_refit_applied = True
-            xgb_final_n_estimators = n_est_full
-        except Exception as exc:
-            # Keep the tuned estimator if the full-budget refit fails.
-            vlog(
-                verbose,
-                f"XGB full-refit skipped; keeping tuned estimator ({exc})",
-                level="info",
-            )
+        pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
+            model_name=model_name,
+            task=task,
+            fitted_pipe=search.best_estimator_,
+            x_train=x_train,
+            y_train=y_train,
+            inner_cv=inner_cv,
+            verbose=verbose,
+        )
+        search.best_estimator_ = pipe_es
 
     # Compute total candidate count for logging.
     use_lhs = _use_lhs_strategy(search_strategy, model_name)
@@ -882,6 +1475,27 @@ def _fit_grid_search(
         f"candidates={total_candidates}, best_score={float(search.best_score_):.6f}",
     )
 
+    # Log MLP early stopping info if present.
+    if model_name == "mlp":
+        # UNUSED: Legacy defensive try/except wrapper removed during refactor;
+        # this block now runs directly and exceptions should be visible in logs.
+        # TODO: remove this note if no rollback to the old guarded behavior is needed.
+        # try:
+        from sklearn.pipeline import Pipeline
+
+        best_est = search.best_estimator_
+        if isinstance(best_est, Pipeline) and "model" in best_est.named_steps:
+            mlp_model = best_est.named_steps["model"]
+            if hasattr(mlp_model, "n_epochs_trained_"):
+                vlog(
+                    verbose,
+                    f"MLP early stopping: n_epochs_trained={mlp_model.n_epochs_trained_}",
+                )
+            # UNUSED: Historical silent-error suppression for MLP logging.
+            # TODO: remove these commented lines after one release cycle.
+        # except Exception:
+        #     pass  # Silently skip on any error; not critical for logging.
+
     # Switch best estimator to CPU to avoid device-mismatch warnings downstream.
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
 
@@ -889,9 +1503,391 @@ def _fit_grid_search(
         "best_params": sanitize_best_params(search.best_params_),
         "best_score": float(search.best_score_),
     }
+    if model_name in {"xgb", "rf"}:
+        tuning_info["tree_es_applied"] = tree_es_applied
+        tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
+
+    try:
+        cv_res = search.cv_results_
+        split_keys = sorted(
+            k for k in cv_res if k.startswith("split") and k.endswith("_test_score")
+        )
+        n = len(cv_res["params"])
+        tuning_info["cv_results"] = {
+            "n_candidates": n,
+            "mean_test_score": [
+                float(v) if np.isfinite(float(v)) else None
+                for v in cv_res["mean_test_score"]
+            ],
+            "std_test_score": [
+                float(v) if np.isfinite(float(v)) else None
+                for v in cv_res["std_test_score"]
+            ],
+            "rank_test_score": [int(v) for v in cv_res["rank_test_score"]],
+            "params_json": [
+                json.dumps(sanitize_best_params(p), sort_keys=True, default=str)
+                for p in cv_res["params"]
+            ],
+            "split_keys": split_keys,
+            "split_scores": {
+                k: [float(v) if np.isfinite(float(v)) else None for v in cv_res[k]]
+                for k in split_keys
+            },
+        }
+    except Exception as exc:
+        vlog(verbose, f"grid search cv_results extraction failed: {exc}", level="debug")
+
+    return search.best_estimator_, tuning_info
+
+
+def _fit_optuna_search(
+    task: str,
+    model_name: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    pipe: Pipeline,
+    inner_cv: list[tuple[np.ndarray, np.ndarray]],
+    max_cores: int,
+    param_grid_size: int,
+    optuna_sampler: str,
+    optuna_n_startup_trials: int,
+    optuna_multivariate: bool,
+    xgb_use_gpu: bool | None,
+    cuml_use_gpu: bool | None,
+    verbose: bool,
+    optuna_wandb_callback: bool = False,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit a model via Optuna Bayesian optimisation (TPE or CMA-ES).
+
+    Uses ``OptunaSearchCV`` as a drop-in for GridSearchCV.  GPU retry logic
+    and XGBoost post-search refit are preserved from ``_fit_grid_search``.
+    """
+    try:
+        import optuna
+        from optuna_integration.sklearn import OptunaSearchCV
+    except ImportError as exc:
+        raise ImportError(
+            "optuna_backend=True requires optuna and optuna-integration[sklearn]. "
+            "Install with: pip install 'optuna-integration[sklearn]>=3.4'"
+        ) from exc
+
+    from .grids import build_optuna_distributions
+
+    # ---- Parallelism budget (mirrors _fit_grid_search) --------------------
+    if model_name == "mlp":
+        _mlp_has_gpu = False
+        try:
+            import torch as _torch
+
+            _mlp_has_gpu = _torch.cuda.is_available()
+            try:
+                _mlp_has_gpu = _mlp_has_gpu or _torch.accelerator.is_available()
+            except AttributeError:
+                vlog(verbose, "torch.accelerator not available (older torch); using cuda/mps only", level="debug")
+            if hasattr(_torch.backends, "mps"):
+                _mlp_has_gpu = _mlp_has_gpu or _torch.backends.mps.is_available()
+        except ImportError:
+            vlog(verbose, "torch not installed; MLP will run on CPU", level="debug")
+        search_n_jobs = 1 if _mlp_has_gpu else max_cores
+        model_n_jobs = 1
+    elif (model_name in {"xgb", "rf"} and bool(xgb_use_gpu)) or (
+        model_name == "svm" and bool(cuml_use_gpu)
+    ):
+        search_n_jobs = 1
+        model_n_jobs = 1
+    elif model_name in {"rf", "xgb"} and max_cores > 1:
+        model_n_jobs = max(1, int(max_cores**0.5))
+        search_n_jobs = max(1, max_cores // model_n_jobs)
+    else:
+        search_n_jobs = max_cores
+        model_n_jobs = 1
+
+    # ---- Imbalance weight for XGB classification --------------------------
+    scale_pos_weight: float | None = None
+    if task == "classification" and model_name in {"xgb", "rf"}:
+        pos = int(np.sum(y_train == 1))
+        neg = int(np.sum(y_train == 0))
+        if pos > 0 and neg > 0:
+            scale_pos_weight = neg / pos
+
+    # ---- Helper: build sampler + OptunaSearchCV ---------------------------
+    def _make_search(
+        xgb_gpu: bool | None,
+        cuml_gpu: bool | None,
+        n_jobs: int,
+    ) -> OptunaSearchCV:
+        """Internal helper for make search."""
+        base_model, distributions = build_optuna_distributions(
+            model_name=model_name,
+            task=task,
+            n_samples=x_train.shape[0],
+            n_features=x_train.shape[1],
+            xgb_use_gpu=xgb_gpu,
+            cuml_use_gpu=cuml_gpu,
+            verbose=verbose,
+            model_n_jobs=model_n_jobs,
+            scale_pos_weight=scale_pos_weight,
+        )
+
+        # For XGB with early stopping, n_estimators is determined by ES — not by
+        # the search.  Fix it on the base model and remove from distributions so
+        # Optuna only tunes the remaining hyperparameters.
+        if model_name == "xgb":
+            base_model.set_params(n_estimators=_TREE_ES_N_MAX)
+            distributions.pop("model__n_estimators", None)
+            vlog(
+                verbose,
+                f"XGB Optuna search: fixed n_estimators={_TREE_ES_N_MAX} (determined by ES); "
+                f"removed from distributions",
+                level="debug",
+            )
+
+        pipe_copy = clone(pipe)
+        pipe_copy.set_params(model=base_model)
+
+        # Wrap pipeline with _ESPipeline for models that need early stopping
+        if model_name in {"xgb", "mlp"}:
+            pipe_copy = _ESPipeline(pipe_copy.steps, model_name=model_name)
+
+        # Activate _ContextAwareCV for models that need inner-fold validation data
+        cv_splitter = inner_cv
+        if model_name in {"xgb", "mlp"}:
+            cv_splitter = _ContextAwareCV(inner_cv, model_name)
+
+        warnings.filterwarnings(
+            "ignore", category=optuna.exceptions.ExperimentalWarning
+        )
+        if optuna_sampler == "cmaes":
+            sampler = optuna.samplers.CmaEsSampler(
+                seed=RNG_SEED,
+                n_startup_trials=optuna_n_startup_trials,
+                restart_strategy="ipop",
+            )
+        else:
+            sampler = optuna.samplers.TPESampler(
+                seed=RNG_SEED,
+                n_startup_trials=optuna_n_startup_trials,
+                multivariate=optuna_multivariate,
+                constant_liar=True,
+            )
+
+        # Match Optuna log verbosity to the pipeline's --verbose/--debug flags.
+        optuna.logging.set_verbosity(
+            optuna.logging.INFO if verbose else optuna.logging.WARNING
+        )
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        callbacks = []
+        if optuna_wandb_callback:
+            try:
+                import wandb as _wandb
+                from optuna_integration.wandb import WeightsAndBiasesCallback
+
+                if _wandb.run is not None:
+                    callbacks.append(
+                        WeightsAndBiasesCallback(
+                            metric_name=f"{model_name}/{scorer_name(task)}",
+                            as_multirun=False,
+                        )
+                    )
+            except Exception as exc:
+                vlog(verbose, f"wandb callback setup failed: {exc}", level="debug")
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=optuna.exceptions.ExperimentalWarning
+            )
+            return OptunaSearchCV(
+                estimator=pipe_copy,
+                param_distributions=distributions,
+                scoring=scorer_name(task),
+                cv=cv_splitter,
+                n_trials=param_grid_size,
+                n_jobs=n_jobs,
+                refit=True,
+                error_score=np.nan,
+                study=study,
+                callbacks=callbacks if callbacks else None,
+                verbose=0,
+            )
+
+    search = _make_search(xgb_use_gpu, cuml_use_gpu, search_n_jobs)
+
+    def _fit_search(search_obj: OptunaSearchCV) -> None:
+        """Internal helper for fit search."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Setting penalty=None will ignore the C and l1_ratio parameters",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore", category=optuna.exceptions.ExperimentalWarning
+            )
+            if search_n_jobs > 1:
+                with parallel_backend("threading", n_jobs=search_n_jobs):
+                    search_obj.fit(x_train, y_train)
+                return
+            search_obj.fit(x_train, y_train)
+
+    def _fallback_to_grid(reason: str) -> tuple[Pipeline, dict[str, Any]]:
+        """Fallback to the deterministic grid-search path when Optuna produces no usable trials."""
+        vlog(
+            verbose,
+            f"Optuna search fallback to grid for model={model_name}, task={task} ({reason})",
+            level="info",
+        )
+        fallback_xgb_use_gpu = False if model_name in {"xgb", "rf"} else xgb_use_gpu
+        fallback_cuml_use_gpu = False if model_name == "svm" else cuml_use_gpu
+        return _fit_grid_search(
+            task=task,
+            model_name=model_name,
+            x_train=x_train,
+            y_train=y_train,
+            pipe=pipe,
+            inner_cv=inner_cv,
+            max_cores=max_cores,
+            param_grid_size=param_grid_size,
+            search_strategy="grid",
+            lhs_scale_mode="auto",
+            xgb_use_gpu=fallback_xgb_use_gpu,
+            cuml_use_gpu=fallback_cuml_use_gpu,
+            verbose=verbose,
+            debug_grid_progress=False,
+        )
+
+    optuna_failure_reason: str | None = None
+    _log_early_stopping_fold_sizes(model_name, inner_cv, verbose=verbose)
+    try:
+        _fit_search(search)
+    except Exception as exc:
+        # On GPU failure rebuild with a fresh study (NaN GPU trials corrupt the
+        # surrogate model) and retry on CPU once.
+        if (
+            model_name in {"xgb", "rf"}
+            and bool(xgb_use_gpu)
+            and _looks_like_gpu_failure(exc)
+        ):
+            vlog(
+                verbose,
+                f"{model_name.upper()} GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            search = _make_search(False, cuml_use_gpu, max_cores)
+            _fit_search(search)
+        elif (
+            model_name == "svm" and bool(cuml_use_gpu) and _looks_like_gpu_failure(exc)
+        ):
+            vlog(
+                verbose,
+                f"cuML SVM GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            search = _make_search(xgb_use_gpu, False, max_cores)
+            _fit_search(search)
+        else:
+            message = str(exc)
+            if (
+                "No trials are completed yet" in message
+                or "The value nan is not acceptable" in message
+                or "failed with value np.float64(nan)" in message
+            ):
+                optuna_failure_reason = message
+            else:
+                raise
+
+    if optuna_failure_reason is None:
+        try:
+            best_score = float(search.best_score_)
+            if not np.isfinite(best_score):
+                optuna_failure_reason = f"best_score={best_score!r}"
+        except Exception as exc:
+            optuna_failure_reason = str(exc)
+
+    if optuna_failure_reason is not None:
+        return _fallback_to_grid(optuna_failure_reason)
+
+    # XGBoost (boosted): Use post-search early stopping to find optimal n_estimators.
+    tree_es_applied = False
+    tree_es_n_estimators: int | None = None
     if model_name == "xgb":
-        tuning_info["xgb_refit_applied"] = xgb_refit_applied
-        tuning_info["xgb_final_n_estimators"] = xgb_final_n_estimators
+        pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
+            model_name=model_name,
+            task=task,
+            fitted_pipe=search.best_estimator_,
+            x_train=x_train,
+            y_train=y_train,
+            inner_cv=inner_cv,
+            verbose=verbose,
+        )
+        search.best_estimator_ = pipe_es
+
+    vlog(
+        verbose,
+        f"Optuna search complete model={model_name}, task={task}, "
+        f"sampler={optuna_sampler}, n_trials={param_grid_size}, "
+        f"best_score={float(search.best_score_):.6f}",
+    )
+
+    # Log MLP early stopping info if present.
+    if model_name == "mlp":
+        try:
+            from sklearn.pipeline import Pipeline
+
+            best_est = search.best_estimator_
+            if isinstance(best_est, Pipeline) and "model" in best_est.named_steps:
+                mlp_model = best_est.named_steps["model"]
+                if hasattr(mlp_model, "n_epochs_trained_"):
+                    vlog(
+                        verbose,
+                        f"MLP early stopping: n_epochs_trained={mlp_model.n_epochs_trained_}",
+                    )
+        except Exception as exc:
+            vlog(verbose, f"MLP n_epochs_trained_ extraction failed: {exc}", level="debug")
+
+    _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
+
+    tuning_info: dict[str, Any] = {
+        "best_params": sanitize_best_params(search.best_params_),
+        "best_score": float(search.best_score_),
+        "optuna_n_trials": int(param_grid_size),
+        "optuna_sampler": optuna_sampler,
+    }
+    if model_name in {"xgb", "rf"}:
+        tuning_info["tree_es_applied"] = tree_es_applied
+        tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
+
+    try:
+        cv_res = search.cv_results_
+        vlog(verbose, f"optuna cv_results keys: {sorted(cv_res.keys())}", level="debug")
+        split_keys = sorted(
+            k for k in cv_res if k.startswith("split") and k.endswith("_test_score")
+        )
+        params = cv_res.get("params", [])
+        n = len(params)
+        tuning_info["cv_results"] = {
+            "n_candidates": n,
+            "mean_test_score": [
+                float(v) if np.isfinite(float(v)) else None
+                for v in cv_res.get("mean_test_score", [])
+            ],
+            "std_test_score": [
+                float(v) if np.isfinite(float(v)) else None
+                for v in cv_res.get("std_test_score", [])
+            ],
+            "rank_test_score": [int(v) for v in cv_res.get("rank_test_score", [])],
+            "params_json": [
+                json.dumps(sanitize_best_params(p), sort_keys=True, default=str)
+                for p in params
+            ],
+            "split_keys": split_keys,
+            "split_scores": {
+                k: [float(v) if np.isfinite(float(v)) else None for v in cv_res[k]]
+                for k in split_keys
+            },
+        }
+    except Exception as exc:
+        vlog(verbose, f"optuna cv_results extraction failed: {exc}", level="debug")
 
     return search.best_estimator_, tuning_info
 
@@ -916,6 +1912,11 @@ def fit_best_estimator(
     cuml_use_gpu: bool | None = None,
     verbose: bool = False,
     debug_grid_progress: bool = False,
+    optuna_backend: bool = False,
+    optuna_sampler: str = "tpe",
+    optuna_n_startup_trials: int = 5,
+    optuna_multivariate: bool = True,
+    optuna_wandb_callback: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Tune hyperparameters via grouped inner CV and return the best estimator.
 
@@ -942,6 +1943,7 @@ def fit_best_estimator(
             max_cores=max_cores,
             verbose=verbose,
             cuml_use_gpu=cuml_use_gpu,
+            debug_grid_progress=debug_grid_progress,
         )
 
     if task == "classification" and model_name == "elasticnet":
@@ -954,6 +1956,7 @@ def fit_best_estimator(
             max_cores=max_cores,
             verbose=verbose,
             cuml_use_gpu=cuml_use_gpu,
+            debug_grid_progress=debug_grid_progress,
         )
 
     # BetaRegressor: no external hyperparameters; use cross_validate for scoring.
@@ -968,10 +1971,32 @@ def fit_best_estimator(
             verbose=verbose,
         )
 
-    # All other models: GridSearchCV with candidate grid or LHS samples.
+    # All other models: GridSearchCV or Optuna search.
     from sklearn.linear_model import LinearRegression
 
     pipe = Pipeline(steps=[("prep", preprocessor), ("model", LinearRegression())])
+
+    # Optuna path: Bayesian optimisation via TPE or CMA-ES.
+    # "linear" is excluded (no hyperparameters to tune).
+    if optuna_backend and model_name not in {"linear"}:
+        return _fit_optuna_search(
+            task=task,
+            model_name=model_name,
+            x_train=x_train,
+            y_train=y_train,
+            pipe=pipe,
+            inner_cv=inner_cv,
+            max_cores=max_cores,
+            param_grid_size=param_grid_size,
+            optuna_sampler=optuna_sampler,
+            optuna_n_startup_trials=optuna_n_startup_trials,
+            optuna_multivariate=optuna_multivariate,
+            xgb_use_gpu=xgb_use_gpu,
+            cuml_use_gpu=cuml_use_gpu,
+            verbose=verbose,
+            optuna_wandb_callback=optuna_wandb_callback,
+        )
+
     return _fit_grid_search(
         task=task,
         model_name=model_name,

@@ -127,7 +127,7 @@ class TestIntegrationSmoke:
                 only_event_type="SE",
                 only_transcript_filter="transcripts",
                 only_variability="High",
-                outer_splits=3,
+                outer_splits=4,
                 inner_splits=4,  # Explicitly set to 4, not derived from outer_splits.
                 include_models=("linear",),
                 run_regression=True,
@@ -146,3 +146,13 @@ class TestIntegrationSmoke:
                     # Should have successfully tuned models, indicating inner CV worked.
                     for fold in result["fold_results"]:
                         assert "tuning" in fold, "Fold missing tuning info"
+                        outer_test = set(fold["outer_test_indices"])
+                        for inner_split in fold["inner_splits_global"]:
+                            inner_train = set(inner_split["inner_train_indices"])
+                            inner_valid = set(inner_split["inner_valid_indices"])
+                            assert inner_train.isdisjoint(
+                                inner_valid
+                            ), "Inner train/validation indices overlap"
+                            assert outer_test.isdisjoint(
+                                inner_valid
+                            ), "Inner validation indices overlap outer test indices"

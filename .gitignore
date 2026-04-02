@@ -19,3 +19,5 @@ rmats_out*
 rmats_mapping/
 splicing_analysis
 splicing_ml/**/__pycache__/
+splicing_ml/output/
+*.pyc

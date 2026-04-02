@@ -22,7 +22,9 @@ from ..metrics import (
     regression_metrics_by_psi_bin,
 )
 from ..utils import vlog
+from ._contexts import _es_raw_val_context
 from .beta import BetaRegressor, _inverse_logit, _logit_transform
+from .search import _compute_es_splits
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference
 
 __all__ = ["evaluate_outer_fold", "tune_threshold_balanced_accuracy"]
@@ -52,11 +54,29 @@ def tune_threshold_balanced_accuracy(
     """
     thresholds = np.linspace(0.05, 0.95, 19)
     all_probs = np.zeros_like(y_train, dtype=float)
-    for tr_idx, va_idx in inner_splits:
+    # Mirror _ContextAwareCV/_compute_es_splits: dedicated ES val from another fold,
+    # disjoint from the scoring val. Only computed when >=2 splits available.
+    es_splits = _compute_es_splits(inner_splits) if len(inner_splits) >= 2 else None
+    for i, (tr_idx, va_idx) in enumerate(inner_splits):
         est = clone(estimator)
-        est.fit(x_train.iloc[tr_idx], y_train[tr_idx])
+        if es_splits is not None:
+            es_train_idx, es_val_idx = es_splits[i]
+            _es_raw_val_context.X_val = x_train.iloc[es_val_idx]
+            _es_raw_val_context.y_val = y_train[es_val_idx]
+            fit_idx = es_train_idx
+        else:
+            fit_idx = tr_idx
+        try:
+            est.fit(x_train.iloc[fit_idx], y_train[fit_idx])
+        finally:
+            _es_raw_val_context.X_val = None
+            _es_raw_val_context.y_val = None
         _set_xgb_cpu_predictor_for_inference(est)
-        all_probs[va_idx] = est.predict_proba(x_train.iloc[va_idx])[:, 1]
+        if hasattr(est, "predict_proba"):
+            all_probs[va_idx] = est.predict_proba(x_train.iloc[va_idx])[:, 1]
+        else:
+            decision = est.decision_function(x_train.iloc[va_idx])
+            all_probs[va_idx] = 1.0 / (1.0 + np.exp(-decision))
 
     best_threshold, best_score = 0.5, -np.inf
     for thr in thresholds:
@@ -91,7 +111,7 @@ def _eval_classification(
         vlog(verbose, f"Threshold tuning selected threshold={threshold:.4f}")
     else:
         threshold = 0.5
-        vlog(verbose, "Threshold tuning disabled; using fixed threshold=0.5000")
+        vlog(verbose, f"Threshold tuning disabled; threshold={threshold:.4f}")
 
     if calibrate:
         # Fit Platt-scaled calibration using the inner splits as CV folds.
@@ -108,7 +128,11 @@ def _eval_classification(
     else:
         best_estimator.fit(x_train, y_train)
         _set_xgb_cpu_predictor_for_inference(best_estimator)
-        y_prob = best_estimator.predict_proba(x_test)[:, 1]
+        if hasattr(best_estimator, "predict_proba"):
+            y_prob = best_estimator.predict_proba(x_test)[:, 1]
+        else:
+            decision = best_estimator.decision_function(x_test)
+            y_prob = 1.0 / (1.0 + np.exp(-decision))
         final_estimator = best_estimator
 
     scores = classification_metrics(y_test, y_prob, threshold=threshold)
@@ -143,7 +167,7 @@ def _eval_regression(
     y_test_eval = np.asarray(y_test, dtype=float)
 
     # BetaRegressor expects raw PSI targets; invert logit if needed.
-    if _model_outputs_psi_scale(best_estimator) and bool(
+    if _model_outputs_psi_scale(best_estimator) and (
         np.any(y_train_fit < 0.0) or np.any(y_train_fit > 1.0)
     ):
         y_train_fit = _inverse_logit(y_train_fit)

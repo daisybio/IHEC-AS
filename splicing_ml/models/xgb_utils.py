@@ -143,6 +143,7 @@ def _set_xgb_cpu_predictor_for_inference(estimator: Any) -> None:
     """
 
     def _apply(obj: Any) -> None:
+        """Internal helper for apply."""
         if obj is None:
             return
 

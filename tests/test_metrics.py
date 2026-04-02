@@ -75,6 +75,7 @@ class TestRegressionMetricsByPsiBin:
     """Tests for per-PSI-bin regression metrics."""
 
     def test_bin_keys_match_range(self):
+        """Test bin keys match range."""
         rng = np.random.default_rng(0)
         y = rng.uniform(0.2, 0.8, 300)
         result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
@@ -84,6 +85,7 @@ class TestRegressionMetricsByPsiBin:
         assert "bin_0.60_0.80" in result
 
     def test_perfect_prediction_gives_zero_rmse(self):
+        """Test perfect prediction gives zero rmse."""
         rng = np.random.default_rng(1)
         y = rng.uniform(0.2, 0.8, 300)
         result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
@@ -92,6 +94,7 @@ class TestRegressionMetricsByPsiBin:
 
     def test_sparse_bin_returns_nan(self):
         # Only one sample in [0.2, 0.4)
+        """Test sparse bin returns nan."""
         y_true = np.array([0.25, 0.5, 0.5, 0.5, 0.7])
         y_pred = np.array([0.30, 0.5, 0.5, 0.5, 0.7])
         result = regression_metrics_by_psi_bin(y_true, y_pred, psi_low=0.2, psi_high=0.8)
@@ -99,6 +102,7 @@ class TestRegressionMetricsByPsiBin:
         assert np.isnan(result["bin_0.20_0.40"]["rmse"])
 
     def test_n_counts_sum_to_total(self):
+        """Test n counts sum to total."""
         rng = np.random.default_rng(2)
         y = rng.uniform(0.2, 0.8, 200)
         result = regression_metrics_by_psi_bin(y, y, psi_low=0.2, psi_high=0.8)
@@ -106,6 +110,7 @@ class TestRegressionMetricsByPsiBin:
         assert total_n == len(y)
 
     def test_custom_psi_range(self):
+        """Test custom psi range."""
         rng = np.random.default_rng(3)
         y = rng.uniform(0.1, 0.9, 300)
         result = regression_metrics_by_psi_bin(y, y, psi_low=0.1, psi_high=0.9, n_bins=4)

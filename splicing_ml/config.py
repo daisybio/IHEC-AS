@@ -62,9 +62,17 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
     "xgb",
     "beta",
     "svm",
+    "nysvm",
     "mlp",
 )
-# Smoke mode covers all available model types.
+# Default production runs exclude SVM (O(n²), unusable at SE scale) and
+# nysvm (OOM-killed on SE; worst-performing model at all scales).
+# MLP was optimized with batch-size scaling, mixed precision, and early
+# stopping and is now fast enough for routine production runs.
+DEFAULT_MODEL_TYPES: tuple[str, ...] = tuple(
+    m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm"}
+)
+# Smoke mode covers all available model types including MLP.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
 
 
@@ -166,6 +174,24 @@ def validate_run_config(cfg: RunConfig) -> list[str]:
             f"got {cfg.lhs_scale_mode}"
         )
 
+    # Optuna backend validation.
+    if cfg.optuna_sampler not in {"tpe", "cmaes"}:
+        raise ValueError(
+            f"optuna_sampler must be one of: tpe, cmaes, got {cfg.optuna_sampler}"
+        )
+    if cfg.optuna_n_startup_trials < 1:
+        raise ValueError(
+            f"optuna_n_startup_trials must be >= 1, got {cfg.optuna_n_startup_trials}"
+        )
+    if cfg.optuna_backend:
+        try:
+            import optuna  # noqa: F401
+        except Exception:
+            warnings.append(
+                "optuna_backend=True but optuna is not installed; "
+                "install with: pip install 'optuna-integration[sklearn]>=3.4'"
+            )
+
     # Parallelism validation.
     if cfg.max_cores < 1:
         raise ValueError(f"max_cores must be >= 1, got {cfg.max_cores}")
@@ -210,13 +236,20 @@ class RunConfig:
     only_transcript_filter: str | None = None
     only_variability: str | None = None
     only_group_col: str | None = None
-    outer_splits: int = 5
+    outer_splits: int = (
+        5  # Original: 10; reduced to cut inner_splits 9→4 (28 vs 63 CV tasks)
+    )
     inner_splits: int = 3
     random_seed: int = RNG_SEED
     max_cores: int = default_max_cores()
     param_grid_size: int = 16
     search_strategy: str = "hybrid"
     lhs_scale_mode: str = "auto"
+    optuna_backend: bool = True
+    optuna_sampler: str = "tpe"
+    optuna_n_startup_trials: int = 5
+    optuna_multivariate: bool = True
+    optuna_wandb_callback: bool = False
     xgb_use_gpu: bool | None = None
     cuml_use_gpu: bool | None = None
     verbose: bool = False
@@ -228,7 +261,7 @@ class RunConfig:
     categorical_missing_strategy: str = "missing_token"
     categorical_missing_token: str = "__MISSING__"
     generate_html_reports: bool = True
-    use_logit_regression: bool = True
+    use_logit_regression: bool = False
     smoke_mode: bool = False
     smoke_max_rows: int = 20000
     calibrate_classifiers: bool = True

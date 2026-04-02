@@ -162,7 +162,11 @@ def _estimate_filter_fraction_csv(
     filter_variability: str | None,
     sample_rows: int = 500000,
 ) -> float | None:
-    """Estimate row retention fraction for CLI subset filters from a CSV sample."""
+    """Estimate row retention fraction for CLI subset filters from CSV windows.
+
+    The total sample budget is split across head/middle/tail windows to reduce
+    bias when matching rows are concentrated near the end of the file.
+    """
     has_filters = any(
         x is not None for x in [filter_event_type, filter_transcript_filter]
     ) or (filter_variability not in {None, "both"})
@@ -170,9 +174,50 @@ def _estimate_filter_fraction_csv(
         return 1.0
 
     usecols = ["Event Type", "transcript_filter", "Variability"]
-    seen = 0
-    matched = 0
+    budget = max(1, int(sample_rows))
+    per_window = max(1, budget // 3)
+    trailing_budget = max(1, budget - 2 * per_window)
+    window_sizes = [per_window, per_window, trailing_budget]
+
+    def _match_count(chunk: pd.DataFrame) -> int:
+        """Internal helper for match count."""
+        mask = pd.Series(True, index=chunk.index)
+        if filter_event_type is not None:
+            mask &= chunk["Event Type"] == filter_event_type
+        if filter_transcript_filter is not None:
+            mask &= chunk["transcript_filter"] == filter_transcript_filter
+        if filter_variability is not None and filter_variability != "both":
+            mask &= chunk["Variability"] == filter_variability
+        return int(mask.sum())
+
+    def _read_window(offset: int, n_rows: int) -> tuple[int, int]:
+        """Internal helper for read window."""
+        if n_rows <= 0:
+            return (0, 0)
+        try:
+            # `skiprows` callable preserves header while skipping to a window.
+            if offset > 0:
+                skiprows = lambda i: i > 0 and i <= offset
+            else:
+                skiprows = None
+            chunk = pd.read_csv(
+                path,
+                compression="infer",
+                usecols=usecols,
+                skiprows=skiprows,
+                nrows=n_rows,
+                low_memory=False,
+            )
+            seen_rows = int(chunk.shape[0])
+            if seen_rows == 0:
+                return (0, 0)
+            return (seen_rows, _match_count(chunk))
+        except Exception:
+            return (0, 0)
+
     try:
+        # Fast first pass to estimate total rows without loading all columns.
+        total_rows = 0
         for chunk in pd.read_csv(
             path,
             compression="infer",
@@ -180,18 +225,43 @@ def _estimate_filter_fraction_csv(
             chunksize=100000,
             low_memory=False,
         ):
-            mask = pd.Series(True, index=chunk.index)
-            if filter_event_type is not None:
-                mask &= chunk["Event Type"] == filter_event_type
-            if filter_transcript_filter is not None:
-                mask &= chunk["transcript_filter"] == filter_transcript_filter
-            if filter_variability is not None and filter_variability != "both":
-                mask &= chunk["Variability"] == filter_variability
-
-            seen += int(chunk.shape[0])
-            matched += int(mask.sum())
-            if seen >= sample_rows:
+            total_rows += int(chunk.shape[0])
+            if total_rows >= budget * 3:
+                # For moderate files this is enough to place meaningful windows.
                 break
+
+        if total_rows == 0:
+            return None
+
+        # If file is likely larger than the first-pass cap, get the exact row count.
+        if total_rows >= budget * 3:
+            total_rows = 0
+            for chunk in pd.read_csv(
+                path,
+                compression="infer",
+                usecols=usecols,
+                chunksize=100000,
+                low_memory=False,
+            ):
+                total_rows += int(chunk.shape[0])
+
+        max_start = max(0, total_rows - 1)
+        starts = [
+            0,
+            min(max_start, max(0, (total_rows // 2) - (window_sizes[1] // 2))),
+            min(max_start, max(0, total_rows - window_sizes[2])),
+        ]
+
+        seen = 0
+        matched = 0
+        covered: set[int] = set()
+        for start, n_rows in zip(starts, window_sizes):
+            if start in covered:
+                continue
+            covered.add(start)
+            win_seen, win_matched = _read_window(start, n_rows)
+            seen += win_seen
+            matched += win_matched
 
         if seen == 0:
             return None
