@@ -696,14 +696,24 @@ def _mlp_batch_sizes(n_samples: int) -> list[int]:
         return [1024, 2048, 4096]
 
 
+MLP_ES_PATIENCE = 10
+"""Early-stopping patience for MLP (epochs without val-loss improvement before stopping).
+
+Set to 10 rather than the _EarlyStopping default of 5 because the ReduceLROnPlateau
+scheduler (patience=3) fires first, and the model needs at least a few epochs after
+each LR reduction to demonstrate whether it can recover.  10 ≥ 2 × scheduler_patience
+gives two scheduler steps plus a small buffer before ES triggers.
+"""
+
+
 def _mlp_base_model(task: str) -> Any:
     """Return MLP estimator for the task."""
     from .deep import MLPClassifier, MLPRegressor
 
     return (
-        MLPClassifier(random_state=RNG_SEED)
+        MLPClassifier(random_state=RNG_SEED, early_stopping_patience=MLP_ES_PATIENCE)
         if task == "classification"
-        else MLPRegressor(random_state=RNG_SEED)
+        else MLPRegressor(random_state=RNG_SEED, early_stopping_patience=MLP_ES_PATIENCE)
     )
 
 

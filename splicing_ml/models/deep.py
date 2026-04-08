@@ -138,6 +138,7 @@ class _BaseMLP(BaseEstimator):
         early_stopping_patience: int = 5,
         val_fraction: float = 0.15,
         random_state: int = RNG_SEED,
+        restore_best_weights: bool = True,
     ) -> None:
         # All params stored exactly as received — required by sklearn convention.
         """Initialize a _BaseMLP instance."""
@@ -150,6 +151,7 @@ class _BaseMLP(BaseEstimator):
         self.early_stopping_patience = early_stopping_patience
         self.val_fraction = val_fraction
         self.random_state = random_state
+        self.restore_best_weights = restore_best_weights
 
     # ------------------------------------------------------------------
     # Device detection
@@ -339,8 +341,10 @@ class _BaseMLP(BaseEstimator):
             if stopper.step(val_loss, net):
                 break
 
-        # Always restore the best-validation weights.
-        stopper.restore_best(net)
+        # Restore best-validation weights unless explicitly disabled (e.g. final
+        # all-data refit where optimal_n is already known and no clean val exists).
+        if self.restore_best_weights:
+            stopper.restore_best(net)
         self.model_ = net
         self.device_ = device
         self.n_epochs_trained_ = epoch + 1  # Store for diagnostics

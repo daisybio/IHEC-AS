@@ -376,12 +376,7 @@ def run_single_configuration(
 
             def _grp(idx_arr) -> str:
                 """Group-name:count summary for a list/array of global row indices."""
-                s = (
-                    groups_outer.iloc[idx_arr]
-                    .astype(str)
-                    .value_counts()
-                    .sort_index()
-                )
+                s = groups_outer.iloc[idx_arr].astype(str).value_counts().sort_index()
                 return ", ".join(f"{g}:{int(n)}" for g, n in s.items()) or "<empty>"
 
             vlog(
@@ -522,7 +517,7 @@ def run_single_configuration(
                 # Compute training scores to detect overfitting.
                 fitted_estimator = ev.get("estimator")
                 train_scores: dict[str, float] = {}
-                if fitted_estimator is not None:
+                if fitted_estimator is not None and run_cfg.output_level == "diagnostics":
                     try:
                         if task == "classification":
                             if hasattr(fitted_estimator, "predict_proba"):
@@ -599,6 +594,17 @@ def run_single_configuration(
                     else:
                         fold_result["baseline_y_pred"] = baseline_pred.tolist()
                 fold_result["_estimator"] = ev.get("estimator")
+
+                # Release TabICL's training-data cache and GPU/CPU tensors
+                # immediately so subsequent folds don't accumulate RAM.
+                if model_name == "tabicl":
+                    del best_estimator, fitted_estimator
+                    try:
+                        import torch as _t
+                        if _t.cuda.is_available():
+                            _t.cuda.empty_cache()
+                    except Exception:
+                        pass
 
                 return fold_result
             except Exception as exc:
@@ -851,7 +857,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--data-reader-backend",
-        default="auto",
+        default="polars",
         choices=["auto", "pandas", "polars"],
     )
     p.add_argument(
@@ -955,10 +961,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable classifier calibration (disabled by default for speed)",
     )
     p.add_argument(
-        "--tune-threshold",
-        action="store_true",
-        help="Enable decision threshold tuning on inner-fold predictions (default: fixed at 0.5)",
+        "--no-tune-threshold",
+        dest="tune_threshold",
+        action="store_false",
+        help="Disable decision threshold tuning on inner-fold predictions (default: enabled)",
     )
+    p.set_defaults(tune_threshold=True)
     p.add_argument(
         "--output-level",
         type=str,
@@ -1066,9 +1074,6 @@ def main() -> None:
         args.optuna = True
 
     requested_models = tuple(args.models)
-    if args.smoke:
-        # extract all available models in smoke mode for comprehensive testing, regardless of user default
-        requested_models = SMOKE_MODEL_TYPES
 
     vlog(
         args.verbose,
@@ -1172,8 +1177,11 @@ def main() -> None:
 
     models = tuple(args.models)
     if args.smoke:
-        # extract all available models in smoke mode for comprehensive testing, regardless of user default
-        models = SMOKE_MODEL_TYPES
+        # if smoke mode change the default to SMOKE_MODEL_TYPES, i.e., check whether requested_models are DEFAULT_MODEL_TYPES or not, if not, then use requested_models, else use SMOKE_MODEL_TYPES
+        if models == DEFAULT_MODEL_TYPES:
+            # extract all available models in smoke mode for comprehensive testing, regardless of user default
+            models = SMOKE_MODEL_TYPES
+        # Use requested models if they are not the default
 
     xgb_use_gpu = None
     if "xgb" in models:
@@ -1193,29 +1201,28 @@ def main() -> None:
             level="info",
         )
 
-    if "mlp" in models:
+    if "mlp" in models or "tabicl" in models:
         try:
             import torch as _torch
 
-            _mlp_device = "cpu"
+            _torch_device = "cpu"
             try:
                 if _torch.accelerator.is_available():
-                    _mlp_device = str(_torch.accelerator.current_accelerator())
+                    _torch_device = str(_torch.accelerator.current_accelerator())
             except AttributeError:
                 if _torch.cuda.is_available():
-                    _mlp_device = "cuda"
+                    _torch_device = "cuda"
                 elif (
                     hasattr(_torch.backends, "mps")
                     and _torch.backends.mps.is_available()
                 ):
-                    _mlp_device = "mps"
+                    _torch_device = "mps"
         except ImportError:
-            _mlp_device = "torch not installed"
-        vlog(
-            args.verbose,
-            f"MLP runtime device check: {_mlp_device}",
-            level="info",
-        )
+            _torch_device = "torch not installed"
+        if "mlp" in models:
+            vlog(args.verbose, f"MLP runtime device check: {_torch_device}", level="info")
+        if "tabicl" in models:
+            vlog(args.verbose, f"TabICL runtime device check: {_torch_device}", level="info")
 
     outer_splits = args.outer_splits
     if args.smoke:

@@ -31,7 +31,7 @@ set -euo pipefail
 DATA_PATH="${1:-processed_data/aggregated_dt_filtered.csv.gz}"
 OUTPUT_ROOT="${2:-splicing_ml/output/slurm_ml_outputs}"
 ENV_NAME="${3:-ihec-as}"
-WANDB_PROJECT="${4:-splicing-ml}"
+WANDB_PROJECT="${4:-}" # splicing-ml
 # QOS limitgpus: max 4 GPUs and 80 CPUs concurrently across all running jobs.
 # Per-tier limits are CPU-bound: L=2 (2x32c), M=3 (3x24c), S=4 (4x16c, GPU-bound).
 # These assume only one tier is active; reduce if submitting multiple tiers simultaneously.
@@ -92,7 +92,7 @@ for key, path in [("L", CONFIG_L), ("M", CONFIG_M), ("S", CONFIG_S)]:
             f.write(f"{cfg.event_type}\t{cfg.transcript_filter}\t{cfg.variability}\t{cfg.group_col}\tclassification\n")
     n_rows = sum(
         1 for cfg in buckets[key]
-        if cfg.transcript_filter == "biotype_filtered" and cfg.variability == "both"
+        if cfg.transcript_filter != "biotype_filtered" and cfg.variability != "both"
     )
     print(f"Tier {key}: {n_rows} jobs -> {path}")
 PY
@@ -130,4 +130,6 @@ submit_tier() {
 # Original (outer_splits=10): L=2-00:00:00, M=1-12:00:00, S=1-00:00:00
 # GPU: all tiers use A40 (48 GB VRAM). The only other GPU type available is Titan (~12 GB VRAM,
 # 92 GB node RAM), which is insufficient for cuML SVM on any tier's dataset sizes.
-submit_tier "S" "$CONFIG_S" "16G" "16" "0-08:00:00" "$MAX_PARALLEL_S" && submit_tier "M" "$CONFIG_M" "24G" "24" "0-10:00:00" "$MAX_PARALLEL_M" && submit_tier "L" "$CONFIG_L" "40G" "32" "0-16:00:00" "$MAX_PARALLEL_L"
+submit_tier "S" "$CONFIG_S" "32G" "8"  "0-06:00:00" "$MAX_PARALLEL_S" && \
+submit_tier "M" "$CONFIG_M" "64G" "8"  "0-12:00:00" "$MAX_PARALLEL_M" && \
+submit_tier "L" "$CONFIG_L" "128G" "12" "0-24:00:00" "$MAX_PARALLEL_L"

@@ -64,6 +64,7 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
     "svm",
     "nysvm",
     "mlp",
+    "tabicl",
 )
 # Default production runs exclude:
 # - svm (O(n²), unusable at SE scale)
@@ -72,7 +73,12 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
 # MLP was optimized with batch-size scaling, mixed precision, and early
 # stopping and is now fast enough for routine production runs.
 DEFAULT_MODEL_TYPES: tuple[str, ...] = tuple(
-    m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm", "elasticnet"}
+    {
+        "linear",
+        "xgb",
+        "tabicl",
+    }
+    # m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm", "elasticnet", "mlp", "rf", "xgb"}
 )
 # Smoke mode covers all available model types including MLP.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
@@ -233,7 +239,7 @@ class RunConfig:
 
     data_path: str
     output_dir: str
-    data_reader_backend: str = "auto"
+    data_reader_backend: str = "polars"
     only_event_type: str | None = None
     only_transcript_filter: str | None = None
     only_variability: str | None = None
@@ -267,7 +273,7 @@ class RunConfig:
     smoke_mode: bool = False
     smoke_max_rows: int = 20000
     calibrate_classifiers: bool = True
-    tune_threshold: bool = False
+    tune_threshold: bool = True
     output_level: str = "diagnostics"
     log_level: str = "info"
     use_wandb: bool = False

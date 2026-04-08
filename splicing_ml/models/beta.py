@@ -321,18 +321,6 @@ class BetaRegressor(BaseEstimator, RegressorMixin):
         y_arr = np.asarray(y, dtype=float)
         y_arr = np.clip(y_arr, self.epsilon, 1.0 - self.epsilon)
 
-        # Optional row subsampling to control fit time for large datasets.
-        if x_arr.shape[0] > max(1, int(self.max_train_rows)):
-            rng = np.random.default_rng(RNG_SEED)
-            fit_idx = rng.choice(
-                x_arr.shape[0],
-                size=max(1, int(self.max_train_rows)),
-                replace=False,
-            )
-            fit_idx = np.sort(np.asarray(fit_idx, dtype=int))
-            x_arr = x_arr[fit_idx]
-            y_arr = y_arr[fit_idx]
-
         # Degenerate column removal and QR rank reduction.
         x_use, self._feature_mask_, self._qr_keep_idx_ = (
             self._remove_degenerate_columns(x_arr)

@@ -83,7 +83,6 @@ echo "[SLURM] output=${OUT_DIR}"
 CMD=(
   python -u run_splicing_ml.py
   --debug
-  --tune-threshold
   --optuna
   --data-path "$DATA_PATH"
   --output-dir "$OUT_DIR"

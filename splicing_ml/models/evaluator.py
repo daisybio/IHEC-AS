@@ -126,7 +126,6 @@ def _eval_classification(
         y_prob = calibrated.predict_proba(x_test)[:, 1]
         final_estimator = calibrated
     else:
-        best_estimator.fit(x_train, y_train)
         _set_xgb_cpu_predictor_for_inference(best_estimator)
         if hasattr(best_estimator, "predict_proba"):
             y_prob = best_estimator.predict_proba(x_test)[:, 1]

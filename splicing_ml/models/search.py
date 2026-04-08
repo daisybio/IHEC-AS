@@ -17,6 +17,7 @@ strategy helpers based on model type:
 
 import json
 import math
+import os
 from typing import Any
 import warnings
 
@@ -40,6 +41,7 @@ from .grids import (
     _ALPHA_GRID,
     _C_GRID,
     _L1_RATIO_GRID,
+    MLP_ES_PATIENCE,
 )
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference, xgb_gpu_available
 
@@ -802,6 +804,194 @@ def _fit_beta(
     }
 
 
+
+def _slurm_available_cpu_mb() -> float | None:
+    """Return available memory within the current cgroup/SLURM allocation, in MB.
+
+    SLURM enforces limits via cgroups; psutil.virtual_memory() reads
+    /proc/meminfo and therefore sees the full node RAM, not the job cap.
+    We read the process's own cgroup memory controller directly.
+
+    Returns None when not running under a memory-capped cgroup (e.g. local dev).
+    """
+    from pathlib import Path
+
+    # Locate the process's own cgroup from /proc/self/cgroup.
+    # cgroup v2: single line "0::/<path>"
+    # cgroup v1: multiple lines "<id>:<subsystems>:<path>"; find the memory one.
+    try:
+        cgroup_lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        cgroup_lines = []
+
+    # --- cgroup v2 ---
+    for line in cgroup_lines:
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0":
+            cg_path = parts[2].lstrip("/")
+            base = Path("/sys/fs/cgroup") / cg_path
+            # Walk up towards root until we find a memory.max with a real limit.
+            candidate = base
+            while True:
+                limit_file = candidate / "memory.max"
+                usage_file = candidate / "memory.current"
+                try:
+                    limit_txt = limit_file.read_text().strip()
+                    if limit_txt not in ("max", "") and int(limit_txt) < 2**62:
+                        limit = int(limit_txt)
+                        usage = int(usage_file.read_text().strip())
+                        return max(0.0, (limit - usage) / (1024 * 1024))
+                except (OSError, ValueError):
+                    pass
+                parent = candidate.parent
+                if parent == candidate:
+                    break
+                candidate = parent
+            break  # v2 has only one line; stop after it
+
+    # --- cgroup v1 ---
+    for line in cgroup_lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        subsystems = parts[1].split(",")
+        if "memory" not in subsystems:
+            continue
+        cg_path = parts[2].lstrip("/")
+        base = Path("/sys/fs/cgroup/memory") / cg_path
+        candidate = base
+        while True:
+            limit_file = candidate / "memory.limit_in_bytes"
+            usage_file = candidate / "memory.usage_in_bytes"
+            try:
+                limit = int(limit_file.read_text().strip())
+                if limit < 2**62:
+                    usage = int(usage_file.read_text().strip())
+                    return max(0.0, (limit - usage) / (1024 * 1024))
+            except (OSError, ValueError):
+                pass
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+        break
+
+    # Fallback: SLURM_MEM_PER_NODE is in MB; subtract a small buffer for OS overhead.
+    mem_str = os.environ.get("SLURM_MEM_PER_NODE")
+    if mem_str:
+        try:
+            return max(0.0, float(mem_str) - 2048)  # keep 2 GB for OS
+        except ValueError:
+            pass
+
+    return None
+
+
+def _patch_psutil_for_slurm() -> None:
+    """Permanently patch psutil.virtual_memory to respect the cgroup/SLURM memory cap.
+
+    TabICL's InferenceManager.get_available_cpu_memory() calls
+    psutil.virtual_memory().available during predict(), which reads /proc/meminfo
+    and sees the full node RAM — not the SLURM job's cgroup limit.  A context
+    manager cannot fix this because predict() is called from a different call
+    stack (evaluate_outer_fold) long after _fit_tabicl() returns.
+
+    Applying the patch once here is safe: the patched function re-reads the
+    cgroup on every call so it stays accurate as memory usage changes, and the
+    cap is always min(real, cgroup_limit) so it can never overstate available RAM.
+    No-op when not under a memory-capped cgroup.
+    """
+    import psutil
+
+    avail_mb = _slurm_available_cpu_mb()
+    if avail_mb is None:
+        return  # not under a cgroup limit; nothing to do
+
+    if getattr(psutil.virtual_memory, "_slurm_patched", False):
+        return  # already patched; don't double-wrap
+
+    _real_vmem = psutil.virtual_memory
+    cap_bytes = int(avail_mb * 1024 * 1024)
+
+    def _patched_vmem():
+        real = _real_vmem()
+        # Re-read cgroup available on every call so the cap tracks actual usage.
+        current_cap = _slurm_available_cpu_mb()
+        if current_cap is not None:
+            cap = int(current_cap * 1024 * 1024)
+        else:
+            cap = cap_bytes
+        return real._replace(available=min(real.available, cap))
+
+    _patched_vmem._slurm_patched = True  # type: ignore[attr-defined]
+    psutil.virtual_memory = _patched_vmem
+
+
+def _fit_tabicl(
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    preprocessor: ColumnTransformer,
+    verbose: bool,
+    tabicl_n_estimators: int = 1,
+) -> tuple[Pipeline, dict[str, Any]]:
+    """Fit TabICLv2 directly on the outer training fold — no inner CV needed.
+
+    TabICL is a pre-trained in-context learning model with no hyperparameters
+    to tune. fit() stores the training data; predict() runs a transformer
+    forward pass using that data as context. Checkpoints are auto-downloaded
+    from HuggingFace on first use.
+    """
+    from tabicl import TabICLClassifier, TabICLRegressor
+
+    # Patch psutil permanently so the SLURM cgroup limit is visible to TabICL
+    # during both fit() and predict() (predict() is called later from evaluate_outer_fold).
+    _patch_psutil_for_slurm()
+
+    common_kwargs: dict[str, Any] = dict(
+        n_estimators=tabicl_n_estimators,
+        verbose=verbose,
+        random_state=RNG_SEED,
+        batch_size=1,
+        offload_mode="auto",  # psutil is patched above; auto decision is now cgroup-aware
+        disk_offload_dir=os.path.join(
+            os.environ.get("TMPDIR", "/localscratch"), "tabicl_offload"
+        ),  # absolute path — relative paths silently fail under SLURM, disabling disk fallback
+    )
+
+    if task == "regression":
+        model = TabICLRegressor(
+            checkpoint_version="tabicl-regressor-v2-20260212.ckpt",
+            **common_kwargs,
+        )
+    else:
+        model = TabICLClassifier(
+            checkpoint_version="tabicl-classifier-v2-20260212.ckpt",
+            **common_kwargs,
+        )
+
+    pipe = Pipeline(steps=[("prep", preprocessor), ("model", model)])
+
+    try:
+        pipe.fit(x_train, y_train)
+    except Exception as exc:
+        compact = (
+            str(exc).strip().splitlines()[0]
+            if str(exc).strip()
+            else exc.__class__.__name__
+        )
+        raise RuntimeError(f"tabicl fit failed: {compact}") from exc
+
+    vlog(
+        verbose,
+        f"Search complete model=tabicl, task={task}, strategy=fixed, candidates=1",
+    )
+    return pipe, {
+        "best_params": sanitize_best_params({"model": pipe.named_steps["model"]}),
+        "best_score": float("nan"),
+    }
+
+
 def _looks_like_gpu_failure(exc: Exception) -> bool:
     """Return True when an exception message suggests a CUDA/GPU problem."""
     msg = str(exc).lower()
@@ -888,9 +1078,13 @@ class _ContextAwareCV:
         return len(self._inner_cv)
 
 
-_TREE_ES_ROUNDS = 30  # patience for per-trial early stopping
-_TREE_ES_N_MAX = 500  # max n_estimators for post-search probe
-_TREE_ES_N_MIN = 50  # floor on optimal n_estimators
+_TREE_ES_ROUNDS = (
+    30  # patience for per-trial XGB early stopping (consecutive non-improving rounds)
+)
+_XGB_ES_N_MAX = 2000  # max n_estimators for XGB post-search probe
+_XGB_ES_N_MIN = 50  # floor on XGB optimal n_estimators (degenerate below this)
+_MLP_ES_N_MAX = 500  # max epochs for MLP post-search probe (hard ceiling)
+# MLP_ES_PATIENCE imported from grids (defined alongside _mlp_base_model so one source of truth)
 
 
 class _ESPipeline(Pipeline):
@@ -1014,16 +1208,16 @@ def _build_grid_search(
     )
 
     # For XGB with early stopping, n_estimators is determined by ES — not by the
-    # search.  Fix it to _TREE_ES_N_MAX on every candidate's base model and remove
+    # search.  Fix it to _XGB_ES_N_MAX on every candidate's base model and remove
     # it from the grid so the search only tunes the remaining hyperparameters.
     if model_name == "xgb":
         for c in candidates:
             c.pop("model__n_estimators", None)
             for m in c.get("model", []):
-                m.set_params(n_estimators=_TREE_ES_N_MAX)
+                m.set_params(n_estimators=_XGB_ES_N_MAX)
         vlog(
             verbose,
-            f"XGB grid search: fixed n_estimators={_TREE_ES_N_MAX} (determined by ES); "
+            f"XGB grid search: fixed n_estimators={_XGB_ES_N_MAX} (determined by ES); "
             f"removed from search grid",
             level="debug",
         )
@@ -1193,7 +1387,7 @@ def _fit_tree_early_stopping(
 
         if model_name == "xgb":
             # XGBoost (boosted): try early stopping, fall back to standard fit if unsupported
-            model_final.set_params(n_estimators=_TREE_ES_N_MAX)
+            model_final.set_params(n_estimators=_XGB_ES_N_MAX)
             if y_final_val is not None:
                 vlog(
                     verbose,
@@ -1209,7 +1403,7 @@ def _fit_tree_early_stopping(
                         eval_set=[(X_final_val_t, y_final_val)],
                         verbose=False,
                     )
-                    optimal_n = max(_TREE_ES_N_MIN, int(model_final.best_iteration) + 1)
+                    optimal_n = max(_XGB_ES_N_MIN, int(model_final.best_iteration) + 1)
                 except Exception as exc:
                     vlog(
                         verbose,
@@ -1217,12 +1411,13 @@ def _fit_tree_early_stopping(
                         level="debug",
                     )
                     model_final.fit(X_final_train_t, y_final_train)
-                    optimal_n = _TREE_ES_N_MAX
+                    optimal_n = _XGB_ES_N_MAX
             else:
                 model_final.fit(X_final_train_t, y_final_train)
-                optimal_n = _TREE_ES_N_MAX
+                optimal_n = _XGB_ES_N_MAX
         elif model_name == "mlp":
-            # MLP: store validation data in context for early stopping
+            # MLP: inject val context so early stopping uses a proper group partition,
+            # not the sequential val_fraction fallback (which is typically OOD).
             if y_final_val is not None:
                 _es_pp_val_context.X_val_pp = X_final_val_t
                 _es_pp_val_context.y_val = y_final_val
@@ -1238,24 +1433,27 @@ def _fit_tree_early_stopping(
                     _es_pp_val_context.y_val = None
             else:
                 model_final.fit(X_final_train_t, y_final_train)
-            # MLP early stopping tracks epochs; use n_epochs_trained_ as proxy for "n_estimators"
-            optimal_n = max(
-                _TREE_ES_N_MIN,
-                min(
-                    _TREE_ES_N_MAX,
-                    int(getattr(model_final, "n_epochs_trained_", _TREE_ES_N_MAX)),
-                ),
+            # Use discovered epoch count for final refit; cap at _MLP_ES_N_MAX.
+            # No floor: if ES genuinely converged early, honour that.
+            optimal_n = min(
+                _MLP_ES_N_MAX,
+                int(getattr(model_final, "n_epochs_trained_", _MLP_ES_N_MAX)),
             )
         else:
             # Fallback for unknown model types
             model_final.fit(X_final_train_t, y_final_train)
-            optimal_n = _TREE_ES_N_MAX
+            optimal_n = _MLP_ES_N_MAX
 
-        # Refit final model on all training data with optimal n_estimators.
-        # Reset early_stopping_rounds so the final fit runs for exactly optimal_n
-        # rounds without requiring an eval_set.
+        # Refit final model on all training data using the discovered optimal depth.
+        # For XGB: set n_estimators=optimal_n and clear early_stopping_rounds so the
+        #   fit runs for exactly optimal_n trees without needing an eval_set.
+        # For MLP: set max_epochs=optimal_n and disable weight restoration — the probe
+        #   already identified the right epoch count, and there is no clean val set for
+        #   all-data training (es_val is a subset of x_train, so it would be in-sample).
         if optimal_n is not None and model_name == "xgb":
             model_final.set_params(n_estimators=optimal_n, early_stopping_rounds=None)
+        elif optimal_n is not None and model_name == "mlp":
+            model_final.set_params(max_epochs=optimal_n, restore_best_weights=False)
         X_all_train_t = prep_fitted.transform(x_train)
         model_final.fit(X_all_train_t, y_train)
 
@@ -1462,10 +1660,10 @@ def _fit_grid_search(
         else:
             raise
 
-    # XGBoost (boosted): Use post-search early stopping to find optimal n_estimators.
+    # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
-    if model_name == "xgb":
+    if model_name in {"xgb", "mlp"}:
         pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
             model_name=model_name,
             task=task,
@@ -1495,27 +1693,6 @@ def _fit_grid_search(
         f"candidates={total_candidates}, best_score={float(search.best_score_):.6f}",
     )
 
-    # Log MLP early stopping info if present.
-    if model_name == "mlp":
-        # UNUSED: Legacy defensive try/except wrapper removed during refactor;
-        # this block now runs directly and exceptions should be visible in logs.
-        # TODO: remove this note if no rollback to the old guarded behavior is needed.
-        # try:
-        from sklearn.pipeline import Pipeline
-
-        best_est = search.best_estimator_
-        if isinstance(best_est, Pipeline) and "model" in best_est.named_steps:
-            mlp_model = best_est.named_steps["model"]
-            if hasattr(mlp_model, "n_epochs_trained_"):
-                vlog(
-                    verbose,
-                    f"MLP early stopping: n_epochs_trained={mlp_model.n_epochs_trained_}",
-                )
-            # UNUSED: Historical silent-error suppression for MLP logging.
-            # TODO: remove these commented lines after one release cycle.
-        # except Exception:
-        #     pass  # Silently skip on any error; not critical for logging.
-
     # Switch best estimator to CPU to avoid device-mismatch warnings downstream.
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
 
@@ -1523,7 +1700,7 @@ def _fit_grid_search(
         "best_params": sanitize_best_params(search.best_params_),
         "best_score": float(search.best_score_),
     }
-    if model_name in {"xgb", "rf"}:
+    if model_name in {"xgb", "mlp", "rf"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
 
@@ -1657,11 +1834,11 @@ def _fit_optuna_search(
         # the search.  Fix it on the base model and remove from distributions so
         # Optuna only tunes the remaining hyperparameters.
         if model_name == "xgb":
-            base_model.set_params(n_estimators=_TREE_ES_N_MAX)
+            base_model.set_params(n_estimators=_XGB_ES_N_MAX)
             distributions.pop("model__n_estimators", None)
             vlog(
                 verbose,
-                f"XGB Optuna search: fixed n_estimators={_TREE_ES_N_MAX} (determined by ES); "
+                f"XGB Optuna search: fixed n_estimators={_XGB_ES_N_MAX} (determined by ES); "
                 f"removed from distributions",
                 level="debug",
             )
@@ -1831,10 +2008,10 @@ def _fit_optuna_search(
     if optuna_failure_reason is not None:
         return _fallback_to_grid(optuna_failure_reason)
 
-    # XGBoost (boosted): Use post-search early stopping to find optimal n_estimators.
+    # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
-    if model_name == "xgb":
+    if model_name in {"xgb", "mlp"}:
         pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
             model_name=model_name,
             task=task,
@@ -1853,26 +2030,6 @@ def _fit_optuna_search(
         f"best_score={float(search.best_score_):.6f}",
     )
 
-    # Log MLP early stopping info if present.
-    if model_name == "mlp":
-        try:
-            from sklearn.pipeline import Pipeline
-
-            best_est = search.best_estimator_
-            if isinstance(best_est, Pipeline) and "model" in best_est.named_steps:
-                mlp_model = best_est.named_steps["model"]
-                if hasattr(mlp_model, "n_epochs_trained_"):
-                    vlog(
-                        verbose,
-                        f"MLP early stopping: n_epochs_trained={mlp_model.n_epochs_trained_}",
-                    )
-        except Exception as exc:
-            vlog(
-                verbose,
-                f"MLP n_epochs_trained_ extraction failed: {exc}",
-                level="debug",
-            )
-
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
 
     tuning_info: dict[str, Any] = {
@@ -1881,7 +2038,7 @@ def _fit_optuna_search(
         "optuna_n_trials": int(param_grid_size),
         "optuna_sampler": optuna_sampler,
     }
-    if model_name in {"xgb", "rf"}:
+    if model_name in {"xgb", "mlp", "rf"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
 
@@ -1996,6 +2153,16 @@ def fit_best_estimator(
             preprocessor=preprocessor,
             inner_cv=inner_cv,
             max_cores=max_cores,
+            verbose=verbose,
+        )
+
+    # TabICLv2: pre-trained in-context learning model, no hyperparameters, no inner CV.
+    if model_name == "tabicl":
+        return _fit_tabicl(
+            task=task,
+            x_train=x_train,
+            y_train=y_train,
+            preprocessor=preprocessor,
             verbose=verbose,
         )
 
