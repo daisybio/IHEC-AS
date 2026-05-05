@@ -24,12 +24,18 @@ event_dir <- file.path("processed_data", "event_models")
 #   file.path("processed_data", paste0("event_models_", feature_sets)),
 #   feature_sets
 # )
-
-already_computed_ids <- as.integer(gsub(
-  "(_robust)*.rds$",
-  "",
-  basename(list.files(event_dir, pattern = ".rds"))
-))
+already_computed_ids <- as.integer(
+  sub(
+    "^event_summary_(.+)\\.csv\\.gz$",
+    "\\1",
+    basename(list.files(event_dir, pattern = "^event_summary_.*\\.csv\\.gz$"))
+  )
+)
+# already_computed_ids <- as.integer(gsub(
+#   "(_robust)*.rds$",
+#   "",
+#   basename(list.files(event_dir, pattern = ".rds"))
+# ))
 # lapply(event_dirs, function(d) {
 #   dir.create(d, showWarnings = FALSE)
 #   as.integer(gsub(
@@ -114,14 +120,22 @@ ids_to_build <- ids_to_build[
       ID
     ]
 ]
+# first only make biotype_filtered ids
+ids_to_build <- ids_to_build[
+  ids_to_build %in% event_dt[transcript_filter == "biotype_filtered", ID]
+]
 event_dt[ID %in% ids_to_build, table(transcript_filter, `Event Type`)]
+
 
 # PSI matrix (events × samples) used inside each SLURM job to select
 # rotation-control events that match on type, chromosome, variability, filter.
-psi_table <- dcast(
-  aggregated_dt[ID %in% base::intersect(keep_rows_manual, ids_to_build)],
-  uuid ~ ID,
-  value.var = response
+psi_table <- as.matrix(
+  dcast(
+    aggregated_dt[ID %in% base::intersect(keep_rows_manual, ids_to_build)],
+    uuid ~ ID,
+    value.var = response
+  ),
+  rownames = "uuid"
 )
 
 ids_to_build <- setdiff(ids_to_build, already_computed_ids)
@@ -266,8 +280,14 @@ session_rds <- file.path("processed_data", "session_09_1_ml_local.rds")
 saveRDS(
   list(
     psi_table = psi_table,
-    event_dt = event_dt,
-    chromhmm_hits_smaller = chromhmm_hits_smaller,
+    event_dt = event_dt[, .(
+      ID,
+      `Event Type`,
+      seqnames,
+      Variability,
+      transcript_filter
+    )],
+    chromhmm_hits_smaller = as.matrix(chromhmm_hits_smaller),
     keep_rows_manual = keep_rows_manual
   ),
   session_rds
@@ -285,220 +305,27 @@ saveRDS(
   nrotations = nrotations
 )
 
-library(future.batchtools)
-library(future.apply)
-plan(
-  batchtools_slurm,
-  template = normalizePath("scripts/batchtools.slurm.tmpl"),
-  resources = list(
-    partition = "shared-cpu",
-    memory = "6G",
-    ncpus = 1L,
-    walltime = "2:00:00",
-    conda_env = "ihec-as"
-  )
+dir.create(event_dir, showWarnings = FALSE)
+dir.create("event_glmnet_logs", showWarnings = FALSE)
+
+ids_file <- normalizePath(
+  file.path("processed_data", "event_glmnet_ids.txt"),
+  mustWork = FALSE
 )
-
-## in dev make it sequential for easier debugging; in prod, switch to batchtools_slurm
-# plan(multisession, workers = 10L)
-
-event_models <- future_lapply(
-  ids_to_build[1:10],
-  function(id) {
-    cfg <- .slurm_cfg
-    setwd(cfg$project_dir)
-    source(file.path(cfg$project_dir, "07-ml-event-glmnet-tidymodels.R"))
-
-    sess <- readRDS(cfg$session_rds)
-    psi_table <- sess$psi_table
-    event_dt <- sess$event_dt
-    chromhmm_hits_smaller <- sess$chromhmm_hits_smaller
-    keep_rows_manual <- sess$keep_rows_manual
-    rm(sess)
-
-    feature_table_dir <- cfg$feature_table_dir
-    feature_sets <- cfg$feature_sets
-    event_dir <- cfg$event_dir
-    response <- cfg$response
-    grouping_col <- cfg$grouping_col
-    nfolds <- cfg$nfolds
-    nrotations <- cfg$nrotations
-
-    tryCatch(
-      {
-        feature_data <- data.table::fread(file.path(
-          feature_table_dir,
-          paste0("feature_table_", id, ".csv.gz")
-        ))
-
-        # All columns that are not metadata / response are candidate predictors
-        explanatory <- names(feature_data)[
-          !names(feature_data) %in%
-            c(
-              "IHEC",
-              "ID",
-              "Event Type",
-              "Variability",
-              "gene_id",
-              "uuid",
-              "transcript_filter",
-              "project",
-              grouping_col,
-              response
-            )
-        ]
-        chromhmm_explanatory <- explanatory[grepl(
-          "chromhmm",
-          explanatory,
-          fixed = TRUE
-        )]
-
-        # "local" set: chromHMM regions within the narrow window (vicinity/10)
-        # "short" set: removes narrow-window regions, keeping only wider ones
-        # "long"  set: all chromHMM regions including distal (full vicinity)
-        smaller_chromhmm_ids <- S4Vectors::to(chromhmm_hits_smaller[
-          S4Vectors::from(chromhmm_hits_smaller) ==
-            which(keep_rows_manual == id)
-        ])
-        old_chromhmm_explanatory <- chromhmm_explanatory[Reduce(
-          `&`,
-          lapply(sprintf("chromhmm_%d", smaller_chromhmm_ids), function(suff) {
-            !endsWith(chromhmm_explanatory, suff)
-          })
-        )]
-
-        explanatory_vars <- setNames(
-          list(
-            explanatory,
-            explanatory[!explanatory %in% old_chromhmm_explanatory],
-            explanatory[!explanatory %in% chromhmm_explanatory]
-          ),
-          feature_sets
-        )
-
-        # Rotation controls: events on different chromosomes that match this
-        # event on type, variability, and transcript filter
-        subset_psi_matrix <- as.matrix(
-          psi_table[feature_data[, uuid]],
-          rownames = "uuid"
-        )
-        other_ids <- as.integer(colnames(subset_psi_matrix)[
-          colSums(is.na(subset_psi_matrix)) == 0 &
-            apply(subset_psi_matrix, 2, sd, na.rm = TRUE) > 0
-        ])
-        this_event <- event_dt[ID == id]
-        other_ids <- other_ids[
-          other_ids != id &
-            other_ids %in%
-              event_dt[`Event Type` == this_event$`Event Type`, ID] &
-            other_ids %in% event_dt[seqnames != this_event$seqnames, ID] &
-            other_ids %in% event_dt[Variability == this_event$Variability, ID] &
-            other_ids %in%
-              event_dt[transcript_filter == this_event$transcript_filter, ID]
-        ]
-
-        this_rotations <- min(nrotations, length(other_ids))
-        if (this_rotations < nrotations) {
-          warning(sprintf(
-            "Not enough rotation controls for %d, using %d",
-            id,
-            this_rotations
-          ))
-        }
-        stopifnot(
-          rownames(subset_psi_matrix) == feature_data[, as.character(uuid)]
-        )
-        set.seed(id)
-        rotated_psis <- subset_psi_matrix[, as.character(sample(
-          other_ids,
-          this_rotations
-        ))]
-
-        wflow_res <- run_event_glmnet(
-          this_feature_data = cbind(feature_data, rotated_psis),
-          explanatory_vars,
-          response,
-          rotated_psis,
-          grouping_col,
-          nfolds,
-          seed = id
-        )
-
-        saveRDS(
-          wflow_res,
-          file.path(event_dir, paste0(id, ".rds")),
-          compress = TRUE
-        )
-        # Save every workflow result to its feature-set directory.
-        # Filename convention (all under event_dirs[[set_name]]/):
-        #   {id}.rds            — primary PSI, non-logit
-        #   logit_{id}.rds      — primary PSI, logit scale
-        #   rotated_{rot}_{id}.rds — negative-control (rotated PSI response)
-        # for (set_name in feature_sets) {
-        #   suffix <- paste0("_", set_name, "_glmnet")
-        #   set_wfs <- wflow_res$workflow_results[
-        #     endsWith(names(wflow_res$workflow_results), suffix)
-        #   ]
-        #   for (wf_name in names(set_wfs)) {
-        #     fname <- if (wf_name == paste0(response, suffix)) {
-        #       paste0(id, ".rds")
-        #     } else if (wf_name == paste0("logit_", response, suffix)) {
-        #       paste0("logit_", id, ".rds")
-        #     } else {
-        #       rot_id <- sub(suffix, "", wf_name, fixed = TRUE)
-        #       paste0("rotated_", rot_id, "_", id, ".rds")
-        #     }
-        #     saveRDS(
-        #       set_wfs[[wf_name]],
-        #       file.path(event_dirs[[set_name]], fname)
-        #     )
-        #   }
-        # }
-        invisible(NULL)
-      },
-      error = function(e) e$message
-    )
-  },
-  future.globals = ".slurm_cfg",
-  future.seed = TRUE
+cfg_file <- normalizePath(
+  file.path("processed_data", "event_glmnet_cfg.rds"),
+  mustWork = FALSE
 )
+writeLines(as.character(ids_to_build), ids_file)
+saveRDS(.slurm_cfg, cfg_file)
 
-# =============================================================================
-# Post-hoc error audit
-# =============================================================================
-names(event_models) <- ids_to_build
-failed <- event_models[!sapply(event_models, is.null)]
-message(sprintf("%d / %d events failed", length(failed), length(ids_to_build)))
-if (length(failed) > 0L) {
-  table(unlist(failed))
-}
-
-# sd = 0: PSI constant across samples — expected to fail, verify that is the cause
-sd_check <- aggregated_dt[
-  ID %in% names(failed)[failed == "not_all_na[response] is not TRUE"],
-  .(sd = sd(get(response))),
-  by = ID
-]
-stopifnot(sd_check[, all(sd == 0, na.rm = TRUE)])
-
-# Too few ontology groups for k-fold CV — expected for events with rare tissues
-group_check <- aggregated_dt[
-  ID %in% names(failed)[startsWith(unlist(failed), "`k` should be less than")],
-  .(unique_ontology = uniqueN(get(grouping_col))),
-  by = ID
-]
-stopifnot(group_check[, all(unique_ontology < nfolds)])
-
-# Constant y within folds — PSI has no within-fold variance
-constant_check <- aggregated_dt[
-  ID %in%
-    names(failed)[
-      failed == "y is constant; gaussian glmnet fails at standardization step"
-    ],
-  .(uniqueResponses = unique(get(response))),
-  by = .(ID, get(grouping_col))
-]
-stopifnot(constant_check[,
-  .(groupsWithVar = sum(uniqueResponses > 1)),
-  by = ID
-][, all(groupsWithVar < nfolds)])
+n <- length(ids_to_build)
+system(sprintf(
+  'sbatch --array=0-%d%%10 "%s" "%s" "%s" "%s"',
+  10, #n - 1,
+  normalizePath("09-1-ml-local-array.sh"),
+  ids_file,
+  cfg_file,
+  normalizePath(".")
+))
+message(sprintf("Submitted %d array jobs", n))

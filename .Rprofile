@@ -12,11 +12,13 @@ renv::settings$ignored.packages(
 )
 
 # vscode specific libraries
-library(jsonlite)
-library(rlang)
-library(languageserver)
-library(httpgd)
-options(setWidthOnResize = TRUE)
+if (interactive()) {
+  library(jsonlite)
+  library(rlang)
+  library(languageserver)
+  library(httpgd)
+  options(setWidthOnResize = TRUE)
+}
 
 # general libraries
 library(R.utils)

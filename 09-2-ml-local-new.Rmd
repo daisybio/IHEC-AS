@@ -1,0 +1,419 @@
+---
+title: "ML event models"
+output: pdf_document
+---
+
+# check models
+```{r setup}
+library(tidymodels)
+library(glmnet)
+library(data.table)
+library(ggplot2)
+library(pbmcapply)
+```
+
+```{r load-session}
+# Load session objects produced by 09-1-ml-local.R
+sess <- readRDS("processed_data/session_09_1_ml_local.rds")
+event_dt <- sess$event_dt # trimmed: ID, Event Type, seqnames, Variability, transcript_filter
+keep_rows <- sess$keep_rows_manual
+rm(sess)
+gc()
+
+# load aggregating.rda and aggregated_dt
+load("processed_data/aggregating.rda")
+aggregated_dt <- fread(
+  "processed_data/aggregated_dt_filtered.csv.gz",
+  stringsAsFactors = TRUE
+)
+```
+
+```{r load-data}
+event_dir <- file.path("processed_data", "event_models")
+
+plot_dir_ev <- file.path(plot_dir, "event_models")
+dir.create(plot_dir_ev, showWarnings = FALSE)
+
+# Helper: aggregate per-event CSVs saved by worker
+read_event_csvs <- function(pattern) {
+  rbindlist(
+    lapply(list.files(event_dir, pattern = pattern, full.names = TRUE), fread),
+    fill = TRUE
+  )
+}
+
+# Best hyperparameters per (event, workflow)
+best_params_table <- read_event_csvs("^best_params_.*\\.csv\\.gz$")
+best_params_table[, ID := as.integer(ID)]
+best_params_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+
+ggplot(
+  best_params_table,
+  aes(x = as.character(mixture), y = -log10(penalty), color = feature_set)
+) +
+  geom_boxplot(alpha = .5) +
+  facet_grid(ID ~ response == "PSI") +
+  theme_bw()
+
+# In-sample fit metrics per (event, workflow)
+fit_metrics_table <- read_event_csvs("^fit_metrics_.*\\.csv\\.gz$")
+fit_metrics_table[, ID := as.integer(ID)]
+fit_metrics_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+
+ggplot(
+  fit_metrics_table[!endsWith(.metric, "_logit")],
+  aes(x = response == "PSI", y = .estimate, color = feature_set)
+) +
+  geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
+  geom_jitter(
+    alpha = .3,
+    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.8)
+  ) +
+  facet_grid(.metric ~ ., scales = "free_y") +
+  theme_bw() +
+  coord_cartesian(ylim = c(0, NA))
+```
+
+```{r create-tables}
+# cv_metrics_table: per-fold metrics at selected config
+cv_metrics_table <- read_event_csvs("^all_metrics_.*\\.csv\\.gz$")
+cv_metrics_table[, ID := as.integer(ID)]
+cv_metrics_table <- cv_metrics_table[
+  best_params_table[, .(ID, wflow_id, .config)],
+  on = .(ID, wflow_id, .config),
+  nomatch = NULL
+]
+cv_metrics_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+cv_metrics_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+
+# event_summary_table: robust feature count + expression bias per workflow
+event_summary_table <- read_event_csvs("^event_summary_.*\\.csv\\.gz$")
+event_summary_table[, ID := as.integer(ID)]
+event_summary_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+event_summary_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+event_summary_table[
+  event_dt,
+  on = "ID",
+  c("Event Type", "Variability", "seqnames") := .(`Event Type`, Variability, seqnames)
+]
+
+# Join mean CV R²
+cv_rsq <- cv_metrics_table[
+  .metric == "rsq_trad_psi",
+  .(mean_cv_rsq = mean(.estimate, na.rm = TRUE)),
+  by = .(ID, wflow_id)
+]
+event_summary_table[cv_rsq, on = .(ID, wflow_id), mean_cv_rsq := mean_cv_rsq]
+
+# "Rotated Hit": did this event's PSI appear as a rotation in any other event?
+rotation_ids <- event_summary_table[response_type == "rotated", unique(as.integer(response))]
+event_summary_table[
+  response_type == "real",
+  rotated_hit := fifelse(ID %in% rotation_ids, "Hit by Rotation", "Not Hit")
+]
+
+# feature_table: selected features per CV fold per workflow
+feature_table <- read_event_csvs("^fold_features_.*\\.csv\\.gz$")
+feature_table[, ID := as.integer(ID)]
+feature_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+feature_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+feature_table[event_dt, on = "ID", c("Event Type", "Variability") := .(`Event Type`, Variability)]
+feature_table[
+  event_summary_table[response_type == "real", .(ID, expression_bias)],
+  on = "ID",
+  expression_bias := expression_bias
+]
+
+# coef_table: robust non-zero coefficients per workflow
+coef_table <- read_event_csvs("^nonzero_coefs_.*\\.csv\\.gz$")
+coef_table[, ID := as.integer(ID)]
+coef_table[,
+  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+]
+coef_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+coef_table[event_dt, on = "ID", c("Event Type", "Variability") := .(`Event Type`, Variability)]
+coef_table[
+  event_summary_table[response_type == "real", .(ID, expression_bias)],
+  on = "ID",
+  expression_bias := expression_bias
+]
+coef_table[, let(c("mark", "region"), tstrsplit(feature, ";", fixed = TRUE))]
+coef_table[,
+  coefficient_sign := fifelse(coef > 0, "positive coefficient", "negative coefficient")
+]
+coef_table[,
+  Response := factor(
+    fifelse(response_type == "real", "Real", "Rotated"),
+    levels = c("Real", "Rotated")
+  )
+]
+coef_table[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+```
+
+```{r counting-events}
+modeled_ids <- event_summary_table[
+  response_type == "real" & has_model == TRUE,
+  unique(ID)
+]
+
+event_counts <- rbindlist(
+  list(
+    Filtered = event_dt[ID %in% keep_rows, .(.N), by = .(`Event Type`)],
+    Quantified = aggregated_dt[, .(N = uniqueN(ID)), by = `Event Type`],
+    `No Model` = aggregated_dt[
+      !ID %in% modeled_ids,
+      .(N = uniqueN(ID)),
+      by = `Event Type`
+    ],
+    `Model` = event_summary_table[
+      response_type == "real" & has_model == TRUE,
+      .(.N),
+      by = .(`Event Type`)
+    ],
+    `Epigenetic\nOnly Model` = event_summary_table[
+      response_type == "real" &
+        expression_bias == "Epigenetic Only" &
+        has_model == TRUE,
+      .(.N),
+      by = .(`Event Type`)
+    ]
+  ),
+  idcol = "filtering"
+)
+
+print(event_summary_table[
+  response_type == "real",
+  table(expression_bias, `Event Type`)
+])
+
+ggplot(event_counts, aes(x = N, y = reorder(filtering, N))) +
+  geom_col() +
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    text = element_text(size = 20),
+    axis.text.x = element_blank()
+  ) +
+  facet_wrap(~`Event Type`, scales = "free_x") +
+  geom_text(aes(label = N), vjust = 1.1, size = 4, angle = 90) +
+  labs(x = "Number of Events", y = NULL)
+ggsave(file.path(plot_dir_ev, "event_counts.pdf"), width = 7, height = 3)
+```
+
+```{r generate-count-plots}
+event_summary_table[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+event_summary_table[,
+  `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))
+]
+
+event_count_dt <- event_summary_table[
+  has_model == TRUE,
+  {
+    counts <- .SD[, .(count = .N), by = response][, count]
+    .(
+      mean_count = mean(counts),
+      sd_count = sd(counts) / sqrt(uniqueN(response))
+    )
+  },
+  by = .(
+    `Event Type`,
+    response_type,
+    expression_bias,
+    Variability,
+    rotated_hit
+  )
+]
+
+event_count_dt[response_type == "real", response_type := "Real"]
+event_count_dt[response_type == "rotated", response_type := "Rotated"]
+event_count_dt[,
+  response_type := factor(response_type, levels = c("Real", "Rotated"))
+]
+event_count_dt[
+  expression_bias == "Expression Bias",
+  expression_bias := "Expression\nBias"
+]
+event_count_dt[
+  expression_bias == "Epigenetic Only",
+  expression_bias := "Epigenetic\nOnly"
+]
+event_count_dt[
+  order(Variability, decreasing = TRUE),
+  cumsum_mean_count := cumsum(mean_count),
+  by = .(`Event Type`, response_type, expression_bias)
+]
+
+ggplot(
+  event_count_dt,
+  aes(y = mean_count, x = expression_bias, fill = Variability)
+) +
+  geom_col() +
+  facet_grid(`Event Type` ~ response_type, scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.box = "vertical",
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  scale_fill_manual(values = variability_colors) +
+  labs(y = "Number of Events") +
+  geom_errorbar(
+    aes(
+      y = cumsum_mean_count,
+      ymin = cumsum_mean_count - sd_count,
+      ymax = cumsum_mean_count + sd_count
+    ),
+    width = .2
+  )
+ggsave(
+  file.path(plot_dir_ev, "events_rotation.png"),
+  width = 6,
+  height = 3,
+  dpi = 600
+)
+
+event_count_dt[
+  response_type == "Real",
+  expression_bias := sub("\n", " ", expression_bias, fixed = TRUE)
+]
+ggplot(
+  event_count_dt[response_type == "Real"],
+  aes(y = mean_count, x = Variability, fill = expression_bias)
+) +
+  geom_col(position = "fill") +
+  geom_text(aes(label = mean_count), position = position_fill(vjust = 0.5)) +
+  facet_grid(`Event Type` ~ rotated_hit, scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.box = "vertical",
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom"
+  ) +
+  scale_fill_manual(
+    values = c(`Epigenetic Only` = "orange", `Expression Bias` = "steelblue")
+  ) +
+  labs(y = "Proportion of Events", fill = NULL)
+ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 5, height = 3)
+```
+
+```{r cv-metrics-plot}
+# CV R² distribution: real PSI vs rotated negative controls
+cv_rsq_dt <- cv_metrics_table[.metric == "rsq_trad_psi"]
+cv_rsq_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
+cv_rsq_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+ggplot(
+  cv_rsq_dt,
+  aes(x = response_type, y = .estimate, color = feature_set)
+) +
+  geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
+  geom_jitter(
+    alpha = .2,
+    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.5),
+    size = .5
+  ) +
+  facet_grid(`Event Type` ~ ., scales = "free_y") +
+  theme_bw() +
+  labs(x = NULL, y = "CV R² (PSI scale)")
+ggsave(file.path(plot_dir_ev, "cv_rsq_distribution.pdf"), width = 5, height = 4)
+```
+
+```{r plot-mark-counts}
+# NOTE: activeChromHMM, event_gr, downstream_gr, upstream_gr must be
+# loaded in the session (defined in earlier notebooks 01-08).
+activeChromHMM_dt <- data.table(
+  region = activeChromHMM$name,
+  chrom_state = activeChromHMM$chrom_state,
+  region_width = width(activeChromHMM),
+  region_ID = seq_along(activeChromHMM)
+)
+coef_table[
+  activeChromHMM_dt,
+  on = "region",
+  c("chrom_state", "region_width", "region_ID") := .(
+    chrom_state,
+    region_width,
+    region_ID
+  )
+]
+
+err_dt <- coef_table[
+  mark != "(Intercept)" &
+    expression_bias == "Epigenetic Only" &
+    response_type == "real",
+  .(mark = unique(mark)),
+  by = .(ID, response, response_type, `Event Type`, Variability)
+][,
+  {
+    counts <- .SD[, .(count = .N), by = response][, count]
+    .(
+      mean_count = mean(counts),
+      sd_count = sd(counts) / sqrt(uniqueN(response))
+    )
+  },
+  by = .(`Event Type`, response_type, mark, Variability)
+]
+
+err_dt[,
+  Response := factor(
+    fifelse(response_type == "real", "Real", "Rotated"),
+    levels = c("Real", "Rotated")
+  )
+]
+err_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("Low", "High")
+  )
+]
+err_dt[, `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))]
+err_dt[, mark := tools::toTitleCase(gsub("_", " ", mark))]
+
+hex_colors <- c(
+  mark_hex_colors,
+  summed_enhancer = "darkorange",
+  max_promoter = "tomato"
+)
+plot_colors <- setNames(
+  rep("dark grey", err_dt[, uniqueN(mark)]),
+  err_dt[, unique(mark)]
+)
+names(hex_colors) <- tools::toTitleCase(gsub("_", " ", names(hex_colors)))
+for (name in names(hex_colors)) {
+  inds <- startsWith(names(plot_colors), name)
+  plot_colors[inds] <- hex_colors[name]
+}
+
+ggplot(err_dt, aes(x = Response, y = mean_count, fill = mark)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(
+    aes(ymin = mean_count - sd_count, ymax = mean_count + sd_count),
+    width = .7,
+    position = position_dodge(.9)
+  ) +
+  facet_wrap(`Event Type` ~ Variability, scales = "free_y", nrow = 2) +
+  labs(y = NULL, x = NULL, fill = "Mark") +
+  theme_bw() +
+  scale_fill_manual(values = plot_colors) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "white")
+  )
+ggsave(file.path(plot_dir_ev, "mark_counts_error.pdf"), width = 6.1, height = 4)
+```

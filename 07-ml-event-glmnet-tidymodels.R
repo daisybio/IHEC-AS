@@ -419,7 +419,7 @@ run_event_glmnet <- function(
   grouping_col = "ontology",
   nfolds = 5L,
   seed = 1234L,
-  parallel = FALSE
+  parallel = 1L
 ) {
   # -- Ontology-guided grouped CV folds ---------------------------------------
   set.seed(seed)
@@ -460,11 +460,11 @@ run_event_glmnet <- function(
   # protocol × gene_expression interaction terms.
   explanatory_recipe_list <- unlist(
     sapply(
-      base_recipes,
-      function(base_recipe) {
+      explanatory_vars,
+      function(var) {
         sapply(
-          explanatory_vars,
-          function(var) {
+          base_recipes,
+          function(base_recipe) {
             base_recipe |>
               update_role(all_of(var), new_role = "predictor") |>
               step_rm(has_role("misc")) |>
@@ -482,7 +482,7 @@ run_event_glmnet <- function(
   )
 
   # unlist() joins nested list names with "." — normalise to "_" so that
-  # workflow_set produces predictable IDs like "PSI_long_glmnet".
+  # workflow_set produces predictable IDs like "long_PSI_glmnet".
   names(explanatory_recipe_list) <- gsub(
     ".",
     "_",
@@ -530,7 +530,7 @@ run_event_glmnet <- function(
   # among correlated chromHMM features where pure lasso is unstable.
   glmnet_grid <- tidyr::crossing(
     penalty = 10^seq(-5, 0, length.out = 50),
-    mixture = c(0.1, 0.5, 0.7, 0.9, 0.95, 0.99)
+    mixture = c(0.5, 0.7, 0.9)
   ) |>
     arrange(mixture, penalty) # ensure lambda path is contiguous for each alpha
 
@@ -640,13 +640,14 @@ run_event_glmnet <- function(
   }
 
   # -- Tune, finalize, fit, and extract features in a single pass -------------
-  # Sequential: only 6 workflows per event; nested forking inside the outer
-  # pbmclapply (09-1-ml-local.R) wastes resources and conflicts with progress.
   workflow_results <- pbmcapply::pbmclapply(
     seq_len(n_wflows),
     function(i) {
-      set.seed(seed + i) # per-workflow offset for reproducibility
       wid <- wflow_to_tune$wflow_id[[i]]
+      print(glue::glue(
+        "Tuning workflow {i} / {n_wflows} ({wid})..."
+      ))
+      set.seed(seed + i) # per-workflow offset for reproducibility
       wf <- workflowsets::extract_workflow(wflow_to_tune, id = wid)
       this_grid <- wflow_to_tune$option[[i]]$grid
       specs <- workflowsets::extract_spec_parsnip(wflow_to_tune, wid)
@@ -670,13 +671,23 @@ run_event_glmnet <- function(
       # unjustified: both models have built-in regularisation (lasso penalty /
       # GCV pruning) that already controls complexity without a second heuristic.
       best_params <- select_best(tuned, metric = "rsq_trad_psi")
+      best_cv_summary <- tuned |>
+        collect_metrics(summarize = TRUE) |>
+        dplyr::filter(.config == best_params$.config) |>
+        dplyr::select(.metric, mean, std_err, n) |>
+        tidyr::pivot_wider(
+          names_from = .metric,
+          values_from = c(mean, std_err, n),
+          names_glue = "cv_{.value}_{.metric}"
+        )
+      best_params <- dplyr::bind_cols(best_params, best_cv_summary)
       final_wf <- tune::finalize_workflow(wf, best_params)
       final_fit <- parsnip::fit(final_wf, data = this_feature_data)
 
       # CV metric at the selected config (used for cross-workflow comparison)
-      final_metrics <- collect_metrics(tuned) |>
-        subset(.config == best_params$.config)
-      cv_rsq <- subset(final_metrics, .metric == "rsq_trad_psi")$mean[[1L]]
+      # final_metrics <- collect_metrics(tuned) |>
+      #   subset(.config == best_params$.config)
+      # cv_rsq <- subset(final_metrics, .metric == "rsq_trad_psi")$mean[[1L]]
 
       # In-sample metrics (diagnostic).  Logit-recipe predictions are on the logit
       # scale; back-transform to PSI so truth and estimate share the same scale
@@ -700,17 +711,16 @@ run_event_glmnet <- function(
         best_params = best_params,
         final_wf = final_wf,
         final_fit = final_fit,
-        cv_rsq = cv_rsq,
-        tuned = tuned,
-        final_metrics = final_metrics,
+        all_metrics = data.table::as.data.table(tuned |> collect_metrics(summarize = FALSE)),
+        # final_metrics = final_metrics,
         fit_metrics = fit_metrics
       )
 
       if (inherits(specs, "linear_reg")) {
         feat <- .robust_glmnet_coefs(entry, cv_folds, this_feature_data)
-        c(entry, list(model_type = "glmnet"), feat)
+        entry <- c(entry, list(model_type = "glmnet"), feat)
       } else if (inherits(specs, "mars")) {
-        c(
+        entry <- c(
           entry,
           list(
             model_type = "mars",
@@ -718,19 +728,21 @@ run_event_glmnet <- function(
           )
         )
       } else {
-        c(entry, list(model_type = "unknown"))
+        entry <- c(entry, list(model_type = "unknown"))
       }
-    }
+      entry$final_fit <- NULL
+      entry$final_wf <- NULL
+      entry$specs <- NULL
+      entry
+    },
+    mc.cores = parallel,
+    ignore.interactive = TRUE
   )
   names(workflow_results) <- wflow_to_tune$wflow_id
 
   # Reconstruct grid_results workflowset (mirrors workflow_map output structure)
   # grid_results <- wflow_to_tune
   # grid_results[["result"]] <- lapply(workflow_results, `[[`, "tuned")
-  workflow_results <- lapply(workflow_results, function(x) {
-    x$tuned <- tuned |> collect_metrics(summarize = FALSE) # keep all metrics, not just the best config
-    x
-  })
 
   # -- Best workflow = highest CV R² among primary-response workflows only ----
   # Restrict to PSI / logit_PSI — rotated workflows are negative controls and
@@ -750,7 +762,7 @@ run_event_glmnet <- function(
   # -- Return -----------------------------------------------------------------
   return(list(
     workflow_results = workflow_results,
-    cv_folds = rbindlist(mapply(
+    cv_folds = data.table::rbindlist(mapply(
       cv_folds$splits,
       cv_folds$id,
       FUN = function(split, id) {
