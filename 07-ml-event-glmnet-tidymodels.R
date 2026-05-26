@@ -1,16 +1,14 @@
 ## ---------------------------------------------------------------------------
 ## Event-specific regularised regression via tidymodels
 ##
-## Fits penalised regression (glmnet) and MARS models for a single splicing
-## event using biology-guided grouped CV folds.  Both PSI and logit-scale PSI
-## response variants are fitted in parallel; the best workflow (highest CV CCC
-## on the PSI scale) is returned along with robust non-zero lasso coefficients.
+## Fits glmnet (elastic net) models for a single splicing event using
+## biology-guided grouped CV folds.  One workflow per (feature set × response)
+## combination; response = primary PSI or a rotated PSI negative control.
 ## ---------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   library(tidymodels)
   library(glmnet) # required by parsnip's glmnet engine
-  library(earth) # required by parsnip's MARS engine
 })
 
 tidymodels::tidymodels_prefer()
@@ -213,163 +211,14 @@ conflicted::conflicts_prefer(base::setdiff)
 
 
 # ---------------------------------------------------------------------------
-# PSI / logit-scale metrics  (module-level: defined once, reused per call)
+# Metrics  (module-level: defined once, reused per call)
 # ---------------------------------------------------------------------------
-# Scale is auto-detected from truth: any value outside [0, 1] → logit scale.
-#   _psi   variants: logit truth/estimate → plogis(); PSI → identity
-#   _logit variants: PSI  truth/estimate → qlogis(.clamp()); logit → identity
-# All workflows share one metric set; model selection uses rsq_trad_psi
-# (traditional R²: 1 - SS_res/SS_tot) because it directly answers "what
-# fraction of PSI variation do the epigenetic features explain?" and does not
-# penalise calibration bias between PSI-recipe and logit-recipe workflows.
-.clamp <- function(x, eps = 0.01) pmax(pmin(x, 1 - eps), eps)
-.to_psi <- function(truth, x) {
-  if (any(truth < 0 | truth > 1, na.rm = TRUE)) plogis(x) else x
-}
-.to_logit <- function(truth, x) {
-  if (any(truth < 0 | truth > 1, na.rm = TRUE)) x else qlogis(.clamp(x))
-}
-
-rmse_psi_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::rmse_vec(
-    .to_psi(truth, truth),
-    .to_psi(truth, estimate),
-    na_rm = na_rm
-  )
-}
-rmse_psi <- function(data, ...) UseMethod("rmse_psi")
-rmse_psi.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
-  yardstick::numeric_metric_summarizer(
-    "rmse_psi",
-    rmse_psi_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-rmse_psi <- yardstick::new_numeric_metric(rmse_psi, direction = "minimize")
-
-rsq_trad_psi_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::rsq_trad_vec(
-    .to_psi(truth, truth),
-    .to_psi(truth, estimate),
-    na_rm = na_rm
-  )
-}
-rsq_trad_psi <- function(data, ...) UseMethod("rsq_trad_psi")
-rsq_trad_psi.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
-  yardstick::numeric_metric_summarizer(
-    "rsq_trad_psi",
-    rsq_trad_psi_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-rsq_trad_psi <- yardstick::new_numeric_metric(
-  rsq_trad_psi,
-  direction = "maximize"
-)
-
-ccc_psi_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::ccc_vec(
-    .to_psi(truth, truth),
-    .to_psi(truth, estimate),
-    na_rm = na_rm
-  )
-}
-ccc_psi <- function(data, ...) UseMethod("ccc_psi")
-ccc_psi.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
-  yardstick::numeric_metric_summarizer(
-    "ccc_psi",
-    ccc_psi_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-ccc_psi <- yardstick::new_numeric_metric(ccc_psi, direction = "maximize")
-
-rmse_logit_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::rmse_vec(
-    .to_logit(truth, truth),
-    .to_logit(truth, estimate),
-    na_rm = na_rm
-  )
-}
-rmse_logit <- function(data, ...) UseMethod("rmse_logit")
-rmse_logit.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
-  yardstick::numeric_metric_summarizer(
-    "rmse_logit",
-    rmse_logit_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-rmse_logit <- yardstick::new_numeric_metric(rmse_logit, direction = "minimize")
-
-rsq_trad_logit_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::rsq_trad_vec(
-    .to_logit(truth, truth),
-    .to_logit(truth, estimate),
-    na_rm = na_rm
-  )
-}
-rsq_trad_logit <- function(data, ...) UseMethod("rsq_trad_logit")
-rsq_trad_logit.data.frame <- function(
-  data,
-  truth,
-  estimate,
-  na_rm = TRUE,
-  ...
-) {
-  yardstick::numeric_metric_summarizer(
-    "rsq_trad_logit",
-    rsq_trad_logit_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-rsq_trad_logit <- yardstick::new_numeric_metric(
-  rsq_trad_logit,
-  direction = "maximize"
-)
-
-ccc_logit_vec <- function(truth, estimate, na_rm = TRUE, ...) {
-  yardstick::ccc_vec(
-    .to_logit(truth, truth),
-    .to_logit(truth, estimate),
-    na_rm = na_rm
-  )
-}
-ccc_logit <- function(data, ...) UseMethod("ccc_logit")
-ccc_logit.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
-  yardstick::numeric_metric_summarizer(
-    "ccc_logit",
-    ccc_logit_vec,
-    data = data,
-    truth = {{ truth }},
-    estimate = {{ estimate }},
-    na_rm = na_rm
-  )
-}
-ccc_logit <- yardstick::new_numeric_metric(ccc_logit, direction = "maximize")
-
-# rsq_trad_psi is the selection metric; _logit variants are diagnostic only.
+# All responses are PSI-scale ([0, 1]); standard yardstick metrics suffice.
+# Model selection uses rsq_trad (traditional R²: 1 − SS_res/SS_tot).
 all_metrics <- yardstick::metric_set(
-  rmse_psi,
-  rsq_trad_psi,
-  ccc_psi,
-  rmse_logit,
-  rsq_trad_logit,
-  ccc_logit
+  yardstick::rmse,
+  yardstick::rsq_trad,
+  yardstick::ccc
 )
 
 
@@ -377,40 +226,29 @@ all_metrics <- yardstick::metric_set(
 # Main function
 # ---------------------------------------------------------------------------
 
-#' Fit regularised regression for a single splicing event
+#' Fit glmnet for a single splicing event
 #'
-#' Builds a \code{workflow_set} of glmnet and MARS models over PSI and
-#' logit-scale PSI responses, tunes each via biology-guided grouped CV, and
-#' returns the best-performing workflow together with its robust features.
+#' One workflow per (feature set × response): primary PSI + rotated PSI
+#' negative controls.  Tuned via biology-guided grouped CV; returns robust
+#' non-zero coefficients per workflow.
 #'
-#' @param this_feature_data  data.table: predictors, response, and grouping col.
-#' @param explanatory_vars   Named list of predictor sets; each element is a
-#'   character vector of column names and the name identifies the set
-#'   (e.g. \code{list(local = c("h3k27ac", ...), chromhmm = c("s1", ...))}).
-#' @param response      Name of the primary PSI response column.
-#' @param rotated_psis  Optional data.table whose columns are additional response
-#'   targets (e.g. rotated PSI components).  Recipes are built for each column
-#'   but only the primary \code{response} workflows are tuned.
-#' @param grouping_col  Ontology column used for biology-guided grouped CV.
-#' @param nfolds        Number of CV folds (= number of ontology supergroups).
-#' @param seed          Random seed; each workflow also gets a per-index offset
-#'   for reproducibility.
-#' @param verbose       Passed to \code{tune::control_grid(verbose = ...)}.
+#' @param this_feature_data  data.table: predictors, response, grouping col.
+#' @param explanatory_vars   Named list of predictor-name vectors (one per
+#'   feature set, e.g. \code{list(long = ..., short = ..., local = ...)}).
+#' @param response      Primary PSI response column name.
+#' @param rotated_psis  Matrix/data.table of rotated-PSI negative-control
+#'   columns appended to \code{this_feature_data}.
+#' @param grouping_col  Ontology column for biology-guided grouped CV.
+#' @param nfolds        Number of CV folds (ontology supergroups).
+#' @param seed          Base random seed; per-workflow offset added inside loop.
+#' @param parallel      \code{mc.cores} for \code{pbmclapply}.
+#' @param cv_folds_path Path for the fold-assignment summary CSV (gzipped).
+#'   If \code{NULL}, nothing is written.
 #'
-#' @return A named list:
-#'   \describe{
-#'     \item{cv_results}{Workflow set with tuning results attached.}
-#'     \item{workflow_results}{List of per-workflow result objects.}
-#'     \item{best_workflow}{ID of the winning workflow.}
-#'     \item{best_model_type}{\code{"glmnet"} or \code{"mars"}.}
-#'     \item{final_fit}{Finalized fitted \code{workflows::workflow}.}
-#'     \item{best_params}{Tibble with winning hyperparameters.}
-#'     \item{cv_rsq}{Best-workflow CV R² on the PSI scale (traditional formula).}
-#'     \item{nonzero_coefs}{Robust non-zero glmnet coefficients (NULL for MARS).}
-#'     \item{fold_features}{Per-fold selected features (NULL for MARS).}
-#'     \item{robust_features}{Feature names passing the robustness filter (NULL for MARS).}
-#'     \item{importance}{MARS variable-importance matrix (NULL for glmnet).}
-#'   }
+#' @return Named list (one element per workflow) where each element contains:
+#'   \code{wflow_id}, \code{best_params}, \code{all_metrics}, \code{fit_metrics},
+#'   \code{model_type}, \code{nonzero_coefs}, \code{fold_features},
+#'   \code{robust_features}.
 run_event_glmnet <- function(
   this_feature_data,
   explanatory_vars,
@@ -419,27 +257,61 @@ run_event_glmnet <- function(
   grouping_col = "ontology",
   nfolds = 5L,
   seed = 1234L,
-  parallel = 1L
+  parallel = 1L,
+  cv_folds_path = NULL
 ) {
   # -- Ontology-guided grouped CV folds ---------------------------------------
   set.seed(seed)
+  n_unique_ont <- length(unique(tolower(trimws(
+    as.character(this_feature_data[[grouping_col]])
+  ))))
+  actual_nfolds <- max(3L, min(nfolds, n_unique_ont))
+  if (actual_nfolds != nfolds) {
+    warning(sprintf(
+      "CV folds reduced %d → %d (only %d unique ontology groups in data)",
+      nfolds, actual_nfolds, n_unique_ont
+    ))
+  }
   this_feature_data[,
     hc_group := .map_ontology_to_supergroups(
       this_feature_data[[grouping_col]],
-      n_groups = nfolds
+      n_groups = actual_nfolds
     )
   ]
+  n_unique_hc <- data.table::uniqueN(this_feature_data[["hc_group"]])
+  if (n_unique_hc < actual_nfolds) {
+    warning(sprintf(
+      "CV folds further reduced %d → %d (mapping collapsed to %d supergroups)",
+      actual_nfolds, n_unique_hc, n_unique_hc
+    ))
+    actual_nfolds <- n_unique_hc
+  }
   cv_folds <- rsample::group_vfold_cv(
     this_feature_data,
     group = "hc_group",
-    v = nfolds,
+    v = actual_nfolds,
     balance = "observations"
   )
 
-  # -- Recipes ----------------------------------------------------------------
-  # Build one base recipe per response (primary + any rotated PSI columns), then
-  # one variant per explanatory set, then duplicate with a logit outcome transform.
+  if (!is.null(cv_folds_path)) {
+    cv_folds_dt <- data.table::rbindlist(mapply(
+      cv_folds$splits,
+      cv_folds$id,
+      FUN = function(split, id) {
+        split |>
+          rsample::assessment() |>
+          dplyr::select(dplyr::all_of(grouping_col), hc_group) |>
+          dplyr::mutate(resample = id) |>
+          dplyr::count(dplyr::across(dplyr::everything()))
+      },
+      SIMPLIFY = FALSE
+    ))
+    data.table::fwrite(cv_folds_dt, cv_folds_path)
+  }
 
+  # -- Recipes ----------------------------------------------------------------
+  # One base recipe per response (primary PSI + rotated PSI columns), then one
+  # variant per explanatory set.
   responses_to_build <- c(response, colnames(rotated_psis))
 
   # Base: all columns are "misc" (excluded) except the nominated outcome.
@@ -469,9 +341,11 @@ run_event_glmnet <- function(
               update_role(all_of(var), new_role = "predictor") |>
               step_rm(has_role("misc")) |>
               step_impute_mean(all_numeric_predictors()) |>
-              step_zv(all_predictors()) |>
-              step_dummy(all_nominal_predictors()) |>
-              step_interact(terms = ~ starts_with("protocol"):gene_expression) # protocol × gene_expression
+              step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+              step_interact(
+                terms = ~ starts_with("protocol"):gene_expression
+              ) |>
+              step_zv(all_predictors())
           },
           simplify = FALSE
         )
@@ -490,15 +364,6 @@ run_event_glmnet <- function(
     fixed = TRUE
   )
 
-  # Logit-scale variants: step_logit(skip = TRUE) transforms the outcome during
-  # prep but keeps predictions on the logit scale (back-transformed after tuning).
-  logit_recipe_list <- lapply(explanatory_recipe_list, function(rec) {
-    rec |> step_logit(all_outcomes(), offset = 0.01, skip = TRUE)
-  })
-  names(logit_recipe_list) <- paste0("logit_", names(explanatory_recipe_list))
-
-  recipe_list <- c(explanatory_recipe_list, logit_recipe_list)
-
   # -- Model specifications ---------------------------------------------------
   # glmnet: mixture and penalty both tuned.  The submodel trick lets tune() fit
   # ONE path per (mixture, fold) and evaluate all 50 lambda values via
@@ -506,22 +371,10 @@ run_event_glmnet <- function(
   glmnet_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
     set_engine("glmnet")
 
-  # MARS: additive only (prod_degree = 1) with up to 50 basis-function terms.
-  # Interactions (degree 2) are O(p²) in the forward pass and never outperformed
-  # additive models in CV — cross-tissue folds prevent pairwise interactions from
-  # generalising across tissue types.
-  mars_spec <- mars(num_terms = tune(), prod_degree = 1L) |>
-    set_engine("earth") |>
-    set_mode("regression")
-
-  mars_params <- mars_spec |>
-    extract_parameter_set_dials() |>
-    update(num_terms = num_terms(range = c(2L, 50L)))
-
   # -- Workflow set & grids ---------------------------------------------------
   wflow_set <- workflow_set(
-    preproc = recipe_list,
-    models = list(glmnet = glmnet_spec, mars = mars_spec)
+    preproc = explanatory_recipe_list,
+    models = list(glmnet = glmnet_spec)
   )
 
   # glmnet: structured crossing grid — 6 alpha × 50 lambda values.
@@ -534,34 +387,16 @@ run_event_glmnet <- function(
   ) |>
     arrange(mixture, penalty) # ensure lambda path is contiguous for each alpha
 
-  # MARS: 8 num_terms candidates (prod_degree fixed at 1 in the spec).
-  mars_grid <- tibble::tibble(
-    num_terms = c(2L, 5L, 10L, 15L, 20L, 30L, 40L, 50L)
-  )
-
-  params_list <- list(
-    glmnet = extract_parameter_set_dials(glmnet_spec),
-    mars = mars_params
-  )
+  glmnet_params <- extract_parameter_set_dials(glmnet_spec)
 
   for (wid in wflow_set$wflow_id) {
-    model_key <- if (endsWith(wid, "glmnet")) "glmnet" else "mars"
     wflow_set <- wflow_set |>
-      option_add(param_info = params_list[[model_key]], id = wid) |>
-      option_add(
-        grid = if (model_key == "glmnet") glmnet_grid else mars_grid,
-        id = wid
-      )
+      option_add(param_info = glmnet_params, id = wid) |>
+      option_add(grid = glmnet_grid, id = wid)
   }
 
-  # -- Tune primary + rotated-response workflows (glmnet only) ----------------
-  # all logit variants skipped; only glmnet built, no MARS
-  wflow_to_tune <- wflow_set |>
-    dplyr::filter(
-      endsWith(wflow_id, "glmnet") &
-        # (startsWith(wflow_id, "PSI_")) &
-        (!startsWith(wflow_id, "logit_"))
-    )
+  wflow_to_tune <- wflow_set
+  rm(wflow_set, explanatory_recipe_list, base_recipes)
 
   n_wflows <- nrow(wflow_to_tune)
 
@@ -569,9 +404,9 @@ run_event_glmnet <- function(
 
   # Non-zero glmnet coefficients at the selected penalty, excluding the
   # intercept and gene_expression (used as an interaction base term).
-  .extract_glmnet_coefs <- function(entry) {
-    penalty_val <- entry$best_params$penalty[[1L]]
-    engine <- workflows::extract_fit_engine(entry$final_fit)
+  .extract_glmnet_coefs <- function(best_params, final_fit) {
+    penalty_val <- best_params$penalty[[1L]]
+    engine <- workflows::extract_fit_engine(final_fit)
     coef_mat <- as.matrix(coef(engine, s = penalty_val))
     mask <- coef_mat[, 1L] != 0 &
       !rownames(coef_mat) %in% c("(Intercept)", "gene_expression")
@@ -581,8 +416,14 @@ run_event_glmnet <- function(
   # Robustness filter: a feature must be non-zero in the full-data fit AND
   # appear in >= 2 CV folds (uniqueN(fold) >= 3 counts the "full" label too).
   # Replicates the filter used in 07-ml-helper.R.
-  .robust_glmnet_coefs <- function(entry, cv_folds, this_feature_data) {
-    full_coefs <- .extract_glmnet_coefs(entry)
+  .robust_glmnet_coefs <- function(
+    best_params,
+    final_fit,
+    final_wf,
+    cv_folds,
+    this_feature_data
+  ) {
+    full_coefs <- .extract_glmnet_coefs(best_params, final_fit)
     full_features <- rownames(full_coefs)
 
     if (length(full_features) == 0L) {
@@ -593,9 +434,9 @@ run_event_glmnet <- function(
       ))
     }
 
-    penalty_val <- entry$best_params$penalty[[1L]]
+    penalty_val <- best_params$penalty[[1L]]
     fold_features <- lapply(cv_folds$splits, function(split) {
-      fold_fit <- parsnip::fit(entry$final_wf, data = rsample::analysis(split))
+      fold_fit <- parsnip::fit(final_wf, data = rsample::analysis(split))
       fold_eng <- workflows::extract_fit_engine(fold_fit)
       fold_cm <- as.matrix(coef(fold_eng, s = penalty_val))
       rownames(fold_cm)[
@@ -630,164 +471,451 @@ run_event_glmnet <- function(
     )
   }
 
-  # MARS variable importance via evimp(); nsubsets = number of model subsets in
-  # which each variable appeared (analogous to the fold-count robustness criterion).
-  .extract_mars_importance <- function(entry) {
-    tryCatch(
-      earth::evimp(workflows::extract_fit_engine(entry$final_fit)),
-      error = function(e) NULL
-    )
-  }
-
   # -- Tune, finalize, fit, and extract features in a single pass -------------
   workflow_results <- pbmcapply::pbmclapply(
     seq_len(n_wflows),
     function(i) {
       wid <- wflow_to_tune$wflow_id[[i]]
-      print(glue::glue(
-        "Tuning workflow {i} / {n_wflows} ({wid})..."
-      ))
-      set.seed(seed + i) # per-workflow offset for reproducibility
-      wf <- workflowsets::extract_workflow(wflow_to_tune, id = wid)
-      this_grid <- wflow_to_tune$option[[i]]$grid
-      specs <- workflowsets::extract_spec_parsnip(wflow_to_tune, wid)
+      tryCatch(
+        {
+          print(glue::glue(
+            "Tuning workflow {i} / {n_wflows} ({wid})..."
+          ))
+          set.seed(seed + i) # per-workflow offset for reproducibility
+          wf <- workflowsets::extract_workflow(wflow_to_tune, id = wid)
+          this_grid <- wflow_to_tune$option[[i]]$grid
 
-      tuned <- tune::tune_grid(
-        wf,
-        resamples = cv_folds,
-        grid = this_grid,
-        metrics = all_metrics,
-        control = tune::control_grid(
-          verbose = FALSE,
-          allow_par = FALSE # prevent nested forking inside outer pbmclapply
-        )
-      )
-
-      # select_best for all model types: pick the hyperparameters with the highest
-      # mean CV R² (rsq_trad_psi).  A null or near-null result is a meaningful
-      # outcome — for the primary response it means no cross-tissue signal; for
-      # rotated-response negative controls it is the expected result.
-      # The 1-SE rule was previously applied to MARS only, but the asymmetry is
-      # unjustified: both models have built-in regularisation (lasso penalty /
-      # GCV pruning) that already controls complexity without a second heuristic.
-      best_params <- select_best(tuned, metric = "rsq_trad_psi")
-      best_cv_summary <- tuned |>
-        collect_metrics(summarize = TRUE) |>
-        dplyr::filter(.config == best_params$.config) |>
-        dplyr::select(.metric, mean, std_err, n) |>
-        tidyr::pivot_wider(
-          names_from = .metric,
-          values_from = c(mean, std_err, n),
-          names_glue = "cv_{.value}_{.metric}"
-        )
-      best_params <- dplyr::bind_cols(best_params, best_cv_summary)
-      final_wf <- tune::finalize_workflow(wf, best_params)
-      final_fit <- parsnip::fit(final_wf, data = this_feature_data)
-
-      # CV metric at the selected config (used for cross-workflow comparison)
-      # final_metrics <- collect_metrics(tuned) |>
-      #   subset(.config == best_params$.config)
-      # cv_rsq <- subset(final_metrics, .metric == "rsq_trad_psi")$mean[[1L]]
-
-      # In-sample metrics (diagnostic).  Logit-recipe predictions are on the logit
-      # scale; back-transform to PSI so truth and estimate share the same scale
-      # for the auto-detection logic inside all_metrics.
-      fit_preds <- predict(final_fit, new_data = this_feature_data)$.pred
-      if (grepl("logit", wid)) {
-        fit_preds <- plogis(fit_preds)
-      }
-      fit_metrics <- all_metrics(
-        data = tibble(
-          truth = this_feature_data[[response]],
-          estimate = fit_preds
-        ),
-        truth = truth,
-        estimate = estimate
-      )
-
-      entry <- list(
-        wflow_id = wid,
-        specs = specs,
-        best_params = best_params,
-        final_wf = final_wf,
-        final_fit = final_fit,
-        all_metrics = data.table::as.data.table(tuned |> collect_metrics(summarize = FALSE)),
-        # final_metrics = final_metrics,
-        fit_metrics = fit_metrics
-      )
-
-      if (inherits(specs, "linear_reg")) {
-        feat <- .robust_glmnet_coefs(entry, cv_folds, this_feature_data)
-        entry <- c(entry, list(model_type = "glmnet"), feat)
-      } else if (inherits(specs, "mars")) {
-        entry <- c(
-          entry,
-          list(
-            model_type = "mars",
-            importance = .extract_mars_importance(entry)
+          tuned <- tune::tune_grid(
+            wf,
+            resamples = cv_folds,
+            grid = this_grid,
+            metrics = all_metrics,
+            control = tune::control_grid(
+              verbose = FALSE,
+              allow_par = FALSE # prevent nested forking inside outer pbmclapply
+            )
           )
-        )
-      } else {
-        entry <- c(entry, list(model_type = "unknown"))
-      }
-      entry$final_fit <- NULL
-      entry$final_wf <- NULL
-      entry$specs <- NULL
-      entry
+
+          all_metrics_dt <- data.table::as.data.table(
+            tuned |> collect_metrics(summarize = FALSE)
+          )
+
+          # Finalize, fit, and extract features for one lambda selection criterion.
+          .process_selection <- function(best_params) {
+            if (nrow(best_params) == 0L) {
+              return(NULL)
+            }
+            best_cv_summary <- tuned |>
+              collect_metrics(summarize = TRUE) |>
+              dplyr::filter(.config == best_params$.config) |>
+              dplyr::select(.metric, mean, std_err, n) |>
+              tidyr::pivot_wider(
+                names_from = .metric,
+                values_from = c(mean, std_err, n),
+                names_glue = "cv_{.value}_{.metric}"
+              )
+            best_params <- dplyr::bind_cols(best_params, best_cv_summary)
+            final_wf <- tune::finalize_workflow(wf, best_params)
+            final_fit <- parsnip::fit(final_wf, data = this_feature_data)
+
+            wf_response <- workflows::extract_preprocessor(final_wf)$var_info |>
+              dplyr::filter(role == "outcome") |>
+              dplyr::pull(variable)
+
+            fit_preds <- predict(final_fit, new_data = this_feature_data)$.pred
+            fit_metrics <- all_metrics(
+              data = tibble(
+                truth = this_feature_data[[wf_response]],
+                estimate = fit_preds
+              ),
+              truth = truth,
+              estimate = estimate
+            )
+
+            feat <- .robust_glmnet_coefs(
+              best_params,
+              final_fit,
+              final_wf,
+              cv_folds,
+              this_feature_data
+            )
+            rm(final_fit, final_wf)
+            c(
+              list(
+                best_params = best_params,
+                fit_metrics = fit_metrics,
+                model_type = "glmnet"
+              ),
+              feat
+            )
+          }
+
+          sel_min <- .process_selection(select_best(tuned, metric = "rsq_trad"))
+          sel_1se <- .process_selection(select_by_one_std_err(
+            tuned,
+            metric = "rsq_trad",
+            desc(penalty)
+          ))
+          rm(tuned)
+
+          list(
+            wflow_id = wid,
+            all_metrics = all_metrics_dt,
+            selections = list(min = sel_min, `1se` = sel_1se)
+          )
+        },
+        error = function(e) {
+          call_str <- if (!is.null(conditionCall(e))) {
+            paste0(" [", deparse(conditionCall(e))[[1L]], "]")
+          } else {
+            ""
+          }
+          message(sprintf(
+            "Workflow %s error: %s%s",
+            wid,
+            conditionMessage(e),
+            call_str
+          ))
+          structure(conditionMessage(e), class = "try-error")
+        }
+      )
     },
     mc.cores = parallel,
     ignore.interactive = TRUE
   )
+
   names(workflow_results) <- wflow_to_tune$wflow_id
+  workflow_results
+}
 
-  # Reconstruct grid_results workflowset (mirrors workflow_map output structure)
-  # grid_results <- wflow_to_tune
-  # grid_results[["result"]] <- lapply(workflow_results, `[[`, "tuned")
 
-  # -- Best workflow = highest CV R² among primary-response workflows only ----
-  # Restrict to PSI / logit_PSI — rotated workflows are negative controls and
-  # should not compete for "best" (their response is a different event's PSI).
-  # primary_names <- names(workflow_results)[
-  #   startsWith(names(workflow_results), response) |
-  #     startsWith(names(workflow_results), paste0("logit_", response))
-  # ]
-  # best_idx <- which.max(vapply(
-  #   workflow_results[primary_names],
-  #   `[[`,
-  #   numeric(1L),
-  #   "cv_rsq"
-  # ))
-  # best_result <- workflow_results[primary_names][[best_idx]]
+# ---------------------------------------------------------------------------
+# CLI entry point — invoked by 09-1-ml-local-array.sh as:
+#   Rscript 07-ml-event-glmnet-tidymodels.R <cfg_rds> <event_id>
+# ---------------------------------------------------------------------------
+if (!interactive()) {
+  args <- commandArgs(trailingOnly = TRUE)
+  cfg_path <- args[1]
+  this_id <- as.integer(args[2])
 
-  # -- Return -----------------------------------------------------------------
-  return(list(
-    workflow_results = workflow_results,
-    cv_folds = data.table::rbindlist(mapply(
-      cv_folds$splits,
-      cv_folds$id,
-      FUN = function(split, id) {
-        split |>
-          assessment() |>
-          select(all_of(grouping_col), hc_group) |>
-          mutate(resample = id) |>
-          count(across(everything()))
-      },
-      SIMPLIFY = FALSE
-    ))
-  ))
-  # list(
-  #   # cv_results = grid_results,
-  #   workflow_results = workflow_results,
-  #   best_workflow = best_result$wflow_id,
-  #   best_model_type = best_result$model_type,
-  #   final_fit = best_result$final_fit,
-  #   best_params = best_result$best_params,
-  #   cv_rsq = best_result$cv_rsq,
-  #   # glmnet-specific (NULL for MARS)
-  #   nonzero_coefs = best_result$nonzero_coefs,
-  #   fold_features = best_result$fold_features,
-  #   robust_features = best_result$robust_features,
-  #   # MARS-specific (NULL for glmnet)
-  #   importance = best_result$importance
-  # )
+  ## dev:
+  # cfg_path <- "processed_data/event_glmnet_cfg.rds"
+  # this_id <- 29728
+
+  cfg <- readRDS(cfg_path)
+  setwd(cfg$project_dir)
+
+  sess <- readRDS(cfg$session_rds)
+  psi_table <- sess$psi_table
+  event_dt <- sess$event_dt
+  chromhmm_hits_smaller <- sess$chromhmm_hits_smaller
+  keep_rows_manual <- sess$keep_rows_manual
+  rm(sess)
+  gc()
+
+  feature_table_dir <- cfg$feature_table_dir
+  feature_sets <- cfg$feature_sets
+  event_dir <- cfg$event_dir
+  response <- cfg$response
+  grouping_col <- cfg$grouping_col
+  nfolds <- cfg$nfolds
+  nrotations <- cfg$nrotations
+
+  tryCatch(
+    {
+      feature_data <- data.table::fread(file.path(
+        feature_table_dir,
+        paste0("feature_table_", this_id, ".csv.gz")
+      ))
+
+      explanatory <- names(feature_data)[
+        !names(feature_data) %in%
+          c(
+            "IHEC",
+            "ID",
+            "Event Type",
+            "Variability",
+            "seqnames",
+            "gene_id",
+            "uuid",
+            "transcript_filter",
+            "project",
+            "harmonized_sample_ontology_term_high_order_fig1",
+            grouping_col,
+            response
+          )
+      ]
+      chromhmm_explanatory <- explanatory[grepl(
+        "chromhmm",
+        explanatory,
+        fixed = TRUE
+      )]
+
+      smaller_chromhmm_ids <- chromhmm_hits_smaller[
+        chromhmm_hits_smaller[, "queryHits"] ==
+          which(keep_rows_manual == this_id),
+        "subjectHits"
+      ]
+      old_chromhmm_explanatory <- chromhmm_explanatory[Reduce(
+        `&`,
+        lapply(sprintf("chromhmm_%d", smaller_chromhmm_ids), function(suff) {
+          !endsWith(chromhmm_explanatory, suff)
+        })
+      )]
+
+      explanatory_vars <- setNames(
+        list(
+          explanatory,
+          explanatory[!explanatory %in% old_chromhmm_explanatory],
+          explanatory[!explanatory %in% chromhmm_explanatory]
+        ),
+        feature_sets
+      )
+
+      subset_psi_matrix <- psi_table[feature_data[, uuid], , drop = FALSE]
+      other_ids <- as.integer(colnames(subset_psi_matrix)[
+        colSums(is.na(subset_psi_matrix)) == 0 &
+          apply(subset_psi_matrix, 2, sd, na.rm = TRUE) > 0
+      ])
+      this_event <- event_dt[ID == this_id]
+      other_ids <- other_ids[
+        other_ids != this_id &
+          other_ids %in% event_dt[`Event Type` == this_event$`Event Type`, ID] &
+          other_ids %in% event_dt[seqnames != this_event$seqnames, ID] &
+          other_ids %in% event_dt[Variability == this_event$Variability, ID] &
+          other_ids %in%
+            event_dt[transcript_filter == this_event$transcript_filter, ID]
+      ]
+
+      this_rotations <- min(nrotations, length(other_ids))
+      if (this_rotations < nrotations) {
+        warning(sprintf(
+          "Not enough rotation controls for %d, using %d",
+          this_id,
+          this_rotations
+        ))
+      }
+      stopifnot(
+        rownames(subset_psi_matrix) == feature_data[, as.character(uuid)]
+      )
+      set.seed(this_id)
+      print(glue::glue(
+        "Running event {this_id} with {this_rotations} rotations (out of {nrotations})..."
+      ))
+      rotated_psis <- subset_psi_matrix[, as.character(sample(
+        other_ids,
+        this_rotations
+      ))]
+
+      rm(
+        psi_table,
+        subset_psi_matrix,
+        event_dt,
+        chromhmm_hits_smaller,
+        keep_rows_manual
+      )
+      gc()
+
+      parallel <- if (length(args) >= 3L) as.integer(args[3L]) else 1L
+
+      wrs <- run_event_glmnet(
+        this_feature_data = cbind(feature_data, rotated_psis),
+        explanatory_vars,
+        response,
+        rotated_psis,
+        grouping_col,
+        nfolds,
+        seed = this_id,
+        parallel = parallel,
+        cv_folds_path = file.path(
+          event_dir,
+          paste0(this_id, "_cv_folds.csv.gz")
+        )
+      )
+      rm(feature_data, rotated_psis, explanatory_vars)
+      gc()
+
+      # Log any pbmclapply worker errors before writing CSVs.
+      worker_errors <- Filter(
+        inherits_try_error <- function(x) inherits(x, "try-error"),
+        wrs
+      )
+      if (length(worker_errors) > 0L) {
+        message(sprintf(
+          "WARNING: %d/%d workflows errored for event %d: %s",
+          length(worker_errors),
+          length(wrs),
+          this_id,
+          paste(names(worker_errors), collapse = ", ")
+        ))
+      }
+
+      # Write one file per table; rows tagged with lambda_selection ("min"/"1se").
+      # Each per-workflow-selection fn call is guarded: a failure logs to stderr
+      # and returns NULL rather than aborting the whole write pass.
+      write_wrs_sel <- function(name, fn) {
+        dt <- data.table::rbindlist(
+          lapply(names(wrs), function(wid) {
+            wr <- wrs[[wid]]
+            if (inherits(wr, "try-error")) {
+              return(NULL)
+            }
+            data.table::rbindlist(
+              lapply(names(wr$selections), function(sel) {
+                wr_sel <- wr$selections[[sel]]
+                if (is.null(wr_sel)) {
+                  return(NULL)
+                }
+                tryCatch(
+                  {
+                    res <- fn(wid, sel, wr_sel)
+                    if (!is.null(res)) {
+                      res[, lambda_selection := sel][]
+                    } else {
+                      NULL
+                    }
+                  },
+                  error = function(e) {
+                    message(sprintf(
+                      "write_wrs_sel[%s/%s/%s] error: %s",
+                      name,
+                      wid,
+                      sel,
+                      conditionMessage(e)
+                    ))
+                    NULL
+                  }
+                )
+              }),
+              fill = TRUE
+            )
+          }),
+          fill = TRUE
+        )
+        if (is.null(dt) || nrow(dt) == 0L) {
+          dt <- data.table::data.table()
+        }
+        dt[, ID := this_id]
+        data.table::fwrite(
+          dt,
+          file.path(event_dir, paste0(this_id, "_", name, ".csv.gz"))
+        )
+      }
+
+      # all_metrics: shared across selections — write once (completion sentinel)
+      write_wrs_once <- function(name, fn) {
+        dt <- data.table::rbindlist(
+          lapply(names(wrs), function(wid) {
+            tryCatch(fn(wid), error = function(e) {
+              message(sprintf(
+                "write_wrs_once[%s/%s] error: %s",
+                name,
+                wid,
+                conditionMessage(e)
+              ))
+              NULL
+            })
+          }),
+          fill = TRUE
+        )
+        if (is.null(dt) || nrow(dt) == 0L) {
+          dt <- data.table::data.table()
+        }
+        dt[, ID := this_id]
+        data.table::fwrite(
+          dt,
+          file.path(event_dir, paste0(this_id, "_", name, ".csv.gz"))
+        )
+      }
+
+      write_wrs_sel("best_params", function(wid, sel, wr_sel) {
+        bp <- wr_sel$best_params
+        if (is.null(bp)) {
+          return(NULL)
+        }
+        data.table::as.data.table(bp)[, wflow_id := wid][]
+      })
+
+      write_wrs_sel("fit_metrics", function(wid, sel, wr_sel) {
+        m <- wr_sel$fit_metrics
+        if (is.null(m)) {
+          return(NULL)
+        }
+        data.table::as.data.table(m)[, wflow_id := wid][]
+      })
+
+      write_wrs_sel("event_summary", function(wid, sel, wr_sel) {
+        rf <- wr_sel$robust_features
+        data.table::data.table(
+          wflow_id = wid,
+          model_type = wr_sel$model_type,
+          n_robust = length(rf),
+          has_model = length(rf) > 0L,
+          expression_bias = data.table::fifelse(
+            length(rf) == 0L,
+            NA_character_,
+            data.table::fifelse(
+              any(grepl("gene_expression", rf, fixed = TRUE)),
+              "Expression Bias",
+              "Epigenetic Only"
+            )
+          )
+        )
+      })
+
+      write_wrs_sel("fold_features", function(wid, sel, wr_sel) {
+        ff <- wr_sel$fold_features
+        if (is.null(ff) || length(ff) == 0L) {
+          return(NULL)
+        }
+        data.table::rbindlist(
+          lapply(names(ff), function(fold) {
+            data.table::data.table(
+              wflow_id = wid,
+              fold = fold,
+              feature = ff[[fold]]
+            )
+          }),
+          fill = TRUE
+        )
+      })
+
+      write_wrs_sel("nonzero_coefs", function(wid, sel, wr_sel) {
+        nc <- wr_sel$nonzero_coefs
+        if (is.null(nc) || nrow(nc) == 0L) {
+          return(NULL)
+        }
+        data.table::data.table(
+          wflow_id = wid,
+          feature = rownames(nc),
+          coef = nc[, 1L]
+        )
+      })
+
+      # all_metrics written last — its existence is the completion sentinel
+      write_wrs_once("all_metrics", function(wid) {
+        wr <- wrs[[wid]]
+        if (inherits(wr, "try-error")) {
+          return(NULL)
+        }
+        m <- wr$all_metrics
+        if (is.null(m)) {
+          return(NULL)
+        }
+        data.table::as.data.table(m)[, wflow_id := wid][]
+      })
+
+      rm(wrs)
+      gc()
+      message("Done: ", this_id)
+    },
+    error = function(e) {
+      call_str <- if (!is.null(conditionCall(e))) {
+        paste0(" [", deparse(conditionCall(e))[[1L]], "]")
+      } else {
+        ""
+      }
+      message("ERROR for id ", this_id, ": ", conditionMessage(e), call_str)
+    }
+  )
 }

@@ -3,7 +3,14 @@ title: "ML event models"
 output: pdf_document
 ---
 
-# check models
+# Epigenetic Prediction of Alternative Splicing: Per-Event Models
+
+Each AS event is modelled independently with elastic net regression (glmnet) using IHEC epigenetic features. Predictive performance is evaluated against 10 **rotated negative controls** — models trained on PSI values from unrelated events that preserve data structure while breaking the epigenetic–splicing link.
+
+**Feature sets**: `local` (event-overlapping regions only), `short` (±50 kb), `long` (±500 kb).
+**Lambda selection**: `min` (lowest CV error) vs `1se` (most regularised model within 1 SE of min).
+**Expression bias**: a real-PSI model is labelled *Epigenetic Only* if no `gene_expression`-containing feature survives robust cross-fold selection; otherwise *Expression Bias*.
+
 ```{r setup}
 library(tidymodels)
 library(glmnet)
@@ -20,15 +27,23 @@ keep_rows <- sess$keep_rows_manual
 rm(sess)
 gc()
 
+
 # load aggregating.rda and aggregated_dt
-load("processed_data/aggregating.rda")
+load("processed_data/aggregating.rda", verbose = TRUE)
 aggregated_dt <- fread(
   "processed_data/aggregated_dt_filtered.csv.gz",
   stringsAsFactors = TRUE
 )
+
+# Restrict to biotype_filtered events only
+keep_rows <- keep_rows[
+  keep_rows %in% event_dt[transcript_filter == "biotype_filtered", ID]
+]
 ```
 
-```{r load-data}
+## Hyperparameter diagnostics
+
+```{r load-data, cache = TRUE}
 event_dir <- file.path("processed_data", "event_models")
 
 plot_dir_ev <- file.path(plot_dir, "event_models")
@@ -36,120 +51,272 @@ dir.create(plot_dir_ev, showWarnings = FALSE)
 
 # Helper: aggregate per-event CSVs saved by worker
 read_event_csvs <- function(pattern) {
-  rbindlist(
-    lapply(list.files(event_dir, pattern = pattern, full.names = TRUE), fread),
-    fill = TRUE
-  )
+  files <- list.files(event_dir, pattern = pattern, full.names = TRUE)
+  rbindlist(pbmclapply(files, fread), fill = TRUE)
 }
 
 # Best hyperparameters per (event, workflow)
-best_params_table <- read_event_csvs("^best_params_.*\\.csv\\.gz$")
+best_params_table <- read_event_csvs("^\\d+_best_params\\.csv\\.gz$")
 best_params_table[, ID := as.integer(ID)]
 best_params_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
 ]
+best_params_table[,
+  response_type := fifelse(response == "PSI", "Real", "Rotated")
+]
+best_params_table[,
+  lambda_selection := factor(lambda_selection, levels = c("min", "1se"))
+]
+
+# In-sample fit metrics per (event, workflow)
+fit_metrics_table <- read_event_csvs("^\\d+_fit_metrics\\.csv\\.gz$")
+fit_metrics_table[, ID := as.integer(ID)]
+fit_metrics_table[,
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
+]
+```
+
+```{r exploratory-plots}
+# How do hyperparameter choices vary across feature sets and real vs rotated response?
+# A systematic difference in penalty/mixture suggests the model uses different
+# regularisation regimes for real vs random targets.
+ggplot(
+  best_params_table[!is.na(lambda_selection)],
+  aes(
+    x = lambda_selection,
+    y = -log10(penalty),
+    color = as.factor(mixture),
+    group = interaction(ID, wflow_id)
+  )
+) +
+  geom_line(alpha = 0.2) +
+  geom_boxplot(
+    aes(group = lambda_selection),
+    color = "grey30",
+    fill = NA,
+    outliers = FALSE
+  ) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  facet_grid(response_type ~ feature_set) +
+  scale_color_brewer(palette = "Set1", name = "mixture") +
+  labs(
+    title = "Selected penalty by lambda rule, feature set, and response type",
+    x = "Lambda selection rule",
+    y = "-log10(penalty)"
+  ) +
+  theme_bw()
 
 ggplot(
   best_params_table,
   aes(x = as.character(mixture), y = -log10(penalty), color = feature_set)
 ) +
   geom_boxplot(alpha = .5) +
-  facet_grid(ID ~ response == "PSI") +
+  facet_grid(. ~ response == "PSI") +
+  labs(
+    title = "Penalty distribution by mixture and response type",
+    x = "Mixture (0 = ridge, 1 = lasso)",
+    y = "-log10(penalty)"
+  ) +
   theme_bw()
 
-# In-sample fit metrics per (event, workflow)
-fit_metrics_table <- read_event_csvs("^fit_metrics_.*\\.csv\\.gz$")
-fit_metrics_table[, ID := as.integer(ID)]
-fit_metrics_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
-]
-
+# In-sample R² will be inflated by overfitting; compare to CV in paired-rotation-analysis.
 ggplot(
-  fit_metrics_table[!endsWith(.metric, "_logit")],
+  fit_metrics_table,
   aes(x = response == "PSI", y = .estimate, color = feature_set)
 ) +
   geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
   geom_jitter(
-    alpha = .3,
-    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.8)
+    alpha = .2,
+    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.5),
+    size = .5
   ) +
-  facet_grid(.metric ~ ., scales = "free_y") +
-  theme_bw() +
+  facet_grid(.metric ~ lambda_selection, scales = "free_y") +
+  labs(
+    title = "In-sample fit metrics: real PSI vs rotated (overfitting diagnostic)",
+    x = "Real PSI response",
+    y = "Fit estimate (PSI scale)"
+  ) +
+  main_theme(16) +
   coord_cartesian(ylim = c(0, NA))
 ```
 
-```{r create-tables}
-# cv_metrics_table: per-fold metrics at selected config
-cv_metrics_table <- read_event_csvs("^all_metrics_.*\\.csv\\.gz$")
+**What to look for:** penalty should be similar for real and rotated responses — systematic differences would suggest the CV procedure is leaking information. Mixture near 1 (lasso) implies sparse solutions; near 0 (ridge) implies dense regularisation.
+
+## Data tables
+
+```{r build-cv-tables, cache = TRUE, dependson = "load-data"}
+# cv_metrics_table: per-fold CV metrics at selected config, tagged by lambda_selection
+# cv_rsq: mean CV R² per (event, workflow) — used downstream by paired-rotation-analysis
+#         and n-robust-significance
+cv_metrics_table <- read_event_csvs("^\\d+_all_metrics\\.csv\\.gz$")
 cv_metrics_table[, ID := as.integer(ID)]
 cv_metrics_table <- cv_metrics_table[
-  best_params_table[, .(ID, wflow_id, .config)],
+  best_params_table[, .(ID, wflow_id, .config, lambda_selection)],
   on = .(ID, wflow_id, .config),
   nomatch = NULL
 ]
 cv_metrics_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
 ]
-cv_metrics_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+cv_metrics_table[,
+  response_type := fifelse(response == "PSI", "real", "rotated")
+]
+cv_metrics_table[,
+  feature_set := factor(feature_set, levels = c("local", "short", "long"))
+]
 
-# event_summary_table: robust feature count + expression bias per workflow
-event_summary_table <- read_event_csvs("^event_summary_.*\\.csv\\.gz$")
+cv_rsq <- cv_metrics_table[
+  .metric == "rsq_trad",
+  .(mean_cv_rsq = mean(.estimate, na.rm = TRUE)),
+  by = .(ID, wflow_id, lambda_selection)
+]
+```
+
+```{r build-summary-tables, cache = TRUE, dependson = c("load-data", "build-cv-tables")}
+# event_summary_table: one row per (event, workflow, lambda_selection).
+# Includes n_robust, expression_bias, mean CV R², rotated_hit flag.
+event_summary_table <- read_event_csvs("^\\d+_event_summary\\.csv\\.gz$")
 event_summary_table[, ID := as.integer(ID)]
 event_summary_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
 ]
-event_summary_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
+event_summary_table[,
+  response_type := fifelse(response == "PSI", "real", "rotated")
+]
 event_summary_table[
   event_dt,
   on = "ID",
-  c("Event Type", "Variability", "seqnames") := .(`Event Type`, Variability, seqnames)
+  c("Event Type", "Variability", "seqnames") := .(
+    `Event Type`,
+    Variability,
+    seqnames
+  )
+]
+event_summary_table[
+  cv_rsq,
+  on = .(ID, wflow_id, lambda_selection),
+  mean_cv_rsq := mean_cv_rsq
 ]
 
-# Join mean CV R²
-cv_rsq <- cv_metrics_table[
-  .metric == "rsq_trad_psi",
-  .(mean_cv_rsq = mean(.estimate, na.rm = TRUE)),
-  by = .(ID, wflow_id)
+# "Rotated Hit": did this event's real PSI appear as a rotation in another event?
+rotation_ids <- event_summary_table[
+  response_type == "rotated",
+  unique(as.integer(response))
 ]
-event_summary_table[cv_rsq, on = .(ID, wflow_id), mean_cv_rsq := mean_cv_rsq]
-
-# "Rotated Hit": did this event's PSI appear as a rotation in any other event?
-rotation_ids <- event_summary_table[response_type == "rotated", unique(as.integer(response))]
 event_summary_table[
   response_type == "real",
   rotated_hit := fifelse(ID %in% rotation_ids, "Hit by Rotation", "Not Hit")
 ]
 
-# feature_table: selected features per CV fold per workflow
-feature_table <- read_event_csvs("^fold_features_.*\\.csv\\.gz$")
+# rotation_rank: 1..n_rotations per (event, feature_set, lambda), 0 for real.
+# Used to group rotated models by slot rather than source event ID.
+# Source IDs are unique per event (independent sampling), so grouping by source
+# gives counts ≈ 1. Grouping by rank gives uniqueN(ID) ≈ N_events per slot.
+event_summary_table[
+  response_type == "rotated",
+  rotation_rank := frankv(response, ties.method = "first"),
+  by = .(ID, feature_set, lambda_selection)
+]
+event_summary_table[response_type == "real", rotation_rank := 0L]
+
+event_summary_table[,
+  feature_set := factor(feature_set, levels = c("local", "short", "long"))
+]
+event_summary_table[,
+  lambda_selection := factor(lambda_selection, levels = c("min", "1se"))
+]
+event_summary_table[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+event_summary_table[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+```
+
+```{r build-feature-coef-tables, cache = TRUE, dependson = c("load-data", "build-summary-tables")}
+# feature_table: features selected per CV fold per workflow.
+# coef_table: robust non-zero coefficients per workflow.
+# expression_bias is propagated from the real-PSI model for each event via the
+# ID + lambda_selection join, so rotated coef rows also carry the real model's bias label.
+
+feature_table <- read_event_csvs("^\\d+_fold_features\\.csv\\.gz$")
 feature_table[, ID := as.integer(ID)]
 feature_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
 ]
 feature_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
-feature_table[event_dt, on = "ID", c("Event Type", "Variability") := .(`Event Type`, Variability)]
 feature_table[
-  event_summary_table[response_type == "real", .(ID, expression_bias)],
+  event_dt,
   on = "ID",
+  c("Event Type", "Variability") := .(`Event Type`, Variability)
+]
+feature_table[
+  event_summary_table[
+    response_type == "real",
+    .(ID, lambda_selection, expression_bias)
+  ],
+  on = .(ID, lambda_selection),
   expression_bias := expression_bias
 ]
 
-# coef_table: robust non-zero coefficients per workflow
-coef_table <- read_event_csvs("^nonzero_coefs_.*\\.csv\\.gz$")
+coef_table <- read_event_csvs("^\\d+_nonzero_coefs\\.csv\\.gz$")
 coef_table[, ID := as.integer(ID)]
 coef_table[,
-  c("feature_set", "response") := tstrsplit(wflow_id, "_", fixed = TRUE, keep = c(1L, 2L))
+  c("feature_set", "response") := tstrsplit(
+    wflow_id,
+    "_",
+    fixed = TRUE,
+    keep = c(1L, 2L)
+  )
 ]
 coef_table[, response_type := fifelse(response == "PSI", "real", "rotated")]
-coef_table[event_dt, on = "ID", c("Event Type", "Variability") := .(`Event Type`, Variability)]
 coef_table[
-  event_summary_table[response_type == "real", .(ID, expression_bias)],
+  event_dt,
   on = "ID",
+  c("Event Type", "Variability") := .(`Event Type`, Variability)
+]
+# expression_bias from real-PSI model propagated to rotated rows via ID+lambda_selection join
+coef_table[
+  event_summary_table[
+    response_type == "real",
+    .(ID, lambda_selection, expression_bias)
+  ],
+  on = .(ID, lambda_selection),
   expression_bias := expression_bias
 ]
 coef_table[, let(c("mark", "region"), tstrsplit(feature, ";", fixed = TRUE))]
 coef_table[,
-  coefficient_sign := fifelse(coef > 0, "positive coefficient", "negative coefficient")
+  coefficient_sign := fifelse(
+    coef > 0,
+    "positive coefficient",
+    "negative coefficient"
+  )
 ]
 coef_table[,
   Response := factor(
@@ -158,57 +325,121 @@ coef_table[,
   )
 ]
 coef_table[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+coef_table[
+  response_type == "rotated",
+  rotation_rank := match(response, unique(response)),
+  by = .(ID, feature_set, lambda_selection)
+]
+coef_table[response_type == "real", rotation_rank := 0L]
+
+for (.dt in list(feature_table, coef_table)) {
+  .dt[,
+    feature_set := factor(feature_set, levels = c("local", "short", "long"))
+  ]
+  .dt[, lambda_selection := factor(lambda_selection, levels = c("min", "1se"))]
+  .dt[,
+    Variability := factor(
+      sub(" Variability", "", Variability, fixed = TRUE),
+      levels = c("High", "Low")
+    )
+  ]
+  .dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+}
 ```
 
-```{r counting-events}
-modeled_ids <- event_summary_table[
-  response_type == "real" & has_model == TRUE,
-  unique(ID)
-]
+## 1. Event counts and filtering
 
+How many events survive each filtering step, and how many receive a model?
+A model requires at least one feature to be robustly selected across all CV folds (`n_robust > 0`).
+`lambda.min` produces weaker regularisation — more features selected, more events modelled.
+`lambda.1se` is stricter — fewer events have any robust features (`has_model == FALSE`).
+
+```{r counting-events}
 event_counts <- rbindlist(
-  list(
-    Filtered = event_dt[ID %in% keep_rows, .(.N), by = .(`Event Type`)],
-    Quantified = aggregated_dt[, .(N = uniqueN(ID)), by = `Event Type`],
-    `No Model` = aggregated_dt[
-      !ID %in% modeled_ids,
-      .(N = uniqueN(ID)),
-      by = `Event Type`
-    ],
-    `Model` = event_summary_table[
-      response_type == "real" & has_model == TRUE,
-      .(.N),
-      by = .(`Event Type`)
-    ],
-    `Epigenetic\nOnly Model` = event_summary_table[
-      response_type == "real" &
-        expression_bias == "Epigenetic Only" &
-        has_model == TRUE,
-      .(.N),
-      by = .(`Event Type`)
-    ]
-  ),
-  idcol = "filtering"
+  lapply(unique(event_summary_table$lambda_selection), function(sel) {
+    rbindlist(
+      lapply(unique(event_summary_table$feature_set), function(fs) {
+        this_summary <- event_summary_table[
+          lambda_selection == sel & feature_set == fs
+        ]
+        modeled_ids <- this_summary[
+          response_type == "real" & has_model == TRUE,
+          unique(ID)
+        ]
+        rbindlist(
+          list(
+            Quantified = aggregated_dt[
+              ID %in% keep_rows,
+              .(N = uniqueN(ID)),
+              by = `Event Type`
+            ],
+            Filtered = event_dt[ID %in% keep_rows, .(.N), by = .(`Event Type`)],
+            `No Model` = aggregated_dt[
+              !ID %in% modeled_ids & ID %in% keep_rows,
+              .(N = uniqueN(ID)),
+              by = `Event Type`
+            ],
+            `Model` = this_summary[
+              response_type == "real" & has_model == TRUE,
+              .(.N),
+              by = .(`Event Type`)
+            ],
+            `Epigenetic\nOnly Model` = this_summary[
+              response_type == "real" &
+                expression_bias == "Epigenetic Only" &
+                has_model == TRUE,
+              .(.N),
+              by = .(`Event Type`)
+            ]
+          ),
+          idcol = "filtering"
+        )[, c("lambda_selection", "feature_set") := .(sel, fs)]
+      }),
+      fill = TRUE
+    )
+  }),
+  fill = TRUE
 )
 
 print(event_summary_table[
   response_type == "real",
-  table(expression_bias, `Event Type`)
+  table(expression_bias, `Event Type`, lambda_selection, feature_set)
 ])
 
-ggplot(event_counts, aes(x = N, y = reorder(filtering, N))) +
-  geom_col() +
+event_counts[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+event_counts[,
+  feature_set := factor(feature_set, levels = c("long", "short", "local"))
+]
+
+ggplot(
+  event_counts,
+  aes(x = N, y = reorder(filtering, N), fill = lambda_selection)
+) +
+  geom_col(position = "dodge") +
   theme_bw() +
   theme(
     strip.background = element_rect(fill = "white"),
     text = element_text(size = 20),
     axis.text.x = element_blank()
   ) +
-  facet_wrap(~`Event Type`, scales = "free_x") +
-  geom_text(aes(label = N), vjust = 1.1, size = 4, angle = 90) +
-  labs(x = "Number of Events", y = NULL)
-ggsave(file.path(plot_dir_ev, "event_counts.pdf"), width = 7, height = 3)
+  facet_grid(feature_set ~ `Event Type`, scales = "free_x") +
+  geom_text(
+    aes(label = N),
+    position = position_dodge(width = 0.9),
+    vjust = 1.1,
+    size = 4,
+    angle = 90
+  ) +
+  labs(
+    title = "Event waterfall: counts at each filtering stage",
+    x = "Number of Events",
+    y = NULL
+  )
+ggsave(file.path(plot_dir_ev, "event_counts.pdf"), width = 12, height = 5)
 ```
+
+Events without any robust features (`has_model == FALSE`) are excluded from all downstream analyses.
+Expression bias is classified per real-PSI model and propagated to its associated rotated controls.
 
 ```{r generate-count-plots}
 event_summary_table[,
@@ -218,24 +449,28 @@ event_summary_table[,
   )
 ]
 event_summary_table[,
-  `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))
+  `Event Type` := factor(`Event Type`, levels = to_analyze)
 ]
 
 event_count_dt <- event_summary_table[
   has_model == TRUE,
   {
-    counts <- .SD[, .(count = .N), by = response][, count]
+    # Group by rotation_rank (0 for real, 1-10 for rotated) and count unique events.
+    # For real: one rank (0), uniqueN(ID) = N events. mean_count = N.
+    # For rotated: ranks 1-10, uniqueN(ID) per rank = events in that slot. mean/SD across slots.
+    counts <- .SD[, .(count = uniqueN(ID)), by = rotation_rank][, count]
     .(
       mean_count = mean(counts),
-      sd_count = sd(counts) / sqrt(uniqueN(response))
+      sd_count = sd(counts) / sqrt(uniqueN(rotation_rank))
     )
   },
   by = .(
     `Event Type`,
+    feature_set,
     response_type,
     expression_bias,
     Variability,
-    rotated_hit
+    lambda_selection
   )
 ]
 
@@ -255,15 +490,23 @@ event_count_dt[
 event_count_dt[
   order(Variability, decreasing = TRUE),
   cumsum_mean_count := cumsum(mean_count),
-  by = .(`Event Type`, response_type, expression_bias)
+  by = .(
+    `Event Type`,
+    feature_set,
+    response_type,
+    expression_bias,
+    lambda_selection
+  )
 ]
 
 ggplot(
   event_count_dt,
-  aes(y = mean_count, x = expression_bias, fill = Variability)
+  aes(y = mean_count, x = response_type, fill = Variability)
 ) +
   geom_col() +
-  facet_grid(`Event Type` ~ response_type, scales = "free_y") +
+  ggh4x::facet_nested_wrap(
+    `Event Type` ~ feature_set + lambda_selection + expression_bias
+  ) +
   theme_bw() +
   theme(
     legend.box = "vertical",
@@ -272,7 +515,10 @@ ggplot(
     axis.title.x = element_blank()
   ) +
   scale_fill_manual(values = variability_colors) +
-  labs(y = "Number of Events") +
+  labs(
+    title = "Model counts by expression bias, variability, and response type",
+    y = "Number of Events"
+  ) +
   geom_errorbar(
     aes(
       y = cumsum_mean_count,
@@ -283,11 +529,12 @@ ggplot(
   )
 ggsave(
   file.path(plot_dir_ev, "events_rotation.png"),
-  width = 6,
+  width = 16,
   height = 3,
   dpi = 600
 )
-
+```
+```{r, generate-proportion-plots}
 event_count_dt[
   response_type == "Real",
   expression_bias := sub("\n", " ", expression_bias, fixed = TRUE)
@@ -298,7 +545,7 @@ ggplot(
 ) +
   geom_col(position = "fill") +
   geom_text(aes(label = mean_count), position = position_fill(vjust = 0.5)) +
-  facet_grid(`Event Type` ~ rotated_hit, scales = "free_y") +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
   theme_bw() +
   theme(
     legend.box = "vertical",
@@ -308,35 +555,578 @@ ggplot(
   scale_fill_manual(
     values = c(`Epigenetic Only` = "orange", `Expression Bias` = "steelblue")
   ) +
-  labs(y = "Proportion of Events", fill = NULL)
-ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 5, height = 3)
+  labs(
+    title = "Proportion of real-PSI models by variability: Epigenetic Only vs Expression Bias",
+    y = "Proportion of Events",
+    fill = NULL
+  )
+ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 10, height = 3)
 ```
 
-```{r cv-metrics-plot}
-# CV R² distribution: real PSI vs rotated negative controls
-cv_rsq_dt <- cv_metrics_table[.metric == "rsq_trad_psi"]
-cv_rsq_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
-cv_rsq_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+## 2. Rotation test: does epigenetic signal exceed chance?
+
+The core question: does a model trained on real PSI outperform 10 models trained on unrelated (rotated) PSI values? Three complementary tests are applied:
+
+1. **Real R² (diagnostic)** — compares in-sample vs CV R²; the gap quantifies overfitting. All rotation testing uses CV R² only.
+2. **Empirical p-value** — fraction of rotated controls with R² ≥ real model R² (plus 1 pseudo-count). With 10 rotations, minimum achievable p = 1/11 ≈ 0.091; conventional p < 0.05 requires ≥ 19 rotations.
+3. **t-statistic** — standardised distance of real R² from the rotated distribution: t = (real − mean(rotated)) / (SD(rotated) / √n). Accounts for variation in how spread out the rotated null is per event.
+
+```{r paired-rotation-analysis}
+# Defensive re-assignment (already set in build chunks)
+fit_metrics_table[,
+  response_type := fifelse(response == "PSI", "real", "rotated")
+]
+cv_metrics_table[,
+  response_type := fifelse(response == "PSI", "real", "rotated")
+]
+
+# Average CV folds to one value per workflow
+cv_wflow <- cv_metrics_table[
+  .metric == "rsq_trad",
+  .(.estimate = mean(.estimate, na.rm = TRUE)),
+  by = .(ID, wflow_id, feature_set, lambda_selection, response_type)
+]
+
+# Combine in-sample and CV for overfitting diagnostic (Plot 1 only).
+# emp_p and t-statistic use CV only — in-sample R² is biased by overfitting.
+wflow_fit <- rbindlist(
+  list(
+    `In-sample` = fit_metrics_table[
+      .metric == "rsq_trad",
+      .(ID, wflow_id, feature_set, lambda_selection, response_type, .estimate)
+    ],
+    CV = cv_wflow
+  ),
+  idcol = "metric_type"
+)
+wflow_fit[event_dt, on = "ID", `Event Type` := `Event Type`]
+wflow_fit[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+wflow_fit[, metric_type := factor(metric_type, levels = c("In-sample", "CV"))]
+
+# ------------------------------------------------------------------
+# Plot 1: Real R² distribution — overfitting diagnostic only.
+# In-sample R² is inflated; the rotation test below uses CV only.
+# ------------------------------------------------------------------
+real_rsq_dt <- wflow_fit[
+  response_type == "real",
+  .(
+    ID,
+    `Event Type`,
+    feature_set,
+    lambda_selection,
+    metric_type,
+    real_rsq = .estimate
+  )
+]
+
+ggplot(real_rsq_dt, aes(x = feature_set, y = real_rsq, color = feature_set)) +
+  geom_violin(alpha = .5) +
+  geom_jitter() +
+  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
+  coord_cartesian(ylim = c(0, 1)) +
+  main_theme(base_size = 16) +
+  labs(
+    title = "Real PSI R2: in-sample vs CV (in-sample inflated by overfitting)",
+    x = NULL,
+    y = "R2 (real PSI)"
+  )
+ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
+
+# ------------------------------------------------------------------
+# Plot 2: Empirical p-value (in-sample and CV)
+# For each event: p = (# rotations with R² >= real R² + 1) / (# rotations + 1)
+# With 10 rotations: min achievable p = 1/11 ≈ 0.091.
+# Conventional p < 0.05 requires >= 19 rotations.
+# Computed for both in-sample and CV; see rationale below.
+# ------------------------------------------------------------------
+emp_p_both_dt <- wflow_fit[,
+  {
+    real_val <- .SD[response_type == "real", .estimate]
+    rot_vals <- .SD[response_type == "rotated", .estimate]
+    if (length(real_val) == 1L && length(rot_vals) > 0L) {
+      .(emp_p = (sum(rot_vals >= real_val) + 1L) / (length(rot_vals) + 1L))
+    } else {
+      .(emp_p = NA_real_)
+    }
+  },
+  by = .(ID, `Event Type`, feature_set, lambda_selection, metric_type)
+]
+emp_p_both_dt[, sig := emp_p <= (1 / 11)]
+
+# CV-only slice — downstream chunks (variability-significance, n-robust-significance,
+# lambda-switching) use emp_p_dt which is CV-only (unbiased generalization test).
+emp_p_dt <- emp_p_both_dt[metric_type == "CV"]
+
+# ------------------------------------------------------------------
+# Sanity check: rotated_hit should not affect emp_p distribution.
+# "Hit by Rotation" events had their real PSI borrowed as a null for another event.
+# If Hit events show systematically lower emp_p, it implies their PSI correlates
+# broadly with cell-type identity (fingerprint), inflating the null for those events.
+# Expected result: distributions overlap — rotation sampling is matched and unbiased.
+# ------------------------------------------------------------------
+rotated_hit_check_dt <- copy(emp_p_dt)
+rotated_hit_check_dt[
+  event_summary_table[
+    response_type == "real",
+    .(ID, feature_set, lambda_selection, rotated_hit)
+  ],
+  on = .(ID, feature_set, lambda_selection),
+  rotated_hit := rotated_hit
+]
+ggplot(
+  rotated_hit_check_dt[!is.na(emp_p) & !is.na(rotated_hit)],
+  aes(x = emp_p, fill = rotated_hit)
+) +
+  geom_histogram(
+    breaks = seq(0, 1, by = 1 / 11),
+    position = "dodge",
+    alpha = .7
+  ) +
+  geom_vline(xintercept = 1 / 11, linetype = "dashed", color = "red") +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
+  theme_bw() +
+  labs(
+    title = "Rotation sampling sanity check: emp p by Hit vs Not Hit events",
+    x = "Empirical p-value (CV)",
+    y = "Number of events",
+    fill = "Rotation status",
+    caption = paste(
+      "Hit by Rotation: this event's PSI was used as a null control for another event.",
+      "Systematically lower emp p for Hit events would indicate inflated null.",
+      "Expected: distributions overlap (matched sampling, no bias)."
+    )
+  )
+ggsave(file.path(plot_dir_ev, "rotated_hit_sanity.pdf"), width = 14, height = 4)
+
+print(emp_p_dt[,
+  .(
+    n_sig = sum(sig, na.rm = TRUE),
+    n_total = sum(!is.na(emp_p)),
+    pct_sig = round(100 * mean(sig, na.rm = TRUE), 1)
+  ),
+  by = .(`Event Type`, feature_set, lambda_selection)
+])
+
+# Both in-sample and CV shown: the comparison is diagnostic.
+# In-sample > CV signal: genuine signal amplified by overfitting.
+# In-sample < CV signal: rotated models also overfit (fingerprint confound; supports
+#   paper's concern that sample-specific epigenomic fingerprints drive predictions).
+ggplot(emp_p_both_dt[!is.na(emp_p)], aes(x = emp_p, fill = feature_set)) +
+  geom_histogram(
+    breaks = seq(0, 1, by = 1 / 11),
+    position = "dodge",
+    alpha = .7
+  ) +
+  geom_vline(xintercept = 1 / 11, linetype = "dashed", color = "red") +
+  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
+  theme_bw() +
+  labs(
+    title = "Empirical p-value distribution: rotation test (in-sample vs CV R2)",
+    x = "Empirical p-value",
+    y = "Number of events",
+    caption = paste(
+      "Red line: minimum achievable p with 10 rotations (1/11 approx 0.091).",
+      "Conventional p < 0.05 requires >= 19 rotations.",
+      "CV is primary (unbiased). In-sample > CV: overfitting amplifies genuine signal.",
+      "In-sample < CV: rotated models also overfit (fingerprint confound).",
+      "Positive result: excess events at p = 1/11 bin (left spike above uniform null)."
+    )
+  )
+ggsave(file.path(plot_dir_ev, "empirical_pvalue.pdf"), width = 14, height = 4)
+
+# ------------------------------------------------------------------
+# Plot 3: Within-event t-statistic (in-sample and CV)
+# t = (real R² - mean(rotated R²)) / (SD(rotated) / sqrt(n_rot))
+# With n=10 rotations: df=9, one-tailed critical value approx 1.833 (alpha=0.05).
+# Edge case: if all rotated R² are identical (SD=0), t is undefined -> NA.
+# ------------------------------------------------------------------
+t_both_dt <- wflow_fit[,
+  {
+    real_val <- .SD[response_type == "real", .estimate]
+    rot_vals <- .SD[response_type == "rotated", .estimate]
+    n_rot <- length(rot_vals)
+    if (length(real_val) == 1L && n_rot > 1L) {
+      sd_rot <- sd(rot_vals, na.rm = TRUE)
+      if (!is.na(sd_rot) && sd_rot > .Machine$double.eps) {
+        .(
+          t_stat = (real_val - mean(rot_vals, na.rm = TRUE)) /
+            (sd_rot / sqrt(n_rot)),
+          n_rot = n_rot
+        )
+      } else {
+        .(t_stat = NA_real_, n_rot = n_rot)
+      }
+    } else {
+      .(t_stat = NA_real_, n_rot = NA_integer_)
+    }
+  },
+  by = .(ID, `Event Type`, feature_set, lambda_selection, metric_type)
+]
+
+# CV-only t_dt (for reference; t_both_dt used in plot)
+t_dt <- t_both_dt[metric_type == "CV"]
+t_crit <- qt(0.95, df = 9) # critical value for most events (n_rot=10, df=9)
 
 ggplot(
-  cv_rsq_dt,
-  aes(x = response_type, y = .estimate, color = feature_set)
+  t_both_dt[!is.na(t_stat)],
+  aes(x = feature_set, y = t_stat, color = feature_set)
 ) +
-  geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
-  geom_jitter(
-    alpha = .2,
-    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.5),
-    size = .5
-  ) +
-  facet_grid(`Event Type` ~ ., scales = "free_y") +
+  geom_hline(yintercept = t_crit, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+  geom_violin(alpha = .5) +
+  geom_jitter(alpha = .2, width = 0.2, size = .5) +
+  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
   theme_bw() +
-  labs(x = NULL, y = "CV R² (PSI scale)")
-ggsave(file.path(plot_dir_ev, "cv_rsq_distribution.pdf"), width = 5, height = 4)
+  labs(
+    title = "Within-event t-statistic: real R2 vs rotated distribution (in-sample and CV)",
+    x = NULL,
+    y = "t-statistic ((real R2 - mean rotated) / (SD rotated / sqrt(n)))",
+    caption = sprintf(
+      paste(
+        "Red line: one-tailed t critical value alpha=0.05, df=9 (t=%.3f).",
+        "CV is primary. In-sample vs CV comparison is diagnostic:",
+        "in-sample > CV = genuine signal amplified by overfitting;",
+        "in-sample < CV = rotated models also overfit (fingerprint confound).",
+        "Positive result: distribution bulk above red line."
+      ),
+      t_crit
+    )
+  )
+ggsave(file.path(plot_dir_ev, "tstat_rsq.pdf"), width = 14, height = 4)
 ```
 
+## 3. Biological context of significant events
+
+The following analyses ask *which events* show the strongest epigenetic signal and *why*, probing whether significance associates with biologically meaningful properties.
+
+```{r variability-significance}
+# Research question: do High-Variability events show a higher rotation-test
+# significance rate than Low-Variability events? This directly tests whether
+# epigenetic regulation is stronger for dynamically regulated splicing.
+
+emp_p_var_dt <- copy(emp_p_dt)
+emp_p_var_dt[
+  event_dt[, .(ID, Variability)],
+  on = "ID",
+  Variability := Variability
+]
+emp_p_var_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+emp_p_var_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+var_sig_dt <- emp_p_var_dt[
+  !is.na(emp_p) & !is.na(Variability),
+  .(
+    n_sig = sum(sig, na.rm = TRUE),
+    n_total = .N,
+    pct_sig = 100 * mean(sig, na.rm = TRUE)
+  ),
+  by = .(Variability, `Event Type`, feature_set, lambda_selection)
+]
+
+ggplot(var_sig_dt, aes(x = Variability, y = pct_sig, fill = feature_set)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = sprintf("%d/%d", n_sig, n_total)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 3
+  ) +
+  facet_grid(`Event Type` ~ lambda_selection) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Rotation test significance rate by splicing variability group",
+    x = "Variability",
+    y = "% events with emp p <= 1/11",
+    fill = "Feature set",
+    caption = "CV R2 only. emp p <= 1/11 is the minimum achievable with 10 rotations. Positive result: High-Variability bars taller than Low-Variability, supporting epigenetic control of dynamic splicing."
+  )
+ggsave(
+  file.path(plot_dir_ev, "variability_significance.pdf"),
+  width = 8,
+  height = 4
+)
+```
+
+```{r n-robust-significance}
+# Research question: do events with more robustly selected features (n_robust)
+# tend to pass the rotation test? n_robust counts features present in all CV
+# folds; higher n_robust = more stable, confident model.
+
+nrob_sig_dt <- copy(emp_p_dt)
+nrob_sig_dt[
+  event_summary_table[
+    response_type == "real",
+    .(ID, feature_set, lambda_selection, n_robust)
+  ],
+  on = .(ID, feature_set, lambda_selection),
+  n_robust := n_robust
+]
+nrob_sig_dt[
+  event_dt[, .(ID, Variability)],
+  on = "ID",
+  Variability := Variability
+]
+nrob_sig_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+nrob_sig_dt[
+  !is.na(emp_p),
+  sig_label := fifelse(sig, "Significant (p <= 1/11)", "Not significant")
+]
+nrob_sig_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# Events with n_robust == 0 (no model) will not appear in emp_p_dt; filter is defensive
+ggplot(
+  nrob_sig_dt[!is.na(n_robust) & n_robust > 0 & !is.na(sig_label)],
+  aes(x = sig_label, y = n_robust, fill = sig_label)
+) +
+  geom_violin(alpha = .5, quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(alpha = .15, width = 0.2, size = .5) +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_manual(
+    values = c(
+      "Significant (p <= 1/11)" = "#D55E00",
+      "Not significant" = "#56B4E9"
+    ),
+    guide = "none"
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Robust feature count by rotation test outcome",
+    x = NULL,
+    y = "n_robust (features selected in all CV folds)",
+    caption = "CV R2 only. Events with n_robust = 0 (no model) excluded. Positive result: Significant events shifted toward higher n_robust, confirming that more stable models pass the rotation test."
+  )
+ggsave(
+  file.path(plot_dir_ev, "nrobust_significance.pdf"),
+  width = 16,
+  height = 6
+)
+```
+
+```{r feature-consistency}
+# Research question: how consistently is each feature selected across CV folds?
+# Computed on real-PSI models only; fold "0" (full-training fit) excluded since
+# it is not a cross-validation fold.
+# High mean consistency = features robustly selected regardless of held-out tissue.
+
+feat_cons_dt <- feature_table[
+  response_type == "real" & fold != "0",
+  .(n_folds_selected = uniqueN(fold)),
+  by = .(ID, wflow_id, feature_set, lambda_selection, feature, `Event Type`)
+]
+total_folds_dt <- feature_table[
+  response_type == "real" & fold != "0",
+  .(total_folds = uniqueN(fold)),
+  by = .(ID, wflow_id, lambda_selection)
+]
+feat_cons_dt[
+  total_folds_dt,
+  on = .(ID, wflow_id, lambda_selection),
+  frac_folds := n_folds_selected / total_folds
+]
+
+per_event_cons_dt <- feat_cons_dt[,
+  .(mean_consistency = mean(frac_folds, na.rm = TRUE)),
+  by = .(ID, feature_set, lambda_selection, `Event Type`)
+]
+per_event_cons_dt[
+  event_dt[, .(ID, Variability)],
+  on = "ID",
+  Variability := Variability
+]
+per_event_cons_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+per_event_cons_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+ggplot(
+  per_event_cons_dt[!is.na(mean_consistency)],
+  aes(x = mean_consistency, fill = feature_set)
+) +
+  geom_histogram(bins = 20, position = "dodge", alpha = .7) +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "CV fold consistency of selected features (real PSI models)",
+    x = "Mean fraction of folds selecting each feature",
+    y = "Number of events",
+    fill = "Feature set",
+    caption = "Fold 0 (full-training fit) excluded. Mean computed over all features per event. Events concentrated near 1.0 = features selected in nearly every fold (robust); near 0 = unstable, fold-sensitive selection."
+  )
+ggsave(
+  file.path(plot_dir_ev, "feature_consistency.pdf"),
+  width = 16,
+  height = 6
+)
+```
+
+If significant events consistently have more robust features, this suggests that the rotation test is not just detecting noise but events where epigenetic marks provide a stable, cross-tissue predictive signal.
+
+```{r real-vs-rotated-n-robust}
+# Research question: do real PSI models robustly select more features than
+# rotated (permutation) controls? More robust features in real models supports
+# genuine epigenetic signal rather than overfitting to PSI structure.
+
+nrob_comp_dt <- event_summary_table[
+  !is.na(n_robust),
+  .(
+    ID,
+    feature_set,
+    lambda_selection,
+    `Event Type`,
+    Variability,
+    response_type,
+    n_robust
+  )
+]
+nrob_comp_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+nrob_comp_dt[,
+  response_label := factor(
+    fifelse(response_type == "real", "Real PSI", "Rotated PSI"),
+    levels = c("Real PSI", "Rotated PSI")
+  )
+]
+nrob_comp_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+ggplot(
+  nrob_comp_dt,
+  aes(x = response_label, y = n_robust, fill = response_label)
+) +
+  geom_violin(alpha = .5, quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(alpha = .1, width = 0.2, size = .3) +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_manual(
+    values = c("Real PSI" = "#D55E00", "Rotated PSI" = "#56B4E9"),
+    guide = "none"
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Robust feature count: real PSI vs rotated controls",
+    x = NULL,
+    y = "n_robust (features selected in all CV folds)",
+    caption = "Includes events with n_robust = 0 (no model built). Positive result: Real PSI distribution shifted right vs Rotated, indicating more features are robustly selected when predicting genuine splicing."
+  )
+ggsave(
+  file.path(plot_dir_ev, "nrobust_real_vs_rotated.pdf"),
+  width = 16,
+  height = 6
+)
+```
+
+Feature selection consistency across folds measures whether the same marks are chosen regardless of which tissue group is held out. Events with high consistency provide more reliable targets for follow-up validation.
+
+```{r lambda-switching}
+# Research question: are rotation-test results stable across lambda selection rules?
+# Concordance (both sig or both non-sig) suggests robust signal.
+# "min only" events = sensitive to regularisation; "1se only" = rare edge case.
+
+lambda_wide_dt <- dcast(
+  emp_p_dt[!is.na(emp_p)],
+  ID + feature_set + `Event Type` ~ lambda_selection,
+  value.var = "sig"
+)
+setnames(lambda_wide_dt, c("min", "1se"), c("sig_min", "sig_1se"))
+lambda_wide_dt[
+  event_dt[, .(ID, Variability)],
+  on = "ID",
+  Variability := Variability
+]
+lambda_wide_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+
+lambda_wide_dt[,
+  lambda_category := fcase(
+    sig_min & sig_1se   , "Both significant"    ,
+    sig_min & !sig_1se  , "min only"            ,
+    !sig_min & sig_1se  , "1se only"            ,
+    !sig_min & !sig_1se , "Neither significant"
+  )
+]
+lambda_wide_dt[,
+  lambda_category := factor(
+    lambda_category,
+    levels = c(
+      "Both significant",
+      "min only",
+      "1se only",
+      "Neither significant"
+    )
+  )
+]
+lambda_wide_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+lambda_summary <- lambda_wide_dt[
+  !is.na(lambda_category),
+  .(n = .N),
+  by = .(`Event Type`, Variability, feature_set, lambda_category)
+]
+lambda_summary[,
+  pct := 100 * n / sum(n),
+  by = .(`Event Type`, Variability, feature_set)
+]
+
+ggplot(lambda_summary, aes(x = feature_set, y = pct, fill = lambda_category)) +
+  geom_col(position = "stack") +
+  geom_text(
+    aes(label = sprintf("%.0f%%\n(n=%d)", pct, n)),
+    position = position_stack(vjust = 0.5),
+    size = 3
+  ) +
+  facet_grid(Variability ~ `Event Type`) +
+  scale_fill_manual(
+    values = c(
+      "Both significant" = "#D55E00",
+      "min only" = "#E69F00",
+      "1se only" = "#56B4E9",
+      "Neither significant" = "#999999"
+    )
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Lambda rule concordance in rotation test significance",
+    x = "Feature set",
+    y = "% of events",
+    fill = "Lambda significance",
+    caption = "CV R2 only, emp p <= 1/11. Large 'Both significant' segment = results robust to regularisation choice; large 'min only' segment = signal is sensitive to regularisation and should be interpreted cautiously."
+  )
+ggsave(file.path(plot_dir_ev, "lambda_switching.pdf"), width = 8, height = 4)
+```
+
+## 4. Epigenetic mark-level analysis
+
+Which specific histone marks drive prediction in Epigenetic Only models? Comparing real vs rotated mark usage tests whether the mark composition reflects genuine epigenetic–splicing associations or chance feature selection. Events where the same marks are selected for both real and rotated PSI are less convincing.
+
 ```{r plot-mark-counts}
-# NOTE: activeChromHMM, event_gr, downstream_gr, upstream_gr must be
-# loaded in the session (defined in earlier notebooks 01-08).
+# NOTE: activeChromHMM must be loaded in the session (defined in earlier notebooks 01-08).
+# Research question: which epigenetic marks are robustly selected in Epigenetic Only models?
+# Does mark usage differ between real PSI and rotated controls?
+# Similar mark profiles for real and rotated would imply chance selection.
 activeChromHMM_dt <- data.table(
   region = activeChromHMM$name,
   chrom_state = activeChromHMM$chrom_state,
@@ -353,21 +1143,37 @@ coef_table[
   )
 ]
 
+# Both real and rotated rows included; expression_bias was propagated from the
+# real-PSI model for each event, so the Epigenetic Only filter applies to both.
+# feature_set kept to distinguish local (event-overlapping) vs short/long window marks.
 err_dt <- coef_table[
-  mark != "(Intercept)" &
-    expression_bias == "Epigenetic Only" &
-    response_type == "real",
+  mark != "(Intercept)" & expression_bias == "Epigenetic Only",
   .(mark = unique(mark)),
-  by = .(ID, response, response_type, `Event Type`, Variability)
+  by = .(
+    ID,
+    rotation_rank,
+    feature_set,
+    response_type,
+    `Event Type`,
+    Variability,
+    lambda_selection
+  )
 ][,
   {
-    counts <- .SD[, .(count = .N), by = response][, count]
+    counts <- .SD[, .(count = uniqueN(ID)), by = rotation_rank][, count]
     .(
       mean_count = mean(counts),
-      sd_count = sd(counts) / sqrt(uniqueN(response))
+      sd_count = sd(counts) / sqrt(uniqueN(rotation_rank))
     )
   },
-  by = .(`Event Type`, response_type, mark, Variability)
+  by = .(
+    `Event Type`,
+    feature_set,
+    response_type,
+    mark,
+    Variability,
+    lambda_selection
+  )
 ]
 
 err_dt[,
@@ -379,7 +1185,7 @@ err_dt[,
 err_dt[,
   Variability := factor(
     sub(" Variability", "", Variability, fixed = TRUE),
-    levels = c("Low", "High")
+    levels = c("High", "Low")
   )
 ]
 err_dt[, `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))]
@@ -407,13 +1213,998 @@ ggplot(err_dt, aes(x = Response, y = mean_count, fill = mark)) +
     width = .7,
     position = position_dodge(.9)
   ) +
-  facet_wrap(`Event Type` ~ Variability, scales = "free_y", nrow = 2) +
-  labs(y = NULL, x = NULL, fill = "Mark") +
+  facet_grid(
+    Variability + `Event Type` ~ feature_set + lambda_selection,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Epigenetic mark usage in Epigenetic Only models: real vs rotated",
+    y = "Mean number of events selecting mark",
+    x = NULL,
+    fill = "Mark",
+    caption = "Positive result: Real bar taller than Rotated for specific marks. Compare local vs short/long: local marks are event-overlapping, long marks include distal regulatory elements."
+  ) +
   theme_bw() +
   scale_fill_manual(values = plot_colors) +
   theme(
     legend.position = "bottom",
     strip.background = element_rect(fill = "white")
   )
-ggsave(file.path(plot_dir_ev, "mark_counts_error.pdf"), width = 6.1, height = 4)
+ggsave(file.path(plot_dir_ev, "mark_counts_error.pdf"), width = 18, height = 10)
+```
+
+### Rotation-test stratified mark analysis
+
+The overall Real > Rotated gap in mark counts conflates two groups: events that **pass** the rotation test (genuine epigenetic–splicing signal) and events that **fail** (likely fingerprint confound). Only the passing group has trustworthy feature associations. If mark profiles are identical between the two groups, all selection is fingerprint-driven. Different profiles support causal interpretation for the significant subset.
+
+```{r mark-counts-rotation-stratified}
+# Research question: do events passing the rotation test select different marks
+# than failing events?
+#
+# Interpretation guide:
+#   POSITIVE — distinct profiles, mark enriched in passing group:
+#     Specific marks drive genuine epigenetic-splicing associations beyond
+#     fingerprint confound. Feature interpretation trustworthy for the
+#     significant subset.
+#
+#   NULL — similar profiles between groups:
+#     Two indistinguishable explanations at this n:
+#     (a) Fingerprint confound: all mark selection reflects cell-type identity;
+#         passing events beat the test by chance (min achievable p = 1/11 ≈ 9%,
+#         observed 14-15%, only borderline above chance rate).
+#     (b) Genuine signal uses the SAME marks as the fingerprint — mark profile
+#         comparison cannot separate the two; larger n or different design needed.
+#
+#   CONFOUND signal — Protocol/RNA-seq marks enriched in passing group:
+#     Technical RNA-seq protocol effects drive apparent signal rather than
+#     epigenetic regulation. Flag for investigation.
+
+# Collapse rotation test significance to (ID, lambda_selection): significant if
+# any feature_set passes emp_p <= 1/11 (CV R2 only).
+sig_collapse_dt <- emp_p_dt[,
+  .(sig_any = any(sig, na.rm = TRUE)),
+  by = .(ID, lambda_selection)
+]
+sig_collapse_dt[,
+  rotation_outcome := factor(
+    fifelse(sig_any, "Passes rotation test", "Fails rotation test"),
+    levels = c("Passes rotation test", "Fails rotation test")
+  )
+]
+
+coef_real_sig <- coef_table[
+  response_type == "real" &
+    mark != "(Intercept)" &
+    expression_bias == "Epigenetic Only"
+]
+coef_real_sig[
+  sig_collapse_dt,
+  on = .(ID, lambda_selection),
+  rotation_outcome := rotation_outcome
+]
+
+# Per event per feature_set: unique marks selected.
+# Keeping feature_set separates local (event-overlapping) from short/long window marks.
+event_mark_dt <- coef_real_sig[
+  !is.na(rotation_outcome),
+  .(mark = unique(mark)),
+  by = .(
+    ID,
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    rotation_outcome
+  )
+]
+
+# n_group: total events per stratum.
+n_group_dt <- event_mark_dt[,
+  .(n_group = uniqueN(ID)),
+  by = .(
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    rotation_outcome
+  )
+]
+
+err_sig_dt <- event_mark_dt[,
+  .(n_events = uniqueN(ID)),
+  by = .(
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    rotation_outcome,
+    mark
+  )
+]
+err_sig_dt[
+  n_group_dt,
+  on = .(
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    rotation_outcome
+  ),
+  c("n_group", "pct_events") := .(n_group, 100 * n_events / n_group)
+]
+
+err_sig_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+err_sig_dt[, `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))]
+err_sig_dt[, mark := tools::toTitleCase(gsub("_", " ", mark))]
+
+# Fisher's exact test per mark per stratum.
+# Fisher preferred over chi-squared: passing group sizes are small.
+# Null: profiles indistinguishable → fingerprint OR same-mark genuine signal.
+# Significant enrichment in passing group: mark associated beyond fingerprint.
+fisher_dt <- err_sig_dt[,
+  {
+    pass_row <- .SD[rotation_outcome == "Passes rotation test"]
+    fail_row <- .SD[rotation_outcome == "Fails rotation test"]
+    if (nrow(pass_row) > 0L && nrow(fail_row) > 0L) {
+      mat <- matrix(
+        c(
+          pass_row$n_events[1L],
+          pass_row$n_group[1L] - pass_row$n_events[1L],
+          fail_row$n_events[1L],
+          fail_row$n_group[1L] - fail_row$n_events[1L]
+        ),
+        nrow = 2,
+        dimnames = list(c("selected", "not"), c("passes", "fails"))
+      )
+      res <- fisher.test(mat)
+      .(p_value = res$p.value, odds_ratio = unname(res$estimate))
+    } else {
+      .(p_value = NA_real_, odds_ratio = NA_real_)
+    }
+  },
+  by = .(`Event Type`, Variability, feature_set, lambda_selection, mark)
+]
+fisher_dt[, p_adj := p.adjust(p_value, method = "BH")]
+fisher_dt[,
+  sig_label := fcase(
+    p_adj < 0.001 , "***" ,
+    p_adj < 0.01  , "**"  ,
+    p_adj < 0.05  , "*"   ,
+    p_adj < 0.1   , "."   ,
+    default = ""
+  )
+]
+print(fisher_dt[order(
+  `Event Type`,
+  Variability,
+  feature_set,
+  lambda_selection,
+  p_adj
+)])
+
+# Annotate passing-group bars with significance label (stars above bar).
+plot_sig_dt <- err_sig_dt[rotation_outcome == "Passes rotation test"][
+  fisher_dt[, .(
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    mark,
+    sig_label
+  )],
+  on = .(`Event Type`, Variability, feature_set, lambda_selection, mark)
+]
+
+sig_plot_colors <- setNames(
+  rep("dark grey", err_sig_dt[, uniqueN(mark)]),
+  err_sig_dt[, unique(mark)]
+)
+for (name in names(hex_colors)) {
+  inds <- startsWith(names(sig_plot_colors), name)
+  sig_plot_colors[inds] <- hex_colors[name]
+}
+
+ggplot(err_sig_dt, aes(x = rotation_outcome, y = pct_events, fill = mark)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    data = plot_sig_dt[sig_label != ""],
+    aes(label = sig_label, y = pct_events + 3),
+    position = position_dodge(0.9),
+    size = 3,
+    vjust = 0
+  ) +
+  facet_grid(
+    Variability + `Event Type` ~ feature_set + lambda_selection,
+    scales = "free_y"
+  ) +
+  scale_fill_manual(values = sig_plot_colors) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  ) +
+  labs(
+    title = "Mark composition by rotation test outcome (Epigenetic Only, real PSI)",
+    x = NULL,
+    y = "% of events in group selecting mark",
+    fill = "Mark",
+    caption = paste(
+      "Stars above Passes bars: Fisher's exact test, BH-adjusted (. p<0.1, * p<0.05, ** p<0.01).",
+      "Null (no stars, similar profiles): fingerprint confound explains selection, OR genuine",
+      "signal uses same marks as fingerprint -- indistinguishable at this n.",
+      "Significant enrichment in passing group: specific mark beyond fingerprint confound."
+    )
+  )
+ggsave(
+  file.path(plot_dir_ev, "mark_counts_rotation_stratified.pdf"),
+  width = 18,
+  height = 10
+)
+```
+
+### TSS proximity of promoter-mark-selected events
+
+H3K4me3 and H3K27ac are promoter-associated marks. If events where these marks are robustly
+selected are systematically closer to the TSS than unselected events, the mark selection may
+reflect promoter chromatin contaminating the feature window rather than event-level regulation.
+The `local` feature set (event-overlapping only) is the critical comparator: if H3K4me3 is
+selected even in `local`, the mark genuinely overlaps the exon/intron body. Selection in
+`short`/`long` windows near TSS is more likely window contamination.
+
+```{r tss-proximal}
+# distance_TSS: genomic distance from event to nearest TSS.
+# Event-level property — same across all samples. Take first non-NA per event.
+tss_dist_dt <- aggregated_dt[
+  !is.na(distance_TSS),
+  .(
+    distance_TSS = distance_TSS[1L],
+    abs_distance_TSS = abs(distance_TSS[1L]),
+    `Event Type` = `Event Type`[1L]
+  ),
+  by = ID
+]
+tss_dist_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# Identify events with H3K4me3 and/or H3K27ac robustly selected.
+# Real PSI models only; all expression_bias categories (H3K4me3 may drive expression bias).
+# Stratify by feature_set and lambda_selection.
+promoter_events <- coef_table[
+  response_type == "real" &
+    mark %in% c("H3K4me3", "H3K27ac"),
+  .(
+    has_H3K4me3 = any(mark == "H3K4me3"),
+    has_H3K27ac = any(mark == "H3K27ac"),
+    has_either = TRUE,
+    expression_bias = expression_bias[1L]
+  ),
+  by = .(ID, feature_set, lambda_selection)
+]
+
+# Reference: all events with a fitted real-PSI model — one set per feature_set x lambda_selection.
+# Use cross-join to avoid missing events that appear in coef_table for some combos but not all.
+modeled_ids <- event_summary_table[
+  response_type == "real" & has_model == TRUE,
+  unique(ID)
+]
+fs_ls_combos <- unique(promoter_events[, .(feature_set, lambda_selection)])
+
+combined_dt <- rbindlist(
+  lapply(seq_len(nrow(fs_ls_combos)), function(i) {
+    fs <- fs_ls_combos$feature_set[i]
+    ls <- fs_ls_combos$lambda_selection[i]
+    sel_ids <- promoter_events[
+      feature_set == fs & lambda_selection == ls & has_either == TRUE,
+      unique(ID)
+    ]
+    tss_dist_dt[
+      ID %in% modeled_ids,
+      .(
+        ID,
+        `Event Type`,
+        abs_distance_TSS,
+        distance_TSS,
+        feature_set = fs,
+        lambda_selection = ls,
+        group = fifelse(
+          ID %in% sel_ids,
+          "H3K4me3 or H3K27ac selected",
+          "Not selected"
+        )
+      )
+    ]
+  })
+)
+combined_dt[,
+  group := factor(
+    group,
+    levels = c("H3K4me3 or H3K27ac selected", "Not selected")
+  )
+]
+combined_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# --- Plot 1: Density of abs(distance_TSS), log-scale ---
+ggplot(
+  combined_dt[!is.na(abs_distance_TSS)],
+  aes(x = abs_distance_TSS, fill = group, color = group)
+) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10() +
+  scale_fill_manual(
+    values = c(
+      "H3K4me3 or H3K27ac selected" = "#D55E00",
+      "Not selected" = "#56B4E9"
+    ),
+    name = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      "H3K4me3 or H3K27ac selected" = "#D55E00",
+      "Not selected" = "#56B4E9"
+    ),
+    guide = "none"
+  ) +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "TSS proximity: events with promoter marks selected vs not",
+    x = "abs(distance_TSS) [bp, log10]",
+    y = "Density",
+    caption = paste(
+      "H3K4me3 and H3K27ac are promoter-associated marks.",
+      "Left shift = selected events closer to TSS than unselected.",
+      "local feature set: mark overlaps exon body — strongest evidence of event-level regulation.",
+      "short/long: flanking window may capture nearby promoter, not the event itself.",
+      "RI events are often first-intron; TSS proximity expected and not necessarily a confound."
+    )
+  )
+ggsave(
+  file.path(plot_dir_ev, "tss_proximal_density.pdf"),
+  width = 16,
+  height = 5
+)
+
+# --- Plot 2: % of events within distance thresholds ---
+thresholds <- c(1000L, 2000L, 5000L, 10000L)
+thresh_dt <- rbindlist(lapply(thresholds, function(th) {
+  combined_dt[
+    !is.na(abs_distance_TSS),
+    .(
+      pct_proximal = 100 * mean(abs_distance_TSS <= th),
+      n_events = .N,
+      threshold_bp = th
+    ),
+    by = .(`Event Type`, feature_set, lambda_selection, group)
+  ]
+}))
+thresh_dt[, threshold_label := paste0("<= ", threshold_bp / 1000L, " kb")]
+thresh_dt[,
+  threshold_label := factor(
+    threshold_label,
+    levels = paste0("<= ", thresholds / 1000L, " kb")
+  )
+]
+
+ggplot(
+  thresh_dt,
+  aes(x = threshold_label, y = pct_proximal, fill = group)
+) +
+  geom_col(position = "dodge") +
+  geom_text(
+    aes(label = sprintf("%.0f%%\n(n=%d)", pct_proximal, n_events)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.2,
+    size = 2.3
+  ) +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_manual(
+    values = c(
+      "H3K4me3 or H3K27ac selected" = "#D55E00",
+      "Not selected" = "#56B4E9"
+    ),
+    name = NULL
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "% of events within distance threshold of TSS",
+    x = "Distance threshold",
+    y = "% of events"
+  )
+ggsave(
+  file.path(plot_dir_ev, "tss_proximal_thresholds.pdf"),
+  width = 16,
+  height = 5
+)
+
+# --- Wilcoxon test: are selected events closer to TSS? ---
+# One-tailed: alternative = "less" tests whether selected events are *closer*.
+wilcox_dt <- combined_dt[
+  !is.na(abs_distance_TSS),
+  {
+    sel <- .SD[group == "H3K4me3 or H3K27ac selected", abs_distance_TSS]
+    nosel <- .SD[group == "Not selected", abs_distance_TSS]
+    if (length(sel) >= 3L && length(nosel) >= 3L) {
+      wt <- wilcox.test(sel, nosel, alternative = "less")
+      .(
+        p_value = wt$p.value,
+        median_sel_kb = round(median(sel) / 1000, 1),
+        median_ref_kb = round(median(nosel) / 1000, 1),
+        n_sel = length(sel),
+        n_ref = length(nosel)
+      )
+    } else {
+      .(
+        p_value = NA_real_,
+        median_sel_kb = NA_real_,
+        median_ref_kb = NA_real_,
+        n_sel = length(sel),
+        n_ref = length(nosel)
+      )
+    }
+  },
+  by = .(`Event Type`, feature_set, lambda_selection)
+]
+wilcox_dt[, p_adj := p.adjust(p_value, method = "BH")]
+wilcox_dt[,
+  sig_label := fcase(
+    p_adj < 0.001 , "***" ,
+    p_adj < 0.01  , "**"  ,
+    p_adj < 0.05  , "*"   ,
+    p_adj < 0.1   , "."   ,
+    default = "ns"
+  )
+]
+print(wilcox_dt[order(`Event Type`, feature_set, lambda_selection)])
+```
+
+Interpretation guide:
+- **`local` feature set, H3K4me3, no TSS enrichment**: mark genuinely overlaps exon/intron; event-level regulation plausible.
+- **`short`/`long` feature set, significant TSS enrichment**: window captures nearby promoter; selection may be a positional confound. Add as Discussion note; consider TSS-distance filter (e.g., exclude events within 5 kb of TSS from H3K4me3/H3K27ac interpretation).
+- **RI events near TSS**: first-intron retention is common and biologically expected near promoters; TSS proximity alone does not disqualify RI H3K4me3 associations.
+
+## 5. PSI variability and model performance
+
+Does the magnitude of PSI change across samples predict model quality? Events with larger PSI range provide more signal for feature learning but may also show stronger expression bias (gene expression co-varies with large PSI shifts).
+
+```{r dpsi-analysis}
+# Research question: do high-dPSI events yield better models and more expression bias?
+#
+# NOTE: aggregated_dt is pre-filtered to variable splicing events — all events have
+# PSI range > 0.25. Absolute cutoffs (e.g., "stable <= 0.1") produce empty bins.
+# Use quantile-based tertile bins to compare within the observed range.
+#
+# Interpretation guide:
+#   HIGH dPSI → more models built + higher CV R²:
+#     Signal strength drives model quality. Supports genuine epigenetic regulation.
+#
+#   NO dPSI effect on R² (flat slope in scatter):
+#     Marks capture static cell-type identity, not dynamic regulation intensity.
+#     All events are already "high change"; variation within that range is irrelevant.
+#
+#   HIGH dPSI → more expression bias:
+#     Gene expression co-varies with large PSI shifts (differentiation state), confounding
+#     epigenetic attribution. "Epigenetic Only" label may be unreliable for top-dPSI events.
+#
+#   HIGH and LOW Variability groups show similar PSI range:
+#     The "High/Low Variability" classification is NOT based on PSI range magnitude —
+#     it likely reflects relative between-tissue vs. within-tissue variation. Both groups
+#     fully overlap in absolute PSI range; the label captures a different biological axis.
+
+# Per-event PSI statistics.
+psi_var_dt <- aggregated_dt[
+  !is.na(PSI),
+  .(
+    sd_psi = sd(PSI),
+    range_psi = max(PSI) - min(PSI),
+    n_samples = .N,
+    `Event Type` = `Event Type`[1L],
+    Variability = Variability[1L]
+  ),
+  by = ID
+]
+psi_var_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# Variability in aggregated_dt uses "High"/"Low" (not "High Variability"/"Low Variability").
+ggplot(
+  psi_var_dt[!is.na(`Event Type`)],
+  aes(x = Variability, y = range_psi, fill = Variability)
+) +
+  geom_violin(alpha = 0.5, quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(alpha = 0.1, width = 0.2, size = 0.3) +
+  facet_wrap(~`Event Type`) +
+  scale_fill_manual(
+    values = c("High" = "#D55E00", "Low" = "#56B4E9"),
+    guide = "none"
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "PSI range by variability group (alignment check)",
+    x = NULL,
+    y = "PSI range (max - min)",
+    caption = paste(
+      "Range = max(PSI) - min(PSI) across IHEC samples ~ max pairwise dPSI.",
+      "All events have range > 0.25 (pre-filtered). High/Low Variability groups overlap",
+      "almost completely -- the Variability label is not based on PSI range magnitude."
+    )
+  )
+ggsave(
+  file.path(plot_dir_ev, "psi_range_distribution.pdf"),
+  width = 6,
+  height = 4
+)
+
+# Compute tertile bins on psi_var_dt (one row per event) BEFORE cartesian join.
+# Use -Inf/Inf as outer boundaries to avoid "breaks not unique" from probs=c(0,1) matching
+# the min/max values. Epsilon guard ensures strict monotonicity if q1==q2.
+{
+  dpsi_q <- quantile(
+    psi_var_dt$range_psi,
+    probs = c(1 / 3, 2 / 3),
+    na.rm = TRUE
+  )
+  if (dpsi_q[[1L]] >= dpsi_q[[2L]]) {
+    dpsi_q[[2L]] <- dpsi_q[[1L]] +
+      .Machine$double.eps * max(1, abs(dpsi_q[[1L]])) * 1e6
+  }
+  psi_var_dt[,
+    dpsi_bin := cut(
+      range_psi,
+      breaks = c(-Inf, dpsi_q[[1L]], dpsi_q[[2L]], Inf),
+      labels = c(
+        sprintf("Low tertile\n(<= %.2f)", dpsi_q[[1L]]),
+        sprintf("Mid tertile\n(%.2f-%.2f)", dpsi_q[[1L]], dpsi_q[[2L]]),
+        sprintf("High tertile\n(> %.2f)", dpsi_q[[2L]])
+      ),
+      include.lowest = TRUE
+    )
+  ]
+}
+
+# Join with all feature_set x lambda_selection combinations for full stratification.
+# allow.cartesian: one psi_var_dt row fans out to (n_feature_sets x n_lambda) rows.
+# dpsi_bin carried through join from psi_var_dt.
+dpsi_model_dt <- psi_var_dt[
+  event_summary_table[
+    response_type == "real",
+    .(
+      ID,
+      feature_set,
+      lambda_selection,
+      has_model,
+      expression_bias,
+      n_robust,
+      mean_cv_rsq
+    )
+  ],
+  on = "ID",
+  allow.cartesian = TRUE,
+  nomatch = NULL
+]
+dpsi_model_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+dpsi_model_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# Model-building rate by dPSI tertile, stratified by Event Type, Variability,
+# feature_set, and lambda_selection.
+model_rate_dt <- dpsi_model_dt[
+  !is.na(dpsi_bin),
+  .(
+    n_model = sum(has_model, na.rm = TRUE),
+    n_total = .N,
+    pct_model = 100 * mean(has_model, na.rm = TRUE)
+  ),
+  by = .(`Event Type`, Variability, feature_set, lambda_selection, dpsi_bin)
+]
+ggplot(model_rate_dt, aes(x = dpsi_bin, y = pct_model, fill = dpsi_bin)) +
+  geom_col() +
+  geom_text(
+    aes(label = sprintf("%d/%d", n_model, n_total)),
+    vjust = -0.3,
+    size = 2.5
+  ) +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_brewer(palette = "OrRd", guide = "none") +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Model-building rate by PSI range tertile",
+    x = "PSI range tertile",
+    y = "% events with model (n_robust > 0)"
+  )
+ggsave(file.path(plot_dir_ev, "dpsi_model_rate.pdf"), width = 16, height = 8)
+
+# Continuous scatter: range_psi vs mean CV R² with loess trend.
+# More informative than bins given the pre-filtered range (all > 0.25).
+# Null: flat or noisy slope — PSI range within this range doesn't predict model quality.
+# Positive: upward slope — higher absolute change → better epigenetic predictability.
+ggplot(
+  dpsi_model_dt[has_model == TRUE & !is.na(mean_cv_rsq)],
+  aes(x = range_psi, y = mean_cv_rsq, color = Variability)
+) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(aes(group = Variability), method = "loess", se = FALSE) +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
+  scale_color_manual(values = c("High" = "#D55E00", "Low" = "#56B4E9")) +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "PSI range vs CV R2",
+    x = "PSI range (max - min)",
+    y = "Mean CV R2",
+    caption = paste(
+      "Loess trend per Variability group. Null: flat slope within the pre-filtered high-change range.",
+      "All events have range > 0.25; variation above that threshold may not drive model quality."
+    )
+  )
+ggsave(file.path(plot_dir_ev, "dpsi_cv_rsq.pdf"), width = 16, height = 5)
+
+# Expression bias by dPSI tertile.
+# High-dPSI events may show more expression bias if gene expression co-varies
+# with large PSI shifts (e.g., differentiation).
+bias_dt <- dpsi_model_dt[
+  has_model == TRUE & !is.na(dpsi_bin) & !is.na(expression_bias),
+  .(n = .N),
+  by = .(
+    `Event Type`,
+    Variability,
+    feature_set,
+    lambda_selection,
+    dpsi_bin,
+    expression_bias
+  )
+][,
+  pct := 100 * n / sum(n),
+  by = .(`Event Type`, Variability, feature_set, lambda_selection, dpsi_bin)
+]
+ggplot(bias_dt, aes(x = dpsi_bin, y = pct, fill = expression_bias)) +
+  geom_col(position = "stack") +
+  geom_text(
+    aes(label = sprintf("%.0f%%\n(n=%d)", pct, n)),
+    position = position_stack(vjust = 0.5),
+    size = 2.5
+  ) +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_manual(
+    values = c("Epigenetic Only" = "#56B4E9", "Expression Bias" = "#E69F00"),
+    name = "Expression bias"
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Expression bias by PSI range tertile (events with models)",
+    x = "PSI range tertile",
+    y = "% of events",
+    caption = "Expression Bias = gene_expression feature in all CV folds."
+  )
+ggsave(
+  file.path(plot_dir_ev, "dpsi_expression_bias.pdf"),
+  width = 16,
+  height = 8
+)
+```
+
+## 6. Inter-model feature variation
+
+Why do individual event models differ from each other? Coherent groups of events sharing the same marks would imply shared epigenetic regulatory programs. Idiosyncratic, uncorrelated mark selection would support fingerprint confound.
+
+```{r feature-heatmap}
+# Research question: is mark selection structured across events, or random?
+#
+# Interpretation guide:
+#   COHERENT CLUSTERS (events group by mark pattern in heatmap):
+#     Shared epigenetic programs drive splicing prediction for groups of events.
+#     Supports genuine regulatory logic: different chromatin contexts predict
+#     splicing in different genomic contexts (e.g., promoter vs. enhancer regulated).
+#
+#   NO CLUSTER STRUCTURE (scattered heatmap):
+#     Feature selection is idiosyncratic — no shared regulatory logic across events.
+#     Consistent with fingerprint confound: marks selected via cell-type correlation,
+#     not because of event-specific epigenetic regulation.
+#
+#   ALL-POSITIVE CO-OCCURRENCE MATRIX (observed result):
+#     No negative correlations even between biologically antagonistic marks
+#     (H3K27ac active vs H3K27me3 repressive, r=0.65). This is a hallmark of
+#     fingerprint confound: all marks correlate with cell-type identity, so
+#     events where the model learns cell-type structure select ALL marks regardless
+#     of their biological antagonism. A genuine regulatory signal would show
+#     negative correlation between active and repressive marks (mutually exclusive
+#     chromatin states at the same locus).
+#     Protocol mRNA.Seq = Protocol total.RNA.Seq at r=1.00: these are duplicate
+#     features (likely same numerical values), not independent marks.
+#
+#   MIXED COEFFICIENT SIGN (same mark → + in some events, − in others):
+#     Mark effect is context-dependent. H3K27ac might activate exon inclusion in
+#     one locus and repress it in another, reflecting local regulatory architecture.
+#     Consistent sign = universal association; mixed sign = locus-specific effect.
+
+# All real Epigenetic Only models — stratified by Event Type, feature_set, lambda_selection.
+hm_coef_dt <- coef_table[
+  response_type == "real" &
+    expression_bias == "Epigenetic Only" &
+    mark != "(Intercept)"
+]
+hm_coef_dt[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+hm_coef_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+
+# --- Coefficient sign distribution -------------------------------------------
+# Stratified by Event Type (SE vs RI), feature_set (local/short/long),
+# lambda_selection (min/1se), Variability (High/Low).
+sign_dt <- hm_coef_dt[,
+  .(n_pos = sum(coef > 0), n_neg = sum(coef < 0)),
+  by = .(mark, `Event Type`, Variability, feature_set, lambda_selection)
+]
+sign_dt[, `:=`(
+  pct_pos = 100 * n_pos / (n_pos + n_neg),
+  pct_neg = 100 * n_neg / (n_pos + n_neg)
+)]
+sign_dt[, mark := tools::toTitleCase(gsub("_", " ", mark))]
+sign_long <- melt(
+  sign_dt,
+  id.vars = c(
+    "mark",
+    "Event Type",
+    "Variability",
+    "feature_set",
+    "lambda_selection"
+  ),
+  measure.vars = c("pct_pos", "pct_neg"),
+  variable.name = "direction",
+  value.name = "pct"
+)
+sign_long[,
+  direction := fifelse(
+    direction == "pct_pos",
+    "Positive (+PSI)",
+    "Negative (-PSI)"
+  )
+]
+
+ggplot(
+  sign_long,
+  aes(x = reorder(mark, pct), y = pct, fill = direction)
+) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  facet_grid(Variability + `Event Type` ~ feature_set + lambda_selection) +
+  scale_fill_manual(
+    values = c("Positive (+PSI)" = "#D55E00", "Negative (-PSI)" = "#56B4E9"),
+    name = "Coefficient sign"
+  ) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill = NA)) +
+  labs(
+    title = "Coefficient sign per mark (Epigenetic Only)",
+    x = NULL,
+    y = "% of coefficients",
+    caption = paste(
+      "Positive = mark associated with higher PSI (active chromatin -> exon inclusion).",
+      "Negative = mark associated with lower PSI (repressive chromatin -> exon skipping).",
+      "Mixed sign = context-dependent effect; consistent sign = universal association.",
+      "Compare SE vs RI: RI marks may differ (intron retention context differs from exon skipping).",
+      "Compare local vs long: local = event-overlapping marks; long = 500kb window (distal regulatory).",
+      "High vs Low Variability: if sign profiles differ, epigenetic regulation may vary by event dynamics."
+    )
+  )
+ggsave(file.path(plot_dir_ev, "mark_coef_sign.pdf"), width = 18, height = 10)
+
+# --- Mark co-occurrence correlation and sig-event heatmap --------------------
+# Loop over Event Type x feature_set x lambda_selection.
+# For each: binary presence matrix -> correlation heatmap + sig-event heatmap.
+# Expected: all-positive co-occurrence (fingerprint). Any negative correlation
+# between antagonistic marks (H3K27ac/H3K27me3) = evidence of genuine signal.
+
+for (et in to_analyze) {
+  for (fs in c("local", "short", "long")) {
+    for (ls in c("min", "1se")) {
+      hm_sub <- hm_coef_dt[
+        `Event Type` == et & feature_set == fs & lambda_selection == ls
+      ]
+      if (nrow(hm_sub) < 5L) {
+        next
+      }
+
+      hm_dt_sub <- hm_sub[, .(mean_coef = mean(coef)), by = .(ID, mark)]
+      all_ids_sub <- hm_dt_sub[, unique(ID)]
+      all_marks_sub <- hm_dt_sub[, unique(mark)]
+      pres_grid_sub <- CJ(ID = all_ids_sub, mark = all_marks_sub)
+      pres_grid_sub[hm_dt_sub, on = .(ID, mark), selected := 1L]
+      pres_grid_sub[is.na(selected), selected := 0L]
+
+      pres_wide_sub <- dcast(
+        pres_grid_sub,
+        mark ~ ID,
+        value.var = "selected",
+        fill = 0L
+      )
+      pres_mat_sub <- as.matrix(pres_wide_sub[, -1L, with = FALSE])
+      rownames(pres_mat_sub) <- pres_wide_sub$mark
+
+      valid_marks_sub <- rownames(pres_mat_sub)[
+        apply(pres_mat_sub, 1L, var) > 0
+      ]
+      if (length(valid_marks_sub) < 2L) {
+        next
+      }
+
+      cor_mat_sub <- cor(t(pres_mat_sub[valid_marks_sub, ]))
+      hc_cor_sub <- hclust(as.dist(1 - cor_mat_sub), method = "ward.D2")
+      mark_ord_sub <- tools::toTitleCase(
+        gsub("_", " ", rownames(cor_mat_sub)[hc_cor_sub$order])
+      )
+      cor_long_sub <- melt(
+        data.table(mark1 = rownames(cor_mat_sub), cor_mat_sub),
+        id.vars = "mark1",
+        variable.name = "mark2",
+        value.name = "correlation"
+      )
+      cor_long_sub[, `:=`(
+        mark1 = factor(
+          tools::toTitleCase(gsub("_", " ", mark1)),
+          levels = mark_ord_sub
+        ),
+        mark2 = factor(
+          tools::toTitleCase(gsub("_", " ", mark2)),
+          levels = mark_ord_sub
+        )
+      )]
+
+      p_cor_sub <- ggplot(
+        cor_long_sub,
+        aes(x = mark1, y = mark2, fill = correlation)
+      ) +
+        geom_tile(color = "white") +
+        geom_text(aes(label = sprintf("%.2f", correlation)), size = 2.5) +
+        scale_fill_gradient2(
+          low = "#56B4E9",
+          mid = "white",
+          high = "#D55E00",
+          midpoint = 0,
+          limits = c(-1, 1),
+          name = "Pearson r"
+        ) +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(
+          title = sprintf(
+            "Mark co-occurrence: %s | %s | lambda.%s (n=%d)",
+            et,
+            fs,
+            ls,
+            length(all_ids_sub)
+          ),
+          x = NULL,
+          y = NULL,
+          caption = paste(
+            "All-positive = fingerprint confound signature.",
+            "Negative r between active/repressive marks = genuine regulatory signal.",
+            "Protocol mRNA.Seq = Protocol total.RNA.Seq (r=1.00): duplicate features."
+          )
+        )
+      print(p_cor_sub)
+      ggsave(
+        file.path(
+          plot_dir_ev,
+          sprintf("mark_cooccurrence_%s_%s_%s.pdf", tolower(et), fs, ls)
+        ),
+        plot = p_cor_sub,
+        width = 7,
+        height = 6
+      )
+
+      # Sig-event heatmap.
+      sig_ids_sub <- emp_p_dt[
+        sig == TRUE & lambda_selection == ls & ID %in% all_ids_sub,
+        unique(ID)
+      ]
+      pres_sig_sub <- pres_grid_sub[ID %in% sig_ids_sub]
+      if (
+        pres_sig_sub[, uniqueN(ID)] < 3L || pres_sig_sub[, uniqueN(mark)] < 3L
+      ) {
+        next
+      }
+
+      pres_sig_wide_sub <- dcast(
+        pres_sig_sub,
+        mark ~ ID,
+        value.var = "selected",
+        fill = 0L
+      )
+      pres_sig_mat_sub <- as.matrix(pres_sig_wide_sub[, -1L, with = FALSE])
+      rownames(pres_sig_mat_sub) <- pres_sig_wide_sub$mark
+
+      hc_ev_sub <- hclust(
+        dist(t(pres_sig_mat_sub), method = "binary"),
+        method = "ward.D2"
+      )
+      hc_mark_sub <- hclust(
+        dist(pres_sig_mat_sub, method = "binary"),
+        method = "ward.D2"
+      )
+
+      sig_long_sub <- melt(
+        data.table(mark = rownames(pres_sig_mat_sub), pres_sig_mat_sub),
+        id.vars = "mark",
+        variable.name = "ID",
+        value.name = "selected"
+      )
+      sig_long_sub[,
+        ID := factor(
+          ID,
+          levels = colnames(pres_sig_mat_sub)[hc_ev_sub$order]
+        )
+      ]
+      sig_long_sub[,
+        mark := factor(
+          tools::toTitleCase(gsub("_", " ", mark)),
+          levels = tools::toTitleCase(
+            gsub("_", " ", rownames(pres_sig_mat_sub)[hc_mark_sub$order])
+          )
+        )
+      ]
+      # Annotate Variability per event.
+      sig_annot_sub <- hm_sub[
+        ID %in% sig_ids_sub,
+        .(ID = as.character(ID), Variability = as.character(Variability))
+      ][, .SD[1L], by = ID]
+      sig_long_sub[sig_annot_sub, on = "ID", Variability := Variability]
+
+      p_hm_sub <- ggplot(
+        sig_long_sub,
+        aes(x = ID, y = mark, fill = factor(selected))
+      ) +
+        geom_tile(color = "grey85", linewidth = 0.3) +
+        scale_fill_manual(
+          values = c("0" = "white", "1" = "#D55E00"),
+          labels = c("0" = "Not selected", "1" = "Selected"),
+          name = NULL
+        ) +
+        theme_bw() +
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+        labs(
+          title = sprintf(
+            "%d sig events: %s | %s | lambda.%s",
+            pres_sig_sub[, uniqueN(ID)],
+            et,
+            fs,
+            ls
+          ),
+          x = "Events (hierarchical clustering, binary distance)",
+          y = NULL,
+          caption = paste(
+            "Coherent column blocks = shared epigenetic predictor program.",
+            "Scattered = idiosyncratic selection.",
+            "Clusters likely reflect cell-type fingerprint subgroups."
+          )
+        )
+      print(p_hm_sub)
+      ggsave(
+        file.path(
+          plot_dir_ev,
+          sprintf("sig_event_mark_heatmap_%s_%s_%s.pdf", tolower(et), fs, ls)
+        ),
+        plot = p_hm_sub,
+        width = 9,
+        height = 4
+      )
+    }
+  }
+}
 ```

@@ -26,9 +26,9 @@ event_dir <- file.path("processed_data", "event_models")
 # )
 already_computed_ids <- as.integer(
   sub(
-    "^event_summary_(.+)\\.csv\\.gz$",
+    "^(\\d+)_all_metrics\\.csv\\.gz$",
     "\\1",
-    basename(list.files(event_dir, pattern = "^event_summary_.*\\.csv\\.gz$"))
+    basename(list.files(event_dir, pattern = "^\\d+_all_metrics\\.csv\\.gz$"))
   )
 )
 # already_computed_ids <- as.integer(gsub(
@@ -319,13 +319,54 @@ cfg_file <- normalizePath(
 writeLines(as.character(ids_to_build), ids_file)
 saveRDS(.slurm_cfg, cfg_file)
 
-n <- length(ids_to_build)
-system(sprintf(
-  'sbatch --array=0-%d%%10 "%s" "%s" "%s" "%s"',
-  10, #n - 1,
-  normalizePath("09-1-ml-local-array.sh"),
-  ids_file,
-  cfg_file,
-  normalizePath(".")
-))
-message(sprintf("Submitted %d array jobs", n))
+# =============================================================================
+# Phase 2 dispatch: local test OR SLURM array
+# =============================================================================
+# Set n_local_test > 0 to run a small subset locally instead of sbatch.
+#   n_outer_cores — how many events run in parallel
+#   n_inner_cores — workflows parallelised within each event
+#                   (passed as 3rd CLI arg; SLURM always uses 1)
+n_local_test <- 0L # set > 0 to bypass sbatch
+n_outer_cores <- 5L
+n_inner_cores <- 11L
+
+if (n_local_test > 0L) {
+  test_ids <- head(ids_to_build, n_local_test)
+  message(sprintf(
+    "Local test: %d events, %d outer x %d inner cores",
+    length(test_ids),
+    n_outer_cores,
+    n_inner_cores
+  ))
+  dir.create("event_glmnet_logs", showWarnings = FALSE)
+  pbmcapply::pbmclapply(
+    test_ids,
+    function(id) {
+      system2(
+        "Rscript",
+        args = c(
+          shQuote(normalizePath("07-ml-event-glmnet-tidymodels.R")),
+          shQuote(cfg_file),
+          as.character(id),
+          as.character(n_inner_cores)
+        ),
+        wait = TRUE,
+        stdout = file.path("event_glmnet_logs", sprintf("local_%d.log", id)),
+        stderr = file.path("event_glmnet_logs", sprintf("local_%d.err", id))
+      )
+    },
+    mc.cores = n_outer_cores
+  )
+  message("Local test runs complete.")
+} else {
+  n <- length(ids_to_build)
+  system(sprintf(
+    'sbatch --array=0-%d%%20 "%s" "%s" "%s" "%s"',
+    1000, #n - 1L,
+    normalizePath("09-1-ml-local-array.sh"),
+    ids_file,
+    cfg_file,
+    normalizePath(".")
+  ))
+  message(sprintf("Submitted %d array jobs", n))
+}

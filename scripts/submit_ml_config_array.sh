@@ -35,8 +35,8 @@ WANDB_PROJECT="${4:-}" # splicing-ml
 # QOS limitgpus: max 4 GPUs and 80 CPUs concurrently across all running jobs.
 # Per-tier limits are CPU-bound: L=2 (2x32c), M=3 (3x24c), S=4 (4x16c, GPU-bound).
 # These assume only one tier is active; reduce if submitting multiple tiers simultaneously.
-MAX_PARALLEL_L="${MAX_PARALLEL_L:-2}"
-MAX_PARALLEL_M="${MAX_PARALLEL_M:-3}"
+MAX_PARALLEL_L="${MAX_PARALLEL_L:-4}"
+MAX_PARALLEL_M="${MAX_PARALLEL_M:-4}"
 MAX_PARALLEL_S="${MAX_PARALLEL_S:-4}"
 
 mkdir -p "$OUTPUT_ROOT"
@@ -87,12 +87,12 @@ for cfg in configs:
 for key, path in [("L", CONFIG_L), ("M", CONFIG_M), ("S", CONFIG_S)]:
     with open(path, "w", encoding="utf-8") as f:
         for cfg in buckets[key]:
-            if cfg.transcript_filter != "biotype_filtered" or cfg.variability != "both":
+            if cfg.transcript_filter == "biotype_filtered" and cfg.variability == "both":
                 continue
             f.write(f"{cfg.event_type}\t{cfg.transcript_filter}\t{cfg.variability}\t{cfg.group_col}\tclassification\n")
     n_rows = sum(
         1 for cfg in buckets[key]
-        if cfg.transcript_filter != "biotype_filtered" and cfg.variability != "both"
+        if cfg.transcript_filter != "biotype_filtered" or cfg.variability != "both"
     )
     print(f"Tier {key}: {n_rows} jobs -> {path}")
 PY

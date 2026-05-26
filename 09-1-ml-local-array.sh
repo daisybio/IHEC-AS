@@ -3,10 +3,12 @@
 #SBATCH --output=event_glmnet_logs/%x_%a_%A_%N.log
 #SBATCH --error=event_glmnet_logs/%x_%a_%A_%N.err
 #SBATCH -p shared-cpu
-#SBATCH --mem=16G
+#SBATCH --mem=4G
 #SBATCH -c 1
 #SBATCH --time=12:00:00
 #SBATCH --exclude=compms-gpu-1.exbio.wzw.tum.de
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=quirin.manz@tum.de
 
 IDS_FILE="$1"
 CFG_FILE="$2"
@@ -19,4 +21,4 @@ module load r/4.2.1
 id=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$IDS_FILE")
 
 cd "$PROJECT_DIR"
-Rscript "${PROJECT_DIR}/09-1-ml-local-worker.R" "$CFG_FILE" "$id"
+Rscript "${PROJECT_DIR}/07-ml-event-glmnet-tidymodels.R" "$CFG_FILE" "$id"

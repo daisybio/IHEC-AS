@@ -41,9 +41,12 @@ library(grDevices)
 # library(RSNNS)
 # library(MLmetrics)
 
-ggplot2::theme_set(
-  theme_bw() +
+main_theme <- function(base_size = 11) {
+  theme_bw(base_size = base_size) +
     theme(strip.background = element_rect(fill = NA))
+}
+ggplot2::theme_set(
+  main_theme()
 )
 
 sample_metadata_file <- "data/IHEC_sample_metadata_harmonization.v1.4_extended.csv"
