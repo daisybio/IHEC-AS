@@ -19,6 +19,8 @@ mkdir -p processed_data
 ```
 
 ```{r, find-epirr-ids}
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
 # Load sample metadata
 metadata <- fread(sample_metadata_file)
 ### make a list of all epirr_ids which contain RNA-Seq, WGBS and observed or imputed ChIP-Seq data
@@ -169,33 +171,126 @@ rna_qc[
 ]
 rna_qc[is.na(trimmed_read_length), trimmed_read_length := 36L]
 
-rna_qc[, included := "EpiATLAS"]
-rna_qc[
-  uuid %in% download_metadata[assay_type == "RNA-Seq", uuid],
-  included := "this_project"
-]
-# ggplot(rna_qc, aes(x = total)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 45e6, linetype='dashed') + labs(title = "Total Reads Density Plot")
-# ggplot(rna_qc, aes(x = fraction_mapped)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = "Fraction Mapped Density Plot")
-# ggplot(rna_qc, aes(x = fraction_intergenic)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .15, linetype='dashed') + labs(title = "Fraction Intergenic Density Plot")
-# ggplot(rna_qc, aes(x = fraction_rrna)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .3, linetype='dashed') + labs(title = "Fraction rRNA Density Plot")
-# ggplot(rna_qc, aes(x = fraction_duplicates)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 0.95, linetype='dashed') + labs(title = "Fraction Duplicated Density Plot")
-# ggplot(rna_qc, aes(x = fraction_duplicates, color = data_generating_centre)) + geom_density() + facet_grid( ~ experiment_type) + geom_vline(xintercept = .4, linetype='dashed') + labs(title = "Fraction Duplicated Density Plot")
-rna_qc[, rna_potentially_problematic := FALSE]
-rna_qc[
-  total < 45e6 |
-    fraction_mapped < .5 |
-    fraction_intergenic > .15 |
-    fraction_rrna > .3 |
-    fraction_duplicates > 0.95,
-  rna_potentially_problematic := TRUE
-]
 rna_qc[,
   epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)
+]
+# Mirror the logic from 02z-rmats-analysis.Rmd:
+#   rna_to_use = RNA-Seq UUIDs for epirrs with full epigenetic panel
+#   intersect with PSI column names = UUIDs that were actually processed by rMATS
+rna_to_use_01 <- download_metadata[
+  assay_type == "RNA-Seq" & epirr_id_without_version %in% epirr_ids_to_use,
+  uuid
+]
+rmats_psi_file <- "splicing_analysis/rmats/biotype_filtered/allevent_SE.psi"
+rmats_uuids <- if (file.exists(rmats_psi_file)) {
+  intersect(rna_to_use_01, names(fread(rmats_psi_file, nrows = 0L, sep = "\t")))
+} else {
+  rna_to_use_01
+}
+rna_qc[, included := "all RNA-Seq"]
+rna_qc[uuid %in% rmats_uuids, included := "with rMATS data"]
+
+# RNA-Seq QC thresholds (used in both plots and flag computation)
+rna_thr <- list(
+  total = 50e6, # IHEC standard
+  mapped = 0.7, # ENCODE ≥70%; < 0.5 previous (too lenient)
+  intergenic = 0.15,
+  rrna = 0.25, # ENCODE total RNA <25%; < 0.3 previous (too lenient)
+  duplicates = 0.7 # ENCODE <80%; conservative
+)
+
+ggplot(rna_qc, aes(x = total)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = rna_thr$total,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 5e6) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(xintercept = rna_thr$total, linetype = 'dashed', color = 'red') +
+  labs(title = "Total Reads")
+ggplot(rna_qc, aes(x = fraction_mapped)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = rna_thr$mapped,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(xintercept = rna_thr$mapped, linetype = 'dashed', color = 'red') +
+  labs(title = "Fraction Mapped")
+ggplot(rna_qc, aes(x = fraction_intergenic)) +
+  annotate(
+    "rect",
+    xmin = rna_thr$intergenic,
+    xmax = Inf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(
+    xintercept = rna_thr$intergenic,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Fraction Intergenic")
+ggplot(rna_qc, aes(x = fraction_rrna)) +
+  annotate(
+    "rect",
+    xmin = rna_thr$rrna,
+    xmax = Inf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(xintercept = rna_thr$rrna, linetype = 'dashed', color = 'red') +
+  labs(title = "Fraction rRNA")
+ggplot(rna_qc, aes(x = fraction_duplicates, fill = data_generating_centre)) +
+  annotate(
+    "rect",
+    xmin = rna_thr$duplicates,
+    xmax = Inf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01, position = "stack") +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(
+    xintercept = rna_thr$duplicates,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Fraction Duplicated Reads")
+rna_qc[, rna_potentially_problematic := FALSE]
+rna_qc[
+  total < rna_thr$total |
+    fraction_mapped < rna_thr$mapped |
+    fraction_intergenic > rna_thr$intergenic |
+    fraction_rrna > rna_thr$rrna |
+    fraction_duplicates > rna_thr$duplicates,
+  rna_potentially_problematic := TRUE
 ]
 rna_qc_stats <- c(
   "epirr_id_without_version",
   "uuid",
   "rna_potentially_problematic",
+  "total",
   "fraction_mapped",
   "fraction_intergenic",
   "fraction_rrna",
@@ -216,25 +311,145 @@ chip_qc[
   uuid %in% download_metadata[assay_type == "ChIP-Seq", uuid],
   included := "this_project"
 ]
-# ggplot(chip_qc, aes(x = `flagstat_qc:mapped_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 60, linetype='dashed') + labs(title = "Mapped Reads Density Plot")
-# ggplot(chip_qc, aes(x = `flagstat_qc:paired_properly_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 90, linetype='dashed') + labs(title = "Paired Properly Reads Density Plot")
-# ggplot(chip_qc, aes(x = `dup_qc:dupes_pct`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 90, linetype='dashed') + labs(title = "Duplicates Density Plot")
-# ggplot(chip_qc, aes(x = `pbc_qc:NRF`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = " Non-Redundant Fraction (NRF) and PCR Bottlenecking Coefficients 1 and 2 Density Plot")
-# ggplot(chip_qc, aes(x = `pbc_qc:PBC1`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .5, linetype='dashed') + labs(title = "PCR Bottlenecking Coefficients 1 Density Plot")
-# ggplot(chip_qc, aes(x = `pbc_qc:PBC2`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = 1, linetype='dashed') + labs(title = "PCR Bottlenecking Coefficients 2 Density Plot")
-# ggplot(chip_qc, aes(x = `frip_macs2_qc:rep1.FRiP`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .1, linetype='dashed') + labs(title = "Fraction of Reads in Peaks Density Plot")
-# ggplot(chip_qc, aes(x = `overlap_frip_qc:rep1-pr.FRiP`)) + geom_density() + facet_grid(antibody ~ included) + geom_vline(xintercept = .1, linetype='dashed') + labs(title = "Fraction of Reads in Peaks across Replicates Density Plot")
+
+# ChIP-Seq QC thresholds (used in both plots and flag computation)
+chip_thr <- list(
+  mapped_pct = 80, # ENCODE >80%; < 60 previous (too lenient)
+  dupes_pct = 0.80, # ENCODE <80%; stored as fraction (0-1), not percent
+  nrf = 0.5, # ENCODE minimum (compliant: 0.8, ideal: 0.9)
+  pbc1 = 0.5, # ENCODE minimum (compliant: 0.8)
+  pbc2 = 1, # ENCODE minimum (compliant: 3)
+  frip = 0.02, # IHEC minimum (broad marks: H3K27me3, H3K9me3, H3K36me3)
+  frip_narrow = 0.05, # Landt et al. 2012 (narrow marks: H3K27ac, H3K4me3, H3K4me1)
+  frip_overlap = 0.02 # IHEC minimum
+)
+narrow_marks <- c("H3K27ac", "H3K4me3", "H3K4me1")
+
+ggplot(chip_qc, aes(x = `flagstat_qc:mapped_pct`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$mapped_pct,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 1) +
+  facet_grid(antibody ~ included) +
+  geom_vline(
+    xintercept = chip_thr$mapped_pct,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Mapped Reads %")
+ggplot(chip_qc, aes(x = `dup_qc:dupes_pct`)) +
+  annotate(
+    "rect",
+    xmin = chip_thr$dupes_pct,
+    xmax = Inf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(antibody ~ included) +
+  geom_vline(
+    xintercept = chip_thr$dupes_pct,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Duplicate Read Fraction")
+ggplot(chip_qc, aes(x = `pbc_qc:NRF`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$nrf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(antibody ~ included) +
+  geom_vline(xintercept = chip_thr$nrf, linetype = 'dashed', color = 'red') +
+  labs(title = "Non-Redundant Fraction (NRF)")
+ggplot(chip_qc, aes(x = `pbc_qc:PBC1`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$pbc1,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(antibody ~ included) +
+  geom_vline(xintercept = chip_thr$pbc1, linetype = 'dashed', color = 'red') +
+  labs(title = "PCR Bottlenecking Coefficient 1 (PBC1)")
+ggplot(chip_qc, aes(x = `pbc_qc:PBC2`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$pbc2,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 1) +
+  coord_cartesian(xlim = c(0, 50)) +
+  facet_grid(antibody ~ included) +
+  geom_vline(xintercept = chip_thr$pbc2, linetype = 'dashed', color = 'red') +
+  labs(title = "PCR Bottlenecking Coefficient 2 (PBC2)")
+ggplot(chip_qc, aes(x = `frip_macs2_qc:rep1.FRiP`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$frip,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(antibody ~ included) +
+  geom_vline(xintercept = chip_thr$frip, linetype = 'dashed', color = 'red') +
+  labs(title = "Fraction of Reads in Peaks (FRiP)")
+ggplot(chip_qc, aes(x = `overlap_frip_qc:rep1-pr.FRiP`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = chip_thr$frip_overlap,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.01) +
+  facet_grid(antibody ~ included) +
+  geom_vline(
+    xintercept = chip_thr$frip_overlap,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Fraction of Reads in Peaks across Replicates (FRiP)")
 chip_qc[, potentially_problematic := FALSE]
 chip_qc_stats <- c("potentially_problematic", chip_qc_stats)
 # removed : | `flagstat_qc:paired_properly_pct` < 90
+# FRiP threshold depends on mark type: narrow marks (H3K27ac, H3K4me3, H3K4me1) use 0.05; broad marks use 0.02
+chip_qc[, frip_threshold := chip_thr$frip]
+chip_qc[antibody %in% narrow_marks, frip_threshold := chip_thr$frip_narrow]
 chip_qc[
-  `flagstat_qc:mapped_pct` < 60 |
-    `dup_qc:dupes_pct` > 90 |
-    `pbc_qc:NRF` < .5 |
-    `pbc_qc:PBC1` < .5 |
-    `pbc_qc:PBC2` < 1 |
-    `frip_macs2_qc:rep1.FRiP` < .02 |
-    `overlap_frip_qc:rep1-pr.FRiP` < .02,
+  `flagstat_qc:mapped_pct` < chip_thr$mapped_pct |
+    `dup_qc:dupes_pct` > chip_thr$dupes_pct |
+    `pbc_qc:NRF` < chip_thr$nrf |
+    `pbc_qc:PBC1` < chip_thr$pbc1 |
+    `pbc_qc:PBC2` < chip_thr$pbc2 |
+    `frip_macs2_qc:rep1.FRiP` < frip_threshold |
+    `overlap_frip_qc:rep1-pr.FRiP` < chip_thr$frip_overlap,
   potentially_problematic := TRUE
 ]
 chip_qc[,
@@ -267,15 +482,83 @@ wgbs_qc[
   on = c(uuid = "uuid"),
   c("experiment_type") := .(experiment_type)
 ]
-# ggplot(wgbs_qc, aes(x = `Mean_CpG_Coverage`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = 3, linetype='dashed') + labs(title = "Mean CpG Coverage Density Plot")
-# ggplot(wgbs_qc, aes(x = `BS_conversion_Rate`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = .95, linetype='dashed') + labs(title = "Bisulfite Conversion Rate Density Plot")
-# ggplot(wgbs_qc, aes(x = `GC_cov_Correlation`)) + geom_density() + facet_grid(experiment_type ~ included) + geom_vline(xintercept = c(-.7, .7), linetype='dashed') + labs(title = "GC Coverage Correlation Density Plot")
+
+# WGBS QC thresholds (used in both plots and flag computation)
+wgbs_thr <- list(
+  cpg_coverage = 10, # IHEC/ENCODE ≥10×; aligns with meth10 downstream; < 3 previous (too lenient)
+  bs_conversion = 0.97, # IHEC ≥97%; < 0.95 previous (ENCODE minimum only)
+  gc_corr = 0.7 # applied as abs(GC_cov_Correlation) > gc_corr; no standard
+)
+
+ggplot(wgbs_qc, aes(x = `Mean_CpG_Coverage`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = wgbs_thr$cpg_coverage,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.5) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(
+    xintercept = wgbs_thr$cpg_coverage,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Mean CpG Coverage")
+ggplot(wgbs_qc, aes(x = `BS_conversion_Rate`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = wgbs_thr$bs_conversion,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.005) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(
+    xintercept = wgbs_thr$bs_conversion,
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "Bisulfite Conversion Rate")
+ggplot(wgbs_qc, aes(x = `GC_cov_Correlation`)) +
+  annotate(
+    "rect",
+    xmin = -Inf,
+    xmax = -wgbs_thr$gc_corr,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  annotate(
+    "rect",
+    xmin = wgbs_thr$gc_corr,
+    xmax = Inf,
+    ymin = -Inf,
+    ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_histogram(binwidth = 0.05) +
+  facet_grid(experiment_type ~ included) +
+  geom_vline(
+    xintercept = c(-wgbs_thr$gc_corr, wgbs_thr$gc_corr),
+    linetype = 'dashed',
+    color = 'red'
+  ) +
+  labs(title = "GC Coverage Correlation")
 wgbs_qc[, wgbs_potentially_problematic := FALSE]
 wgbs_qc[
-  `Mean_CpG_Coverage` < 3 |
-    `BS_conversion_Rate` < .95 |
-    `GC_cov_Correlation` < -.7 |
-    `GC_cov_Correlation` > .7,
+  `Mean_CpG_Coverage` < wgbs_thr$cpg_coverage |
+    `BS_conversion_Rate` < wgbs_thr$bs_conversion |
+    `GC_cov_Correlation` < -wgbs_thr$gc_corr |
+    `GC_cov_Correlation` > wgbs_thr$gc_corr,
   wgbs_potentially_problematic := TRUE
 ]
 wgbs_qc[,
@@ -302,7 +585,92 @@ merged_qc <-
     by = "epirr_id_without_version",
     all = TRUE
   )
+
+# Compute flag count per sample (sum of all potentially_problematic columns)
+flag_cols <- names(merged_qc)[grepl(
+  "potentially_problematic",
+  names(merged_qc)
+)]
+merged_qc[, qc_flag_count := rowSums(.SD, na.rm = TRUE), .SDcols = flag_cols]
+
 fwrite(merged_qc, "processed_data/qc_summary.csv")
+
+# Export covariate file for downstream models (Policy A: retain all 405 samples)
+# UUID-keyed so it joins correctly onto aggregated_dt (keyed by uuid); WGBS/ChIP flags
+# are epirr-level and duplicated per UUID row, which is intentional for epirrs with
+# both mRNA-Seq and total-RNA-Seq.
+qc_flag_covariates <- merged_qc[, .(
+  epirr_id_without_version,
+  uuid,
+  qc_flag_count,
+  rna_potentially_problematic,
+  wgbs_potentially_problematic
+)]
+fwrite(qc_flag_covariates, "processed_data/qc_flag_covariates.csv")
+
+# Per-ontology and per-flag reporting
+dir.create("qc", showWarnings = FALSE)
+lines <- c()
+
+# Flag count distribution
+lines <- c(lines, "=== QC Flag Count Distribution (all 405 samples) ===", "")
+flag_dist <- merged_qc[, .N, by = qc_flag_count][order(qc_flag_count)]
+lines <- c(lines, "Flag count distribution:")
+for (i in 1:nrow(flag_dist)) {
+  lines <- c(
+    lines,
+    sprintf(
+      "  %d flags: %d samples",
+      flag_dist[i, qc_flag_count],
+      flag_dist[i, N]
+    )
+  )
+}
+
+# Per-ontology breakdown
+lines <- c(lines, "", "=== Per-Ontology Flag Distribution ===", "")
+onto_flags <- merged_qc[
+  metadata[, .(
+    epirr_id_without_version,
+    harmonized_sample_ontology_term_high_order_fig1
+  )],
+  on = "epirr_id_without_version"
+][,
+  .(
+    n_samples = .N,
+    mean_flags = mean(qc_flag_count, na.rm = TRUE),
+    n_flagged = sum(qc_flag_count > 0, na.rm = TRUE)
+  ),
+  by = harmonized_sample_ontology_term_high_order_fig1
+][order(-n_flagged)]
+
+for (i in 1:nrow(onto_flags)) {
+  row <- onto_flags[i]
+  lines <- c(
+    lines,
+    sprintf(
+      "  %s: %d/%d samples flagged, mean flags %.2f",
+      row$harmonized_sample_ontology_term_high_order_fig1,
+      row$n_flagged,
+      row$n_samples,
+      row$mean_flags
+    )
+  )
+}
+
+# Per-flag counts (RNA, WGBS, ChIP marks)
+lines <- c(lines, "", "=== Per-Flag Counts ===", "")
+flag_cols <- names(merged_qc)[grepl(
+  "potentially_problematic",
+  names(merged_qc)
+)]
+for (col in flag_cols) {
+  mark <- gsub("_potentially_problematic", "", col)
+  n_flagged <- sum(merged_qc[[col]], na.rm = TRUE)
+  lines <- c(lines, sprintf("  %s: %d samples", mark, n_flagged))
+}
+
+writeLines(lines, "qc/qc_flag_summary.txt")
 
 download_metadata[
   epirr_id_without_version %in% epirr_ids_to_use,

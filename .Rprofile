@@ -11,6 +11,9 @@ renv::settings$ignored.packages(
   persist = FALSE
 )
 
+# global seed
+options(EpiATLAS_AS_SEED = 42L)
+
 # vscode specific libraries
 if (interactive()) {
   library(jsonlite)
