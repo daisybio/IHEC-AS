@@ -6,7 +6,10 @@ output: html_document
 ```{r, load-data}
 # load image and table
 load("processed_data/aggregating.rda")
-aggregated_dt <- fread("processed_data/aggregated_dt_filtered.csv.gz", stringsAsFactors = TRUE)
+aggregated_dt <- fread(
+  "processed_data/aggregated_dt_filtered.csv.gz",
+  stringsAsFactors = TRUE
+)
 source("05zz-feature-preprocessing.R")
 # remove manual_ids, i.e., filter IDs in keep_rows
 # aggregated_dt <- aggregated_dt[ID %in% keep_rows]
@@ -16,12 +19,41 @@ aggregated_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 
 # set some global_variables
 meta_exclude_cols <- c(
-  "ID", "PSI", "IHEC", "Event Type", "gene_id", "Variability", "annotation", "uuid", "transcript_filter",
-  "seqnames", "ontology", "project", "protocol"
+  "ID",
+  "PSI",
+  "IHEC",
+  "Event Type",
+  "gene_id",
+  "Variability",
+  "annotation",
+  "uuid",
+  "transcript_filter",
+  "seqnames",
+  "ontology",
+  "project",
+  "protocol"
 )
 sdcols <- names(aggregated_dt)[!names(aggregated_dt) %in% meta_exclude_cols]
-aggregation_columns <- c("Event Type", "transcript_filter", "uuid", "Variability")
-non_epigenetic_features <- c("gene_expression", "distance_TSS", "distance_gene_start", "distance_TES", "distance_gene_end", "width;upstream_other_region", "width;event_name", "width;downstream_other_region", "3ss", "3ssdown", "5ss", "5ssup")
+aggregation_columns <- c(
+  "Event Type",
+  "transcript_filter",
+  "uuid",
+  "Variability"
+)
+non_epigenetic_features <- c(
+  "gene_expression",
+  "distance_TSS",
+  "distance_gene_start",
+  "distance_TES",
+  "distance_gene_end",
+  "width;upstream_other_region",
+  "width;event_name",
+  "width;downstream_other_region",
+  "3ss",
+  "3ssdown",
+  "5ss",
+  "5ssup"
+)
 main_cor <- "spearman"
 main_variability <- "All"
 main_partial <- TRUE
@@ -41,19 +73,33 @@ full_cor <- function(y, PSI, cor_method, this_minimum_events = minimum_events) {
   rmv <- is.na(y) | is.na(PSI)
   res <- NA_real_
   if ((length(rmv) - sum(rmv)) >= this_minimum_events) {
-    res <- suppressWarnings(stats::cor(PSI, y, use = "pairwise.complete.obs", method = cor_method))
+    res <- suppressWarnings(stats::cor(
+      PSI,
+      y,
+      use = "pairwise.complete.obs",
+      method = cor_method
+    ))
   }
   as.numeric(res)
 }
 
-partial_cor <- function(y_name, y, rest_dt, cor_method, this_minimum_events = minimum_events) {
+partial_cor <- function(
+  y_name,
+  y,
+  rest_dt,
+  cor_method,
+  this_minimum_events = minimum_events
+) {
   this_rest_dt <- copy(rest_dt)
   if (y_name %in% names(this_rest_dt)) {
     this_rest_dt <- this_rest_dt[, !..y_name]
   }
 
   this_rest_dt <- na.omit(this_rest_dt[, test_column := y])
-  this_non_epigenetic_features <- intersect(non_epigenetic_features, names(this_rest_dt))
+  this_non_epigenetic_features <- intersect(
+    non_epigenetic_features,
+    names(this_rest_dt)
+  )
   corr <- NA_real_
 
   if (
@@ -63,11 +109,25 @@ partial_cor <- function(y_name, y, rest_dt, cor_method, this_minimum_events = mi
   ) {
     if (length(this_non_epigenetic_features) > 0L) {
       rhs <- paste0("`", this_non_epigenetic_features, "`", collapse = " + ")
-      psi_res <- resid(stats::lm(stats::as.formula(paste("PSI ~", rhs)), data = this_rest_dt))
-      test_res <- resid(stats::lm(stats::as.formula(paste("test_column ~", rhs)), data = this_rest_dt))
-      cor_result <- suppressWarnings(stats::cor.test(test_res, psi_res, method = cor_method))
+      psi_res <- resid(stats::lm(
+        stats::as.formula(paste("PSI ~", rhs)),
+        data = this_rest_dt
+      ))
+      test_res <- resid(stats::lm(
+        stats::as.formula(paste("test_column ~", rhs)),
+        data = this_rest_dt
+      ))
+      cor_result <- suppressWarnings(stats::cor.test(
+        test_res,
+        psi_res,
+        method = cor_method
+      ))
     } else {
-      cor_result <- suppressWarnings(stats::cor.test(this_rest_dt$test_column, this_rest_dt$PSI, method = cor_method))
+      cor_result <- suppressWarnings(stats::cor.test(
+        this_rest_dt$test_column,
+        this_rest_dt$PSI,
+        method = cor_method
+      ))
     }
     corr <- unname(cor_result$estimate)
   }
@@ -77,7 +137,11 @@ partial_cor <- function(y_name, y, rest_dt, cor_method, this_minimum_events = mi
 
 prepare_with_all_variability <- function(input_dt) {
   prepared_dt <- copy(input_dt)
-  prepared_dt[metadata, on = c(IHEC = "epirr_id_without_version"), annotation := harmonized_sample_ontology_term_high_order_fig1]
+  prepared_dt[
+    metadata,
+    on = c(IHEC = "epirr_id_without_version"),
+    annotation := harmonized_sample_ontology_term_high_order_fig1
+  ]
   rbind(
     prepared_dt,
     copy(prepared_dt)[, Variability := "All"]
@@ -98,7 +162,9 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
   bind_group_results <- function(results, stage_label) {
     is_bindable <- vapply(
       results,
-      function(x) data.table::is.data.table(x) || is.data.frame(x) || is.list(x),
+      function(x) {
+        data.table::is.data.table(x) || is.data.frame(x) || is.list(x)
+      },
       logical(1)
     )
     if (!all(is_bindable)) {
@@ -135,10 +201,17 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
       groups_list <- split(prepared_dt, by = aggregation_columns)
 
       group_results <- pbmclapply(groups_list, function(group_dt) {
-          proc_group_dt <- transform_group(group_dt)
-          proc_group_dt[, lapply(.SD, full_cor, PSI, cor_method), by = aggregation_columns, .SDcols = sdcols]
-        })
-      bind_group_results(group_results, sprintf("full correlation (%s)", cor_method))
+        proc_group_dt <- transform_group(group_dt)
+        proc_group_dt[,
+          lapply(.SD, full_cor, PSI, cor_method),
+          by = aggregation_columns,
+          .SDcols = sdcols
+        ]
+      })
+      bind_group_results(
+        group_results,
+        sprintf("full correlation (%s)", cor_method)
+      )
     }),
     idcol = "Correlation Coefficient"
   )
@@ -150,10 +223,14 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
       groups_list <- split(prepared_dt, by = aggregation_columns)
 
       group_results <- pbmclapply(groups_list, function(group_dt) {
-          proc_group_dt <- transform_group(group_dt)
-          rest_cols <- intersect(c("PSI", non_epigenetic_features), names(proc_group_dt))
-          rest_dt <- proc_group_dt[, ..rest_cols]
-          proc_group_dt[, mapply(
+        proc_group_dt <- transform_group(group_dt)
+        rest_cols <- intersect(
+          c("PSI", non_epigenetic_features),
+          names(proc_group_dt)
+        )
+        rest_dt <- proc_group_dt[, ..rest_cols]
+        proc_group_dt[,
+          mapply(
             y_name = sdcols,
             y = .SD,
             FUN = partial_cor,
@@ -163,10 +240,14 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
             ),
             SIMPLIFY = FALSE
           ),
-          by = aggregation_columns, .SDcols = sdcols
-          ]
-        })
-      bind_group_results(group_results, sprintf("partial correlation (%s)", cor_method))
+          by = aggregation_columns,
+          .SDcols = sdcols
+        ]
+      })
+      bind_group_results(
+        group_results,
+        sprintf("partial correlation (%s)", cor_method)
+      )
     }),
     idcol = "Correlation Coefficient"
   )
@@ -174,7 +255,9 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
   pcor_dt[, `Partial Correlation` := TRUE]
 
   all_cor_dt <- rbind(cor_dt, pcor_dt)
-  all_cor_dt[, Variability := factor(Variability, levels = c("Low", "All", "High"))]
+  all_cor_dt[,
+    Variability := factor(Variability, levels = c("Low", "All", "High"))
+  ]
   append_protocol_levels(all_cor_dt)
 }
 
@@ -195,36 +278,101 @@ if (file.exists(corr_file_preproc)) {
 all_cor_raw[, Preprocessing := "Raw"]
 all_cor_preproc[, Preprocessing := "Preprocessed"]
 all_cor <- rbind(all_cor_raw, all_cor_preproc, use.names = TRUE, fill = TRUE)
-all_cor[, Preprocessing := factor(Preprocessing, levels = c("Raw", "Preprocessed"))]
+all_cor[,
+  Preprocessing := factor(Preprocessing, levels = c("Raw", "Preprocessed"))
+]
 ```
 
 ```{r, nicer-names}
 # this chunk just changes some names in the dt so the plots look nicer
-melt_cor_dt <- melt(all_cor, id.vars = c("Event Type", "transcript_filter", "uuid", "Variability", "Partial Correlation", "Correlation Coefficient", "protocol", "Preprocessing"), variable.name = "feature", value.name = "Correlation w/ PSI")
+melt_cor_dt <- melt(
+  all_cor,
+  id.vars = c(
+    "Event Type",
+    "transcript_filter",
+    "uuid",
+    "Variability",
+    "Partial Correlation",
+    "Correlation Coefficient",
+    "protocol",
+    "Preprocessing"
+  ),
+  variable.name = "feature",
+  value.name = "Correlation w/ PSI"
+)
 melt_cor_dt[, `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))]
-melt_cor_dt[`Event Type` == "SE", feature := gsub("other_region", "Intron", feature, fixed = TRUE)]
-melt_cor_dt[`Event Type` == "RI", feature := gsub("other_region", "Exon", feature, fixed = TRUE)]
-melt_cor_dt[`Event Type` == "SE", feature := gsub("event_name", "SE", feature, fixed = TRUE)]
-melt_cor_dt[`Event Type` == "RI", feature := gsub("event_name", "RI", feature, fixed = TRUE)]
+melt_cor_dt[
+  `Event Type` == "SE",
+  feature := gsub("other_region", "Intron", feature, fixed = TRUE)
+]
+melt_cor_dt[
+  `Event Type` == "RI",
+  feature := gsub("other_region", "Exon", feature, fixed = TRUE)
+]
+melt_cor_dt[
+  `Event Type` == "SE",
+  feature := gsub("event_name", "SE", feature, fixed = TRUE)
+]
+melt_cor_dt[
+  `Event Type` == "RI",
+  feature := gsub("event_name", "RI", feature, fixed = TRUE)
+]
 melt_cor_dt[, feature := sub(";", "\n", feature, fixed = TRUE)]
 melt_cor_dt[, feature := sub(",", "\n", feature, fixed = TRUE)]
 melt_cor_dt[, feature := gsub("_", " ", feature, fixed = TRUE)]
 melt_cor_dt[, feature := sub("distance ", "Distance\n", feature, fixed = TRUE)]
-melt_cor_dt[, feature := sub("upstream Intron", "Intron\nUpstream", feature, fixed = TRUE)]
-melt_cor_dt[, feature := sub("upstream Exon", "Exon\nUpstream", feature, fixed = TRUE)]
-melt_cor_dt[, feature := sub("downstream Intron", "Intron\nDownstream", feature, fixed = TRUE)]
-melt_cor_dt[, feature := sub("downstream Exon", "Exon\nDownstream", feature, fixed = TRUE)]
-melt_cor_dt[, feature := sub("gene expression", "Gene\nExpression", feature, fixed = TRUE)]
+melt_cor_dt[,
+  feature := sub("upstream Intron", "Intron\nUpstream", feature, fixed = TRUE)
+]
+melt_cor_dt[,
+  feature := sub("upstream Exon", "Exon\nUpstream", feature, fixed = TRUE)
+]
+melt_cor_dt[,
+  feature := sub(
+    "downstream Intron",
+    "Intron\nDownstream",
+    feature,
+    fixed = TRUE
+  )
+]
+melt_cor_dt[,
+  feature := sub("downstream Exon", "Exon\nDownstream", feature, fixed = TRUE)
+]
+melt_cor_dt[,
+  feature := sub("gene expression", "Gene\nExpression", feature, fixed = TRUE)
+]
 melt_cor_dt[, feature := sub("width", "Width", feature, fixed = TRUE)]
-aggregate_median_by <- c("feature", "Event Type", "transcript_filter", "Variability", "Partial Correlation", "Correlation Coefficient", "protocol", "Preprocessing")
-melt_cor_dt[, median_cor := median(`Correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
-melt_cor_dt[, mean_cor := mean(`Correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
-melt_cor_dt[, sd_cor := sd(`Correlation w/ PSI`, na.rm = TRUE), by = aggregate_median_by]
+aggregate_median_by <- c(
+  "feature",
+  "Event Type",
+  "transcript_filter",
+  "Variability",
+  "Partial Correlation",
+  "Correlation Coefficient",
+  "protocol",
+  "Preprocessing"
+)
+melt_cor_dt[,
+  median_cor := median(`Correlation w/ PSI`, na.rm = TRUE),
+  by = aggregate_median_by
+]
+melt_cor_dt[,
+  mean_cor := mean(`Correlation w/ PSI`, na.rm = TRUE),
+  by = aggregate_median_by
+]
+melt_cor_dt[,
+  sd_cor := sd(`Correlation w/ PSI`, na.rm = TRUE),
+  by = aggregate_median_by
+]
 melt_cor_dt[, relevant := any(abs(median_cor) > .1), by = aggregate_median_by]
 melt_cor_dt[, Variability := sub(" Variability", "", Variability, fixed = TRUE)]
-melt_cor_dt[, Variability := factor(Variability, levels = c("Low", "All", "High"))]
+melt_cor_dt[,
+  Variability := factor(Variability, levels = c("Low", "All", "High"))
+]
 melt_cor_dt[, protocol := factor(protocol)]
-melt_cor_dt[, Preprocessing := factor(Preprocessing, levels = c("Raw", "Preprocessed"))]
+melt_cor_dt[,
+  Preprocessing := factor(Preprocessing, levels = c("Raw", "Preprocessed"))
+]
 ```
 
 ```{r, top10-overall, fig.width=21, fig.height=8}
@@ -232,14 +380,46 @@ library(ggh4x)
 library(tidytext)
 top_n <- 10 # melt_cor_dt[, uniqueN(feature)]
 # get the top n correlations with PSI from the feature vector
-tmp_cor_dt <- melt_cor_dt[`Variability` == main_variability & `Correlation Coefficient` == main_cor & `Partial Correlation` == main_partial & protocol == main_protocol & Preprocessing == main_preprocessing]
-tmp_cor_dt[order(-abs(median_cor)), .(feature = unique(feature)[1:top_n]), by = .(`Event Type`, transcript_filter)]
+tmp_cor_dt <- melt_cor_dt[
+  `Variability` == main_variability &
+    `Correlation Coefficient` == main_cor &
+    `Partial Correlation` == main_partial &
+    protocol == main_protocol &
+    Preprocessing == main_preprocessing
+]
+tmp_cor_dt[
+  order(-abs(median_cor)),
+  .(feature = unique(feature)[1:top_n]),
+  by = .(`Event Type`, transcript_filter)
+]
 # annotate epigenetic vs intrinsic features
-tmp_cor_dt[, "Feature Type" := ifelse(Reduce(`|`, lapply(c(histone_marks, "DNAm"), function(x) startsWith(feature, x))), "Epigenetic", "Intrinsic")]
-tmp_cor_dt[feature %in% c("max promoter", "summed enhancer"), `Feature Type` := "Epigenetic"]
-plot_dt <- merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature = unique(feature)[1:top_n]), by = .(`Event Type`, transcript_filter)])
+tmp_cor_dt[,
+  "Feature Type" := ifelse(
+    Reduce(
+      `|`,
+      lapply(c(histone_marks, "DNAm"), function(x) startsWith(feature, x))
+    ),
+    "Epigenetic",
+    "Intrinsic"
+  )
+]
+tmp_cor_dt[
+  feature %in% c("max promoter", "summed enhancer"),
+  `Feature Type` := "Epigenetic"
+]
+plot_dt <- merge(
+  tmp_cor_dt,
+  tmp_cor_dt[
+    order(-abs(median_cor)),
+    .(feature = unique(feature)[1:top_n]),
+    by = .(`Event Type`, transcript_filter)
+  ]
+)
 # Create a vector of colors for ggplot, defaulting to dark grey
-plot_colors <- setNames(rep("dark grey", plot_dt[, uniqueN(feature)]), plot_dt[, unique(feature)])
+plot_colors <- setNames(
+  rep("dark grey", plot_dt[, uniqueN(feature)]),
+  plot_dt[, unique(feature)]
+)
 for (name in names(mark_hex_colors)) {
   inds <- startsWith(names(plot_colors), name)
   plot_colors[inds] <- mark_hex_colors[name]
@@ -249,7 +429,11 @@ ggplot(
   plot_dt,
   aes(
     y = `Correlation w/ PSI`,
-    x = tidytext::reorder_within(feature, -median_cor, list(`Event Type`, transcript_filter)),
+    x = tidytext::reorder_within(
+      feature,
+      -median_cor,
+      list(`Event Type`, transcript_filter)
+    ),
     color = feature
   )
 ) + # `Feature Type`)) +
@@ -260,21 +444,39 @@ ggplot(
     title = NULL # , paste('Top', top_n, 'Globally Correlated Features')
   ) +
   tidytext::scale_x_reordered() +
-  ggh4x::facet_nested_wrap(. ~ `Event Type` + factor(transcript_filter, levels = transcript_filters),
+  ggh4x::facet_nested_wrap(
+    . ~ `Event Type` + factor(transcript_filter, levels = transcript_filters),
     nrow = 2,
     scales = "free_x"
   ) +
   scale_color_manual(values = plot_colors) +
   theme_bw(base_size = 12) +
-  theme(legend.position = "none", strip.background = element_rect(fill = "white"))
-ggsave(filename = file.path(plot_dir, paste0("top", top_n, "intrinsic_overall.png")), width = 21, height = 6)
-ggsave(filename = file.path(plot_dir, paste0("top", top_n, "intrinsic_overall.svg")), width = 21, height = 6)
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "white")
+  )
+ggsave(
+  filename = file.path(plot_dir, paste0("top", top_n, "intrinsic_overall.png")),
+  width = 21,
+  height = 6
+)
+ggsave(
+  filename = file.path(plot_dir, paste0("top", top_n, "intrinsic_overall.svg")),
+  width = 21,
+  height = 6
+)
 ```
 
 
 ```{r, comparison-plots, fig.width=21, fig.height=8}
 # make plots comparing different measures and variability
-for (color_by in c("Correlation Coefficient", "Partial Correlation", "Variability", "protocol", "Preprocessing")) {
+for (color_by in c(
+  "Correlation Coefficient",
+  "Partial Correlation",
+  "Variability",
+  "protocol",
+  "Preprocessing"
+)) {
   # aggregate the medians by the relevant columns
   find_relevant_by <- aggregate_median_by[aggregate_median_by != color_by]
   # remove column from earlier iteration
@@ -284,29 +486,80 @@ for (color_by in c("Correlation Coefficient", "Partial Correlation", "Variabilit
   # get the subset of the table that is relevant depending on what to compare
   not_color_by <- TRUE
   if (color_by == "Partial Correlation") {
-    not_color_by <- melt_cor_dt[, `Correlation Coefficient` == main_cor & `Variability` == main_variability & protocol == main_protocol & Preprocessing == main_preprocessing]
+    not_color_by <- melt_cor_dt[,
+      `Correlation Coefficient` == main_cor &
+        `Variability` == main_variability &
+        protocol == main_protocol &
+        Preprocessing == main_preprocessing
+    ]
   } else if (color_by == "Correlation Coefficient") {
-    not_color_by <- melt_cor_dt[, `Partial Correlation` == main_partial & `Variability` == main_variability & protocol == main_protocol & Preprocessing == main_preprocessing]
+    not_color_by <- melt_cor_dt[,
+      `Partial Correlation` == main_partial &
+        `Variability` == main_variability &
+        protocol == main_protocol &
+        Preprocessing == main_preprocessing
+    ]
   } else if (color_by == "Variability") {
-    not_color_by <- melt_cor_dt[, `Partial Correlation` == main_partial & `Correlation Coefficient` == main_cor & protocol == main_protocol & Preprocessing == main_preprocessing]
+    not_color_by <- melt_cor_dt[,
+      `Partial Correlation` == main_partial &
+        `Correlation Coefficient` == main_cor &
+        protocol == main_protocol &
+        Preprocessing == main_preprocessing
+    ]
   } else if (color_by == "protocol") {
-    not_color_by <- melt_cor_dt[, `Partial Correlation` == main_partial & `Correlation Coefficient` == main_cor & `Variability` == main_variability & Preprocessing == main_preprocessing]
+    not_color_by <- melt_cor_dt[,
+      `Partial Correlation` == main_partial &
+        `Correlation Coefficient` == main_cor &
+        `Variability` == main_variability &
+        Preprocessing == main_preprocessing
+    ]
   } else if (color_by == "Preprocessing") {
-    not_color_by <- melt_cor_dt[, `Partial Correlation` == main_partial & `Correlation Coefficient` == main_cor & `Variability` == main_variability & protocol == main_protocol]
+    not_color_by <- melt_cor_dt[,
+      `Partial Correlation` == main_partial &
+        `Correlation Coefficient` == main_cor &
+        `Variability` == main_variability &
+        protocol == main_protocol
+    ]
   }
   # get the number of levels we need to color_by
   color_levels <- melt_cor_dt[not_color_by, uniqueN(get(color_by))]
-  tmp_cor_dt <- melt_cor_dt[not_color_by & !is.na(`Correlation w/ PSI`), if (uniqueN(get(color_by)) == color_levels) .SD, by = .(`Event Type`, transcript_filter, feature)]
+  tmp_cor_dt <- melt_cor_dt[
+    not_color_by & !is.na(`Correlation w/ PSI`),
+    if (uniqueN(get(color_by)) == color_levels) .SD,
+    by = .(`Event Type`, transcript_filter, feature)
+  ]
   if (color_by == "Variability") {
     # for variablity make another plot sorted by the greatest differences
-    median_dt <- dcast(tmp_cor_dt[, .(median_cor = unique(median_cor)), by = .(`Event Type`, transcript_filter, feature, `Variability`)], `Event Type` + transcript_filter + feature ~ `Variability`, value.var = "median_cor")
+    median_dt <- dcast(
+      tmp_cor_dt[,
+        .(median_cor = unique(median_cor)),
+        by = .(`Event Type`, transcript_filter, feature, `Variability`)
+      ],
+      `Event Type` + transcript_filter + feature ~ `Variability`,
+      value.var = "median_cor"
+    )
     median_dt[, diff_col := abs(`Low` - `High`)]
     sorted_idx <- median_dt[, order(-diff_col)]
     p <- ggplot(
-      merge(tmp_cor_dt, median_dt[sorted_idx, .(feature = feature[1:top_n], diff_col = diff_col[1:top_n], all_median = All[1:top_n]), by = .(`Event Type`, transcript_filter)]),
+      merge(
+        tmp_cor_dt,
+        median_dt[
+          sorted_idx,
+          .(
+            feature = feature[1:top_n],
+            diff_col = diff_col[1:top_n],
+            all_median = All[1:top_n]
+          ),
+          by = .(`Event Type`, transcript_filter)
+        ]
+      ),
       aes(
         y = `Correlation w/ PSI`,
-        x = tidytext::reorder_within(feature, -diff_col, list(`Event Type`, transcript_filter)),
+        x = tidytext::reorder_within(
+          feature,
+          -diff_col,
+          list(`Event Type`, transcript_filter)
+        ),
         fill = get(color_by)
       )
     ) +
@@ -315,18 +568,45 @@ for (color_by in c("Correlation Coefficient", "Partial Correlation", "Variabilit
       geom_boxplot() +
       labs(x = "Aggregated Signal or Statistic") +
       tidytext::scale_x_reordered() +
-      ggh4x::facet_nested_wrap(. ~ `Event Type` + factor(transcript_filter, levels = transcript_filters), scales = "free", nrow = 2) +
+      ggh4x::facet_nested_wrap(
+        . ~ `Event Type` +
+          factor(transcript_filter, levels = transcript_filters),
+        scales = "free",
+        nrow = 2
+      ) +
       theme(legend.position = "bottom") +
-      scale_fill_manual(values = variability_colors[1:color_levels], name = color_by)
-    ggsave(filename = file.path(plot_dir, paste0("max diff ", color_by, "_intrinsic.pdf")), p, width = 21, height = 7)
+      scale_fill_manual(
+        values = variability_colors[1:color_levels],
+        name = color_by
+      )
+    ggsave(
+      filename = file.path(
+        plot_dir,
+        paste0("max diff ", color_by, "_intrinsic.pdf")
+      ),
+      p,
+      width = 21,
+      height = 7
+    )
     print(p)
   }
   # always make one plot sorted by the median
   p <- ggplot(
-    merge(tmp_cor_dt, tmp_cor_dt[order(-abs(median_cor)), .(feature = unique(feature)[1:top_n]), by = .(`Event Type`, transcript_filter)]),
+    merge(
+      tmp_cor_dt,
+      tmp_cor_dt[
+        order(-abs(median_cor)),
+        .(feature = unique(feature)[1:top_n]),
+        by = .(`Event Type`, transcript_filter)
+      ]
+    ),
     aes(
       y = `Correlation w/ PSI`,
-      x = tidytext::reorder_within(feature, -median_cor, list(`Event Type`, transcript_filter)),
+      x = tidytext::reorder_within(
+        feature,
+        -median_cor,
+        list(`Event Type`, transcript_filter)
+      ),
       color = get(color_by)
     )
   ) +
@@ -335,8 +615,15 @@ for (color_by in c("Correlation Coefficient", "Partial Correlation", "Variabilit
     geom_boxplot() +
     labs(x = "Aggregated Signal or Statistic") +
     tidytext::scale_x_reordered() +
-    ggh4x::facet_nested_wrap(. ~ `Event Type` + factor(transcript_filter, levels = transcript_filters), scales = "free", nrow = 2) +
-    theme(legend.position = "bottom", strip.background = element_rect(fill = "white"))
+    ggh4x::facet_nested_wrap(
+      . ~ `Event Type` + factor(transcript_filter, levels = transcript_filters),
+      scales = "free",
+      nrow = 2
+    ) +
+    theme(
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "white")
+    )
   if (color_by == "Preprocessing") {
     p <- p + scale_color_manual(values = preprocessing_colors, name = color_by)
   } else {
@@ -344,17 +631,45 @@ for (color_by in c("Correlation Coefficient", "Partial Correlation", "Variabilit
   }
   if (color_levels == 2) {
     if (color_by == "Preprocessing") {
-      p <- p + scale_color_manual(values = preprocessing_colors, name = color_by)
+      p <- p +
+        scale_color_manual(values = preprocessing_colors, name = color_by)
     } else {
-      p <- p + scale_color_manual(values = unname(variability_colors[c(1, 3)]), name = color_by)
+      p <- p +
+        scale_color_manual(
+          values = unname(variability_colors[c(1, 3)]),
+          name = color_by
+        )
     }
   } else if (color_by == "protocol") {
-    p <- p + scale_color_manual(values = setNames(variability_colors, c("total-RNA-Seq", "All", "mRNA-Seq")), name = color_by)
+    p <- p +
+      scale_color_manual(
+        values = setNames(
+          variability_colors,
+          c("total-RNA-Seq", "All", "mRNA-Seq")
+        ),
+        name = color_by
+      )
   }
   if (color_by == "Variability") {
-    ggsave(filename = file.path(plot_dir, paste0("top", top_n, color_by, "_intrinsic.pdf")), p, width = 21, height = 4.5)
+    ggsave(
+      filename = file.path(
+        plot_dir,
+        paste0("top", top_n, color_by, "_intrinsic.pdf")
+      ),
+      p,
+      width = 21,
+      height = 4.5
+    )
   } else if (color_by == "Preprocessing") {
-    ggsave(filename = file.path(plot_dir, paste0("top", top_n, "_preprocessing_intrinsic.pdf")), p, width = 21, height = 4.5)
+    ggsave(
+      filename = file.path(
+        plot_dir,
+        paste0("top", top_n, "_preprocessing_intrinsic.pdf")
+      ),
+      p,
+      width = 21,
+      height = 4.5
+    )
   }
   print(p)
 }
@@ -369,8 +684,8 @@ preproc_cmp_dt <- melt_cor_dt[
     protocol == main_protocol
 ]
 
-preproc_rank_dt <- preproc_cmp_dt[
-  , .(median_cor = unique(median_cor)),
+preproc_rank_dt <- preproc_cmp_dt[,
+  .(median_cor = unique(median_cor)),
   by = .(`Event Type`, transcript_filter, feature, Preprocessing)
 ]
 
@@ -383,14 +698,22 @@ preproc_diff_dt[, diff_preproc := abs(Preprocessed - Raw)]
 
 preproc_top_dt <- merge(
   preproc_cmp_dt,
-  preproc_diff_dt[order(-diff_preproc), .(feature = feature[1:top_n]), by = .(`Event Type`, transcript_filter)]
+  preproc_diff_dt[
+    order(-diff_preproc),
+    .(feature = feature[1:top_n]),
+    by = .(`Event Type`, transcript_filter)
+  ]
 )
 
 p_preproc <- ggplot(
   preproc_top_dt,
   aes(
     y = `Correlation w/ PSI`,
-    x = tidytext::reorder_within(feature, -median_cor, list(`Event Type`, transcript_filter)),
+    x = tidytext::reorder_within(
+      feature,
+      -median_cor,
+      list(`Event Type`, transcript_filter)
+    ),
     color = Preprocessing
   )
 ) +
@@ -399,42 +722,113 @@ p_preproc <- ggplot(
   geom_boxplot() +
   labs(x = "Aggregated Signal or Statistic") +
   tidytext::scale_x_reordered() +
-  ggh4x::facet_nested_wrap(. ~ `Event Type` + factor(transcript_filter, levels = transcript_filters), scales = "free", nrow = 2) +
-  theme(legend.position = "bottom", strip.background = element_rect(fill = "white")) +
+  ggh4x::facet_nested_wrap(
+    . ~ `Event Type` + factor(transcript_filter, levels = transcript_filters),
+    scales = "free",
+    nrow = 2
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "white")
+  ) +
   scale_color_manual(values = preprocessing_colors)
 
-ggsave(filename = file.path(plot_dir, paste0("top", top_n, "_preprocessing_explicit_intrinsic.pdf")), p_preproc, width = 21, height = 4.5)
+ggsave(
+  filename = file.path(
+    plot_dir,
+    paste0("top", top_n, "_preprocessing_explicit_intrinsic.pdf")
+  ),
+  p_preproc,
+  width = 21,
+  height = 4.5
+)
 print(p_preproc)
 ```
 
 ```{r, cor-heatmap, fig.width=21, fig.height=8}
 # make heatmap with the correlation per feature
 heatmap_dt <- unique(melt_cor_dt[
-  `Partial Correlation` == main_partial & `Correlation Coefficient` == main_cor & `Variability` == main_variability & protocol == main_protocol & Preprocessing == main_preprocessing & grepl(paste(c(histone_marks, "DNAm"), collapse = "|"), x = feature),
-  .(`Event Type`, transcript_filter, feature, protocol, median_cor, mean_cor, sd_cor)
+  `Partial Correlation` == main_partial &
+    `Correlation Coefficient` == main_cor &
+    `Variability` == main_variability &
+    protocol == main_protocol &
+    Preprocessing == main_preprocessing &
+    grepl(paste(c(histone_marks, "DNAm"), collapse = "|"), x = feature),
+  .(
+    `Event Type`,
+    transcript_filter,
+    feature,
+    protocol,
+    median_cor,
+    mean_cor,
+    sd_cor
+  )
 ])
-heatmap_dt[, mark := tstrsplit(x = feature, split = "\n", fixed = TRUE, keep = 1)]
-heatmap_dt[, mark := factor(mark, levels = rev(c("H3K9me3", "H3K27me3", "H3K4me3", "H3K4me1", "H3K27ac", "H3K36me3", "DNAm")))]
+heatmap_dt[,
+  mark := tstrsplit(x = feature, split = "\n", fixed = TRUE, keep = 1)
+]
+heatmap_dt[,
+  mark := factor(
+    mark,
+    levels = rev(c(
+      "H3K9me3",
+      "H3K27me3",
+      "H3K4me3",
+      "H3K4me1",
+      "H3K27ac",
+      "H3K36me3",
+      "DNAm"
+    ))
+  )
+]
 heatmap_dt[, region := sub(pattern = ".*?\n", replacement = "", x = feature)]
-heatmap_dt[, region := factor(region, levels = c("5up", "5down", "3up", "3down"))] # c("Intron\nUpstream", "SE", "Intron\nDownstream", "Exon\nUpstream", "RI", "Exon\nDownstream")),]
-ggplot(heatmap_dt, aes(
-  x = region,
-  y = mark,
-  fill = median_cor
-)) +
+heatmap_dt[,
+  region := factor(region, levels = c("5up", "5down", "3up", "3down"))
+] # c("Intron\nUpstream", "SE", "Intron\nDownstream", "Exon\nUpstream", "RI", "Exon\nDownstream")),]
+ggplot(
+  heatmap_dt,
+  aes(
+    x = region,
+    y = mark,
+    fill = median_cor
+  )
+) +
   geom_tile() +
-  ggh4x::facet_grid2(factor(transcript_filter, levels = transcript_filters) ~ `Event Type` + protocol, scales = "free") +
+  ggh4x::facet_grid2(
+    factor(transcript_filter, levels = transcript_filters) ~ `Event Type` +
+      protocol,
+    scales = "free"
+  ) +
   theme_bw() +
-  theme(strip.background = element_rect(fill = "white"), legend.position = "bottom") +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom"
+  ) +
   scale_fill_gradient2(
     low = scales::muted("blue"),
     mid = "white",
     high = scales::muted("red")
   ) +
   # add text into the tile with the value of the mean and sd_cor in parantheses
-  geom_text(aes(label = paste0(round(median_cor, 2), "\n(", round(mean_cor, 2), "\u00B1", round(sd_cor, 2), ")")), size = 3) +
+  geom_text(
+    aes(
+      label = paste0(
+        round(median_cor, 2),
+        "\n(",
+        round(mean_cor, 2),
+        "\u00B1",
+        round(sd_cor, 2),
+        ")"
+      )
+    ),
+    size = 3
+  ) +
   labs(y = "Mark", x = "Region", fill = "Partial Correlation")
-ggsave(filename = file.path(plot_dir, "epigenetic_cor_intrinsic.pdf"), width = 21, height = 8)
+ggsave(
+  filename = file.path(plot_dir, "epigenetic_cor_intrinsic.pdf"),
+  width = 21,
+  height = 8
+)
 ```
 
 ```{r, cor-heatmap-preprocessing-comparison, fig.width=21, fig.height=8}
@@ -445,33 +839,87 @@ heatmap_preproc_dt <- unique(melt_cor_dt[
     `Variability` == main_variability &
     protocol == main_protocol &
     grepl(paste(c(histone_marks, "DNAm"), collapse = "|"), x = feature),
-  .(`Event Type`, transcript_filter, feature, protocol, Preprocessing, median_cor, mean_cor, sd_cor)
+  .(
+    `Event Type`,
+    transcript_filter,
+    feature,
+    protocol,
+    Preprocessing,
+    median_cor,
+    mean_cor,
+    sd_cor
+  )
 ])
 
-heatmap_preproc_dt[, mark := tstrsplit(x = feature, split = "\n", fixed = TRUE, keep = 1)]
-heatmap_preproc_dt[, mark := factor(mark, levels = rev(c("H3K9me3", "H3K27me3", "H3K4me3", "H3K4me1", "H3K27ac", "H3K36me3", "DNAm")))]
-heatmap_preproc_dt[, region := sub(pattern = ".*?\n", replacement = "", x = feature)]
-heatmap_preproc_dt[, region := factor(region, levels = c("5up", "5down", "3up", "3down"))]
+heatmap_preproc_dt[,
+  mark := tstrsplit(x = feature, split = "\n", fixed = TRUE, keep = 1)
+]
+heatmap_preproc_dt[,
+  mark := factor(
+    mark,
+    levels = rev(c(
+      "H3K9me3",
+      "H3K27me3",
+      "H3K4me3",
+      "H3K4me1",
+      "H3K27ac",
+      "H3K36me3",
+      "DNAm"
+    ))
+  )
+]
+heatmap_preproc_dt[,
+  region := sub(pattern = ".*?\n", replacement = "", x = feature)
+]
+heatmap_preproc_dt[,
+  region := factor(region, levels = c("5up", "5down", "3up", "3down"))
+]
 
-ggplot(heatmap_preproc_dt, aes(
-  x = region,
-  y = mark,
-  fill = median_cor
-)) +
+ggplot(
+  heatmap_preproc_dt,
+  aes(
+    x = region,
+    y = mark,
+    fill = median_cor
+  )
+) +
   geom_tile() +
   ggh4x::facet_grid2(
-    factor(transcript_filter, levels = transcript_filters) ~ `Event Type` + Preprocessing,
+    factor(transcript_filter, levels = transcript_filters) ~ `Event Type` +
+      Preprocessing,
     scales = "free"
   ) +
   theme_bw() +
-  theme(strip.background = element_rect(fill = "white"), legend.position = "bottom") +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom"
+  ) +
   scale_fill_gradient2(
     low = scales::muted("blue"),
     mid = "white",
     high = scales::muted("red")
   ) +
-  geom_text(aes(label = paste0(round(median_cor, 2), "\n(", round(mean_cor, 2), "\u00B1", round(sd_cor, 2), ")")), size = 3) +
+  geom_text(
+    aes(
+      label = paste0(
+        round(median_cor, 2),
+        "\n(",
+        round(mean_cor, 2),
+        "\u00B1",
+        round(sd_cor, 2),
+        ")"
+      )
+    ),
+    size = 3
+  ) +
   labs(y = "Mark", x = "Region", fill = "Partial Correlation")
 
-ggsave(filename = file.path(plot_dir, "epigenetic_cor_intrinsic_preprocessing_comparison.pdf"), width = 21, height = 8)
+ggsave(
+  filename = file.path(
+    plot_dir,
+    "epigenetic_cor_intrinsic_preprocessing_comparison.pdf"
+  ),
+  width = 21,
+  height = 8
+)
 ```

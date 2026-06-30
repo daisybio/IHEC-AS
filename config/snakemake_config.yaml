@@ -1,0 +1,129 @@
+# Snakemake pipeline configuration for IHEC-AS
+# Run from project root: mamba run -n ihec-as snakemake --profile profiles/slurm
+
+# ── Wildcards ─────────────────────────────────────────────────────────────────
+transcript_filters:
+  - transcripts
+  - tsl_filtered
+  - biotype_filtered
+
+# Primary filter used for main analyses (09-2, 10)
+primary_filter: biotype_filtered
+
+event_types:
+  - SE
+  - RI
+
+variabilities:
+  - High
+  - Low
+  - both
+
+group_cols:
+  - seqnames
+  - ontology
+
+# biotype_filtered + both is excluded (see original SLURM config exclusion)
+exclude_ml_configs:
+  - transcript_filter: biotype_filtered
+    variability: both
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Pre-existing inputs (not managed by Snakemake)
+rmats_filtered_dir: "splicing_analysis"   # contains {tf}/event_{et}.psi files
+gencode_gtf_dir: "splicing_analysis"      # contains gencode.v29.{tf}.gtf
+wgbs_bed_dir: "processed_data/wgbs_beds"
+
+# Output root for ML results
+ml_output_root: "splicing_ml/output"
+
+# ── Resources (SLURM) ─────────────────────────────────────────────────────────
+# mem_mb, runtime (minutes), threads, gpu (0/1)
+resources:
+  gather_data:
+    mem_mb: 8000
+    runtime: 60
+    threads: 2
+    gpu: 0
+  suppa_analysis:
+    mem_mb: 48000
+    runtime: 120
+    threads: 4
+    gpu: 0
+  rmats_analysis:
+    mem_mb: 32000
+    runtime: 180
+    threads: 8
+    gpu: 0
+  prepare_aggregation:
+    mem_mb: 64000
+    runtime: 360
+    threads: 8
+    gpu: 0
+  maxentscan_scores:
+    mem_mb: 4000
+    runtime: 60
+    threads: 1
+    gpu: 0
+  pangolin_scores:
+    mem_mb: 16000
+    runtime: 180    # ~2 hr CPU; ~30 min GPU
+    threads: 4
+    gpu: 0
+  aggregate_chip_one:
+    mem_mb: 500
+    runtime: 15
+    threads: 1
+    gpu: 0
+  aggregate_chip:
+    mem_mb: 500     # sentinel rule — negligible; kept for R() compatibility
+    runtime: 5
+    threads: 1
+    gpu: 0
+  aggregate_wgbs:
+    mem_mb: 32000
+    runtime: 180
+    threads: 4
+    gpu: 0
+  create_aggregated_dt:
+    mem_mb: 32000
+    runtime: 90
+    threads: 4
+    gpu: 0
+  correlation:
+    mem_mb: 48000
+    runtime: 180
+    threads: 8
+    gpu: 0
+  splicing_ml_S:    # RI + High/Low
+    mem_mb: 32000
+    runtime: 360
+    threads: 8
+    gpu: 1
+  splicing_ml_M:    # SE + High/Low | RI + both
+    mem_mb: 64000
+    runtime: 720
+    threads: 8
+    gpu: 1
+  splicing_ml_L:    # SE + both
+    mem_mb: 128000
+    runtime: 1440
+    threads: 12
+    gpu: 1
+  event_models:
+    mem_mb: 64000
+    runtime: 1440
+    threads: 16
+    gpu: 0
+  analysis:
+    mem_mb: 32000
+    runtime: 240
+    threads: 4
+    gpu: 0
+
+# ── SLURM partitions ──────────────────────────────────────────────────────────
+slurm_cpu_partition: "shared-cpu"
+slurm_gpu_partition: "shared-gpu"
+slurm_gpu_gres: "gpu:a40:1"
+slurm_gpu_qos: "limitgpus"
+slurm_gpu_exclude: "compms-gpu-1.exbio.wzw.tum.de"

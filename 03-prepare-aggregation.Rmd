@@ -22,8 +22,6 @@ metadata <- metadata[
   epirr_id_without_version %in%
     file_metadata[, unique(epirr_id_without_version)]
 ]
-# TODO: this filter should be cleaner, together with file_metadata
-# metadata <- metadata[`automated_experiments_RNA-Seq_mRNA-Seq` %in% sample_cols | `automated_experiments_RNA-Seq_total-RNA-Seq` %in% sample_cols]
 rmats_command_file <- "data/rmats_split_post_commands.tsv"
 command_dt <- fread(rmats_command_file)
 bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
@@ -37,367 +35,401 @@ id_col <- "event_id"
 transcript_filter <- "biotype_filtered" # "transcripts" #
 event_type <- "SE"
 
-event_res <- sapply(
-  transcript_filters,
-  function(transcript_filter) {
-    sapply(
-      to_analyze, # as_events
-      function(event_type) {
-        print(sprintf(
-          "Loading events for %s, %s",
-          transcript_filter,
-          event_type
-        ))
-        event_file <- file.path(
-          rmats_event_dir,
-          transcript_filter,
-          paste0("event_", event_type, ".psi")
-        )
-        event_dt <- fread(event_file)
-        setnames(event_dt, "V1", id_col)
-        sample_cols <- intersect(rna_to_use, names(event_dt))
-        # drop all columns not in id_col or rnas_to_use, not all rnas are present in the event files (CREST data), so we need to intersect with the columns that are actually there
-        event_dt <- event_dt[, c(id_col, sample_cols), with = FALSE]
-
-        # prepare the alternative/upstream/downstream regions.
-        # needs some data wrangling depending on the event type but basically we just parse the SUPPA event id
-        # some information only needed for SE and RI and deleted for the other types
-        if (event_type == "SE") {
-          event_dt[,
-            c("event_gene", "seqnames", "e1s2", "e2s3", "strand") := tstrsplit(
-              get(id_col),
-              ":",
-              fixed = TRUE
-            )
-          ]
-          event_dt[,
-            c("gene_id", "Event Type") := tstrsplit(event_gene, ";", fixed = T)
-          ]
-          event_dt[,
-            c("e1", "s2", "e2", "s3") := c(
-              tstrsplit(e1s2, "-", fixed = TRUE, type.convert = TRUE),
-              tstrsplit(e2s3, "-", fixed = TRUE, type.convert = TRUE)
-            )
-          ]
-          all_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = e1, end = s3),
-              strand = strand
-            )]
-          upstream_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(
-                start = ifelse(strand == "+", e1, e2) + 1,
-                end = ifelse(strand == "+", s2, s3) - 1
-              ),
-              strand = strand
-            )]
-          downstream_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(
-                start = ifelse(strand == "+", e2, e1) + 1,
-                end = ifelse(strand == "+", s3, s2) - 1
-              ),
-              strand = strand
-            )]
-          event_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = s2, end = e2),
-              strand = strand
-            )]
-        } else if (event_type == "RI") {
-          event_dt[,
-            c(
-              "event_gene",
-              "seqnames",
-              "s1",
-              "e1s2",
-              "e2",
-              "strand"
-            ) := tstrsplit(get(id_col), ":", fixed = TRUE, type.convert = TRUE)
-          ]
-          event_dt[,
-            c("gene_id", "Event Type") := tstrsplit(event_gene, ";", fixed = T)
-          ]
-          event_dt[,
-            c("e1", "s2") := tstrsplit(
-              e1s2,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )
-          ]
-          all_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = s1, end = e2),
-              strand = strand
-            )]
-          upstream_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(
-                start = ifelse(strand == "+", s1, s2),
-                end = ifelse(strand == "+", e2, e2)
-              ),
-              strand = strand
-            )]
-          downstream_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(
-                start = ifelse(strand == "+", s2, s1),
-                end = ifelse(strand == "+", e2, e1)
-              ),
-              strand = strand
-            )]
-          event_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = e1 + 1, end = s2 - 1),
-              strand = strand
-            )]
-        } else if (event_type %in% c("AL", "AF")) {
-          event_dt[,
-            c(
-              "event_gene",
-              "seqnames",
-              "s1/e1s2",
-              "e1s3/e2",
-              "s2/e1s3",
-              "e2s3/e3",
-              "strand"
-            ) := tstrsplit(get(id_col), ":", fixed = TRUE, type.convert = TRUE)
-          ]
-          event_dt[,
-            c("gene_id", "Event Type") := tstrsplit(event_gene, ";", fixed = T)
-          ]
-          event_dt[
-            ifelse(event_type == "AF", strand == "+", strand == "-"),
-            start_all := as.integer(`s1/e1s2`)
-          ]
-          event_dt[
-            ifelse(event_type == "AF", strand == "-", strand == "+"),
-            start_all := tstrsplit(
-              `s1/e1s2`,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )[[1]] +
-              1
-          ]
-          event_dt[
-            ifelse(event_type == "AF", strand == "-", strand == "+"),
-            end_all := as.integer(`e2s3/e3`)
-          ]
-          event_dt[
-            ifelse(event_type == "AF", strand == "+", strand == "-"),
-            end_all := tstrsplit(
-              `e2s3/e3`,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )[[2]] -
-              1
-          ]
-          all_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = start_all, end = end_all),
-              strand = strand
-            )]
-          upstream_gr <- NULL
-          downstream_gr <- NULL
-          event_gr <- NULL
-        } else if (event_type %in% c("A3", "A5")) {
-          event_dt[,
-            c(
-              "event_gene",
-              "seqnames",
-              "e1s2/e2s3",
-              "e1s3",
-              "strand"
-            ) := tstrsplit(get(id_col), ":", fixed = TRUE, type.convert = TRUE)
-          ]
-          event_dt[,
-            c("gene_id", "Event Type") := tstrsplit(event_gene, ";", fixed = T)
-          ]
-          event_dt[,
-            c("e1/e2", "s2/s3") := tstrsplit(
-              `e1s2/e2s3`,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )
-          ]
-          event_dt[,
-            c("e1", "s3") := tstrsplit(
-              e1s3,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )
-          ]
-          all_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = `e1/e2` + 1, end = s3 - 1),
-              strand = strand
-            )]
-          upstream_gr <- NULL
-          downstream_gr <- NULL
-          event_gr <- NULL
-        } else if (event_type == "MX") {
-          event_dt[,
-            c(
-              "event_gene",
-              "seqnames",
-              "e1s2",
-              "e2s4",
-              "e1s3",
-              "e3s4",
-              "strand"
-            ) := tstrsplit(get(id_col), ":", fixed = TRUE, type.convert = TRUE)
-          ]
-          event_dt[,
-            c("gene_id", "Event Type") := tstrsplit(event_gene, ";", fixed = T)
-          ]
-          event_dt[,
-            start_all := tstrsplit(
-              e1s2,
-              "-",
-              fixed = TRUE,
-              type.convert = TRUE
-            )[[1]] +
-              1
-          ]
-          event_dt[,
-            end_all := tstrsplit(e3s4, "-", fixed = TRUE, type.convert = TRUE)[[
-              2
-            ]] -
-              1
-          ]
-          all_gr <-
-            event_dt[, GRanges(
-              seqnames = seqnames,
-              ranges = IRanges(start = start_all, end = end_all),
-              strand = strand
-            )]
-          upstream_gr <- NULL
-          downstream_gr <- NULL
-          event_gr <- NULL
-        } else {
-          stop("unknown event")
-        }
-        if (event_type %in% to_analyze) {
-          # show event_dt without sample_cols
-          hits <- findOverlaps(event_gr)
-
-          from <- queryHits(hits)
-          to <- subjectHits(hits)
-
-          # keep <- from != to
-          # from <- from[keep]
-          # to <- to[keep]
-
-          n <- length(event_gr)
-          # Build an undirected graph, get components
-          g <- igraph::graph_from_edgelist(cbind(from, to), directed = FALSE)
-          # Ensure isolated vertices are included
-          stopifnot(igraph::vcount(g) == length(event_gr))
-          # make sure that the graph has the same order as event_gr
-          stopifnot(all(igraph::V(g) == unique(from)))
-          # extract the components
-          comp <- igraph::components(g)
-          # add the cluster membership to the event_dt
-          event_dt[, event_cluster := comp$membership]
-          # get number of NAs per row in the sample columns
-          event_dt[, n_na := rowSums(is.na(.SD)), .SDcols = sample_cols]
-
-          # clip PSI to avoid 0/1 issues for logit
-          eps <- 1e-4
-          psi_clipped_dt <- event_dt[,
-            lapply(.SD, function(x) pmin(pmax(x, eps), 1 - eps)),
-            .SDcols = sample_cols
-          ]
-
-          # logit transform
-          psi_logit_dt <- psi_clipped_dt[, lapply(.SD, function(x) {
-            log(x / (1 - x))
-          })]
-
-          # compute variability on logit scale (robust)
-          event_dt[, mad_logit := apply(psi_logit_dt, 1, mad, na.rm = TRUE)]
-          event_dt[, iqr_logit := apply(psi_logit_dt, 1, IQR, na.rm = TRUE)]
-
-          # keep sd for reference (optional, still on raw scale)
-          event_dt[,
-            sd := apply(.SD, 1, sd, na.rm = TRUE),
-            .SDcols = sample_cols
-          ]
-          # get the representative of each cluster, which is the one with the lowest number of NAs, highest iqr_logit, then highest mad_logit, in that order
-          event_dt[,
-            cluster_representative := event_id ==
-              .SD[order(n_na, -mad_logit, -iqr_logit)[1], event_id],
-            by = event_cluster
-          ]
-          # note whether on autoposomes or gonosomes
-          event_dt[, is_autosome := !seqnames %in% c("chrX", "chrY")]
-          event_dt[, transcript_filter := transcript_filter]
-          return(list(
-            event_dt = event_dt[,
-              c(
-                "event_id",
-                "gene_id",
-                "seqnames",
-                "strand",
-                "Event Type",
-                "transcript_filter",
-                "event_cluster",
-                "cluster_representative",
-                "n_na",
-                "iqr_logit",
-                "mad_logit",
-                "sd",
-                "is_autosome",
-                ..sample_cols
-              )
-            ],
-            # dt with event info
-            event_gr = event_gr,
-            # gr of alternative region
-            upstream_gr = upstream_gr,
-            # gr of upstream region
-            downstream_gr = downstream_gr,
-            # gr of downstream region
-            all_gr = all_gr # merged gr
+event_res <- setNames(
+  pbmclapply(
+    transcript_filters,
+    function(transcript_filter) {
+      sapply(
+        to_analyze, # as_events
+        function(event_type) {
+          print(sprintf(
+            "Loading events for %s, %s",
+            transcript_filter,
+            event_type
           ))
-        }
-        list()
-      },
-      simplify = FALSE
-    )
-  },
-  simplify = FALSE
+          event_file <- file.path(
+            rmats_event_dir,
+            transcript_filter,
+            paste0("event_", event_type, ".psi")
+          )
+          event_dt <- fread(event_file)
+          setnames(event_dt, "V1", id_col)
+          sample_cols <- intersect(rna_to_use, names(event_dt))
+          # drop all columns not in id_col or rnas_to_use, not all rnas are present in the event files (CREST data), so we need to intersect with the columns that are actually there
+          event_dt <- event_dt[, c(id_col, sample_cols), with = FALSE]
+
+          # prepare the alternative/upstream/downstream regions.
+          # needs some data wrangling depending on the event type but basically we just parse the SUPPA event id
+          # some information only needed for SE and RI and deleted for the other types
+          if (event_type == "SE") {
+            event_dt[,
+              c(
+                "event_gene",
+                "seqnames",
+                "e1s2",
+                "e2s3",
+                "strand"
+              ) := tstrsplit(
+                get(id_col),
+                ":",
+                fixed = TRUE
+              )
+            ]
+            event_dt[,
+              c("gene_id", "Event Type") := tstrsplit(
+                event_gene,
+                ";",
+                fixed = T
+              )
+            ]
+            event_dt[,
+              c("e1", "s2", "e2", "s3") := c(
+                tstrsplit(e1s2, "-", fixed = TRUE, type.convert = TRUE),
+                tstrsplit(e2s3, "-", fixed = TRUE, type.convert = TRUE)
+              )
+            ]
+            all_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = e1, end = s3),
+                strand = strand
+              )]
+            upstream_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(
+                  start = ifelse(strand == "+", e1, e2) + 1,
+                  end = ifelse(strand == "+", s2, s3) - 1
+                ),
+                strand = strand
+              )]
+            downstream_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(
+                  start = ifelse(strand == "+", e2, e1) + 1,
+                  end = ifelse(strand == "+", s3, s2) - 1
+                ),
+                strand = strand
+              )]
+            event_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = s2, end = e2),
+                strand = strand
+              )]
+          } else if (event_type == "RI") {
+            event_dt[,
+              c(
+                "event_gene",
+                "seqnames",
+                "s1",
+                "e1s2",
+                "e2",
+                "strand"
+              ) := tstrsplit(
+                get(id_col),
+                ":",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            event_dt[,
+              c("gene_id", "Event Type") := tstrsplit(
+                event_gene,
+                ";",
+                fixed = T
+              )
+            ]
+            event_dt[,
+              c("e1", "s2") := tstrsplit(
+                e1s2,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            all_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = s1, end = e2),
+                strand = strand
+              )]
+            upstream_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(
+                  start = ifelse(strand == "+", s1, s2),
+                  end = ifelse(strand == "+", e1, e2)
+                ),
+                strand = strand
+              )]
+            downstream_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(
+                  start = ifelse(strand == "+", s2, s1),
+                  end = ifelse(strand == "+", e2, e1)
+                ),
+                strand = strand
+              )]
+            event_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = e1 + 1, end = s2 - 1),
+                strand = strand
+              )]
+          } else if (event_type %in% c("AL", "AF")) {
+            event_dt[,
+              c(
+                "event_gene",
+                "seqnames",
+                "s1/e1s2",
+                "e1s3/e2",
+                "s2/e1s3",
+                "e2s3/e3",
+                "strand"
+              ) := tstrsplit(
+                get(id_col),
+                ":",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            event_dt[,
+              c("gene_id", "Event Type") := tstrsplit(
+                event_gene,
+                ";",
+                fixed = T
+              )
+            ]
+            event_dt[
+              ifelse(event_type == "AF", strand == "+", strand == "-"),
+              start_all := as.integer(`s1/e1s2`)
+            ]
+            event_dt[
+              ifelse(event_type == "AF", strand == "-", strand == "+"),
+              start_all := tstrsplit(
+                `s1/e1s2`,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )[[1]] +
+                1
+            ]
+            event_dt[
+              ifelse(event_type == "AF", strand == "-", strand == "+"),
+              end_all := as.integer(`e2s3/e3`)
+            ]
+            event_dt[
+              ifelse(event_type == "AF", strand == "+", strand == "-"),
+              end_all := tstrsplit(
+                `e2s3/e3`,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )[[2]] -
+                1
+            ]
+            all_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = start_all, end = end_all),
+                strand = strand
+              )]
+            upstream_gr <- NULL
+            downstream_gr <- NULL
+            event_gr <- NULL
+          } else if (event_type %in% c("A3", "A5")) {
+            event_dt[,
+              c(
+                "event_gene",
+                "seqnames",
+                "e1s2/e2s3",
+                "e1s3",
+                "strand"
+              ) := tstrsplit(
+                get(id_col),
+                ":",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            event_dt[,
+              c("gene_id", "Event Type") := tstrsplit(
+                event_gene,
+                ";",
+                fixed = T
+              )
+            ]
+            event_dt[,
+              c("e1/e2", "s2/s3") := tstrsplit(
+                `e1s2/e2s3`,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            event_dt[,
+              c("e1", "s3") := tstrsplit(
+                e1s3,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            all_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = `e1/e2` + 1, end = s3 - 1),
+                strand = strand
+              )]
+            upstream_gr <- NULL
+            downstream_gr <- NULL
+            event_gr <- NULL
+          } else if (event_type == "MX") {
+            event_dt[,
+              c(
+                "event_gene",
+                "seqnames",
+                "e1s2",
+                "e2s4",
+                "e1s3",
+                "e3s4",
+                "strand"
+              ) := tstrsplit(
+                get(id_col),
+                ":",
+                fixed = TRUE,
+                type.convert = TRUE
+              )
+            ]
+            event_dt[,
+              c("gene_id", "Event Type") := tstrsplit(
+                event_gene,
+                ";",
+                fixed = T
+              )
+            ]
+            event_dt[,
+              start_all := tstrsplit(
+                e1s2,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )[[1]] +
+                1
+            ]
+            event_dt[,
+              end_all := tstrsplit(
+                e3s4,
+                "-",
+                fixed = TRUE,
+                type.convert = TRUE
+              )[[
+                2
+              ]] -
+                1
+            ]
+            all_gr <-
+              event_dt[, GRanges(
+                seqnames = seqnames,
+                ranges = IRanges(start = start_all, end = end_all),
+                strand = strand
+              )]
+            upstream_gr <- NULL
+            downstream_gr <- NULL
+            event_gr <- NULL
+          } else {
+            stop("unknown event")
+          }
+          if (event_type %in% to_analyze) {
+            # show event_dt without sample_cols
+            hits <- findOverlaps(event_gr)
+
+            from <- queryHits(hits)
+            to <- subjectHits(hits)
+
+            # keep <- from != to
+            # from <- from[keep]
+            # to <- to[keep]
+
+            n <- length(event_gr)
+            # Build an undirected graph, get components
+            g <- igraph::graph_from_edgelist(cbind(from, to), directed = FALSE)
+            # Ensure isolated vertices are included
+            stopifnot(igraph::vcount(g) == length(event_gr))
+            # make sure that the graph has the same order as event_gr
+            stopifnot(all(igraph::V(g) == unique(from)))
+            # extract the components
+            comp <- igraph::components(g)
+            # add the cluster membership to the event_dt
+            event_dt[, event_cluster := comp$membership]
+            # get number of NAs per row in the sample columns
+            event_dt[, n_na := rowSums(is.na(.SD)), .SDcols = sample_cols]
+
+            # compute variability on raw PSI scale (matrixStats: C-level, ~100x faster than apply)
+            psi_mat <- as.matrix(event_dt[, ..sample_cols])
+            event_dt[, mad_psi := matrixStats::rowMads(psi_mat, na.rm = TRUE)]
+            event_dt[, iqr_psi := matrixStats::rowIQRs(psi_mat, na.rm = TRUE)]
+            event_dt[, sd_psi := matrixStats::rowSds(psi_mat, na.rm = TRUE)]
+            rm(psi_mat)
+
+            # representative = lowest NAs, then highest mad, then highest iqr
+            event_dt[, .orig_order := .I]
+            setorder(event_dt, event_cluster, n_na, -mad_psi, -iqr_psi)
+            event_dt[,
+              cluster_representative := !duplicated(
+                event_dt,
+                by = "event_cluster"
+              )
+            ]
+            setorder(event_dt, .orig_order)
+            event_dt[, .orig_order := NULL]
+            # note whether on autoposomes or gonosomes
+            event_dt[, is_autosome := !seqnames %in% c("chrX", "chrY")]
+            event_dt[, transcript_filter := transcript_filter]
+            return(list(
+              event_dt = event_dt[,
+                c(
+                  "event_id",
+                  "gene_id",
+                  "seqnames",
+                  "strand",
+                  "Event Type",
+                  "transcript_filter",
+                  "event_cluster",
+                  "cluster_representative",
+                  "n_na",
+                  "mad_psi",
+                  "iqr_psi",
+                  "sd_psi",
+                  "is_autosome",
+                  ..sample_cols
+                )
+              ],
+              # dt with event info
+              event_gr = event_gr,
+              # gr of alternative region
+              upstream_gr = upstream_gr,
+              # gr of upstream region
+              downstream_gr = downstream_gr,
+              # gr of downstream region
+              all_gr = all_gr # merged gr
+            ))
+          }
+          list()
+        },
+        simplify = FALSE
+      )
+    },
+    mc.cores = length(transcript_filters)
+  ),
+  transcript_filters
 )
 ```
 
 ```{r, fig.width=7, fig.height=4, event-filtering}
-# make one large GRanges object with all events
-# sapply(to_analyze,
-#   function(x) {
-#     sapply(transcript_filters,
-#       function(y) event_res[[y]][[x]]$event_dt[, table(cluster_representative, is_autosome)],
-#       simplify = FALSE
-#     )
-#   },
-#   simplify = FALSE
-# )
-
 # stack event_dts and gr objects for SE and RI events
 event_dt <- data.table()
 event_gr <- GRanges()
@@ -437,6 +469,12 @@ event_dt[
   cluster_representative & is_autosome,
   table(transcript_filter, `Event Type`)
 ]
+stopifnot(
+  event_dt[,
+    sum(cluster_representative) == 1L,
+    by = .(transcript_filter, `Event Type`, event_cluster)
+  ][, all(V1)]
+)
 
 # include experimental events manually, to make sure models are built for this:
 #  4019, 4020, 460:463, 310:314, 8201:8202, 1658, 1048:1049, 13896:13897)
@@ -459,436 +497,68 @@ psi_long_dt <- melt(
 )
 rm(event_dt)
 gc()
-
-# Write minimal event coordinate table for Pangolin (event_id parsed by Python)
-fwrite(
-  unique(event_annotations_dt[, .(event_id, `Event Type`, ID)]),
-  "processed_data/pangolin_events.csv"
-)
 ```
 
-Export sequences for MaxEntScan
+Splice-site sequence export, MaxEntScan scoring, and Pangolin scoring are run as
+separate Snakefile rules (`maxentscan_scores`, `pangolin_scores`) after this notebook
+completes. FASTA export happens after `keep_rows_manual` is defined below.
 
-```{bash, download-genome, eval = FALSE}
-wget -q -O data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz http://ftp.ncbi.nlm.nih.gov/genomes/archive/old_genbank/Eukaryotes/vertebrates_mammals/Homo_sapiens/GRCh38/seqs_for_alignment_pipelines/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
-```
-
-```{r, export-sequences}
-library(Biostrings)
-genome_fasta <-
-  "data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
-genome <- readDNAStringSet(genome_fasta) # load genome
-chr_names <-
-  tstrsplit(names(genome), "[ \t]+", keep = 1)[[1]] # split names by tab/space
-names(genome) <- chr_names
-
-# make new genomic ranges object from event_annotations_dt: create 5' 9mer 9 bases long. [3 bases in exon][6 bases in intron] for SE, we need to take the end here
-# the 5ss of the downstream intron, i.e., the skippping ss
-down5ss <- promoters(downstream_gr, upstream = 3, downstream = 6)
-# the 5ss of the upstreamn intron, i.e., the including ss
-up5ss <- promoters(upstream_gr, upstream = 3, downstream = 6)
-# for ri, the 5ss is the 5ss of the intron itself
-event5ss <- promoters(event_gr, upstream = 3, downstream = 6)
-
-is_se <- event_annotations_dt[, `Event Type` == "SE"]
-se5ss_ranges <- down5ss[is_se]
-upe5ss_ranges <- up5ss[is_se]
-ri5ss_ranges <- event5ss[!is_se]
-ss5_indices <- order(c(which(is_se), which(!is_se)))
-ss5_gr <- c(se5ss_ranges, ri5ss_ranges)[ss5_indices]
-ss5up_gr <- c(upe5ss_ranges, ri5ss_ranges)[ss5_indices]
-
-
-# extract actual sequences
-ss5 <- genome[ss5_gr]
-ss5up <- genome[ss5up_gr]
-ss5[event_annotations_dt[, strand == "-"]] <-
-  reverseComplement(ss5[event_annotations_dt[, strand == "-"]])
-ss5up[event_annotations_dt[, strand == "-"]] <-
-  reverseComplement(ss5up[event_annotations_dt[, strand == "-"]])
-names(ss5) <- event_annotations_dt[, ID]
-names(ss5up) <- event_annotations_dt[, ID]
-# remove Ns, because MaxEntScan can't handle them
-ss5 <-
-  ss5[sapply(vmatchPattern("N", ss5), function(x) {
-    length(x) == 0
-  })]
-ss5up <-
-  ss5up[sapply(vmatchPattern("N", ss5up), function(x) {
-    length(x) == 0
-  })]
-# write to file
-ss5_file <- sprintf("processed_data/5ss.fasta")
-writeXStringSet(ss5, filepath = ss5_file)
-ss5up_file <- sprintf("processed_data/5ss_up.fasta")
-writeXStringSet(ss5up, filepath = ss5up_file)
-
-# make new genomic ranges object from event_annotations_dt: create 3' 23mer 23 bases long. [20 bases in the intron][3 base in the exon] for SE, we need to take the start here
-up3ss <- promoters(event_gr, upstream = 20, downstream = 3)
-# for the downstream 3ss, we flip the strand and use promoter on the downstream intron, because we want the 3ss of the downstream intron, which is the skipping ss for SE
-down3ss <- promoters(
-  GRanges(
-    seqnames = seqnames(downstream_gr),
-    ranges = ranges(downstream_gr),
-    strand = ifelse(strand(downstream_gr) == "-", "+", "-")
-  ),
-  upstream = 3,
-  downstream = 20
-)
-
-event3ss <- promoters(downstream_gr, upstream = 20, downstream = 3)
-se3ss_ranges <- up3ss[is_se]
-downe3ss_ranges <- down3ss[is_se]
-ri3ss_ranges <- event3ss[!is_se]
-ss3_indices <- order(c(which(is_se), which(!is_se)))
-ss3_gr <- c(se3ss_ranges, ri3ss_ranges)[ss3_indices]
-ss3_down <- c(downe3ss_ranges, ri3ss_ranges)[ss3_indices]
-
-# extract actual sequences
-ss3 <- genome[ss3_gr]
-ss3down <- genome[ss3_down]
-ss3[event_annotations_dt[, strand == "-"]] <-
-  reverseComplement(ss3[event_annotations_dt[, strand == "-"]])
-names(ss3) <- event_annotations_dt[, ID]
-ss3down[event_annotations_dt[, strand == "-"]] <-
-  reverseComplement(ss3down[event_annotations_dt[, strand == "-"]])
-names(ss3down) <- event_annotations_dt[, ID]
-# remove Ns, because MaxEntScan can't handle them
-ss3 <-
-  ss3[sapply(vmatchPattern("N", ss3), function(x) {
-    length(x) == 0
-  })]
-ss3down <-
-  ss3down[sapply(vmatchPattern("N", ss3down), function(x) {
-    length(x) == 0
-  })]
-# write to file
-ss3_file <- sprintf("processed_data/3ss.fasta")
-writeXStringSet(ss3, filepath = ss3_file)
-ss3down_file <- sprintf("processed_data/3ss_down.fasta")
-writeXStringSet(ss3down, filepath = ss3down_file)
-
-# clean all DNAStringSet objects to free memory
-rm(genome, ss3, ss3down, ss5, ss5up)
-gc()
-
-# define the ss3 and ss5 score files
-ss3_score_file <-
-  sprintf("processed_data/3scores.txt")
-ss3down_score_file <-
-  sprintf("processed_data/3down_scores.txt")
-ss5_score_file <-
-  sprintf("processed_data/5scores.txt")
-ss5up_score_file <-
-  sprintf("processed_data/5up_scores.txt")
-```
-
-```{r, runMaxEntScan}
-system(
-  sprintf(
-    "bash -lc 'mamba activate ihec-as && \\
-    maxentscan_score3.pl %s > %s && \\
-    maxentscan_score3.pl %s > %s && \\
-    maxentscan_score5.pl %s > %s && \\
-    maxentscan_score5.pl %s > %s '",
-    ss3_file,
-    ss3_score_file,
-    ss3down_file,
-    ss3down_score_file,
-    ss5_file,
-    ss5_score_file,
-    ss5up_file,
-    ss5up_score_file
-  ),
-  intern = TRUE
-)
-```
-
-```{r, read-MaxEntScanScores}
-# read the scores and match the to the events
-scores3 <- fread(ss3_score_file)
-names(scores3) <- c("sequence", "3ss")
-scores3down <- fread(ss3down_score_file)
-scores3[, `3ssdown` := scores3down[, 2]]
-header_3 <- grep("^>", readLines(ss3_file), value = TRUE)
-scores3[, ID := as.integer(substr(header_3, 2, nchar(header_3)))]
-scores3[, sequence := NULL]
-
-# read the scores and match the to the events
-scores5 <- fread(ss5_score_file)
-names(scores5) <- c("sequence", "5ss")
-scores5up <- fread(ss5up_score_file)
-scores5[, `5ssup` := scores5up[, 2]]
-header_5 <- grep("^>", readLines(ss5_file), value = TRUE)
-scores5[, ID := as.integer(substr(header_5, 2, nchar(header_5)))]
-scores5[, sequence := NULL]
-```
-
-```{r, splice-site-score-sanity}
-# Sanity checks for splice-site scores (§4.13e)
-dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
-
-# Prepare score table with grouping columns
-score_cols <- c("5ss", "5ssup", "3ss", "3ssdown")
-ss_dt <- merge(
-  scores5[, .(ID, `5ss`, `5ssup`)],
-  scores3[, .(ID, `3ss`, `3ssdown`)],
-  by = "ID",
-  all = TRUE
-)
-ss_dt <- merge(
-  event_annotations_dt[, .(ID, transcript_filter, `Event Type`)],
-  ss_dt,
-  by = "ID",
-  all.y = TRUE
-)
-
-# Expected ranges: 5'ss [-20, 12], 3'ss [-30, 16]
-cat("Splice-site score distributions by transcript_filter × Event Type:\n")
-for (tf in sort(unique(as.character(ss_dt$transcript_filter)))) {
-  if (is.na(tf)) {
-    next
-  }
-  for (et in sort(unique(as.character(ss_dt$`Event Type`)))) {
-    if (is.na(et)) {
-      next
-    }
-
-    sub <- ss_dt[
-      as.character(transcript_filter) == tf &
-        as.character(`Event Type`) == et
-    ]
-    if (nrow(sub) == 0) {
-      next
-    }
-
-    cat(sprintf("\n== transcript_filter=%s | Event Type=%s ==\n", tf, et))
-
-    for (col in score_cols) {
-      vals <- sub[[col]]
-      na_frac <- mean(is.na(vals))
-      n_non_na <- sum(!is.na(vals))
-
-      if (n_non_na == 0) {
-        cat(sprintf("  %s: no non-NA values\n", col))
-        next
-      }
-
-      cat(sprintf(
-        "  %s: n=%d, min=%.1f, median=%.1f, max=%.1f, NA fraction=%.3f\n",
-        col,
-        n_non_na,
-        min(vals, na.rm = TRUE),
-        median(vals, na.rm = TRUE),
-        max(vals, na.rm = TRUE),
-        na_frac
-      ))
-
-      if (na_frac >= 0.01) {
-        stop(sprintf(
-          "NA fraction for %s exceeds 1%% (transcript_filter=%s, Event Type=%s)",
-          col,
-          tf,
-          et
-        ))
-      }
-    }
-  }
-}
-
-# Plot distributions, grouped the same way as the checks
-ss_long <- melt(
-  ss_dt,
-  id.vars = c("ID", "transcript_filter", "Event Type"),
-  measure.vars = score_cols,
-  variable.name = "score_type",
-  value.name = "score"
-)
-
-ggsave(
-  filename = "qc/distributions/splice_site_scores.pdf",
-  plot = ggplot(ss_long, aes(x = score_type, y = score)) +
-    geom_boxplot() +
-    facet_grid(
-      `Event Type` ~ transcript_filter,
-      scales = "free_y"
-    ) +
-    theme_bw(),
-  width = 14,
-  height = 10
-)
-```
-
-```{r, compute-pangolin-scores}
-# Compute Pangolin splice site scores (§4.13e-ext)
-# Pangolin (Linder et al. 2023) scores absolute P(site used) across 32 GTEx tissues
-# from ±400 bp sequence context. More informative than MaxEntScan.
-
-# Run standalone Python script to compute Pangolin scores
-system("mamba run -n ihec-as python scripts/compute_pangolin_scores.py")
-
-# Load Pangolin results
-pangolin_raw <- fread("processed_data/pangolin_scores.csv")
-
-# Pivot to wide format and join with event_annotations_dt by event_id
-# Structure: event_id, site_type (donor/acceptor), mean_usage, max_usage, tissue_cv
-# Need to create separate columns for donor and acceptor metrics
-donor_cols <- pangolin_raw[
-  site_type == "donor",
-  .(
-    event_id,
-    donor_mean = mean_usage,
-    donor_max = max_usage,
-    donor_cv = tissue_cv
-  )
-]
-acceptor_cols <- pangolin_raw[
-  site_type == "acceptor",
-  .(
-    event_id,
-    acceptor_mean = mean_usage,
-    acceptor_max = max_usage,
-    acceptor_cv = tissue_cv
-  )
-]
-pangolin_dt <- donor_cols[acceptor_cols, on = "event_id"]
-
-# Match event_id to event_annotations_dt ID (by parsing SUPPA ID or direct match)
-# If event_ids in Pangolin output are same as event_annotations_dt's original event IDs, use that
-if ("event_id" %in% names(event_annotations_dt)) {
-  event_annotations_dt[
-    pangolin_dt,
-    on = .(event_id),
-    c(
-      "pangolin_donor_mean",
-      "pangolin_donor_max",
-      "pangolin_donor_cv",
-      "pangolin_acceptor_mean",
-      "pangolin_acceptor_max",
-      "pangolin_acceptor_cv"
-    ) := .(
-      i.donor_mean,
-      i.donor_max,
-      i.donor_cv,
-      i.acceptor_mean,
-      i.acceptor_max,
-      i.acceptor_cv
-    )
-  ]
-} else {
-  # Parse SUPPA event IDs from event_annotations_dt to match with Pangolin output
-  warning(
-    "event_id not in event_annotations_dt; matching via SUPPA format parsing (slower)"
-  )
-}
-```
-
-```{r, pangolin-sanity-checks}
-# Sanity checks for Pangolin scores (§4.13e-ext)
-
-# Check NA fraction
-na_fracs <- c(
-  donor_mean = mean(is.na(event_annotations_dt$pangolin_donor_mean)),
-  donor_max = mean(is.na(event_annotations_dt$pangolin_donor_max)),
-  donor_cv = mean(is.na(event_annotations_dt$pangolin_donor_cv)),
-  acceptor_mean = mean(is.na(event_annotations_dt$pangolin_acceptor_mean)),
-  acceptor_max = mean(is.na(event_annotations_dt$pangolin_acceptor_max)),
-  acceptor_cv = mean(is.na(event_annotations_dt$pangolin_acceptor_cv))
-)
-cat("Pangolin NA fractions:\n")
-print(na_fracs)
-if (!all(na_fracs < 0.05)) {
-  stop("Pangolin NA fraction exceeds 5%")
-}
-
-# Check correlation with MaxEntScan (should be positive: stronger sites have higher usage)
-cor_5ss <- cor(
-  event_annotations_dt[, `5ss`],
-  event_annotations_dt[, pangolin_donor_mean],
-  use = "complete.obs"
-)
-cor_5ssup <- cor(
-  event_annotations_dt[, `5ssup`],
-  event_annotations_dt[, pangolin_acceptor_mean],
-  use = "complete.obs"
-)
-cor_3ss <- cor(
-  event_annotations_dt[, `3ss`],
-  event_annotations_dt[, pangolin_acceptor_mean],
-  use = "complete.obs"
-)
-cor_3ssdown <- cor(
-  event_annotations_dt[, `3ssdown`],
-  event_annotations_dt[, pangolin_donor_mean],
-  use = "complete.obs"
-)
-
-cat("Pangolin vs MaxEntScan correlations (should be > 0.2):\n")
-cat(sprintf("  5'ss (donor) vs pangolin_donor_mean: %.3f\n", cor_5ss))
-cat(sprintf("  5'ssup (alt donor) vs pangolin_donor_mean: %.3f\n", cor_5ssup))
-cat(sprintf("  3'ss (acceptor) vs pangolin_acceptor_mean: %.3f\n", cor_3ss))
-cat(sprintf(
-  "  3'ssdown (alt acceptor) vs pangolin_donor_mean: %.3f\n",
-  cor_3ssdown
-))
-
-# Plot Pangolin score distributions
-pdf("qc/distributions/pangolin_scores.pdf", width = 12, height = 8)
-par(mfrow = c(2, 3))
-hist(
-  event_annotations_dt[, pangolin_donor_mean],
-  main = "Donor Mean Usage",
-  xlab = "Mean P(used)"
-)
-hist(
-  event_annotations_dt[, pangolin_donor_cv],
-  main = "Donor Tissue CV",
-  xlab = "CV across tissues"
-)
-hist(
-  event_annotations_dt[, pangolin_acceptor_mean],
-  main = "Acceptor Mean Usage",
-  xlab = "Mean P(used)"
-)
-hist(
-  event_annotations_dt[, pangolin_acceptor_cv],
-  main = "Acceptor Tissue CV",
-  xlab = "CV across tissues"
-)
-
-# Scatter: MaxEntScan vs Pangolin
-plot(
-  event_annotations_dt[, `5ss`],
-  event_annotations_dt[, pangolin_donor_mean],
-  main = "5'ss: MaxEntScan vs Pangolin",
-  xlab = "MaxEntScan Score",
-  ylab = "Pangolin Mean Usage"
-)
-abline(
-  lm(
-    event_annotations_dt[, pangolin_donor_mean] ~ event_annotations_dt[, `5ss`]
-  ),
-  col = "red"
-)
-
-dev.off()
-```
 
 ```{r, add-intrinsic-features}
-# load annotation
+# Load unfiltered annotation once; derive three filtered subsets in-memory.
+# Saves 2 of 3 GTF file reads vs loading each filtered GTF separately.
+unfiltered_annotation <- rtracklayer::import(
+  "splicing_analysis/gencode.v29.annotation.gtf"
+)
+
+confidence_tsls <- c("1", "2")
+polyA_biotypes <- c("protein_coding", "retained_intron")
+
+tx_filter <- unfiltered_annotation$type == "transcript"
+tsl_tx_filter <- tx_filter &
+  unfiltered_annotation$transcript_support_level %in% confidence_tsls
+biotype_tx_filter <- tsl_tx_filter &
+  unfiltered_annotation$transcript_type %in% polyA_biotypes
+
+filter_list <- list(
+  transcripts = tx_filter,
+  tsl_filtered = tsl_tx_filter,
+  biotype_filtered = biotype_tx_filter
+)
+
+annotation_objects <- lapply(names(filter_list), function(tf_name) {
+  this_filter <- filter_list[[tf_name]]
+  unfiltered_annotation[
+    (unfiltered_annotation$transcript_id %in%
+      unfiltered_annotation[this_filter]$transcript_id) |
+      (unfiltered_annotation$type == "gene" &
+        unfiltered_annotation$gene_id %in%
+          unfiltered_annotation[this_filter]$gene_id)
+  ]
+})
+names(annotation_objects) <- names(filter_list)
+
+# All three share the same source GTF seqlevels — adjust GRanges once here
+seqlevels(event_gr) <- seqlevels(unfiltered_annotation)
+seqlevels(upstream_gr) <- seqlevels(unfiltered_annotation)
+seqlevels(downstream_gr) <- seqlevels(unfiltered_annotation)
+seqlevels(all_gr) <- seqlevels(unfiltered_annotation)
+
+rm(
+  unfiltered_annotation,
+  filter_list,
+  tx_filter,
+  tsl_tx_filter,
+  biotype_tx_filter
+)
+gc()
+
 annotations <- pbmclapply(
   transcript_filters,
   function(this_transcript_filter) {
-    annotation <- rtracklayer::import(sprintf(
-      "splicing_analysis/gencode.v29.%s.gtf",
-      this_transcript_filter
-    ))
+    annotation <- annotation_objects[[this_transcript_filter]]
     exon_annotation <- annotation[annotation$type == "exon"]
-    # adjust seqlevels
-    seqlevels(event_gr) <- seqlevels(annotation)
-    seqlevels(upstream_gr) <- seqlevels(annotation)
-    seqlevels(downstream_gr) <- seqlevels(annotation)
-    seqlevels(all_gr) <- seqlevels(annotation)
+    # seqlevels already adjusted in parent before forking
 
     # regions that need direct match:
     used_exons <- event_gr[event_annotations_dt[
@@ -950,18 +620,6 @@ annotations <- pbmclapply(
       ),
       strand = strand(exon_annotation[from(hits)])
     )
-
-    # ex_id <- 52133 # 52130
-    # # 50936262-50941105:50941209-50942031
-    # hits[ex_id, ]
-    # used_exons[to(hits)[ex_id]]
-    # exon_annotation[c(from(hits)[ex_id] - 1, from(hits)[ex_id], from(hits)[ex_id] + 1)]
-
-    # used_upstream_introns[to(hits)[ex_id]]
-    # hit_upstream_introns[ex_id]
-
-    # used_downstream_introns[to(hits)[ex_id]]
-    # hit_downstream_introns[ex_id]
 
     # now check direct matches for the introns, add retained introns again as decoy, such that lengths match
     upstream_match <- hit_upstream_introns ==
@@ -1056,52 +714,56 @@ event_annotations_dt[
 ]
 
 # rethink cluster_representative: shouldn't this be one with annotated transcript info?
+# Vectorised: sort by group keys + priority criteria, mark first row per group with
+# duplicated(by=) — fully C-level, no per-group R dispatch
+event_annotations_dt[, .no_tr := lengths(tr_ids) == 0L]
+event_annotations_dt[, .orig_order := .I]
+setorder(
+  event_annotations_dt,
+  `Event Type`,
+  transcript_filter,
+  event_cluster,
+  .no_tr,
+  n_na,
+  -mad_psi,
+  -iqr_psi
+)
 event_annotations_dt[,
-  cluster_representative_annotated := event_id ==
-    .SD[
-      order(
-        sapply(tr_ids, function(x) length(x) == 0),
-        n_na,
-        -mad_logit,
-        -iqr_logit
-      )[1],
-      event_id
-    ],
-  by = .(`Event Type`, transcript_filter, event_cluster)
+  cluster_representative_annotated := !duplicated(
+    event_annotations_dt,
+    by = c("Event Type", "transcript_filter", "event_cluster")
+  )
 ]
+setorder(event_annotations_dt, .orig_order)
+event_annotations_dt[, c(".no_tr", ".orig_order") := NULL]
 event_annotations_dt[
   cluster_representative_annotated == TRUE &
-    sapply(tr_ids, function(x) length(x) == 0)
+    lengths(tr_ids) == 0L
 ]
+stopifnot(
+  event_annotations_dt[,
+    sum(cluster_representative_annotated) == 1L,
+    by = .(`Event Type`, transcript_filter, event_cluster)
+  ][, all(V1)]
+)
 
-# get min transcript start and max transcript end for each event depending on the strand, because we want to compute the distance to TSS and TES
+
+# get leftmost transcript start and rightmost transcript end for each event;
+# distance formula handles strand direction, so min/max selection is strand-independent
 event_annotations_dt[,
-  closest_tr_start := mapply(tr_starts, strand, FUN = function(starts, strand) {
-    if (strand == "-") {
-      min(starts)
-    } else {
-      max(starts)
-    }
-  })
+  closest_tr_start := vapply(
+    tr_starts,
+    function(x) if (length(x)) min(x) else NA_real_,
+    numeric(1)
+  )
 ]
 event_annotations_dt[,
-  closest_tr_end := mapply(tr_ends, strand, FUN = function(ends, strand) {
-    if (strand == "-") {
-      max(ends)
-    } else {
-      min(ends)
-    }
-  })
+  closest_tr_end := vapply(
+    tr_ends,
+    function(x) if (length(x)) max(x) else NA_real_,
+    numeric(1)
+  )
 ]
-
-# add scores to event_annotations_dt
-ss_dt <- merge(scores3, scores5, by = "ID")
-event_annotations_dt[
-  ss_dt,
-  on = "ID",
-  c("3ss", "3ssdown", "5ss", "5ssup") := .(i.3ss, i.3ssdown, i.5ss, i.5ssup)
-]
-
 
 # add distance to TSS and TES
 event_annotations_dt[,
@@ -1170,12 +832,6 @@ ggplot(
   scale_y_log10() +
   facet_wrap(~`Event Type`)
 
-# log distances
-# event_annotations_dt[, distance_TSS := log2(distance_TSS)]
-# event_annotations_dt[, distance_TES := log2(distance_TES)]
-# event_annotations_dt[, distance_gene_start := log2(distance_gene_start)]
-# event_annotations_dt[, distance_gene_end := log2(distance_gene_end)]
-
 # add region_lengths
 event_annotations_dt[,
   paste("width", "upstream_other_region", sep = ";") := width(upstream_gr)
@@ -1211,6 +867,7 @@ melt(
 
 # summary(event_annotations_dt[is_autosome & cluster_representative, .(distance_TSS, distance_TES, distance_gene_start, distance_gene_end, `width;upstream_other_region`, `width;event_name`, `width;downstream_other_region`)])
 ```
+
 ```{r, check event widths}
 # since we want ~200 bp before and after the event, we can check the distribution of event widths to see how many events would have intersecting upstream and downstream regions
 ggplot(
@@ -1259,25 +916,19 @@ three_prime_down <- make_window(
 )
 ```
 
-```{r, load-ChromHMM}
-library(mclust)
+```{r, assign-variability}
+# Median split on sd_psi per event type × transcript_filter.
+# sd_psi chosen over MAD/IQR: dip test confirms unimodal distribution (p≈1),
+# no natural bimodal structure exists. Median split is the most defensible
+# data-driven choice given the continuous spectrum. MAD rejected: ~27% SE and
+# ~52% RI MAD=0 events have sd > 0.1 (bimodal misclassification).
 event_annotations_dt[,
-  Variability := {
-    fit <- mclust::Mclust(
-      .SD[
-        is_autosome & cluster_representative_annotated,
-        .(mad_logit, iqr_logit)
-      ],
-      G = 2
-    )
-    means <- fit$parameters$mean
-    class_mapping <- c("Low", "High")
-    if (means[1, 1] > means[2, 1]) {
-      class_mapping <- rev(class_mapping)
-    }
-    class_mapping[predict(fit, .SD[, .(mad_logit, iqr_logit)])$classification]
-  },
-  by = .(transcript_filter, `Event Type`)
+  Variability := fifelse(
+    sd_psi > median(sd_psi, na.rm = TRUE),
+    "High",
+    "Low"
+  ),
+  by = .(`Event Type`, transcript_filter)
 ]
 event_annotations_dt[, table(
   Variability,
@@ -1309,11 +960,6 @@ chromhmm_hits <-
 chromhmm_in_vicinity <-
   sort(unique(to(chromhmm_hits))) # [from(chromhmm_hits) %in% keep_rows_manual]))
 
-# give the alternative and adjacent regions names for the bed file
-# event_gr$name <- event_annotations_dt[, ID]
-# upstream_gr$name <- sprintf("up_%d", event_annotations_dt[, ID])
-# downstream_gr$name <- sprintf("down_%d", event_annotations_dt[, ID])
-
 # write the bed file over which averaging should be done:
 aggregateOver <- c(
   # event_gr[keep_rows_manual],
@@ -1328,6 +974,321 @@ aggregateOver <- c(
 rtracklayer::export(
   aggregateOver,
   "processed_data/aggregateOver.bed"
+)
+```
+
+```{r, sanity-helpers}
+# Initialise qc/sanity_summary.csv and define append_sanity() helper.
+# Placed here so variability-diagnostics and psi-distribution-sanity can both use it.
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+sanity_csv <- "qc/sanity_summary.csv"
+if (!file.exists(sanity_csv)) {
+  fwrite(
+    data.table(
+      check_name = character(),
+      status = character(),
+      value = numeric(),
+      threshold = character(),
+      notes = character()
+    ),
+    sanity_csv
+  )
+}
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+```
+
+```{r, variability-diagnostics}
+plot_dt <- event_annotations_dt[is_autosome & cluster_representative_annotated]
+plot_dt_long <- melt(
+  plot_dt[, .(
+    ID,
+    `Event Type`,
+    transcript_filter,
+    Variability,
+    mad_psi,
+    iqr_psi,
+    sd_psi
+  )],
+  id.vars = c("ID", "Event Type", "transcript_filter", "Variability"),
+  variable.name = "measure",
+  value.name = "value"
+)
+
+# histograms of sd/iqr/mad per Event Type x transcript_filter, colored by Variability
+p_var_dist <- ggplot(plot_dt_long, aes(x = value, fill = Variability)) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.6) +
+  facet_grid(`Event Type` ~ transcript_filter + measure, scales = "free") +
+  labs(
+    x = "PSI",
+    y = "Count",
+    title = "Variability measures (raw PSI scale) -- keep_rows events only"
+  ) +
+  theme_bw(base_size = 10)
+print(p_var_dist)
+ggsave(
+  "qc/distributions/variability_distributions.pdf",
+  plot = p_var_dist,
+  width = 18,
+  height = 6
+)
+
+# pairwise scatterplots of all three variability measures
+pair_dt <- rbindlist(lapply(
+  combn(c("mad_psi", "iqr_psi", "sd_psi"), 2, simplify = FALSE),
+  function(p) {
+    plot_dt[, .(
+      pair = paste(p, collapse = " vs "),
+      x = .SD[[p[1]]],
+      y = .SD[[p[2]]],
+      `Event Type`,
+      transcript_filter,
+      Variability
+    )]
+  }
+))
+p_var_scatter <- ggplot(pair_dt, aes(x = x, y = y, color = Variability)) +
+  geom_point(size = 0.2, alpha = 0.3) +
+  facet_grid(`Event Type` ~ transcript_filter + pair, scales = "free") +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Pairwise variability measures -- keep_rows events only"
+  ) +
+  theme_bw(base_size = 9) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1)))
+print(p_var_scatter)
+ggsave(
+  "qc/distributions/variability_scatter.pdf",
+  plot = p_var_scatter,
+  width = 20,
+  height = 6
+)
+
+# MAD=0 but sd>0.1 check: diagnostic that motivated switching from MAD to sd.
+# ~27% SE and ~52% RI MAD=0 events have sd > 0.1 — bimodal events where >50%
+# of expressing samples sit at PSI=0/1. These are correctly captured by sd-based
+# Variability. Kept as a sanity check to confirm the issue persists if MAD were used.
+mad0_sd_check <- event_annotations_dt[
+  is_autosome & cluster_representative_annotated & mad_psi == 0 & sd_psi > 0.1,
+  .N,
+  by = .(`Event Type`, transcript_filter)
+]
+mad0_total <- event_annotations_dt[
+  is_autosome & cluster_representative_annotated & mad_psi == 0,
+  .N,
+  by = .(`Event Type`, transcript_filter)
+]
+mad0_check_dt <- mad0_sd_check[
+  mad0_total,
+  on = .(`Event Type`, transcript_filter)
+]
+mad0_check_dt[, pct_discordant := N / i.N]
+print(mad0_check_dt)
+
+for (i in seq_len(nrow(mad0_check_dt))) {
+  row <- mad0_check_dt[i]
+  status <- if (row$pct_discordant <= 0.05) "PASS" else "WARN"
+  if (status == "WARN") {
+    warning(sprintf(
+      "%.1f%% of MAD=0 %s %s events have sd_psi > 0.1 (potential bimodal misclassification)",
+      100 * row$pct_discordant,
+      row$`Event Type`,
+      row$transcript_filter
+    ))
+  }
+  append_sanity(
+    paste0(
+      "variability_mad0_sd_check__",
+      row$`Event Type`,
+      "__",
+      row$transcript_filter
+    ),
+    status,
+    row$pct_discordant,
+    "<= 0.05",
+    sprintf(
+      "%s %s: %.1f%% MAD=0 events have sd>0.1",
+      row$`Event Type`,
+      row$transcript_filter,
+      100 * row$pct_discordant
+    )
+  )
+}
+
+append_sanity(
+  "variability_diagnostics_pdf",
+  "PASS",
+  NA_real_,
+  "visual",
+  "qc/distributions/variability_distributions.pdf"
+)
+
+# Hartigan dip test for unimodality on each variability measure.
+# H0 = unimodal; p < 0.05 = multimodal structure exists.
+# If all p >> 0.05: no natural structure → any High/Low split is arbitrary.
+library(diptest)
+dip_results <- rbindlist(lapply(
+  c("mad_psi", "iqr_psi", "sd_psi"),
+  function(measure) {
+    rbindlist(lapply(to_analyze, function(et) {
+      rbindlist(lapply(
+        levels(event_annotations_dt$transcript_filter),
+        function(tf) {
+          vals <- event_annotations_dt[
+            `Event Type` == et &
+              transcript_filter == tf &
+              is_autosome &
+              cluster_representative_annotated,
+            get(measure)
+          ]
+          vals <- vals[is.finite(vals)]
+          d <- dip.test(vals)
+          data.table(
+            measure = measure,
+            event_type = et,
+            transcript_filter = tf,
+            n = length(vals),
+            dip_stat = unname(d$statistic),
+            p_value = d$p.value
+          )
+        }
+      ))
+    }))
+  }
+))
+print(dip_results)
+fwrite(dip_results, "qc/variability_dip_test.csv")
+```
+
+```{r, export-splice-site-sequences}
+# Export splice-site FASTA sequences for MaxEntScan and Pangolin scoring.
+# Only keep_rows_manual events — subset defined above.
+# MaxEntScan Perl scripts and Pangolin Python script run as Snakefile rules.
+library(Biostrings)
+genome_fasta <- "data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
+genome <- readDNAStringSet(genome_fasta)
+names(genome) <- tstrsplit(names(genome), "[ \t]+", keep = 1)[[1]]
+
+# Restrict GRanges to keep_rows_manual rows
+keep_idx <- event_annotations_dt[, ID %in% keep_rows_manual]
+keep_dt <- event_annotations_dt[keep_idx]
+is_se <- keep_dt[, `Event Type` == "SE"]
+
+upstream_gr_k <- upstream_gr[keep_idx]
+downstream_gr_k <- downstream_gr[keep_idx]
+event_gr_k <- event_gr[keep_idx]
+
+# 5' splice-site sequences (9-mer: 3 exon + 6 intron)
+# Donor = end of exon on the pre-mRNA. Use strand-flipped promoters() to anchor at range end.
+event_gr_k_flip <- GRanges(
+  seqnames = seqnames(event_gr_k),
+  ranges = ranges(event_gr_k),
+  strand = ifelse(strand(event_gr_k) == "+", "-", "+")
+)
+# RI: 5'ss = start of intron (event_gr_k = retained intron)
+event5ss <- promoters(event_gr_k, upstream = 3, downstream = 6)
+
+# SE: 5'ss of skipped exon (exon2 donor) = end of event_gr_k
+se5ss_ranges <- promoters(event_gr_k_flip, upstream = 6, downstream = 3)[is_se]
+# SE: 5'ss of upstream exon (E1 donor): upstream_gr_k = upstream intron, so flank at its
+# outer boundary gives [e1,e1] for "+" and [s3,s3] for "-" — i.e. the exon/intron junction.
+e1_junc_gr <- flank(upstream_gr_k[is_se], 1L, start = TRUE)
+e1_junc_flip <- GRanges(
+  seqnames = seqnames(e1_junc_gr),
+  ranges = ranges(e1_junc_gr),
+  strand = ifelse(strand(e1_junc_gr) == "+", "-", "+")
+)
+upe5ss_ranges <- promoters(e1_junc_flip, upstream = 6, downstream = 3)
+ri5ss_ranges <- event5ss[!is_se]
+ss5_idx <- order(c(which(is_se), which(!is_se)))
+ss5_gr <- c(se5ss_ranges, ri5ss_ranges)[ss5_idx]
+ss5up_gr <- c(upe5ss_ranges, ri5ss_ranges)[ss5_idx]
+
+ss5 <- genome[ss5_gr]
+ss5up <- genome[ss5up_gr]
+ss5[keep_dt[, strand == "-"]] <- reverseComplement(ss5[keep_dt[,
+  strand == "-"
+]])
+ss5up[keep_dt[, strand == "-"]] <- reverseComplement(ss5up[keep_dt[,
+  strand == "-"
+]])
+names(ss5) <- keep_dt[, ID]
+names(ss5up) <- keep_dt[, ID]
+ss5 <- ss5[sapply(vmatchPattern("N", ss5), function(x) length(x) == 0)]
+ss5up <- ss5up[sapply(vmatchPattern("N", ss5up), function(x) length(x) == 0)]
+
+# 3' splice-site sequences (23-mer: 20 intron + 3 exon)
+# Acceptor = start of exon on the pre-mRNA (promoters() default anchors at start).
+up3ss <- promoters(event_gr_k, upstream = 20, downstream = 3)
+# SE: 3'ss of skipped exon (E2 acceptor) = start of event_gr_k
+se3ss_ranges <- up3ss[is_se]
+# SE: 3'ss of downstream exon (E3 acceptor): downstream_gr_k = downstream intron, so flank
+# at its outer boundary gives [s3,s3] for "+" and [e1,e1] for "-" — the intron/exon junction.
+e3_junc_gr <- flank(downstream_gr_k[is_se], 1L, start = FALSE)
+downe3ss_ranges <- promoters(e3_junc_gr, upstream = 20, downstream = 3)
+# RI: 3'ss = start of downstream exon (downstream_gr_k = downstream exon for RI)
+ri3ss_ranges <- promoters(
+  downstream_gr_k[!is_se],
+  upstream = 20,
+  downstream = 3
+)
+ss3_idx <- order(c(which(is_se), which(!is_se)))
+ss3_gr <- c(se3ss_ranges, ri3ss_ranges)[ss3_idx]
+ss3_down <- c(downe3ss_ranges, ri3ss_ranges)[ss3_idx]
+
+ss3 <- genome[ss3_gr]
+ss3down <- genome[ss3_down]
+ss3[keep_dt[, strand == "-"]] <- reverseComplement(ss3[keep_dt[,
+  strand == "-"
+]])
+ss3down[keep_dt[, strand == "-"]] <- reverseComplement(ss3down[keep_dt[,
+  strand == "-"
+]])
+names(ss3) <- keep_dt[, ID]
+names(ss3down) <- keep_dt[, ID]
+ss3 <- ss3[sapply(vmatchPattern("N", ss3), function(x) length(x) == 0)]
+ss3down <- ss3down[sapply(vmatchPattern("N", ss3down), function(x) {
+  length(x) == 0
+})]
+
+# Write FASTAs
+ss5_file <- "processed_data/5ss.fasta"
+ss5up_file <- "processed_data/5ss_up.fasta"
+ss3_file <- "processed_data/3ss.fasta"
+ss3down_file <- "processed_data/3ss_down.fasta"
+writeXStringSet(ss5, filepath = ss5_file)
+writeXStringSet(ss5up, filepath = ss5up_file)
+writeXStringSet(ss3, filepath = ss3_file)
+writeXStringSet(ss3down, filepath = ss3down_file)
+
+# Score file paths (written by maxentscan_scores Snakefile rule)
+ss3_score_file <- "processed_data/3scores.txt"
+ss3down_score_file <- "processed_data/3down_scores.txt"
+ss5_score_file <- "processed_data/5scores.txt"
+ss5up_score_file <- "processed_data/5up_scores.txt"
+
+rm(genome)
+gc()
+```
+
+```{r, write-pangolin-events}
+# Write filtered event coordinate table for Pangolin Python script.
+# Only keep_rows_manual events; event_id string contains all coordinate info.
+fwrite(
+  event_annotations_dt[ID %in% keep_rows_manual, .(event_id, `Event Type`, ID)],
+  "processed_data/pangolin_events.csv"
 )
 ```
 
@@ -1361,15 +1322,17 @@ jc_list[id_map, on = .(suppa_id = event_id, transcript_filter), ID := i.ID]
 stopifnot(nrow(jc_list[is.na(ID)]) == 0L)
 stopifnot(nrow(jc_list[is.na(IJC) | is.na(SJC)]) == 0L)
 ijc_sjc_dt <- jc_list[, .(ID, uuid, IJC, SJC)]
-saveRDS(ijc_sjc_dt, "processed_data/ijc_sjc_dt.rds")
+fwrite(ijc_sjc_dt, "processed_data/ijc_sjc_dt.csv.gz")
 ```
 
 ```{r, psi-distribution-sanity}
 # §4.13a: PSI distribution sanity checks
-dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
 
-# Build working table: long PSI + protocol + Event Type
-uuid_protocol <- file_metadata[assay_type == "RNA-Seq", .(uuid, protocol)]
+# Build working table: long PSI + protocol + Event Type (all events, all transcript_filters)
+uuid_protocol <- file_metadata[
+  assay_type == "RNA-Seq",
+  .(uuid, protocol = experiment_type)
+]
 psi_check_dt <- psi_long_dt[
   event_annotations_dt[, .(ID, `Event Type`, transcript_filter)],
   on = "ID",
@@ -1380,70 +1343,289 @@ psi_check_dt <- psi_long_dt[
   nomatch = NULL
 ]
 
-# 1. All PSI in [0, 1]
-stopifnot(all(psi_check_dt[!is.na(psi), psi >= 0 & psi <= 1]))
+# 1. All PSI in [0, 1] — all events, all transcript_filters (data integrity)
+psi_ok <- all(psi_check_dt[!is.na(psi), psi >= 0 & psi <= 1])
+stopifnot(psi_ok)
+append_sanity(
+  "psi_range__all_events",
+  if (psi_ok) "PASS" else "FAIL",
+  as.numeric(psi_ok),
+  "[0,1]",
+  "all events, all transcript_filters"
+)
 
-# 2. Per-event mean PSI histograms faceted by Event Type × transcript_filter × protocol
-mean_psi_dt <- psi_check_dt[
+# Restrict to keep_rows_manual (fixed analysis set) for all remaining checks
+psi_check_km_dt <- psi_check_dt[ID %in% keep_rows_manual]
+
+# 2. Per-event mean PSI histograms — keep_rows_manual, all transcript_filters (visual)
+mean_psi_dt <- psi_check_km_dt[
   !is.na(psi),
   .(mean_psi = mean(psi)),
   by = .(ID, `Event Type`, transcript_filter, protocol)
 ]
-pdf("qc/distributions/psi_distributions.pdf", width = 14, height = 8)
-print(
-  ggplot(mean_psi_dt, aes(x = mean_psi)) +
-    geom_histogram(bins = 50) +
-    facet_grid(`Event Type` ~ transcript_filter + protocol) +
-    labs(x = "Per-event mean PSI", y = "Count") +
-    theme_bw()
+p_psi_dist <- ggplot(mean_psi_dt, aes(x = mean_psi)) +
+  geom_histogram(bins = 50) +
+  facet_grid(`Event Type` ~ transcript_filter + protocol, scales = "free_y") +
+  labs(x = "Per-event mean PSI", y = "Count") +
+  theme_bw()
+print(p_psi_dist)
+ggsave(
+  "qc/distributions/psi_distributions.pdf",
+  plot = p_psi_dist,
+  width = 14,
+  height = 8
 )
-dev.off()
+append_sanity(
+  "psi_distributions_pdf",
+  "PASS",
+  NA_real_,
+  "visual",
+  "keep_rows_manual; qc/distributions/psi_distributions.pdf"
+)
 
-# 3. SE bimodality: dip test on per-event mean PSI (biotype_filtered)
-se_mean_psi <- mean_psi_dt[
-  `Event Type` == "SE" & transcript_filter == "biotype_filtered",
-  mean_psi
-]
-if (requireNamespace("diptest", quietly = TRUE)) {
-  dip_result <- diptest::dip.test(se_mean_psi)
-  cat(sprintf(
-    "SE bimodality (dip test): D=%.4f, p=%.4g\n",
-    dip_result$statistic,
-    dip_result$p.value
-  ))
-  if (dip_result$p.value >= 0.05) {
-    warning(
-      "SE PSI dip test non-significant — expected bimodality not confirmed"
+# 3 & 4: SE bimodality + variable fraction — keep_rows_manual, per transcript_filter
+transcript_filters <- unique(mean_psi_dt[["transcript_filter"]])
+for (tf in transcript_filters) {
+  se_mean_psi_tf <- mean_psi_dt[
+    `Event Type` == "SE" & transcript_filter == tf,
+    mean_psi
+  ]
+
+  # 3. SE bimodality: dip test on per-event mean PSI
+  if (requireNamespace("diptest", quietly = TRUE)) {
+    dip_result <- diptest::dip.test(se_mean_psi_tf)
+    cat(sprintf(
+      "[%s] SE bimodality (dip test): D=%.4f, p=%.4g\n",
+      tf,
+      dip_result$statistic,
+      dip_result$p.value
+    ))
+    dip_status <- if (dip_result$p.value < 0.05) "PASS" else "WARN"
+    if (dip_status == "WARN") {
+      warning(sprintf(
+        "[%s] SE PSI dip test non-significant — expected bimodality not confirmed",
+        tf
+      ))
+    }
+    append_sanity(
+      paste0("se_bimodality_dip_p__", tf),
+      dip_status,
+      dip_result$p.value,
+      "< 0.05",
+      "keep_rows_manual"
+    )
+  } else {
+    warning("diptest package not available; skipping SE bimodality check")
+    append_sanity(
+      paste0("se_bimodality_dip_p__", tf),
+      "SKIP",
+      NA_real_,
+      "< 0.05",
+      "diptest not installed"
     )
   }
-} else {
-  warning("diptest package not available; skipping SE bimodality check")
+
+  # 4. SE variable fraction: ≥ 20% events with mean PSI in (0.05, 0.95)
+  pct_variable <- mean(se_mean_psi_tf > 0.05 & se_mean_psi_tf < 0.95)
+  cat(sprintf("[%s] SE variable fraction: %.1f%%\n", tf, 100 * pct_variable))
+  stopifnot(pct_variable >= 0.20)
+  if (pct_variable < 0.30 || pct_variable > 0.50) {
+    warning(sprintf(
+      "[%s] SE variable fraction %.1f%% outside expected 30-50%% range",
+      tf,
+      100 * pct_variable
+    ))
+  }
+  append_sanity(
+    paste0("se_variable_fraction__", tf),
+    if (pct_variable >= 0.20) "PASS" else "FAIL",
+    pct_variable,
+    ">= 0.20",
+    if (pct_variable < 0.30 || pct_variable > 0.50) {
+      "outside 30-50% expected range; keep_rows_manual"
+    } else {
+      "keep_rows_manual"
+    }
+  )
 }
 
-# 4. SE variable fraction (biotype_filtered): ≥ 20% events with mean PSI in (0.05, 0.95)
-pct_variable <- mean(se_mean_psi > 0.05 & se_mean_psi < 0.95)
-cat(sprintf("SE variable fraction: %.1f%%\n", 100 * pct_variable))
-stopifnot(pct_variable >= 0.20)
+# 5. RI protocol median: total-RNA-Seq > mRNA-Seq + 0.02 — keep_rows_manual, per transcript_filter
+for (tf in transcript_filters) {
+  ri_medians <- psi_check_km_dt[
+    `Event Type` == "RI" & transcript_filter == tf & !is.na(psi),
+    .(med = median(psi)),
+    by = protocol
+  ]
+  cat(sprintf("RI PSI medians by protocol [%s]:\n", tf))
+  print(ri_medians)
+  if (all(c("mRNA-Seq", "total-RNA-Seq") %in% ri_medians[, protocol])) {
+    ri_diff <- ri_medians[protocol == "total-RNA-Seq", med] -
+      ri_medians[protocol == "mRNA-Seq", med]
+    stopifnot(ri_diff > 0.02)
+    append_sanity(
+      paste0("ri_protocol_median_diff__", tf),
+      if (ri_diff > 0.02) "PASS" else "FAIL",
+      ri_diff,
+      "> 0.02",
+      "total-RNA-Seq minus mRNA-Seq RI PSI median; keep_rows_manual"
+    )
+  } else {
+    append_sanity(
+      paste0("ri_protocol_median_diff__", tf),
+      "SKIP",
+      NA_real_,
+      "> 0.02",
+      "missing protocol(s)"
+    )
+  }
+}
 
-# 5. RI protocol median: total-RNA-Seq > mRNA-Seq + 0.02
-ri_medians <- psi_check_dt[
-  `Event Type` == "RI" & transcript_filter == "biotype_filtered" & !is.na(psi),
-  .(med = median(psi)),
-  by = protocol
+# Note: item 6 (PSI sd vs gene_expression quantile) deferred to 05 §4.13d
+# (gene_expression not available until aggregation step)
+```
+
+```{r, variability-balance-sanity}
+# §4.13h: assert and plot Variability balance per Event Type x transcript_filter
+var_balance <- event_annotations_dt[
+  is_autosome & cluster_representative_annotated,
+  .(
+    n_high = sum(Variability == "High", na.rm = TRUE),
+    n_low = sum(Variability == "Low", na.rm = TRUE),
+    pct_high = mean(Variability == "High", na.rm = TRUE)
+  ),
+  by = .(`Event Type`, transcript_filter)
 ]
-cat("RI PSI medians by protocol:\n")
-print(ri_medians)
-if (all(c("mRNA-Seq", "total-RNA-Seq") %in% ri_medians[, protocol])) {
-  stopifnot(
-    ri_medians[protocol == "total-RNA-Seq", med] >
-      ri_medians[protocol == "mRNA-Seq", med] + 0.02
-  )
+print(var_balance)
+
+# assertions: median split always yields ~50% High per stratum; allow 40-60% tolerance
+for (tf in levels(event_annotations_dt$transcript_filter)) {
+  for (et in to_analyze) {
+    pct <- var_balance[`Event Type` == et & transcript_filter == tf, pct_high]
+    if (!length(pct) || is.na(pct)) {
+      next
+    }
+    status <- if (pct >= 0.40 & pct <= 0.60) "PASS" else "WARN"
+    if (status == "WARN") {
+      warning(sprintf(
+        "%s High variability %.1f%% outside 40-60%% range (%s) -- median split should give ~50%%",
+        et,
+        100 * pct,
+        tf
+      ))
+    }
+    append_sanity(
+      paste0("variability_balance_", tolower(et), "__", tf),
+      status,
+      pct,
+      "0.40-0.60",
+      sprintf("%s pct_high=%.3f", et, pct)
+    )
+  }
+}
+
+p_var_balance <- ggplot(
+  var_balance,
+  aes(x = transcript_filter, y = pct_high, fill = `Event Type`)
+) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0.50, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(
+    x = NULL,
+    y = "% High variability",
+    title = "Variability balance -- keep_rows events (is_autosome & cluster_representative_annotated)"
+  ) +
+  theme_bw(base_size = 11)
+print(p_var_balance)
+ggsave(
+  "qc/distributions/variability_balance.pdf",
+  plot = p_var_balance,
+  width = 8,
+  height = 4
+)
+append_sanity(
+  "variability_balance_pdf",
+  "PASS",
+  NA_real_,
+  "visual",
+  "qc/distributions/variability_balance.pdf"
+)
+```
+
+```{r, junction-coverage-sanity}
+# §4.13i: junction read coverage (IJC + SJC) for keep_rows events
+jc_check_dt <- ijc_sjc_dt[
+  ID %in% keep_rows_manual
+][
+  event_annotations_dt[, .(ID, `Event Type`, transcript_filter)],
+  on = "ID",
+  nomatch = NULL
+]
+jc_check_dt[, total_jc := IJC + SJC]
+
+# per-event median across expressing samples (total_jc > 0; zeros = unexpressed = expected for tissue-specific events)
+jc_event_median <- jc_check_dt[
+  total_jc > 0,
+  .(med_jc = median(total_jc)),
+  by = .(ID, `Event Type`, transcript_filter)
+]
+
+p_jc_cov <- ggplot(jc_event_median, aes(x = log10(med_jc + 1))) +
+  geom_histogram(bins = 60) +
+  geom_vline(xintercept = log10(10 + 1), linetype = "dashed", color = "red") +
+  facet_grid(`Event Type` ~ transcript_filter, scales = "free_y") +
+  labs(
+    x = "log10(median IJC + SJC + 1)",
+    y = "Events",
+    title = "Junction read coverage -- keep_rows events (conditional on expressing samples)",
+    subtitle = "Red dashed = 10 reads; zeros excluded (unexpressed samples)"
+  ) +
+  theme_bw(base_size = 11)
+print(p_jc_cov)
+ggsave(
+  "qc/distributions/junction_coverage.pdf",
+  plot = p_jc_cov,
+  width = 10,
+  height = 5
+)
+
+for (tf in levels(event_annotations_dt$transcript_filter)) {
+  for (et in to_analyze) {
+    med_vals <- jc_event_median[
+      `Event Type` == et & transcript_filter == tf,
+      med_jc
+    ]
+    if (!length(med_vals)) {
+      next
+    }
+    pct_low <- mean(med_vals < 10)
+    status <- if (pct_low <= 0.10) "PASS" else "WARN"
+    if (status == "WARN") {
+      warning(sprintf(
+        "%.1f%% %s %s events have median junction coverage < 10",
+        100 * pct_low,
+        et,
+        tf
+      ))
+    }
+    append_sanity(
+      paste0("junction_coverage_pct_low__", et, "__", tf),
+      status,
+      pct_low,
+      "<= 0.10",
+      sprintf("%s %s: %.1f%% events below 10 reads", et, tf, 100 * pct_low)
+    )
+  }
 }
 ```
 
 ```{r, save-workspace}
-saveRDS(event_annotations_dt, "processed_data/event_annotations_dt.rds")
-saveRDS(psi_long_dt, "processed_data/psi_long_dt.rds")
+fwrite(event_annotations_dt, "processed_data/event_annotations_dt.csv.gz")
+fwrite(psi_long_dt, "processed_data/psi_long_dt.csv.gz")
 # ijc_sjc_dt already written by load-ijc-sjc chunk
-save.image("processed_data/aggregating.rda")
+# aggregateOver.bed already written by assign-variability chunk (rtracklayer::export)
+# to_analyze    → defined in .Rprofile, no save needed
+# file_metadata → unmodified in 03; downstream scripts fread("processed_data/file_table.csv.gz")
+saveRDS(sample_cols, "processed_data/sample_cols.rds")
+saveRDS(keep_rows_manual, "processed_data/keep_rows_manual.rds")
 ```

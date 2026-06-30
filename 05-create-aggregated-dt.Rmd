@@ -1,15 +1,22 @@
 ---
 title: "Post-aggregation analysis"
 output: html_document
+params:
+  transcript_filter: "biotype_filtered"
 ---
 
 ```{r, load-data}
-# load the image
+# Non-tabular workspace objects: aggregateOver, file_metadata, sample_cols, keep_rows_manual, to_analyze
 load("processed_data/aggregating.rda")
+event_annotations_dt <- fread("processed_data/event_annotations_dt.csv.gz")
+psi_long_dt          <- fread("processed_data/psi_long_dt.csv.gz")
+ijc_sjc_dt           <- fread("processed_data/ijc_sjc_dt.csv.gz")
 # load the files table
 # file_table <- fread('processed_data/file_table.csv.gz')
 # locate
-file_metadata[, local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))]
+file_metadata[,
+  local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))
+]
 stopifnot(file_metadata[assay_type == "ChIP-Seq", all(file.exists(local_file))])
 
 setkey(file_metadata, "local_file")
@@ -22,7 +29,8 @@ fwrite(file_metadata, "processed_data/file_table.csv.gz")
 # load WGBS data
 wgbs_agg <- fread(file.path(sample_dt_dir, "WGBS_agg.csv.gz"))
 wgbs_agg <- wgbs_agg[!startsWith(name, "chromhmm")]
-wgbs_agg <- melt(wgbs_agg,
+wgbs_agg <- melt(
+  wgbs_agg,
   id.vars = c("ID", "ihec", "name"),
   value.name = "score",
   variable.name = "experiment_type",
@@ -50,7 +58,12 @@ histone_dt <- rbindlist(
   idcol = "local_file"
 )
 # some mapping for ids and histone marks
-histone_dt[, c("ihec", "experiment_type") := file_metadata[local_file, .(epirr_id_without_version, experiment_type)]]
+histone_dt[,
+  c("ihec", "experiment_type") := file_metadata[
+    local_file,
+    .(epirr_id_without_version, experiment_type)
+  ]
+]
 # histone_dt[, experiment_type:=file_metadata[local_file, experiment_type]]
 setnames(histone_dt, old = "mean", new = "score")
 
@@ -77,7 +90,12 @@ aggregated_dt[, experiment_type := droplevels(experiment_type)]
 aggregated_dt[, ihec := as.factor(ihec)]
 aggregated_dt[, ID := as.integer(ID)]
 # from long to wide
-aggregated_dt <- dcast(aggregated_dt, ihec + ID ~ experiment_type + position, value.var = "score", sep = ";")
+aggregated_dt <- dcast(
+  aggregated_dt,
+  ihec + ID ~ experiment_type + position,
+  value.var = "score",
+  sep = ";"
+)
 setnames(aggregated_dt, old = "ihec", new = "IHEC")
 # write full table to disk
 fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
@@ -85,18 +103,31 @@ fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
 
 
 ```{r, melt-psi}
-# bring PSI values to long format for compatibility with the aggregated table
-melted_psi <- melt(event_dt, measure.vars = sample_cols, id.vars = c("ID", "Event Type", "transcript_filter", "gene_id"), variable.name = "uuid", value.name = "PSI", variable.factor = FALSE)
+# psi_long_dt from 03 is already long format (ID, uuid, psi) — no melt needed
+melted_psi <- copy(psi_long_dt)
+setnames(melted_psi, "psi", "PSI")
+melted_psi[event_annotations_dt, on = .(ID),
+  c("Event Type", "transcript_filter", "gene_id") := .(`Event Type`, transcript_filter, gene_id)]
 melted_psi <- melted_psi[!is.na(PSI)]
-# merge on uuid to get ihec from the file_metadata
 melted_psi[file_metadata, on = .(uuid), IHEC := epirr_id_without_version]
 ```
 
 
 ```{r, expand-aggregated-dt}
 # merge PSI on the aggregated table
-aggregated_dt <- merge(aggregated_dt, melted_psi[ID %in% keep_rows_manual & !is.na(PSI), .(ID, IHEC, uuid, PSI, transcript_filter)], by = c("ID", "IHEC"))
-aggregated_dt[melted_psi[ID %in% keep_rows_manual & !is.na(PSI)], on = .(ID, IHEC), c("uuid", "PSI", "transcript_filter") := .(uuid, PSI, transcript_filter)]
+aggregated_dt <- merge(
+  aggregated_dt,
+  melted_psi[
+    ID %in% keep_rows_manual & !is.na(PSI),
+    .(ID, IHEC, uuid, PSI, transcript_filter)
+  ],
+  by = c("ID", "IHEC")
+)
+aggregated_dt[
+  melted_psi[ID %in% keep_rows_manual & !is.na(PSI)],
+  on = .(ID, IHEC),
+  c("uuid", "PSI", "transcript_filter") := .(uuid, PSI, transcript_filter)
+]
 # remove NA PSIs
 aggregated_dt <- aggregated_dt[!is.na(PSI)]
 # NA for columns starting with CpGs can be replaced by 0
@@ -105,12 +136,23 @@ for (i in grep("^CpGs", names(aggregated_dt))) {
 }
 
 # gather the intrinsic features
+# Note: splice-site scores (3ss, 5ss, etc.) joined separately after MaxEntScan rule
 cols_to_add <- c(
-  "3ss", "3ssdown", "5ss", "5ssup", "distance_TSS", "distance_TES", "distance_gene_start", "distance_gene_end", "width;upstream_other_region", "width;event_name", "width;downstream_other_region", "Event Type", "gene_id", "seqnames", "Variability"
+  "distance_TSS",
+  "distance_TES",
+  "distance_gene_start",
+  "distance_gene_end",
+  "width;upstream_other_region",
+  "width;event_name",
+  "width;downstream_other_region",
+  "Event Type",
+  "gene_id",
+  "seqnames",
+  "Variability"
 )
 
 # add the intrinsic features
-aggregated_dt[event_dt, on = .(ID), (cols_to_add) := mget(cols_to_add)]
+aggregated_dt[event_annotations_dt, on = .(ID), (cols_to_add) := mget(cols_to_add)]
 # also add the protocol
 aggregated_dt[file_metadata, on = .(uuid), protocol := experiment_type]
 # add the ontology term and the project
@@ -125,26 +167,55 @@ aggregated_dt[
 
 
 # load transcript ids per filter
-filtered_transcript_ids <- readRDS("splicing_analysis/filtered_transcript_ids.rds")
+filtered_transcript_ids <- readRDS(
+  "splicing_analysis/filtered_transcript_ids.rds"
+)
 # load isoform quantifications
-isoform_quants <- fread("splicing_analysis/isoform_quantifications_subset.tsv.gz")
+isoform_quants <- fread(
+  "splicing_analysis/isoform_quantifications_subset.tsv.gz"
+)
 # compute gene-level quantifications
-gene_quants <- rbindlist(sapply(transcript_filters, function(this_transcript_filter) {
-  # subset the isoform quantifications to the samples we want to use
-  this_filtered_transcripts <- filtered_transcript_ids[[this_transcript_filter]]
+gene_quants <- rbindlist(
+  sapply(
+    transcript_filters,
+    function(this_transcript_filter) {
+      # subset the isoform quantifications to the samples we want to use
+      this_filtered_transcripts <- filtered_transcript_ids[[
+        this_transcript_filter
+      ]]
 
-  # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
-  isoform_quants_filtered <- copy(isoform_quants[transcript_id %in% this_filtered_transcripts])
-  isoform_quants_filtered[effective_length > 0, RPK := 1000 * expected_count / effective_length, by = .(uuid, epirr_id_without_version)]
-  isoform_quants_filtered[, TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE), by = .(uuid, epirr_id_without_version)]
-  isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
-  isoform_quants_filtered[, TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE), .(uuid, epirr_id_without_version)]
-}, simplify = FALSE), idcol = "transcript_filter")
+      # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
+      isoform_quants_filtered <- copy(isoform_quants[
+        transcript_id %in% this_filtered_transcripts
+      ])
+      isoform_quants_filtered[
+        effective_length > 0,
+        RPK := 1000 * expected_count / effective_length,
+        by = .(uuid, epirr_id_without_version)
+      ]
+      isoform_quants_filtered[,
+        TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE),
+        by = .(uuid, epirr_id_without_version)
+      ]
+      isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
+      isoform_quants_filtered[,
+        TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE),
+        .(uuid, epirr_id_without_version)
+      ]
+    },
+    simplify = FALSE
+  ),
+  idcol = "transcript_filter"
+)
 
 
 # manually change gene_id for ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13 from the manual ids that were kept
 # aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
-aggregated_dt[gene_quants, on = .(transcript_filter, uuid, gene_id), gene_expression := TPM_scale]
+aggregated_dt[
+  gene_quants,
+  on = .(transcript_filter, uuid, gene_id),
+  gene_expression := TPM_scale
+]
 
 # make sure all of the gene_expression values are at least one: (deprecated because we don't have the suppa tpm filter anymore)
 # stopifnot(all(aggregated_dt[, gene_expression >= 1]))

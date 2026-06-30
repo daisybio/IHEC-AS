@@ -5,9 +5,57 @@ This is the code repository for [Revisiting Evidence for Epigenetic Control of A
 Most analyses are done in R using the .Rmd files in this repo. To keep track of R package versions, we use `renv`. To restore this project's versions, which are documented in the [renv.lock](renv.lock), use `renv::restore()`.
 Some analyses use other languages. For those, we have a mamba/conda environment with the documented versions in [env.yml](env.yml) that you can restore using `mamba env create -f env.yml`.
 
-Please run the scripts in the order indicated by the number with which the files start. The first notebook is [01-gather-data.Rmd](01-gather-data.Rmd) and the last one is [10-experimental-events.Rmd](10-experimental-events.Rmd).
+## Running the pipeline
 
-You can adjust parameters for your local machine in the [.Rprofile](.Rprofile) file.
+The full pipeline is managed by [Snakemake](https://snakemake.readthedocs.io/) (installed in the `ihec-as` mamba environment). Steps are numbered 01–10; `08-*` global ML models are replaced by the `splicing_ml` Python package.
+
+### Dry run (check DAG, no execution)
+
+```bash
+mamba run -n ihec-as snakemake --profile profiles/slurm -n
+```
+
+### Full run on SLURM
+
+```bash
+mamba run -n ihec-as snakemake --profile profiles/slurm
+```
+
+This submits all jobs to SLURM automatically. CPU and GPU rules are dispatched to the correct partitions via `scripts/snakemake/slurm_submit.sh`.
+
+### Run a single transcript filter
+
+```bash
+mamba run -n ihec-as snakemake --profile profiles/slurm \
+    --config transcript_filters='["biotype_filtered"]'
+```
+
+### Run a specific target
+
+```bash
+# Re-run correlation for one filter only
+mamba run -n ihec-as snakemake --profile profiles/slurm \
+    processed_data/correlation_intrinsic_biotype_filtered.csv.gz
+
+# Re-run all ML configs for one filter
+mamba run -n ihec-as snakemake --profile profiles/slurm \
+    --config transcript_filters='["biotype_filtered"]' \
+    $(mamba run -n ihec-as snakemake --profile profiles/slurm \
+        --config transcript_filters='["biotype_filtered"]' -n --quiet 2>/dev/null \
+        | grep splicing_ml | awk '{print $NF}')
+```
+
+### Force re-run a rule
+
+```bash
+mamba run -n ihec-as snakemake --profile profiles/slurm \
+    --forcerun create_aggregated_dt
+```
+
+### Configuration
+
+Pipeline parameters (paths, resource budgets, filter lists) are in [`config/snakemake_config.yaml`](config/snakemake_config.yaml).  
+Local machine parameters go in [`.Rprofile`](.Rprofile).
 
 ## Environment Setup
 

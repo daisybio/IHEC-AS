@@ -1,9 +1,10 @@
 # this script aggregates the methylation matrices to the regions of interest
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 # first locate the wgbs matrices
 chr_files <- list.files(wgbs_matrices_data_dir, pattern = ".meth10.csv.gz$", full.names = TRUE)
 chr_seqnames <- tstrsplit(basename(list.files(wgbs_matrices_data_dir, pattern = ".meth10.csv.gz$", full.names = TRUE)), split =".", fixed=TRUE, keep = 1)[[1]]
 # load the image with the aggregated regions
-load("processed_data/aggregating.rda")
+aggregateOver <- rtracklayer::import("processed_data/aggregateOver.bed")
 
 # function to aggregate the matrices
 aggregate_matrix <- function(file, seqname){
@@ -37,5 +38,37 @@ stopifnot(length(Reduce(intersect, lapply(result, function(x)x$name))) == 0)
 dir.create(sample_dt_dir, showWarnings = FALSE)
 dir.create(file.path(sample_dt_dir, "error_logs"), showWarnings = FALSE)
 dir.create(file.path(sample_dt_dir, "logs"), showWarnings = FALSE)
+# bind all chromosomes into single table
+full_result <- rbindlist(result)
+
+# β distribution sanity checks (§4.13c)
+stopifnot(all(full_result$score >= 0 & full_result$score <= 1))
+
+full_result[, feature_set := sub("_[0-9]+$", "", name)]
+
+# median CpG count >= 5 per window type
+for (fs in unique(full_result$feature_set)) {
+  med_n <- full_result[feature_set == fs, median(n)]
+  if (med_n < 5) warning(sprintf("median CpGs = %.1f for feature_set '%s' (< 5)", med_n, fs))
+}
+
+# coverage gap: fraction of aggregateOver regions with no WGBS data
+n_total <- length(aggregateOver)
+n_covered <- full_result[, uniqueN(ID)]
+gap_frac <- 1 - n_covered / n_total
+if (gap_frac > 0.5) warning(sprintf("%.1f%% of windows have no WGBS coverage", gap_frac * 100))
+
+# β histograms per window type
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+pdf("qc/distributions/dnam_beta.pdf", width = 9, height = 4)
+for (fs in unique(full_result$feature_set)) {
+  hist(full_result[feature_set == fs, score],
+       main = paste("beta distribution -", fs),
+       xlab = "mean beta", breaks = 50, col = "steelblue", border = "white")
+}
+dev.off()
+
+full_result[, feature_set := NULL]
+
 # write the result to file
-fwrite(rbindlist(result), file.path(sample_dt_dir, 'WGBS_agg.csv.gz'))
+fwrite(full_result, file.path(sample_dt_dir, 'WGBS_agg.csv.gz'))

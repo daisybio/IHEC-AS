@@ -1,0 +1,24 @@
+# Snakemake SLURM profile — use with:
+#   mamba run -n ihec-as snakemake --profile profiles/slurm [targets]
+#
+# Requires snakemake>=9 + snakemake-executor-plugin-slurm=2.7.1 (bioconda).
+# GPU vs CPU partition controlled per-rule via slurm_partition/slurm_extra resources
+# (set by _partition()/_extra() helpers in Snakefile).
+
+executor: slurm
+slurm-logdir: logs/slurm
+
+jobs: 200
+latency-wait: 90
+max-jobs-per-second: 5
+slurm-array-jobs: "aggregate_chip_one"
+slurm-array-limit: 200
+restart-times: 1
+keep-incomplete: true
+rerun-incomplete: true
+
+default-resources:
+  - slurm_partition="shared-cpu"
+  - slurm_extra="--mail-type=FAIL,END --mail-user=quirin.manz@tum.de"
+  - mem_mb=16000
+  - runtime=120
