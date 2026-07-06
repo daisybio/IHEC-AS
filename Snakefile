@@ -29,6 +29,13 @@ from itertools import product
 
 configfile: "config/snakemake_config.yaml"
 
+CONDA_BASE = "/nfs/data/cluster/software/miniforge3/24.7.1/miniforge3"
+shell.prefix(
+    "source /usr/share/modules/init/bash 2>/dev/null || true && "
+    f"source {CONDA_BASE}/etc/profile.d/conda.sh && "
+    f"source {CONDA_BASE}/etc/profile.d/mamba.sh && "
+)
+
 localrules: all, clean
 
 # ── Wildcard values ────────────────────────────────────────────────────────────
@@ -63,7 +70,6 @@ def R(rule_key, field):
     return config["resources"][rule_key][field]
 
 def ml_resource(et, var, field):
-    """Map (event_type, variability) to resource tier."""
     if et == "SE" and var == "both":
         tier = "splicing_ml_L"
     elif et == "RI" and var in ("High", "Low"):
@@ -73,18 +79,20 @@ def ml_resource(et, var, field):
     return config["resources"][tier][field]
 
 def _partition(rule_key):
-    """Return SLURM partition for a rule based on its gpu flag."""
     return (config["slurm_gpu_partition"] if config["resources"][rule_key]["gpu"]
             else config["slurm_cpu_partition"])
 
 def _extra(rule_key):
-    """Return extra sbatch args including GPU gres if needed."""
     base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
     if config["resources"][rule_key]["gpu"]:
-        g = config
-        return (f"--gres={g['slurm_gpu_gres']} --qos={g['slurm_gpu_qos']} "
-                f"--exclude={g['slurm_gpu_exclude']} {base}")
+        return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
+
+def _qos(rule_key):
+    return config["slurm_gpu_qos"] if config["resources"][rule_key]["gpu"] else None
+
+def _gres(rule_key):
+    return config["slurm_gpu_gres"] if config["resources"][rule_key]["gpu"] else None
 
 def _ml_partition(wc):
     gpu = ml_resource(wc.event_type, wc.variability, "gpu")
@@ -93,10 +101,16 @@ def _ml_partition(wc):
 def _ml_extra(wc):
     base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
     if ml_resource(wc.event_type, wc.variability, "gpu"):
-        g = config
-        return (f"--gres={g['slurm_gpu_gres']} --qos={g['slurm_gpu_qos']} "
-                f"--exclude={g['slurm_gpu_exclude']} {base}")
+        return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
+
+def _ml_qos(wc):
+    gpu = ml_resource(wc.event_type, wc.variability, "gpu")
+    return config["slurm_gpu_qos"] if gpu else None
+
+def _ml_gres(wc):
+    gpu = ml_resource(wc.event_type, wc.variability, "gpu")
+    return config["slurm_gpu_gres"] if gpu else None
 
 
 # ── ChIP BigWig file list (for aggregate_chip_one wildcard) ───────────────────
@@ -132,6 +146,8 @@ rule gather_data:
         runtime         = R("gather_data", "runtime"),
         slurm_partition = _partition("gather_data"),
         slurm_extra     = _extra("gather_data"),
+        qos             = _qos("gather_data"),
+        gres            = _gres("gather_data"),
     shell:
         """
         Rscript -e "rmarkdown::render('01-gather-data.Rmd',
@@ -158,6 +174,8 @@ rule suppa_analysis:
         runtime         = R("suppa_analysis", "runtime"),
         slurm_partition = _partition("suppa_analysis"),
         slurm_extra     = _extra("suppa_analysis"),
+        qos             = _qos("suppa_analysis"),
+        gres            = _gres("suppa_analysis"),
     shell:
         """
         Rscript -e "rmarkdown::render('02-SUPPA2-analysis.Rmd',
@@ -186,6 +204,8 @@ rule rmats_analysis:
         runtime         = R("rmats_analysis", "runtime"),
         slurm_partition = _partition("rmats_analysis"),
         slurm_extra     = _extra("rmats_analysis"),
+        qos             = _qos("rmats_analysis"),
+        gres            = _gres("rmats_analysis"),
     shell:
         """
         Rscript -e "rmarkdown::render('02z-rmats-analysis.Rmd',
@@ -229,6 +249,8 @@ rule prepare_aggregation:
         runtime         = R("prepare_aggregation", "runtime"),
         slurm_partition = _partition("prepare_aggregation"),
         slurm_extra     = _extra("prepare_aggregation"),
+        qos             = _qos("prepare_aggregation"),
+        gres            = _gres("prepare_aggregation"),
     shell:
         """
         Rscript -e "rmarkdown::render('03-prepare-aggregation.Rmd',
@@ -256,6 +278,8 @@ rule maxentscan_scores:
         runtime         = R("maxentscan_scores", "runtime"),
         slurm_partition = _partition("maxentscan_scores"),
         slurm_extra     = _extra("maxentscan_scores"),
+        qos             = _qos("maxentscan_scores"),
+        gres            = _gres("maxentscan_scores"),
     shell:
         """
         mamba run -n ihec-as bash 04-3-maxentscan-scores.sh > {log} 2>&1
@@ -276,15 +300,102 @@ rule pangolin_scores:
         runtime         = R("pangolin_scores", "runtime"),
         slurm_partition = _partition("pangolin_scores"),
         slurm_extra     = _extra("pangolin_scores"),
+        qos             = _qos("pangolin_scores"),
+        gres            = _gres("pangolin_scores"),
     shell:
         """
-        bash 04-4-pangolin-scores.sh > {log} 2>&1
+        bash 04-4-pangolin-scores.sh --batch-size 4096 > {log} 2>&1
+        """
+
+
+# ── Step 04-5: RNA-Seq gene expression normalisation (PLAN §4.12b, §4.12c) ──
+# Standalone target, NOT in `rule all` and NOT an input to create_aggregated_dt
+# yet: output is exploratory (compares getmm/vst x raw/combat) until `05`'s
+# `use_normalised_expression` flag is wired up (see file-changes/
+# 05-create-aggregated-dt.Rmd.md §4.12b). Run explicitly with
+# `snakemake processed_data/gene_expression_normalised.csv.gz`.
+# `filtered_tx_ids` is the only declared-output input (mirrors
+# create_aggregated_dt's existing pattern) even though the notebook also
+# reads `splicing_analysis/isoform_quantifications_subset.tsv.gz`, an
+# undeclared side-output of `suppa_analysis` — same pre-existing gap
+# `create_aggregated_dt` has, not fixed here.
+#
+# Future consumer (not wired yet, PLAN §3.4, file-changes/
+# 04-6-rbp-binding-sites.Rmd.md Step 2): once implemented, this rule's
+# output also becomes an input to `rbp_binding_sites` below (RBP-score +
+# core-spliceosome-factor expression need the normalised values) — making
+# rnaseq_normalisation a real (transitive) create_aggregated_dt dependency
+# via 04-6, even before `05`'s own `use_normalised_expression` flag lands.
+rule rnaseq_normalisation:
+    input:
+        filtered_tx_ids      = "splicing_analysis/filtered_transcript_ids.rds",
+        file_table           = "processed_data/file_table.csv.gz",
+        event_annotations_dt = "processed_data/event_annotations_dt.csv.gz",
+        psi_long_dt          = "processed_data/psi_long_dt.csv.gz",
+    output:
+        gene_expression_normalised = "processed_data/gene_expression_normalised.csv.gz",
+        html                       = "reports/04-5-rnaseq-normalisation.html",
+    log: "logs/04-5_rnaseq_normalisation.log"
+    threads: R("rnaseq_normalisation", "threads")
+    resources:
+        mem_mb          = R("rnaseq_normalisation", "mem_mb"),
+        runtime         = R("rnaseq_normalisation", "runtime"),
+        slurm_partition = _partition("rnaseq_normalisation"),
+        slurm_extra     = _extra("rnaseq_normalisation"),
+        qos             = _qos("rnaseq_normalisation"),
+        gres            = _gres("rnaseq_normalisation"),
+    shell:
+        """
+        Rscript -e "rmarkdown::render('04-5-rnaseq-normalisation.Rmd',
+            output_file = normalizePath('{output.html}', mustWork = FALSE)
+        )" > {log} 2>&1
+        """
+
+
+# ── Step 04-6: RBP binding-site annotation (PLAN §3.4) ───────────────────────
+# Standalone target, NOT in `rule all` and NOT an input to create_aggregated_dt
+# yet — mirrors rnaseq_normalisation's own pattern above. Currently only
+# Step 1 (binding-site annotation, genomic/expression-independent) is
+# implemented; declared outputs below cover only what the notebook actually
+# writes today. Step 2 (RBP-score + core-spliceosome-factor expression
+# features, file-changes/04-6-rbp-binding-sites.Rmd.md) is NOT YET DONE and
+# will add `gene_expression_normalised.csv.gz` (rnaseq_normalisation's
+# output) as a new input here, plus `rbp_score_dt.csv.gz` /
+# `splicing_factor_expression.csv.gz` / `rbp_wide_expression.csv.gz` as new
+# outputs — at that point this rule becomes a real create_aggregated_dt
+# input, forming the chain create_aggregated_dt -> rbp_binding_sites ->
+# rnaseq_normalisation. Don't add those inputs/outputs before the R code
+# exists — Snakemake requires declared outputs to actually be written.
+# `gencode_gtf` is a static reference file (like `human_postar3`), not a
+# pipeline-generated artifact — no upstream rule produces it.
+rule rbp_binding_sites:
+    input:
+        event_annotations_dt = "processed_data/event_annotations_dt.csv.gz",
+        human_postar3         = "data/human.txt.gz",
+        gencode_gtf            = "splicing_analysis/gencode.v29.annotation.gtf",
+    output:
+        rbp_per_event = "processed_data/rbp_per_event.rds",
+        rbp_gene_ids  = "processed_data/rbp_gene_ids.rds",
+        html          = "reports/04-6-rbp-binding-sites.html",
+    log: "logs/04-6_rbp_binding_sites.log"
+    threads: R("rbp_binding_sites", "threads")
+    resources:
+        mem_mb          = R("rbp_binding_sites", "mem_mb"),
+        runtime         = R("rbp_binding_sites", "runtime"),
+        slurm_partition = _partition("rbp_binding_sites"),
+        slurm_extra     = _extra("rbp_binding_sites"),
+        qos             = _qos("rbp_binding_sites"),
+        gres            = _gres("rbp_binding_sites"),
+    shell:
+        """
+        Rscript -e "rmarkdown::render('04-6-rbp-binding-sites.Rmd',
+            output_file = normalizePath('{output.html}', mustWork = FALSE)
+        )" > {log} 2>&1
         """
 
 
 # ── Step 04b: aggregate ChIP-Seq signal ──────────────────────────────────────
-# Submitted as SLURM arrays via snakemake-executor-plugin-slurm:
-#   profile groups aggregate_chip_one → chip_array (100 tasks per array).
+# aggregate_chip_one submitted as SLURM arrays (slurm-array-jobs in profile).
 # CHIP_BW discovered at parse time via glob_wildcards.
 
 rule aggregate_chip_one:
@@ -329,8 +440,10 @@ rule aggregate_wgbs:
         runtime         = R("aggregate_wgbs", "runtime"),
         slurm_partition = _partition("aggregate_wgbs"),
         slurm_extra     = _extra("aggregate_wgbs"),
+        qos             = _qos("aggregate_wgbs"),
+        gres            = _gres("aggregate_wgbs"),
     shell:
-        "Rscript 04-1-aggregate-WGBS-matrix.R > {log} 2>&1"
+        "module load r/4.2.1 2>/dev/null; Rscript 04-1-aggregate-WGBS-matrix.R > {log} 2>&1"
 
 
 # ── Step 05: create aggregated dataset (all transcript_filters as rows) ────────
@@ -362,6 +475,8 @@ rule create_aggregated_dt:
         runtime         = R("create_aggregated_dt", "runtime"),
         slurm_partition = _partition("create_aggregated_dt"),
         slurm_extra     = _extra("create_aggregated_dt"),
+        qos             = _qos("create_aggregated_dt"),
+        gres            = _gres("create_aggregated_dt"),
     shell:
         """
         Rscript -e "rmarkdown::render('05-create-aggregated-dt.Rmd',
@@ -386,6 +501,8 @@ rule correlation:
         runtime         = R("correlation", "runtime"),
         slurm_partition = _partition("correlation"),
         slurm_extra     = _extra("correlation"),
+        qos             = _qos("correlation"),
+        gres            = _gres("correlation"),
     shell:
         """
         Rscript -e "rmarkdown::render('06-correlation.Rmd',
@@ -408,6 +525,8 @@ rule splicing_ml:
         runtime         = lambda wc: ml_resource(wc.event_type, wc.variability, "runtime"),
         slurm_partition = _ml_partition,
         slurm_extra     = _ml_extra,
+        qos             = _ml_qos,
+        gres            = _ml_gres,
     shell:
         """
         mamba run -n ihec-as python run_splicing_ml.py \
@@ -442,6 +561,8 @@ rule event_models:
         runtime         = R("event_models", "runtime"),
         slurm_partition = _partition("event_models"),
         slurm_extra     = _extra("event_models"),
+        qos             = _qos("event_models"),
+        gres            = _gres("event_models"),
     shell:
         """
         TRANSCRIPT_FILTER={wildcards.transcript_filter} \
@@ -469,6 +590,8 @@ rule ml_analysis:
         runtime         = R("analysis", "runtime"),
         slurm_partition = _partition("analysis"),
         slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
     shell:
         """
         Rscript -e "rmarkdown::render('09-2-ml-local-new.Rmd',
@@ -493,6 +616,8 @@ rule experimental_events:
         runtime         = R("analysis", "runtime"),
         slurm_partition = _partition("analysis"),
         slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
     shell:
         """
         Rscript -e "rmarkdown::render('10-experimental-events.Rmd',

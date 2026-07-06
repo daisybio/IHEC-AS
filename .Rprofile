@@ -56,7 +56,8 @@ sample_metadata_file <- "data/IHEC_sample_metadata_harmonization.v1.4_extended.c
 ontology_column <- "harmonized_sample_ontology_term_high_order_fig1"
 
 
-ncores <- 40
+slurm_cpus <- Sys.getenv("SLURM_CPUS_PER_TASK", unset = "")
+ncores <- if (nchar(slurm_cpus) > 0L) as.integer(slurm_cpus) else 40L
 data.table::setDTthreads(ncores)
 message(sprintf("mc.cores: %d", options()$mc.cores))
 options(mc.cores = ncores)

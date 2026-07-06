@@ -1,0 +1,583 @@
+---
+title: "ChIP signal sanity checks (§4.13b)"
+output: html_document
+---
+
+```{r, setup}
+# §4.13b — sanity checks on the raw bigWigAverageOverBed output, run after
+# the aggregate_chip SLURM array (04-2-aggregate-ChIP.sh) + chip_agg.done.
+#
+# Memory design: at full scale there are 2430 ChIP files x ~424k windows.
+# Materializing all of it as one long table (what 05's `load-data` chunk
+# used to do before it was fixed) costs tens of GB for data that only needs
+# to produce ~2430 per-sample scalars plus a ~424k x 6-mark averaged
+# matrix. This script never holds more than one file's columns (~3 MB) or
+# one mark's running window-accumulator (~3.4 MB) in memory at a time.
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+
+aggregateOver <- rtracklayer::import("processed_data/aggregateOver.bed")
+# chromhmm windows are excluded from every downstream ChIP table (05, and
+# the aggregation script itself never dropped them at source) — restrict
+# to the same window set everything else operates on, so the row-count
+# check below (check 1) has the right expected value.
+is_chip_window <- !startsWith(aggregateOver$name, "chromhmm")
+window_names <- aggregateOver$name[is_chip_window]
+window_width <- width(aggregateOver)[is_chip_window]
+names(window_width) <- window_names
+n_windows <- length(window_names)
+
+file_metadata <- fread("processed_data/file_table.csv.gz")
+file_metadata[,
+  local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))
+]
+chip_files <- file_metadata[assay_type == "ChIP-Seq"]
+stopifnot(all(file.exists(chip_files$local_file)))
+marks <- sort(unique(chip_files$experiment_type))
+```
+
+
+```{r, per-file-summary}
+# Phase 1: one pass over all 2430 files, each producing a single small
+# summary row. bigWigAverageOverBed's 8 columns are name size covered sum
+# mean0 mean min max; `size` is skipped here (window width is already
+# known from aggregateOver and is constant per window across all files, so
+# re-reading it 2430 times would be pure duplication).
+per_file_summary <- rbindlist(pbmcapply::pbmcmapply(
+  FUN = function(file, this_ihec, this_mark, this_is_imputed) {
+    dt <- fread(
+      file,
+      select = c(1, 3, 4, 5, 6, 7, 8),
+      col.names = c("name", "covered", "sum", "mean0", "mean", "min", "max")
+    )
+    dt <- dt[!startsWith(name, "chromhmm")]
+
+    widths_here <- window_width[dt$name]
+
+    data.table(
+      local_file = file,
+      ihec = this_ihec,
+      mark = this_mark,
+      is_imputed = this_is_imputed,
+      n_rows = nrow(dt),
+      # check 1: structural integrity — truncated/corrupted bigwig output
+      n_rows_ok = nrow(dt) == n_windows,
+      # check 2: mean0 = sum/size, mean = sum/covered, covered <= size,
+      # signal >= 0 => mean0 <= mean must always hold; a violation means
+      # either corrupted arithmetic or an unexpectedly negative-valued track
+      mean0_violations = sum(dt$mean0 > dt$mean + 1e-6, na.rm = TRUE),
+      # check 3: signal tracks (p-value / enrichment) are non-negative by
+      # construction; a negative min means the wrong bigwig type got
+      # aggregated here
+      min_violations = sum(dt$min < -1e-6, na.rm = TRUE),
+      # check 4: fraction of this sample's windows where less than half the
+      # window width is actually covered by the bigwig — mean/mean0 are
+      # unreliable extrapolations from very sparse coverage
+      coverage_low_frac = mean(dt$covered / widths_here < 0.5, na.rm = TRUE),
+      median_score = median(dt$mean, na.rm = TRUE),
+      zero_frac = mean(dt$mean == 0, na.rm = TRUE),
+      # check 8 (per-file simplification): 99.9th percentile of this
+      # sample's per-window max — used below to flag samples with extreme
+      # localized spikes (blacklist regions / PCR-duplication hotspots)
+      max_p999 = quantile(dt$max, 0.999, na.rm = TRUE)
+    )
+  },
+  file = chip_files$local_file,
+  this_ihec = chip_files$epirr_id_without_version,
+  this_mark = chip_files$experiment_type,
+  this_is_imputed = chip_files$uuid == "imputed",
+  SIMPLIFY = FALSE
+))
+
+fwrite(per_file_summary, "qc/chip_per_file_summary.csv.gz")
+```
+
+
+```{r, structural-checks}
+# checks 1-3: hard structural/arithmetic invariants. WARN (not stopifnot) —
+# this is a sanity notebook, not a pipeline gate; a violation here should be
+# investigated, not silently crash 04/05.
+n_bad_rowcount <- per_file_summary[, sum(!n_rows_ok)]
+append_sanity(
+  "chip_row_count_integrity",
+  ifelse(n_bad_rowcount == 0, "PASS", "WARN"),
+  n_bad_rowcount, 0,
+  sprintf("%d/%d files have row count != %d", n_bad_rowcount, nrow(per_file_summary), n_windows)
+)
+
+total_mean0_violations <- per_file_summary[, sum(mean0_violations)]
+append_sanity(
+  "chip_mean0_le_mean_invariant",
+  ifelse(total_mean0_violations == 0, "PASS", "WARN"),
+  total_mean0_violations, 0,
+  "count of windows across all files where mean0 > mean (should never happen for non-negative signal)"
+)
+
+total_min_violations <- per_file_summary[, sum(min_violations)]
+append_sanity(
+  "chip_nonnegative_signal",
+  ifelse(total_min_violations == 0, "PASS", "WARN"),
+  total_min_violations, 0,
+  "count of windows across all files where min < 0"
+)
+```
+
+
+```{r, per-sample-outlier-checks}
+# check 5: per-sample median signal, robust z-score within mark. MAD-based
+# (not SD-based) to match the project's existing convention for skewed
+# per-sample metrics (see 03's variability dip-test chunk) and to avoid a
+# single extreme outlier sample inflating the SD used to judge itself.
+per_file_summary[, median_z := {
+  med <- median(median_score)
+  mad_val <- mad(median_score)
+  if (mad_val == 0) rep(0, .N) else (median_score - med) / mad_val
+}, by = mark]
+outlier_samples <- per_file_summary[abs(median_z) > 3]
+append_sanity(
+  "chip_per_sample_signal_outlier",
+  ifelse(nrow(outlier_samples) == 0, "PASS", "WARN"),
+  nrow(outlier_samples), 3,
+  sprintf("samples with |median signal z-score| > 3: %s", paste(outlier_samples$local_file, collapse = "; "))
+)
+
+# check 6: per-sample zero-inflation — flags samples with abnormally flat/
+# zero signal (potential failed ChIP). NOT MAD-z: zero_frac has a large
+# point-mass at (or near) 0 for most marks (median zero_frac == 0 for
+# H3K27ac/H3K36me3/H3K4me3/H3K9me3 in practice), which collapses the MAD to
+# a tiny nonzero value and makes MAD-z explode for any sample even slightly
+# above that near-zero floor — empirically this flagged ~27% of samples,
+# an implausible failure rate. One-sided upper Tukey fence (Q3 + 3*IQR)
+# is the standard robust alternative for a skewed, floor-heavy metric where
+# only the upper tail is a real concern (unusually low zero_frac is not a
+# problem in the way unusually high zero_frac is).
+per_file_summary[, zero_frac_upper_fence := {
+  q1 <- quantile(zero_frac, 0.25)
+  q3 <- quantile(zero_frac, 0.75)
+  rep(q3 + 3 * (q3 - q1), .N)
+}, by = mark]
+zero_outliers <- per_file_summary[zero_frac > zero_frac_upper_fence]
+append_sanity(
+  "chip_zero_inflation_outlier",
+  ifelse(nrow(zero_outliers) == 0, "PASS", "WARN"),
+  nrow(zero_outliers), 3,
+  sprintf("samples with zero-fraction above per-mark Q3+3*IQR: %s", paste(zero_outliers$local_file, collapse = "; "))
+)
+
+# check 8: per-sample extreme max-signal spikes. Same rationale as check 6
+# — max_p999 is heavily right-skewed (up to ~17x the median for H3K4me3),
+# and only unusually HIGH values indicate a real spike artifact (blacklist
+# region / PCR-duplication hotspot); a one-sided upper Tukey fence avoids
+# both the zero-inflation MAD collapse risk and flagging low values that
+# aren't actually a problem.
+per_file_summary[, max_p999_upper_fence := {
+  q1 <- quantile(max_p999, 0.25)
+  q3 <- quantile(max_p999, 0.75)
+  rep(q3 + 3 * (q3 - q1), .N)
+}, by = mark]
+spike_outliers <- per_file_summary[max_p999 > max_p999_upper_fence]
+append_sanity(
+  "chip_extreme_spike_outlier",
+  ifelse(nrow(spike_outliers) == 0, "PASS", "WARN"),
+  nrow(spike_outliers), 3,
+  sprintf("samples with max_p999 above per-mark Q3+3*IQR: %s", paste(spike_outliers$local_file, collapse = "; "))
+)
+
+# check 4 (file-level rollup): fraction of files where >10% of windows are
+# under-covered — a systemic coverage problem rather than a one-off window
+frac_files_low_coverage <- per_file_summary[, mean(coverage_low_frac > 0.10)]
+append_sanity(
+  "chip_coverage_completeness",
+  ifelse(frac_files_low_coverage <= 0.05, "PASS", "WARN"),
+  frac_files_low_coverage, 0.05,
+  "fraction of files where >10% of windows have covered/size < 0.5"
+)
+```
+
+
+```{r, observed-vs-imputed-check}
+# check 7: imputed ChIP tracks (uuid == "imputed") are model outputs and may
+# sit on a different dynamic range than observed tracks; silently mixing
+# them (as 05 does — both feed the same `score`/gene_expression pipeline)
+# would bias marks unevenly across samples if the scales don't match.
+obs_imp_summary <- per_file_summary[, .(
+  median_observed = median(median_score[!is_imputed]),
+  median_imputed   = median(median_score[is_imputed])
+), by = mark]
+obs_imp_summary[, ratio := median_imputed / median_observed]
+bad_marks <- obs_imp_summary[ratio < 0.5 | ratio > 2, mark]
+append_sanity(
+  "chip_observed_vs_imputed_scale",
+  ifelse(length(bad_marks) == 0, "PASS", "WARN"),
+  length(bad_marks), 0,
+  sprintf("marks with imputed/observed median ratio outside [0.5, 2]: %s", paste(bad_marks, collapse = ", "))
+)
+```
+
+
+```{r, window-level-accumulation}
+# Phase 2: per-mark, cohort-averaged signal at every window. Computed with
+# a sequential running sum per mark (not one big collected matrix) so peak
+# memory stays at one window-length vector (~3.4 MB) per mark in flight;
+# the 6 marks are done in parallel, so peak memory is ~6 vectors (~20 MB),
+# not 2430.
+window_mean_by_mark <- pbmcapply::pbmcmapply(
+  FUN = function(mark) {
+    mark_files <- chip_files[experiment_type == mark, local_file]
+    acc <- numeric(n_windows)
+    n_ok <- 0L
+    for (f in mark_files) {
+      dt <- fread(f, select = c(1, 6), col.names = c("name", "mean"))
+      dt <- dt[!startsWith(name, "chromhmm")]
+      idx <- match(window_names, dt$name)
+      if (anyNA(idx)) next # row mismatch already flagged by check 1
+      acc <- acc + dt$mean[idx]
+      n_ok <- n_ok + 1L
+    }
+    acc / n_ok
+  },
+  mark = marks,
+  SIMPLIFY = TRUE
+)
+rownames(window_mean_by_mark) <- window_names
+colnames(window_mean_by_mark) <- marks
+
+window_position <- sub("_[0-9]+$", "", window_names)
+
+# Window -> (Event Type, transcript_filter) stratum, via the ID embedded in
+# each window name (format "<position>_<ID>", same tstrsplit convention 05
+# uses). A given genomic event gets a distinct integer ID per
+# transcript_filter (event_annotations_dt has one row per (event_id,
+# transcript_filter) pair — confirmed empirically: every event_id appears
+# exactly 3 times, once per filter, each with its own ID), so this join is
+# exact, not an approximation.
+window_id <- as.integer(tstrsplit(window_names, "_", fixed = TRUE)[[2]])
+event_annotations_dt <- fread(
+  "processed_data/event_annotations_dt.csv.gz",
+  select = c("ID", "Event Type", "transcript_filter")
+)
+window_strata <- event_annotations_dt[
+  data.table(ID = window_id),
+  on = "ID",
+  .(`Event Type`, transcript_filter)
+]
+```
+
+
+```{r, viz-distributions}
+# viz 1: density of raw + log1p signal per mark x window-position-type.
+# Expected: raw right-skewed; log1p approximately log-normal. Active marks
+# (H3K4me3, H3K27ac) should show a bimodal log1p distribution (background
+# lobe near 0 + signal lobe); broad marks (H3K27me3, H3K36me3, H3K9me3)
+# should be unimodal with broader spread.
+pdf("qc/distributions/chip_signal_distributions.pdf", width = 9, height = 5)
+for (mark in marks) {
+  for (pos in unique(window_position)) {
+    vals <- window_mean_by_mark[window_position == pos, mark]
+    if (length(vals) < 2 || all(vals == 0)) next
+    par(mfrow = c(1, 2))
+    hist(vals,
+      breaks = 50, col = "steelblue", border = "white",
+      main = paste(mark, pos, "- raw"), xlab = "mean signal"
+    )
+    hist(log1p(vals),
+      breaks = 50, col = "darkorange", border = "white",
+      main = paste(mark, pos, "- log1p"), xlab = "log1p(mean signal)"
+    )
+    par(mfrow = c(1, 1))
+  }
+}
+dev.off()
+```
+
+
+```{r, viz-mark-correlation}
+# viz 2: mark-mark correlation across windows (cohort-averaged signal),
+# computed separately per (Event Type, transcript_filter) stratum rather
+# than pooled across all windows. Pooling mixes SE (~150k windows) with RI
+# (~9k windows) and three highly overlapping transcript_filters
+# (transcripts is a superset of tsl_filtered, which is a superset of
+# biotype_filtered — same underlying events, filtered annotation), which
+# risks a Simpson's-paradox-style distortion: a pooled correlation can
+# differ in sign from every individual stratum's correlation. Known
+# finding (see project memory): co-occurrence is all-positive even for
+# antagonistic pairs (e.g. H3K27ac vs H3K27me3) — a chromatin-fingerprint
+# confound, not event-specific regulation. Each stratum is checked against
+# this independently; a negative pair within a stratum is more informative
+# than one from a pooled computation, since it isn't attributable to
+# cross-stratum mixing.
+strata <- unique(window_strata[!is.na(`Event Type`)])
+
+pdf("qc/distributions/chip_mark_correlation.pdf", width = 6, height = 6)
+mark_cor_all <- list()
+for (i in seq_len(nrow(strata))) {
+  this_event_type <- strata$`Event Type`[i]
+  this_filter <- strata$transcript_filter[i]
+  in_stratum <- window_strata$`Event Type` == this_event_type &
+    window_strata$transcript_filter == this_filter
+  in_stratum[is.na(in_stratum)] <- FALSE
+  if (sum(in_stratum) < 10) next # too few windows for a meaningful correlation
+
+  mark_cor <- cor(window_mean_by_mark[in_stratum, , drop = FALSE], method = "spearman")
+  stratum_key <- paste(this_event_type, this_filter, sep = "_")
+  mark_cor_all[[stratum_key]] <- mark_cor
+
+  image(
+    mark_cor,
+    col = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-1, 1, length.out = 51),
+    axes = FALSE,
+    main = sprintf("Mark-mark signal correlation (Spearman)\n%s / %s (n=%d windows)",
+      this_event_type, this_filter, sum(in_stratum))
+  )
+  axis(1, at = seq(0, 1, length.out = ncol(mark_cor)), labels = colnames(mark_cor), las = 2)
+  axis(2, at = seq(0, 1, length.out = nrow(mark_cor)), labels = rownames(mark_cor), las = 2)
+
+  n_negative_pairs <- sum(mark_cor[upper.tri(mark_cor)] < 0)
+  append_sanity(
+    paste0("chip_mark_correlation_all_positive_", stratum_key),
+    ifelse(n_negative_pairs == 0, "PASS", "WARN"),
+    n_negative_pairs, 0,
+    sprintf("%s/%s (n=%d windows): count of mark pairs with negative correlation (0 expected per known fingerprint-confound finding)",
+      this_event_type, this_filter, sum(in_stratum))
+  )
+}
+dev.off()
+
+fwrite(
+  rbindlist(lapply(names(mark_cor_all), function(k) {
+    m <- mark_cor_all[[k]]
+    dt <- as.data.table(m, keep.rownames = "mark_row")
+    dt[, stratum := k]
+  })),
+  "qc/chip_mark_correlation.csv"
+)
+```
+
+
+```{r, sample-axis-correlation-test}
+# Test for the window-axis-vs-sample-axis hypothesis: the window-axis
+# correlation above (does mark A's cohort-averaged level at location X
+# correlate with mark B's level at X, across many X?) showed negative
+# pairs for antagonistic marks in every stratum — the opposite of the
+# project memory's "all-positive mark co-occurrence" finding. Hypothesis:
+# that finding was computed on a different axis — for a FIXED location,
+# do samples with elevated mark A also show elevated mark B, across
+# samples (averaged over many locations)? This is the "fingerprint" axis:
+# a global per-sample activity/accessibility level that could lift
+# multiple marks together regardless of their spatial antagonism. If
+# reproduced here but not on the window axis, the two findings are
+# compatible, not contradictory.
+#
+# Feasibility: a full sample-axis correlation needs, for a set of windows,
+# every sample's value at each window (not just the cohort average used
+# above) — the thing that made the original `histone_dt` load 1e9 rows
+# and ~82 GB. Restricting to a modest random subset of windows per
+# stratum keeps this to a third full pass over the 2430 files, but with
+# only ~3000 of ~424k rows kept per file (2 columns), not the full table.
+n_windows_per_stratum <- 500
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+sample_window_names <- unlist(lapply(seq_len(nrow(strata)), function(i) {
+  this_event_type <- strata$`Event Type`[i]
+  this_filter <- strata$transcript_filter[i]
+  in_stratum <- which(
+    window_strata$`Event Type` == this_event_type &
+      window_strata$transcript_filter == this_filter
+  )
+  sample(window_names[in_stratum], min(n_windows_per_stratum, length(in_stratum)))
+}))
+
+sample_axis_long <- rbindlist(pbmcapply::pbmcmapply(
+  FUN = function(file, this_ihec, this_mark) {
+    dt <- fread(file, select = c(1, 6), col.names = c("name", "mean"))
+    dt <- dt[name %in% sample_window_names]
+    dt[, ihec := this_ihec]
+    dt[, mark := this_mark]
+    dt
+  },
+  file = chip_files$local_file,
+  this_ihec = chip_files$epirr_id_without_version,
+  this_mark = chip_files$experiment_type,
+  SIMPLIFY = FALSE
+))
+sample_axis_wide <- dcast(sample_axis_long, ihec + name ~ mark, value.var = "mean", fun.aggregate = mean)
+
+# Fisher z-transform average — the statistically correct way to average
+# correlation coefficients (a naive arithmetic mean of r is biased,
+# especially away from 0).
+fisher_avg <- function(r_vec) {
+  r_vec <- r_vec[is.finite(r_vec) & abs(r_vec) < 1]
+  if (length(r_vec) == 0) return(NA_real_)
+  tanh(mean(atanh(r_vec)))
+}
+
+name_to_stratum <- window_strata[match(sample_window_names, window_names)]
+name_to_stratum[, name := sample_window_names]
+
+sample_axis_cor_all <- list()
+for (i in seq_len(nrow(strata))) {
+  this_event_type <- strata$`Event Type`[i]
+  this_filter <- strata$transcript_filter[i]
+  stratum_key <- paste(this_event_type, this_filter, sep = "_")
+  stratum_names <- name_to_stratum[
+    `Event Type` == this_event_type & transcript_filter == this_filter,
+    name
+  ]
+
+  # for each sampled window: one 6x6 correlation matrix ACROSS SAMPLES
+  # (~405 data points per window — plenty for a stable per-window estimate)
+  per_window_cors <- lapply(stratum_names, function(nm) {
+    sub <- sample_axis_wide[name == nm, ..marks]
+    if (nrow(sub) < 30) {
+      return(NULL)
+    }
+    tryCatch(
+      cor(sub, method = "spearman", use = "pairwise.complete.obs"),
+      error = function(e) NULL
+    )
+  })
+  per_window_cors <- per_window_cors[!sapply(per_window_cors, is.null)]
+
+  # average those per-window sample-axis matrices across all sampled
+  # windows in this stratum, to get one representative "fingerprint" matrix
+  avg_cor <- matrix(NA_real_,
+    nrow = length(marks), ncol = length(marks),
+    dimnames = list(marks, marks)
+  )
+  for (r1 in marks) {
+    for (r2 in marks) {
+      r_vals <- sapply(per_window_cors, function(m) m[r1, r2])
+      avg_cor[r1, r2] <- fisher_avg(r_vals)
+    }
+  }
+  sample_axis_cor_all[[stratum_key]] <- avg_cor
+}
+
+fwrite(
+  rbindlist(lapply(names(sample_axis_cor_all), function(k) {
+    m <- sample_axis_cor_all[[k]]
+    dt <- as.data.table(m, keep.rownames = "mark_row")
+    dt[, stratum := k]
+  })),
+  "qc/chip_sample_axis_correlation.csv"
+)
+```
+
+
+```{r, axis-comparison}
+# Direct comparison, per mark pair per stratum: window-axis r vs
+# sample-axis r. This is the actual test of the hypothesis above — not
+# just plausible reasoning, real numbers from the same data.
+comparison_rows <- list()
+mark_pairs <- combn(marks, 2)
+for (stratum_key in names(mark_cor_all)) {
+  window_m <- mark_cor_all[[stratum_key]]
+  sample_m <- sample_axis_cor_all[[stratum_key]]
+  for (j in seq_len(ncol(mark_pairs))) {
+    m1 <- mark_pairs[1, j]
+    m2 <- mark_pairs[2, j]
+    comparison_rows[[length(comparison_rows) + 1]] <- data.table(
+      stratum = stratum_key, mark1 = m1, mark2 = m2,
+      window_axis_r = window_m[m1, m2],
+      sample_axis_r = sample_m[m1, m2]
+    )
+  }
+}
+axis_comparison <- rbindlist(comparison_rows)
+fwrite(axis_comparison, "qc/chip_axis_comparison.csv")
+
+pdf("qc/distributions/chip_axis_comparison.pdf", width = 7, height = 6)
+plot(
+  axis_comparison$window_axis_r, axis_comparison$sample_axis_r,
+  xlab = "window axis (spatial) correlation", ylab = "sample axis (fingerprint) correlation",
+  pch = 16, xlim = c(-1, 1), ylim = c(-1, 1),
+  main = "Window-axis vs sample-axis mark correlation"
+)
+abline(h = 0, v = 0, lty = 2, col = "grey")
+abline(a = 0, b = 1, lty = 3, col = "blue")
+text(
+  axis_comparison$window_axis_r, axis_comparison$sample_axis_r,
+  labels = paste(axis_comparison$mark1, axis_comparison$mark2, sep = "-"),
+  cex = 0.6, pos = 3
+)
+dev.off()
+
+n_sample_axis_negative <- axis_comparison[, sum(sample_axis_r < 0, na.rm = TRUE)]
+n_window_axis_negative <- axis_comparison[, sum(window_axis_r < 0, na.rm = TRUE)]
+append_sanity(
+  "chip_sample_vs_window_axis_hypothesis",
+  ifelse(n_sample_axis_negative < n_window_axis_negative, "PASS", "WARN"),
+  n_sample_axis_negative, n_window_axis_negative,
+  sprintf(
+    "hypothesis: memory's all-positive finding is on the sample axis (per-window, across-sample correlation, 'fingerprint'), not the window axis (spatial, across-window correlation). sample_axis negative pairs=%d, window_axis negative pairs=%d (out of %d stratum x pair combinations). PASS if sample axis has fewer negative pairs than window axis.",
+    n_sample_axis_negative, n_window_axis_negative, nrow(axis_comparison)
+  )
+)
+```
+
+
+```{r, viz-per-sample}
+# viz 3: per-sample outlier scatter — median signal per sample, faceted by
+# mark, outliers (|z|>3, checks 5/6/8) highlighted.
+pdf("qc/distributions/chip_per_sample_outliers.pdf", width = 9, height = 6)
+for (this_mark in marks) {
+  sub_dt <- per_file_summary[mark == this_mark]
+  is_outlier <- abs(sub_dt$median_z) > 3
+  plot(
+    seq_len(nrow(sub_dt)), sub_dt$median_score,
+    col = ifelse(is_outlier, "red", "black"),
+    pch = ifelse(is_outlier, 17, 16),
+    main = paste("Per-sample median signal -", this_mark),
+    xlab = "sample index", ylab = "median signal"
+  )
+  if (any(is_outlier)) {
+    legend("topright", legend = "outlier (|z|>3)", pch = 17, col = "red", bty = "n")
+  }
+}
+dev.off()
+
+# viz 4: coverage completeness (per-file fraction of low-coverage windows)
+pdf("qc/distributions/chip_coverage_completeness.pdf", width = 7, height = 5)
+hist(
+  per_file_summary$coverage_low_frac,
+  breaks = 50, col = "steelblue", border = "white",
+  main = "Per-file fraction of windows with covered/size < 0.5",
+  xlab = "fraction of low-coverage windows"
+)
+dev.off()
+
+# viz 5: zero-inflation per mark
+pdf("qc/distributions/chip_zero_inflation.pdf", width = 7, height = 5)
+boxplot(
+  zero_frac ~ mark,
+  data = per_file_summary,
+  main = "Per-sample zero-signal fraction by mark",
+  xlab = "mark", ylab = "fraction of windows with mean == 0", las = 2
+)
+dev.off()
+
+# viz 6: observed vs imputed signal scale
+pdf("qc/distributions/chip_observed_vs_imputed.pdf", width = 8, height = 5)
+boxplot(
+  median_score ~ interaction(mark, is_imputed, sep = " / "),
+  data = per_file_summary,
+  main = "Per-sample median signal: observed vs imputed",
+  xlab = "mark / is_imputed", ylab = "median signal", las = 2
+)
+dev.off()
+```

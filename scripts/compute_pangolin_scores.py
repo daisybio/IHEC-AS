@@ -30,14 +30,17 @@ Outputs:
 """
 
 import argparse
+import os
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import importlib.resources
 import numpy as np
 import polars as pl
 import torch
+from tqdm import tqdm
 
 try:
     import pyfastx
@@ -73,6 +76,11 @@ FASTA_PATH = Path("data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz")
 OUTPUT_PATH = Path("processed_data/pangolin_scores.csv")
 RMATS_DIR   = Path("splicing_analysis/rmats/biotype_filtered")
 
+_BASE_LUT = np.zeros(256, dtype=np.int8)
+for _char, _idx in (("A", 1), ("a", 1), ("C", 2), ("c", 2),
+                     ("G", 3), ("g", 3), ("T", 4), ("t", 4)):
+    _BASE_LUT[ord(_char)] = _idx
+
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 
@@ -102,12 +110,8 @@ def load_models(device: torch.device) -> list:
 
 def _encode(seq: str) -> np.ndarray:
     """DNA string → one-hot (4, L) float32. N → all-zero row."""
-    lut = np.zeros(256, dtype=np.int8)
-    for char, idx in (("A", 1), ("a", 1), ("C", 2), ("c", 2),
-                      ("G", 3), ("g", 3), ("T", 4), ("t", 4)):
-        lut[ord(char)] = idx
     arr = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
-    return IN_MAP[lut[arr]].T   # (4, L)
+    return IN_MAP[_BASE_LUT[arr]].T   # (4, L)
 
 
 def encode_site(seq: str, strand: str) -> np.ndarray:
@@ -145,6 +149,21 @@ def extract_context(fa: "pyfastx.Fasta", chrom: str, pos: int) -> str:
     clip_right = max(0, end - chrom_len)
     seq = fa[chrom][max(0, start): min(chrom_len, end)].seq
     return "N" * clip_left + seq + "N" * clip_right
+
+
+# ── Parallel batch encoding (worker pool) ───────────────────────────────────────
+# extract_context + encode_site are pure-Python/CPU work; running them in worker
+# processes keeps the GPU fed instead of sitting idle behind a serial Python loop.
+
+_worker_fa = None
+
+def _init_worker(fasta_path: Path) -> None:
+    global _worker_fa
+    _worker_fa = pyfastx.Fasta(str(fasta_path))
+
+def _encode_one(site: dict) -> np.ndarray:
+    seq = extract_context(_worker_fa, site["chrom"], site["pos"])
+    return encode_site(seq, site["strand"])
 
 
 # ── Coordinate parsing ─────────────────────────────────────────────────────────
@@ -277,8 +296,8 @@ def check_canonical_dinucleotides(all_sites: list, fa: "pyfastx.Fasta") -> None:
     frac_gt = dinuc_frac(donor_sites,    "GT", CONTEXT,     CONTEXT + 2)
     frac_ag = dinuc_frac(acceptor_sites, "AG", CONTEXT - 2, CONTEXT)
 
-    print(f"  Donor GT fraction:    {frac_gt:.3f} (expected ≥ 0.90)")
-    print(f"  Acceptor AG fraction: {frac_ag:.3f} (expected ≥ 0.90)")
+    print(f"  Donor GT fraction:    {frac_gt:.3f} (expected ≥ 0.90)", flush=True)
+    print(f"  Acceptor AG fraction: {frac_ag:.3f} (expected ≥ 0.90)", flush=True)
 
     if frac_gt < 0.90:
         warnings.warn(
@@ -400,7 +419,8 @@ def compare_to_maxentscan(all_sites: list, fa: "pyfastx.Fasta", id_map: dict) ->
     mismatch_rate = mismatches / checked
     print(
         f"  MaxEntScan sequence cross-check: {checked} sites checked, "
-        f"{mismatches} mismatches ({mismatch_rate:.2%})"
+        f"{mismatches} mismatches ({mismatch_rate:.2%})",
+        flush=True,
     )
     if mismatch_rate > 0.05:
         raise ValueError(
@@ -489,49 +509,57 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
+    if device.type == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)} "
+              f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)", flush=True)
 
-    print("Loading 12 Pangolin models...")
+    print("Loading 12 Pangolin models...", flush=True)
     models = load_models(device)
+    print("  models loaded.", flush=True)
 
-    print(f"Opening FASTA: {FASTA_PATH}")
+    print(f"Opening FASTA: {FASTA_PATH}", flush=True)
     if not FASTA_PATH.exists():
         sys.exit(f"FASTA not found: {FASTA_PATH}")
     fa = pyfastx.Fasta(str(FASTA_PATH))
+    print(f"  FASTA opened ({len(fa)} sequences).", flush=True)
 
-    print("Loading event coordinates...")
+    print("Loading event coordinates...", flush=True)
     all_sites, id_map = load_events()
     if args.n_events is not None:
         all_sites = all_sites[: args.n_events * 4]
-        print(f"  --n-events {args.n_events}: truncated to {len(all_sites)} sites")
+        print(f"  --n-events {args.n_events}: truncated to {len(all_sites)} sites", flush=True)
     print(f"  {len(all_sites)} total sites to score "
-          f"({len(id_map)} events with integer ID for cross-checks)")
+          f"({len(id_map)} events with integer ID for cross-checks)", flush=True)
 
     # ── Validation checks ───────────────────────────────────────────────────────
     if not args.skip_validation:
-        print("Checking GT/AG dinucleotides at splice site positions...")
+        print("Checking GT/AG dinucleotides at splice site positions...", flush=True)
         check_canonical_dinucleotides(all_sites, fa)
+        print("  GT/AG check passed.", flush=True)
 
         if id_map:
-            print("Comparing Pangolin windows to MaxEntScan input sequences...")
+            print("Comparing Pangolin windows to MaxEntScan input sequences...", flush=True)
             compare_to_maxentscan(all_sites, fa, id_map)
+            print("  MaxEntScan cross-check passed.", flush=True)
         else:
-            print("  (MaxEntScan cross-check skipped: no integer ID map)")
+            print("  (MaxEntScan cross-check skipped: no integer ID map)", flush=True)
 
     # ── Batched scoring ─────────────────────────────────────────────────────────
-    print(f"Scoring {len(all_sites)} sites with batch_size={args.batch_size}...")
+    n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+    print(f"Scoring {len(all_sites)} sites with batch_size={args.batch_size}, "
+          f"encoding with {n_workers} worker processes...", flush=True)
     results = []
     n_batches = -(-len(all_sites) // args.batch_size)  # ceiling division
 
-    for b_start in range(0, len(all_sites), args.batch_size):
+    pool = ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_init_worker, initargs=(FASTA_PATH,)
+    )
+    for b_start in tqdm(range(0, len(all_sites), args.batch_size), total=n_batches, file=sys.stdout):
         batch = all_sites[b_start: b_start + args.batch_size]
-        b_idx = b_start // args.batch_size + 1
-        if b_idx % 100 == 1:
-            print(f"  batch {b_idx}/{n_batches}")
 
         encodings = np.stack(
-            [encode_site(extract_context(fa, s["chrom"], s["pos"]), s["strand"])
-             for s in batch],
+            list(pool.map(_encode_one, batch, chunksize=16)),
             axis=0,
         )  # (B, 4, SEQ_LEN)
 
@@ -553,10 +581,13 @@ def main() -> None:
                                    if mean_p > 0 else float("nan")),
             })
 
+    pool.shutdown()
+
     # ── Write output ─────────────────────────────────────────────────────────────
+    print("Writing output...", flush=True)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(results).write_csv(OUTPUT_PATH)
-    print(f"Saved {len(results)} scores → {OUTPUT_PATH}")
+    print(f"Saved {len(results)} scores → {OUTPUT_PATH}", flush=True)
 
 
 if __name__ == "__main__":

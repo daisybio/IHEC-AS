@@ -1,0 +1,709 @@
+---
+title: "RNA-Seq gene expression normalisation (§4.12b)"
+output: html_document
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(fig.width = 9, fig.height = 5)
+```
+
+```{r, load-packages}
+# §4.12b — properly normalised gene-level expression, replacing the raw
+# per-sample-rescaled TPM (`gene_expression = sum(TPM_scale)`) used in 05.
+# Raw TPM has closed-sum composition bias: a handful of highly expressed
+# transcripts/genes suppress the TPM of everything else in the same sample,
+# which distorts cross-sample x cross-gene comparisons (exactly the
+# comparison `gene_expression` is used for downstream, e.g. §4.13d,
+# §4.12e's low-expression filter). Two standard methods are computed and
+# written side by side so they can be compared before picking one for the
+# manuscript (see spec notes: GeTMM-CPM is generally preferred for
+# prediction tasks; vst is the canonical choice for differential
+# expression). 05 consumes this file when `use_normalised_expression = TRUE`.
+#
+# §4.12c — ComBat-seq protocol batch correction (Zhang et al. 2020, NAR
+# Genom Bioinform) was attempted here 2026-07-02 and ABANDONED after running
+# on real data: `qc/sanity_summary.csv`'s `combat_ri_protocol_beta_reduction`
+# entry shows ComBat_seq() itself failed (NA result, caught by a tryCatch
+# that has since been removed along with the rest of this branch). Root
+# cause confirmed empirically, not just suspected: most `ontology` (group)
+# levels are single-protocol (batch)-dominated, so ComBat-seq's
+# `~ batch + group` design is degenerate for them — batch and biology aren't
+# separable. See revision/file-changes/04-5-rnaseq-normalisation.Rmd.md for
+# the full writeup. Decision: use raw (uncorrected) getmm/vst; rely on the
+# existing protocol + protocol×gene_expression ML interaction term instead,
+# which works per-sample and doesn't need balanced protocol/ontology groups.
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+library(edgeR)
+library(DESeq2)
+library(parallel)
+
+# Same standalone append_sanity() pattern as `04-2-chip-signal-sanity.Rmd` —
+# each sanity-checking notebook defines its own local copy rather than
+# depending on `03`'s session state (this file already avoids that
+# dependency for sample_design/isoform_quants too, see `load-data` below).
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+```
+
+```{r, load-data}
+# 1. Load raw transcript-level quantifications (same source 05 uses for
+#    gene_expression) and the per-transcript_filter transcript ID sets.
+isoform_quants <- fread(
+  "splicing_analysis/isoform_quantifications_subset.tsv.gz"
+)
+filtered_transcript_ids <- readRDS(
+  "splicing_analysis/filtered_transcript_ids.rds"
+)
+transcript_filters <- names(filtered_transcript_ids)
+
+# sample metadata for the vst design (~ ontology + protocol): protocol comes
+# from file_table (per-uuid), ontology from the sample metadata sheet
+# (per-epirr). Loaded fresh here rather than depending on another script's
+# session state, matching the pattern used elsewhere in the pipeline (01/03).
+file_metadata <- fread("processed_data/file_table.csv.gz")
+sample_metadata <- fread(sample_metadata_file)
+
+sample_design <- unique(file_metadata[
+  assay_type == "RNA-Seq",
+  .(uuid, epirr_id_without_version, protocol = experiment_type)
+])
+sample_design[
+  sample_metadata,
+  on = c(epirr_id_without_version = "epirr_id_without_version"),
+  ontology := factor(get(..ontology_column))
+]
+sample_design <- sample_design[!is.na(ontology) & !is.na(protocol)]
+
+# file_table's RNA-Seq rows are the full EpiATLAS RNA-Seq pool (1555 uuid /
+# 1467 epirr) — most of which have no matching epigenomic data and are
+# irrelevant to this analysis. `isoform_quants` is already restricted to the
+# "both RNA-Seq and epigenomic data" cohort (441 uuid / 405 epirr, see
+# `02-SUPPA2-analysis.Rmd`'s `rna_to_use` filter), so intersecting here keeps
+# `sample_design` — and everything downstream that reads it, e.g. the
+# per-ontology protocol balance a reader would compute from it — scoped to
+# the samples actually used, instead of a much larger, mostly-irrelevant
+# superset.
+sample_design <- sample_design[uuid %in% unique(isoform_quants$uuid)]
+setkey(sample_design, uuid)
+```
+
+```{r, normalise-function}
+# 2. Per transcript_filter: aggregate transcript-level counts to gene level.
+#    - gene count = sum of transcript expected_count (RSEM), the standard
+#      tximport gene-summarisation rule
+#    - gene effective length = expected_count-weighted mean of transcript
+#      effective_length, so genes dominated by one long/short isoform are
+#      not diluted by rarely-used isoforms of very different length
+
+compute_getmm_and_vst <- function(count_mat, efflen_mat, col_data) {
+  # GeTMM-CPM (Smid et al. 2018, BMC Bioinformatics)
+  #     RPK -> TMM normalisation factors -> CPM. TMM on RPK (rather than raw
+  #     counts) folds the gene-length adjustment in before the library-size
+  #     adjustment, so the result is comparable both across samples (like
+  #     TMM) and across genes of different length (like RPK/TPM).
+  rpk_mat <- count_mat / (efflen_mat / 1000)
+  dge <- DGEList(counts = rpk_mat)
+  dge <- calcNormFactors(dge, method = "TMM")
+  getmm_mat <- cpm(dge, normalized.lib.sizes = TRUE, log = FALSE)
+
+  # lengthScaledTPM + DESeq2 vst (canonical Bioconductor approach)
+  #     lengthScaledTPM reproduces tximport's countsFromAbundance =
+  #     "lengthScaledTPM": TPM is scaled by gene length, then rescaled per
+  #     sample so the column sums match the original library size (total
+  #     mapped reads) — this keeps a count-like scale that DESeq2 expects,
+  #     while retaining TPM's cross-sample normalisation. vst is NOT a
+  #     length correction by itself (per spec note), which is why the counts
+  #     fed into it must already be length-scaled.
+  # `rpk_mat` (count/effLen*1000) computed above for GeTMM is byte-identical
+  # to the RPK-scale numerator TPM needs — reused here instead of
+  # recomputing count_mat / (efflen_mat / 1000) a second time.
+  raw_tpm <- t(t(rpk_mat) / (colSums(rpk_mat) / 1e6))
+  length_scaled <- raw_tpm * efflen_mat
+  lib_sizes <- colSums(count_mat)
+  rescale_factor <- lib_sizes / colSums(length_scaled)
+  length_scaled_tpm <- t(t(length_scaled) * rescale_factor)
+  length_scaled_tpm_int <- round(length_scaled_tpm)
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = length_scaled_tpm_int,
+    colData = col_data,
+    design = ~ ontology + protocol
+  )
+  dds <- estimateSizeFactors(dds)
+  vst_mat <- assay(vst(dds, blind = FALSE))
+
+  # Mean-variance trend per gene, per representation (§4.12b column-choice
+  # decision, discussed 2026-07-02): raw counts, raw TPM (pre-TMM, the
+  # `raw_tpm` computed above) and GeTMM-CPM are all expected to keep a
+  # mean-dependent variance (classic RNA-seq overdispersion); vst is
+  # specifically designed to flatten it. Computed here, not as a separate
+  # pass over `normalised_dt`, since `count_mat`/`raw_tpm`/`getmm_mat`/
+  # `vst_mat` are already in scope and this is a one-line rowMeans/rowSds
+  # per matrix — cheap relative to the vst() fit itself.
+  gene_mean_var <- data.table(
+    gene_id = rownames(count_mat),
+    mean_count = rowMeans(count_mat),
+    sd_count = matrixStats::rowSds(count_mat),
+    mean_tpm = rowMeans(raw_tpm),
+    sd_tpm = matrixStats::rowSds(raw_tpm),
+    mean_getmm = rowMeans(getmm_mat),
+    sd_getmm = matrixStats::rowSds(getmm_mat),
+    mean_vst = rowMeans(vst_mat),
+    sd_vst = matrixStats::rowSds(vst_mat)
+  )
+
+  # TMM normalisation factor spread (§4.12b column-choice decision): if
+  # `calcNormFactors()`'s per-sample factors barely deviate from 1, this
+  # dataset's composition bias is small and a naive per-gene z-score of raw
+  # TPM might be "good enough" in practice; a wide spread means the
+  # composition-bias correction TMM/GeTMM provides is doing real work.
+  norm_factors <- data.table(
+    uuid = colnames(count_mat),
+    tmm_norm_factor = dge$samples$norm.factors
+  )
+
+  list(
+    getmm = getmm_mat,
+    vst = vst_mat,
+    gene_mean_var = gene_mean_var,
+    norm_factors = norm_factors
+  )
+}
+
+normalise_one_filter <- function(this_transcript_filter) {
+  quants <- isoform_quants[
+    transcript_id %in%
+      filtered_transcript_ids[[this_transcript_filter]] &
+      uuid %in% sample_design$uuid
+  ]
+
+  gene_agg <- quants[,
+    .(
+      count = sum(expected_count, na.rm = TRUE),
+      # weighted.mean() with all-zero weights (gene unexpressed in this sample)
+      # would divide 0/0 -> NaN; fall back to the unweighted mean length there,
+      # since the length estimate doesn't matter for an unexpressed gene.
+      eff_length = if (sum(expected_count, na.rm = TRUE) > 0) {
+        weighted.mean(effective_length, w = expected_count, na.rm = TRUE)
+      } else {
+        mean(effective_length, na.rm = TRUE)
+      }
+    ),
+    by = .(uuid, gene_id)
+  ]
+
+  # gene x sample matrices (genes present in ALL samples for this filter;
+  # a gene missing entirely from a sample's quantification is treated as
+  # zero counts, not a missing value)
+  count_wide <- dcast(gene_agg, gene_id ~ uuid, value.var = "count", fill = 0)
+  efflen_wide <- dcast(gene_agg, gene_id ~ uuid, value.var = "eff_length")
+  gene_ids <- count_wide$gene_id
+  sample_uuids <- setdiff(names(count_wide), "gene_id")
+
+  count_mat <- as.matrix(count_wide[, ..sample_uuids])
+  efflen_mat <- as.matrix(efflen_wide[, ..sample_uuids])
+  rownames(count_mat) <- rownames(efflen_mat) <- gene_ids
+
+  # genes never expressed in ANY sample for this filter have effLen = NaN
+  # everywhere (no count-weighted or unweighted mean possible if the
+  # transcript's own effective_length was also NA); such genes cannot be
+  # length-normalised meaningfully, so they are dropped from this filter's
+  # normalisation (they contribute gene_expression = 0 in 05 either way).
+  #
+  # Also drop genes with effLen == 0 in any sample: RSEM legitimately
+  # reports effective_length = 0 for transcripts shorter than the read
+  # length (confirmed empirically: ~3.2% of all transcript-level rows in
+  # isoform_quantifications_subset.tsv.gz). Dividing by 0 below
+  # (count_mat / (efflen_mat / 1000)) produces Inf/NaN that poisons the
+  # entire sample's colSums() in the vst rescaling step further down —
+  # verified this causes DESeq2's "NA counts not allowed" error before this
+  # guard was added. Same "cannot be length-normalised meaningfully"
+  # reasoning as the NA case above, so the fix is the same: drop the gene.
+  keep_genes <- rowSums(!is.na(efflen_mat) & efflen_mat > 0) == ncol(efflen_mat)
+  count_mat <- count_mat[keep_genes, , drop = FALSE]
+  efflen_mat <- efflen_mat[keep_genes, , drop = FALSE]
+
+  col_data <- data.frame(
+    uuid = sample_uuids,
+    row.names = sample_uuids
+  )
+  col_data <- merge(col_data, sample_design, by = "uuid", sort = FALSE)
+  rownames(col_data) <- col_data$uuid
+  col_data <- col_data[sample_uuids, , drop = FALSE]
+
+  raw_result <- compute_getmm_and_vst(count_mat, efflen_mat, col_data)
+
+  list(
+    main = data.table(
+      transcript_filter = this_transcript_filter,
+      gene_id = rep(gene_ids[keep_genes], times = length(sample_uuids)),
+      uuid = rep(sample_uuids, each = sum(keep_genes)),
+      gene_expression_getmm = as.vector(raw_result$getmm),
+      gene_expression_vst = as.vector(raw_result$vst)
+    ),
+    gene_mean_var = raw_result$gene_mean_var[,
+      transcript_filter := this_transcript_filter
+    ],
+    norm_factors = raw_result$norm_factors[,
+      transcript_filter := this_transcript_filter
+    ]
+  )
+}
+```
+
+```{r, run-normalisation}
+# getmm and vst columns are written side by side so they can be compared
+# (§4.12b step 3, CV R² re-run) before picking one for the manuscript.
+# ComBat-seq (_combat) sibling columns were also computed here through
+# 2026-07-02 but removed after failing on real data — see load-packages.
+#
+# transcript_filters are independent (each builds its own gene x sample
+# matrix from isoform_quants, filtered separately) — forked one process per
+# filter via mclapply rather than run serially, since each filter pays for
+# its own DESeq2 vst() fit, the most expensive step in this file. mc.cores
+# capped at
+# length(transcript_filters) (3) since there's nothing to gain forking more
+# workers than there are independent tasks; matches the 4 threads this
+# rule already requests in config/snakemake_config.yaml (1 held in
+# reserve for the parent process / GC). isoform_quants (the ~1.1GB shared
+# input) is not duplicated per fork — Linux fork() is copy-on-write and
+# this file never mutates it in place.
+filter_results <- mclapply(
+  transcript_filters,
+  normalise_one_filter,
+  mc.cores = min(length(transcript_filters), detectCores())
+)
+
+normalised_dt <- rbindlist(lapply(filter_results, `[[`, "main"))
+fwrite(normalised_dt, "processed_data/gene_expression_normalised.csv.gz")
+
+# §4.12b column-choice diagnostics (discussed 2026-07-02): kept as separate,
+# much smaller tables (one row per gene, one row per sample — not per
+# gene x sample like `normalised_dt`) rather than widening the production
+# output, since these columns (raw count/TPM mean+sd, TMM factors) exist to
+# decide which of getmm/vst to adopt, not to ship to `05`.
+gene_mean_var_dt <- rbindlist(lapply(filter_results, `[[`, "gene_mean_var"))
+fwrite(gene_mean_var_dt, "qc/gene_expression_mean_variance.csv.gz")
+
+norm_factors_dt <- rbindlist(lapply(filter_results, `[[`, "norm_factors"))
+fwrite(norm_factors_dt, "qc/gene_expression_tmm_norm_factors.csv.gz")
+```
+
+## Column-choice diagnostics (§4.12b): mean-variance trend and TMM factor spread
+
+Two cheap, no-model-training checks to inform the getmm-vs-vst decision
+(discussed 2026-07-02, see `revision/PLAN.md` §4.12b): does vst actually
+flatten the mean-variance relationship relative to count/TPM/getmm, and is
+this dataset's composition bias (what TMM/GeTMM corrects for) large enough
+to matter in the first place. `gene_expression_mean_variance.csv.gz` and
+`gene_expression_tmm_norm_factors.csv.gz` in `qc/` carry the underlying
+per-gene and per-sample values (mean/sd of count, TPM, getmm, vst; TMM
+factor per sample) so these numbers are reproducible without re-running
+`ComBat_seq`-scale compute.
+
+```{r, mean-variance-trend}
+mean_var_long <- rbindlist(list(
+  gene_mean_var_dt[,
+    .(
+      gene_id,
+      transcript_filter,
+      representation = "count",
+      mean = mean_count,
+      sd = sd_count
+    )
+  ],
+  gene_mean_var_dt[,
+    .(
+      gene_id,
+      transcript_filter,
+      representation = "tpm",
+      mean = mean_tpm,
+      sd = sd_tpm
+    )
+  ],
+  gene_mean_var_dt[,
+    .(
+      gene_id,
+      transcript_filter,
+      representation = "getmm",
+      mean = mean_getmm,
+      sd = sd_getmm
+    )
+  ],
+  gene_mean_var_dt[,
+    .(
+      gene_id,
+      transcript_filter,
+      representation = "vst",
+      mean = mean_vst,
+      sd = sd_vst
+    )
+  ]
+))
+mean_var_long[,
+  transcript_filter := factor(
+    transcript_filter,
+    levels = c("transcripts", "tsl_filtered", "biotype_filtered")
+  )
+]
+mean_var_long[,
+  representation := factor(
+    representation,
+    levels = c("count", "tpm", "getmm", "vst")
+  )
+]
+
+# Spearman (rank-based, robust to the different scales/transforms across
+# representations) correlation between per-gene mean and sd — near 0 means
+# variance no longer depends on expression level (the point of vst); count,
+# TPM and getmm are all expected to still show a clear positive trend.
+meanvar_corr <- mean_var_long[,
+  .(
+    spearman_mean_sd = cor(mean, sd, method = "spearman", use = "complete.obs")
+  ),
+  by = .(transcript_filter, representation)
+]
+meanvar_wide <- dcast(
+  meanvar_corr,
+  transcript_filter ~ representation,
+  value.var = "spearman_mean_sd"
+)
+knitr::kable(
+  meanvar_wide,
+  caption = "Spearman correlation between per-gene mean and sd, by representation and transcript_filter (near 0 = variance-stabilised)"
+)
+
+# Decision signal: is vst's mean-sd correlation meaningfully flatter than
+# getmm's for the same transcript_filter? If not, vst isn't buying the
+# variance-stabilisation it's chosen for here, and the getmm/vst split
+# recommendation (§4.12b) should be reconsidered.
+for (tf in as.character(meanvar_wide$transcript_filter)) {
+  row <- meanvar_wide[transcript_filter == tf]
+  status <- if (row$vst < row$getmm * 0.5) "PASS" else "WARN"
+  append_sanity(
+    paste0("meanvar_trend_vst_vs_getmm__", tf),
+    status,
+    row$vst,
+    row$getmm,
+    sprintf(
+      "Spearman(mean,sd): vst=%.3f vs getmm=%.3f -- PASS if vst is under half of getmm's (variance meaningfully flatter)",
+      row$vst,
+      row$getmm
+    )
+  )
+}
+
+# count/TPM/getmm are non-negative and right-skewed -- log1p both axes.
+# vst is plotted separately (own chunk-local block below) since it can be
+# negative and log1p would be wrong for it, same reasoning as the
+# getmm-vs-vst event-type plots earlier in this file.
+p_meanvar_nonneg <- ggplot(
+  mean_var_long[representation != "vst"],
+  aes(x = log1p(mean), y = log1p(sd), color = representation)
+) +
+  geom_point(alpha = 0.15, size = 0.4) +
+  geom_smooth(se = FALSE, linewidth = 0.6) +
+  facet_wrap(~transcript_filter, nrow = 1) +
+  scale_color_viridis_d(option = "D") +
+  labs(
+    title = "Mean-variance trend: count, TPM, GeTMM-CPM",
+    subtitle = "log1p both axes -- all three expected to show an increasing trend",
+    x = "log1p(mean)",
+    y = "log1p(sd)",
+    color = "Representation"
+  )
+print(p_meanvar_nonneg)
+ggsave(
+  "qc/distributions/gene_expression_meanvar_count_tpm_getmm.pdf",
+  p_meanvar_nonneg,
+  width = 9,
+  height = 5
+)
+
+p_meanvar_vst <- ggplot(
+  mean_var_long[representation == "vst"],
+  aes(x = mean, y = sd)
+) +
+  geom_point(alpha = 0.15, size = 0.4) +
+  geom_smooth(se = FALSE, linewidth = 0.6, color = "black") +
+  facet_wrap(~transcript_filter, nrow = 1) +
+  labs(
+    title = "Mean-variance trend: vst",
+    subtitle = "Raw scale (vst can be negative) -- a flat trend is the intended result",
+    x = "mean(vst)",
+    y = "sd(vst)"
+  )
+print(p_meanvar_vst)
+ggsave(
+  "qc/distributions/gene_expression_meanvar_vst.pdf",
+  p_meanvar_vst,
+  width = 9,
+  height = 5
+)
+```
+
+```{r, tmm-factor-spread}
+# If TMM factors barely deviate from 1, this dataset's composition bias is
+# small and a naive per-gene z-score of raw TPM might be adequate in
+# practice; a wide spread means TMM/GeTMM's correction is doing real work.
+norm_factor_summary <- norm_factors_dt[,
+  .(
+    mean_factor = mean(tmm_norm_factor),
+    cv_pct = 100 * sd(tmm_norm_factor) / mean(tmm_norm_factor),
+    min_factor = min(tmm_norm_factor),
+    max_factor = max(tmm_norm_factor)
+  ),
+  by = transcript_filter
+]
+knitr::kable(
+  norm_factor_summary,
+  caption = "TMM normalisation factor spread per transcript_filter (factors far from 1 / high CV% = real composition bias)"
+)
+
+# Note the polarity here: WARN (>10% CV) means composition bias is large
+# enough to matter -- i.e. an argument FOR GeTMM/vst over a naive TPM
+# z-score -- not a data-quality problem with this pipeline.
+for (i in seq_len(nrow(norm_factor_summary))) {
+  row <- norm_factor_summary[i]
+  status <- if (row$cv_pct > 10) "WARN" else "PASS"
+  append_sanity(
+    paste0("tmm_factor_spread__", row$transcript_filter),
+    status,
+    row$cv_pct,
+    10,
+    "TMM norm.factor CV% across samples -- WARN (>10%) means composition bias is large enough that GeTMM/vst correction matters, not a pipeline data-quality issue"
+  )
+}
+
+p_tmm_spread <- ggplot(
+  norm_factors_dt,
+  aes(x = transcript_filter, y = tmm_norm_factor)
+) +
+  geom_boxplot(width = 0.4, outlier.alpha = 0.3) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  labs(
+    title = "TMM normalisation factor spread per sample",
+    subtitle = "Dashed line = no correction needed (factor = 1)",
+    x = NULL,
+    y = "TMM norm.factor"
+  )
+print(p_tmm_spread)
+ggsave(
+  "qc/distributions/tmm_norm_factor_spread.pdf",
+  p_tmm_spread,
+  width = 7,
+  height = 5
+)
+```
+
+## Gene expression by hosted event type
+
+The remaining sections check whether GeTMM-CPM and vst behave sensibly once
+genes are split by which kind of alternative-splicing event they host — not
+because expression is expected to *cause* an event type, but as a sanity
+check that neither normalisation method introduces an event-type-specific
+artifact, and as a first look at whether SE/RI-hosting genes differ in
+expression level at all.
+
+```{r, join-event-type}
+# Event Type is an event-level attribute (SE/RI), not a gene-level one — a
+# gene can host events of either or both types. Classify each gene, per
+# transcript_filter (event sets differ slightly by filter), by which
+# type(s) it hosts, then join onto the per-gene summarised expression.
+event_annotations_dt <- fread(
+  "processed_data/event_annotations_dt.csv.gz",
+  select = c("gene_id", "Event Type", "transcript_filter")
+)
+
+gene_event_types <- event_annotations_dt[,
+  .(
+    has_se = any(`Event Type` == "SE"),
+    has_ri = any(`Event Type` == "RI")
+  ),
+  by = .(gene_id, transcript_filter)
+]
+gene_event_types[,
+  event_type_class := fcase(
+    has_se & has_ri , "Both"    ,
+    has_se          , "SE only" ,
+    has_ri          , "RI only"
+  )
+]
+
+# per-gene summary across samples (median, not mean — expression is
+# right-skewed and a single high-library-size sample shouldn't dominate the
+# per-gene summary used for a distributional comparison)
+gene_median_expr <- normalised_dt[,
+  .(
+    median_getmm = median(gene_expression_getmm, na.rm = TRUE),
+    median_vst = median(gene_expression_vst, na.rm = TRUE)
+  ),
+  by = .(gene_id, transcript_filter)
+]
+
+# Update-join (not `gene_median_expr[gene_event_types, on=...]`, which was
+# the bug here through 2026-07-02): `X[Y, on=]` takes Y's row count, so a
+# select-join against `gene_event_types` silently kept only event-hosting
+# genes, contradicting the "kept as an explicit reference category" comment
+# below — the `is.na(event_type_class)` coalesce never fired since a select
+# join's `i` columns are never NA for i's own rows. An update-join instead
+# keeps ALL of `gene_median_expr`'s rows (every gene surviving this
+# transcript_filter, per `run-normalisation`), filling event_type_class from
+# `gene_event_types` where matched and leaving it NA — coalesced below —
+# for genes that host no annotated event. Same update-join pattern already
+# used correctly elsewhere for this data (see git history/PLAN for prior
+# use in the now-removed combat-beta-protocol-check chunk).
+gene_median_expr[
+  gene_event_types,
+  on = .(gene_id, transcript_filter),
+  event_type_class := i.event_type_class
+]
+plot_dt <- gene_median_expr
+# genes with no annotated SE/RI event in this transcript_filter are kept as
+# an explicit reference category, not dropped — comparing against them is
+# what makes "do event-hosting genes differ" a meaningful question
+plot_dt[is.na(event_type_class), event_type_class := "No annotated event"]
+plot_dt[,
+  event_type_class := factor(
+    event_type_class,
+    levels = c("No annotated event", "SE only", "RI only", "Both")
+  )
+]
+plot_dt[,
+  transcript_filter := factor(
+    transcript_filter,
+    levels = c("transcripts", "tsl_filtered", "biotype_filtered")
+  )
+]
+```
+
+```{r, group-sizes}
+group_sizes <- plot_dt[, .N, by = .(transcript_filter, event_type_class)]
+knitr::kable(
+  dcast(
+    group_sizes,
+    event_type_class ~ transcript_filter,
+    value.var = "N",
+    fill = 0
+  ),
+  caption = "Number of genes per (Event Type, transcript_filter) group"
+)
+```
+
+```{r, viz-getmm-by-event-type}
+# GeTMM-CPM is non-negative (like TPM/RPKM) and right-skewed — log1p is the
+# standard transform for visualizing this shape without a pseudocount
+# distorting the zero end (log1p(0) = 0, not -Inf).
+# violin (full distribution shape) + narrow boxplot overlay (median/IQR at a
+# glance) is the standard combination for comparing a continuous
+# distribution across a handful of groups — better than a boxplot alone
+# (hides multimodality) or a violin alone (harder to read exact quartiles).
+p_getmm <- ggplot(
+  plot_dt,
+  aes(x = event_type_class, y = log1p(median_getmm), fill = event_type_class)
+) +
+  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
+  facet_wrap(~transcript_filter, nrow = 1) +
+  scale_fill_viridis_d(option = "D", guide = "none") +
+  labs(
+    title = "Gene-level GeTMM-CPM expression by hosted event type",
+    subtitle = "Per-gene median across samples, log1p-transformed",
+    x = NULL,
+    y = "log1p(GeTMM-CPM)"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_getmm)
+ggsave(
+  "qc/distributions/gene_expression_getmm_by_event_type.pdf",
+  p_getmm,
+  width = 9,
+  height = 5
+)
+```
+
+```{r, viz-vst-by-event-type}
+# vst output is already variance-stabilised (roughly log2-like scale,
+# centered near 0, can be negative) — no further transform is appropriate;
+# transforming it again (e.g. log1p) would be a mistake specific to vst
+# that does not apply to GeTMM-CPM, which is why the two methods get
+# separate plots rather than being combined on one shared y-axis.
+p_vst <- ggplot(
+  plot_dt,
+  aes(x = event_type_class, y = median_vst, fill = event_type_class)
+) +
+  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
+  facet_wrap(~transcript_filter, nrow = 1) +
+  scale_fill_viridis_d(option = "D", guide = "none") +
+  labs(
+    title = "Gene-level vst expression by hosted event type",
+    subtitle = "Per-gene median across samples",
+    x = NULL,
+    y = "vst(expression)"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_vst)
+ggsave(
+  "qc/distributions/gene_expression_vst_by_event_type.pdf",
+  p_vst,
+  width = 9,
+  height = 5
+)
+```
+
+```{r, viz-method-agreement}
+# Direct method-agreement check per gene: GeTMM-CPM and vst are different
+# transforms of the same underlying counts, so per-gene values should be
+# monotonically related even though the two axes aren't on the same scale.
+# Colored by event_type_class to check the agreement holds within each
+# group, not just in aggregate (a divergence isolated to one event-type
+# class would suggest a normalisation artifact specific to that group).
+p_compare <- ggplot(
+  plot_dt,
+  aes(x = log1p(median_getmm), y = median_vst, color = event_type_class)
+) +
+  geom_point(alpha = 0.25, size = 0.6) +
+  facet_wrap(~transcript_filter, nrow = 1) +
+  scale_color_viridis_d(option = "D") +
+  labs(
+    title = "GeTMM-CPM vs vst agreement per gene",
+    x = "log1p(GeTMM-CPM)",
+    y = "vst(expression)",
+    color = "Hosted event type"
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2)))
+print(p_compare)
+ggsave(
+  "qc/distributions/gene_expression_getmm_vs_vst.pdf",
+  p_compare,
+  width = 9,
+  height = 5
+)
+```
+
+## ComBat-seq protocol correction — attempted, abandoned
+
+ComBat-seq batch correction (§4.12c) was implemented here 2026-07-02 as
+`_combat` sibling columns alongside raw getmm/vst, then removed the same day
+after running on real data: `ComBat_seq()` failed (its `~ batch + group`
+design matrix is degenerate for most `ontology` groups, which are
+single-`protocol`-dominated — confirmed via the file_table cross-tab, not
+just suspected). See `revision/file-changes/04-5-rnaseq-normalisation.Rmd.md`
+for the full writeup and the real sanity-check evidence
+(`qc/sanity_summary.csv`'s `combat_ri_protocol_beta_reduction` row, logged
+before this branch was removed). Decision: use raw getmm/vst; the existing
+protocol + protocol×gene_expression ML interaction term is the mitigation
+for RI protocol bias going forward, not a corrected `gene_expression` value.

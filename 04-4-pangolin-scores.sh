@@ -6,4 +6,6 @@
 # GPU optional; CPU ~40 min–2 hr at default batch_size=256.
 set -euo pipefail
 
-mamba run -n ihec-as python scripts/compute_pangolin_scores.py "$@"
+module load miniforge3/24.7.1
+export PYTHONUNBUFFERED=1
+mamba run --no-capture-output -n ihec-as python scripts/compute_pangolin_scores.py "$@"

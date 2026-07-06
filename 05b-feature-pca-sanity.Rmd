@@ -1,0 +1,232 @@
+---
+title: "Feature matrix PCA/UMAP sanity checks (§4.13g)"
+output: html_document
+---
+
+```{r, setup}
+# §4.13g — quantitative sanity gate on the full feature matrix: does cell-type
+# identity (ontology) dominate, as expected (fingerprint confound); does
+# protocol or imputation status dominate any PC (would indicate a technical
+# artefact rather than biology).
+#
+# Reuses the same standardized-PCA/UMAP machinery as 05z-visualize-features.Rmd
+# (05zz-feature-preprocessing.R's preprocess_feature_matrix(mode="embedding"))
+# but is a pass/fail sanity notebook (04-2-chip-signal-sanity.Rmd convention:
+# append_sanity(), qc/sanity_summary.csv, WARN not stopifnot), not an
+# exploratory plot gallery -- 05z already covers the gallery use case.
+#
+# All checks run per (Event Type, transcript_filter) stratum, not pooled and
+# not further split by Variability (unlike 05z) -- matches the stratification
+# level 04-2/05b use and what 09-1-ml-local.R models at.
+library(cluster)
+library(uwot)
+library(rsvd)
+library(patchwork)
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+
+source("05zz-feature-preprocessing.R")
+aggregated_dt <- fread("processed_data/aggregated_dt_filtered.csv.gz")
+
+meta_cols <- c(
+  "ID", "IHEC", "uuid", "transcript_filter", "PSI",
+  "Event Type", "gene_id", "seqnames", "Variability",
+  "ontology", "project", "protocol"
+)
+feature_cols <- setdiff(names(aggregated_dt), meta_cols)
+
+# §4.13l's per-mark H3K*_source columns (observed/imputed) may not exist yet
+# if aggregated_dt_filtered.csv.gz predates that change -- degrade gracefully
+# rather than error, and record that item 4 was skipped.
+source_cols <- grep("_source$", names(aggregated_dt), value = TRUE)
+has_imputed_info <- length(source_cols) > 0
+if (!has_imputed_info) {
+  message(
+    "No *_source columns found in aggregated_dt -- imputation-dominance ",
+    "check (item 4) will be skipped. Re-run 05-create-aggregated-dt.Rmd ",
+    "(§4.13l) and rebuild aggregated_dt_filtered.csv.gz to enable it."
+  )
+}
+
+strata <- unique(aggregated_dt[, .(`Event Type`, transcript_filter)])
+setorder(strata, `Event Type`, transcript_filter)
+
+N_PCS             <- 30
+DOWNSAMPLE_TARGET <- 100000L
+SIL_SAMPLE_N      <- 3000L # silhouette is O(n^2) in memory/time; subsample further
+UMAP_NEIGHBORS    <- 30
+UMAP_MIN_DIST     <- 0.05
+UMAP_METRIC       <- "cosine"
+```
+
+
+```{r, per-stratum-pca-checks, fig.width=12, fig.height=9}
+run_stratum <- function(this_et, this_tf) {
+  stratum_key <- paste(this_et, this_tf, sep = "_")
+  sub_dt <- aggregated_dt[`Event Type` == this_et & transcript_filter == this_tf]
+
+  if (nrow(sub_dt) > DOWNSAMPLE_TARGET) {
+    set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+    sub_dt <- sub_dt[sample(.N, DOWNSAMPLE_TARGET)]
+  }
+
+  preprocessed <- preprocess_feature_matrix(
+    feat_mat = as.matrix(sub_dt[, ..feature_cols]),
+    histone_marks = histone_marks,
+    mode = "embedding",
+    drop_sparse = FALSE
+  )
+  feat_mat <- preprocessed$feat_mat
+  if (ncol(feat_mat) < 2) {
+    message(stratum_key, ": < 2 usable feature columns, skipping")
+    return(invisible(NULL))
+  }
+
+  # --- PCA (randomized SVD on standardized features) ------------------------
+  k <- min(N_PCS, nrow(feat_mat) - 1L, ncol(feat_mat))
+  pca_res <- rsvd(feat_mat, k = k)
+  var_pct <- pca_res$d^2 / sum(pca_res$d^2) * 100
+  pc_scores <- sweep(pca_res$u, 2, pca_res$d, `*`)
+
+  cum_var5 <- sum(var_pct[seq_len(min(5, length(var_pct)))])
+  append_sanity(
+    paste0("pca_cumulative_variance_pc1_5_", stratum_key),
+    "PASS", # informational, not a gate
+    cum_var5, NA,
+    sprintf("%s: PC1 var=%.1f%%, cumulative PC1-5=%.1f%%", stratum_key, var_pct[1], cum_var5)
+  )
+
+  # --- item 3: protocol should not dominate PC1 ------------------------------
+  # protocol has exactly 2 levels (mRNA-Seq/total-RNA-Seq) -- operationalize
+  # "PC1 loads protocol with |loading| > 0.5" as |cor(PC1 score, protocol)|,
+  # since protocol itself isn't a PCA input feature (it's metadata used only
+  # for coloring/grouping), a literal PCA loading doesn't exist for it.
+  protocol_num <- as.integer(factor(sub_dt$protocol))
+  protocol_cor_pc1 <- suppressWarnings(cor(pc_scores[, 1], protocol_num, use = "complete.obs"))
+  protocol_dominates <- var_pct[1] > 50 & abs(protocol_cor_pc1) > 0.5
+  append_sanity(
+    paste0("pca_protocol_dominance_", stratum_key),
+    ifelse(!protocol_dominates, "PASS", "WARN"),
+    protocol_cor_pc1, 0.5,
+    sprintf(
+      "%s: PC1 var=%.1f%%, |cor(PC1, protocol)|=%.3f (flag if PC1>50%% var AND |cor|>0.5)",
+      stratum_key, var_pct[1], abs(protocol_cor_pc1)
+    )
+  )
+
+  # --- item 4: imputed vs observed samples should not separate ---------------
+  imputed_any <- NULL
+  if (has_imputed_info) {
+    source_mat <- as.matrix(sub_dt[, ..source_cols])
+    imputed_any <- as.integer(apply(source_mat == "imputed", 1, any, na.rm = TRUE))
+    if (length(unique(imputed_any)) > 1) {
+      imputed_cor_pc1 <- suppressWarnings(cor(pc_scores[, 1], imputed_any, use = "complete.obs"))
+      imputed_dominates <- var_pct[1] > 50 & abs(imputed_cor_pc1) > 0.5
+      append_sanity(
+        paste0("pca_imputation_dominance_", stratum_key),
+        ifelse(!imputed_dominates, "PASS", "WARN"),
+        imputed_cor_pc1, 0.5,
+        sprintf(
+          "%s: PC1 var=%.1f%%, |cor(PC1, imputed_any)|=%.3f (flag if PC1>50%% var AND |cor|>0.5)",
+          stratum_key, var_pct[1], abs(imputed_cor_pc1)
+        )
+      )
+    } else {
+      append_sanity(
+        paste0("pca_imputation_dominance_", stratum_key),
+        "PASS",
+        NA, 0.5,
+        sprintf("%s: all sampled rows have the same imputed/observed status, nothing to compare", stratum_key)
+      )
+    }
+  }
+
+  # --- item 5: silhouette by group, on a further subsample (dist() is O(n^2)) -
+  sil_idx <- if (nrow(pc_scores) > SIL_SAMPLE_N) sample(nrow(pc_scores), SIL_SAMPLE_N) else seq_len(nrow(pc_scores))
+  sil_pcs <- pc_scores[sil_idx, seq_len(min(10, ncol(pc_scores))), drop = FALSE]
+  sil_dist <- dist(sil_pcs)
+
+  mean_silhouette <- function(grouping) {
+    grouping <- grouping[sil_idx]
+    if (length(unique(grouping)) < 2) {
+      return(NA_real_)
+    }
+    mean(cluster::silhouette(as.integer(factor(grouping)), sil_dist)[, "sil_width"])
+  }
+
+  sil_ontology <- mean_silhouette(sub_dt$ontology)
+  sil_protocol <- mean_silhouette(sub_dt$protocol)
+  sil_imputed  <- if (has_imputed_info) mean_silhouette(imputed_any) else NA_real_
+
+  append_sanity(
+    paste0("pca_silhouette_", stratum_key),
+    "PASS", # informational -- reports which variable best explains PC separation, not a gate
+    NA, NA,
+    sprintf(
+      "%s: mean silhouette (first 10 PCs, n=%d) -- ontology=%.3f, protocol=%.3f, imputed=%s",
+      stratum_key, length(sil_idx), sil_ontology, sil_protocol,
+      ifelse(is.na(sil_imputed), "NA", sprintf("%.3f", sil_imputed))
+    )
+  )
+
+  # --- visualization: PC1/PC2 + UMAP colored by ontology/protocol/imputed ----
+  umap_res <- uwot::umap(
+    feat_mat,
+    n_neighbors = UMAP_NEIGHBORS, min_dist = UMAP_MIN_DIST,
+    metric = UMAP_METRIC, n_threads = 2L, seed = getOption("EpiATLAS_AS_SEED", 42L)
+  )
+
+  plot_df <- data.table(
+    PC1 = pc_scores[, 1], PC2 = pc_scores[, 2],
+    U1 = umap_res[, 1], U2 = umap_res[, 2],
+    ontology = sub_dt$ontology, protocol = sub_dt$protocol,
+    imputed = if (has_imputed_info) factor(imputed_any) else NA
+  )
+
+  legend_theme <- theme(legend.key.size = unit(3, "mm"), legend.text = element_text(size = 6))
+  make_panel <- function(x, y, color, xlab, ylab) {
+    ggplot(plot_df, aes(x = .data[[x]], y = .data[[y]], color = .data[[color]])) +
+      geom_point(alpha = 0.3, size = 0.6) +
+      labs(x = xlab, y = ylab, color = color, title = color) +
+      theme_bw(base_size = 9) + legend_theme
+  }
+
+  color_vars <- c("ontology", "protocol", if (has_imputed_info) "imputed")
+  pca_panels <- lapply(color_vars, function(v) make_panel("PC1", "PC2", v, sprintf("PC1 (%.1f%%)", var_pct[1]), sprintf("PC2 (%.1f%%)", var_pct[2])))
+  umap_panels <- lapply(color_vars, function(v) make_panel("U1", "U2", v, "UMAP1", "UMAP2"))
+
+  fig <- (wrap_plots(pca_panels, nrow = 1) / wrap_plots(umap_panels, nrow = 1)) +
+    plot_annotation(title = sprintf("%s -- PCA (top) / UMAP (bottom)", stratum_key))
+  print(fig) # inline, alongside the saved PDF below
+  ggsave(
+    file.path("qc/distributions", sprintf("feature_pca_%s.pdf", stratum_key)),
+    plot = fig, width = 12, height = 9
+  )
+
+  invisible(NULL)
+}
+
+for (i in seq_len(nrow(strata))) {
+  run_stratum(strata$`Event Type`[i], strata$transcript_filter[i])
+}
+```
+
+
+```{r, summary}
+knitr::kable(fread(sanity_csv)[grepl("^pca_", check_name)])
+```

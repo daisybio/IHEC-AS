@@ -6,22 +6,19 @@ params:
 ---
 
 ```{r, load-data}
-# Non-tabular workspace objects: aggregateOver, file_metadata, sample_cols, keep_rows_manual, to_analyze
-load("processed_data/aggregating.rda")
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+keep_rows_manual <- readRDS("processed_data/keep_rows_manual.rds")
+file_metadata <- fread("processed_data/file_table.csv.gz")
+metadata <- fread(sample_metadata_file)
 event_annotations_dt <- fread("processed_data/event_annotations_dt.csv.gz")
-psi_long_dt          <- fread("processed_data/psi_long_dt.csv.gz")
-ijc_sjc_dt           <- fread("processed_data/ijc_sjc_dt.csv.gz")
-# load the files table
-# file_table <- fread('processed_data/file_table.csv.gz')
+psi_long_dt <- fread("processed_data/psi_long_dt.csv.gz")
+ijc_sjc_dt <- fread("processed_data/ijc_sjc_dt.csv.gz")
 # locate
 file_metadata[,
   local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))
 ]
 stopifnot(file_metadata[assay_type == "ChIP-Seq", all(file.exists(local_file))])
-
-setkey(file_metadata, "local_file")
-# write table back to file
-fwrite(file_metadata, "processed_data/file_table.csv.gz")
 
 # # we only need ChIP-Seq data, since WGBS has been aggregated via the matrices
 # file_table <- file_table[assay_type == "ChIP-Seq"]
@@ -42,30 +39,34 @@ wgbs_agg[experiment_type == "n", experiment_type := "CpGs"]
 wgbs_agg[, ihec := sub("\\.[0-9]+$", "", ihec)]
 
 # bind all the samples for the histone marks
+#
+# Memory note: at full scale this table is ~1.03e9 rows (2430 files x
+# ~424k windows), so column choices matter a lot here. bigWigAverageOverBed
+# emits 8 columns (name size covered sum mean0 mean min max); only `name`
+# (window id) and `mean` are ever used downstream (everything else is
+# discarded before the dcast a few lines below and nothing later re-reads
+# it) — keeping all 8 would cost ~40 bytes/row x 1.03e9 rows =~ 41 GB for
+# columns that are immediately dropped. `select=` at fread() time avoids
+# ever allocating them. Likewise, attaching `ihec`/`experiment_type` per
+# file here (instead of carrying the full `local_file` path column through
+# the whole long table, as before) saves another ~8 GB of pure pointer
+# overhead for a value only ever used to look these two up.
+chip_files <- file_metadata[assay_type == "ChIP-Seq"]
 histone_dt <- rbindlist(
   pbmcapply::pbmcmapply(
-    FUN = function(file) {
-      dt <-
-        fread(file)
-      names(dt) <-
-        c("name", "size", "covered", "sum", "mean0", "mean", "min", "max")
-      dt[!startsWith(name, "chromhmm")]
+    FUN = function(file, this_ihec, this_mark) {
+      dt <- fread(file, select = c(1, 6), col.names = c("name", "score"))
+      dt <- dt[!startsWith(name, "chromhmm")]
+      dt[, ihec := this_ihec]
+      dt[, experiment_type := this_mark]
+      dt
     },
-    file = file_metadata[assay_type == "ChIP-Seq", local_file],
-    USE.NAMES = TRUE,
+    file = chip_files$local_file,
+    this_ihec = chip_files$epirr_id_without_version,
+    this_mark = chip_files$experiment_type,
     SIMPLIFY = FALSE
-  ),
-  idcol = "local_file"
+  )
 )
-# some mapping for ids and histone marks
-histone_dt[,
-  c("ihec", "experiment_type") := file_metadata[
-    local_file,
-    .(epirr_id_without_version, experiment_type)
-  ]
-]
-# histone_dt[, experiment_type:=file_metadata[local_file, experiment_type]]
-setnames(histone_dt, old = "mean", new = "score")
 
 # find common cols and rows
 common_ihec <- intersect(histone_dt[, unique(ihec)], wgbs_agg[, unique(ihec)])
@@ -97,8 +98,70 @@ aggregated_dt <- dcast(
   sep = ";"
 )
 setnames(aggregated_dt, old = "ihec", new = "IHEC")
+
+# §4.13l — per-mark observed/imputed source covariate. 04-2-chip-signal-sanity
+# found imputed ChIP tracks run 1.7-7x higher median signal than observed for
+# every mark (worst for H3K27me3/H3K9me3), and this status is per (sample,
+# mark) — a sample can have some marks observed and others imputed — so it
+# is NOT captured by anything already in aggregated_dt. Derived directly
+# from chip_files (a per-file property, constant across all windows for a
+# mark) rather than carried through the window-level table.
+#
+# Written as a STRING ("observed"/"imputed"), not a 0/1 flag, so it is
+# auto-routed to the categorical/nominal branch of both downstream
+# pipelines without any code changes there: splicing_ml's
+# infer_feature_columns() buckets by dtype (non-numeric -> categorical_cols
+# -> OneHotEncoder, same as `protocol`); 07-ml-event-glmnet-tidymodels.R's
+# tidymodels recipe uses all_nominal_predictors() -> step_dummy(). A numeric
+# 0/1 encoding would risk being misclassified as a continuous histone
+# signal by splicing_ml's `col.startswith("H3K")` clip-column rule if named
+# with an H3K prefix; the `_source` suffix and string dtype sidestep this
+# even though the column also happens to start with "H3K".
+chip_source <- unique(chip_files[, .(
+  IHEC = epirr_id_without_version,
+  mark = experiment_type,
+  source = fifelse(uuid == "imputed", "imputed", "observed")
+)])
+chip_source_wide <- dcast(chip_source, IHEC ~ mark, value.var = "source")
+source_cols <- setdiff(names(chip_source_wide), "IHEC")
+setnames(
+  chip_source_wide,
+  old = source_cols,
+  new = paste0(source_cols, "_source")
+)
+source_cols <- paste0(source_cols, "_source")
+
+aggregated_dt[
+  chip_source_wide,
+  on = "IHEC",
+  (source_cols) := mget(paste0("i.", source_cols))
+]
+
 # write full table to disk
 fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
+```
+
+
+```{r, chip-signal-sanity}
+# §4.13b — ChIP signal assertion: NA fraction < 5% and non-negative, for
+# observed (non-imputed) samples only. Imputed samples may have higher NA.
+observed_ihec <- file_metadata[
+  assay_type == "ChIP-Seq" & uuid != "imputed",
+  unique(epirr_id_without_version)
+]
+chip_marks <- file_metadata[assay_type == "ChIP-Seq", unique(experiment_type)]
+chip_cols <- grep(
+  paste0("^(", paste(chip_marks, collapse = "|"), ");"),
+  names(aggregated_dt),
+  value = TRUE
+)
+observed_dt <- aggregated_dt[IHEC %in% observed_ihec]
+for (col in chip_cols) {
+  vals <- observed_dt[[col]]
+  na_frac <- mean(is.na(vals))
+  stopifnot(na_frac < 0.05)
+  stopifnot(all(vals[!is.na(vals)] >= 0))
+}
 ```
 
 
@@ -106,14 +169,27 @@ fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
 # psi_long_dt from 03 is already long format (ID, uuid, psi) — no melt needed
 melted_psi <- copy(psi_long_dt)
 setnames(melted_psi, "psi", "PSI")
-melted_psi[event_annotations_dt, on = .(ID),
-  c("Event Type", "transcript_filter", "gene_id") := .(`Event Type`, transcript_filter, gene_id)]
+melted_psi[
+  event_annotations_dt,
+  on = .(ID),
+  c("Event Type", "transcript_filter", "gene_id") := .(
+    `Event Type`,
+    transcript_filter,
+    gene_id
+  )
+]
 melted_psi <- melted_psi[!is.na(PSI)]
 melted_psi[file_metadata, on = .(uuid), IHEC := epirr_id_without_version]
 ```
 
 
 ```{r, expand-aggregated-dt}
+# guard against re-running this chunk on an already-expanded aggregated_dt
+# (merge() would silently produce PSI.x/PSI.y instead of erroring clearly).
+# If this trips, reload the cheap checkpoint instead of rerunning
+# build-aggregated-dt: aggregated_dt <- fread("processed_data/aggregated_dt.csv.gz")
+stopifnot(!("PSI" %in% names(aggregated_dt)))
+
 # merge PSI on the aggregated table
 aggregated_dt <- merge(
   aggregated_dt,
@@ -123,14 +199,20 @@ aggregated_dt <- merge(
   ],
   by = c("ID", "IHEC")
 )
-aggregated_dt[
-  melted_psi[ID %in% keep_rows_manual & !is.na(PSI)],
-  on = .(ID, IHEC),
-  c("uuid", "PSI", "transcript_filter") := .(uuid, PSI, transcript_filter)
-]
 # remove NA PSIs
 aggregated_dt <- aggregated_dt[!is.na(PSI)]
-# NA for columns starting with CpGs can be replaced by 0
+
+# §4.8 — carry junction read counts (IJC/SJC) forward from 03. Needed
+# downstream for coverage-weighted model fitting (sample_weight = IJC + SJC)
+# and beta-binomial regression on raw counts, and here for the §4.13i
+# coverage sanity check. Joined on (ID, uuid) — same keys as psi_long_dt.
+aggregated_dt[
+  ijc_sjc_dt,
+  on = .(ID, uuid),
+  c("IJC", "SJC") := .(i.IJC, i.SJC)
+]
+
+# NA for columns starting with CpGs can be replaced by 0, because NA means no CpGs were covered in that window, which is equivalent to 0.
 for (i in grep("^CpGs", names(aggregated_dt))) {
   set(aggregated_dt, i = which(is.na(aggregated_dt[[i]])), j = i, value = 0)
 }
@@ -152,7 +234,11 @@ cols_to_add <- c(
 )
 
 # add the intrinsic features
-aggregated_dt[event_annotations_dt, on = .(ID), (cols_to_add) := mget(cols_to_add)]
+aggregated_dt[
+  event_annotations_dt,
+  on = .(ID),
+  (cols_to_add) := mget(cols_to_add)
+]
 # also add the protocol
 aggregated_dt[file_metadata, on = .(uuid), protocol := experiment_type]
 # add the ontology term and the project
@@ -165,57 +251,314 @@ aggregated_dt[
   )
 ]
 
+# §2.1 — QC flag count covariate, joined by uuid (NOT epirr_id_without_version:
+# epirrs with both mRNA-Seq + total-RNA-Seq have multiple uuids). No samples
+# dropped; all 405 epirrs retained.
+qc_flag_covariates <- fread("processed_data/qc_flag_covariates.csv")
+aggregated_dt[
+  qc_flag_covariates,
+  on = .(uuid),
+  qc_flag_count := i.qc_flag_count
+]
+
 
 # load transcript ids per filter
 filtered_transcript_ids <- readRDS(
   "splicing_analysis/filtered_transcript_ids.rds"
 )
-# load isoform quantifications
-isoform_quants <- fread(
-  "splicing_analysis/isoform_quantifications_subset.tsv.gz"
-)
-# compute gene-level quantifications
-gene_quants <- rbindlist(
-  sapply(
-    transcript_filters,
-    function(this_transcript_filter) {
-      # subset the isoform quantifications to the samples we want to use
-      this_filtered_transcripts <- filtered_transcript_ids[[
-        this_transcript_filter
-      ]]
+# `transcript_filters` was previously an undefined variable here (only
+# worked by accident if a prior interactive session had it in the global
+# env, e.g. from running 03 first) — derive it from the actual upstream
+# artifact instead of hardcoding a second copy of the three filter names.
+transcript_filters <- names(filtered_transcript_ids)
 
-      # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
-      isoform_quants_filtered <- copy(isoform_quants[
-        transcript_id %in% this_filtered_transcripts
-      ])
-      isoform_quants_filtered[
-        effective_length > 0,
-        RPK := 1000 * expected_count / effective_length,
-        by = .(uuid, epirr_id_without_version)
-      ]
-      isoform_quants_filtered[,
-        TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE),
-        by = .(uuid, epirr_id_without_version)
-      ]
-      isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
-      isoform_quants_filtered[,
-        TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE),
-        .(uuid, epirr_id_without_version)
-      ]
-    },
-    simplify = FALSE
-  ),
-  idcol = "transcript_filter"
-)
+### Old implementation recomputed TPM, now that we have §4.12b, we use the lengthScaledTPM + vst from 04-5-rnaseq-normalisation.Rmd
+# # load isoform quantifications
+# isoform_quants <- fread(
+#   "splicing_analysis/isoform_quantifications_subset.tsv.gz"
+# )
+# # compute gene-level quantifications
+# gene_quants <- rbindlist(
+#   sapply(
+#     transcript_filters,
+#     function(this_transcript_filter) {
+#       # subset the isoform quantifications to the samples we want to use
+#       this_filtered_transcripts <- filtered_transcript_ids[[
+#         this_transcript_filter
+#       ]]
 
+#       # filter the isoform quantifications to the filtered transcripts and compute gene-level quantifications by summing the TPMs of the transcripts per gene
+#       isoform_quants_filtered <- copy(isoform_quants[
+#         transcript_id %in% this_filtered_transcripts
+#       ])
+#       isoform_quants_filtered[
+#         effective_length > 0,
+#         RPK := 1000 * expected_count / effective_length,
+#         by = .(uuid, epirr_id_without_version)
+#       ]
+#       isoform_quants_filtered[,
+#         TPM_rec := 1000000 * RPK / sum(RPK, na.rm = TRUE),
+#         by = .(uuid, epirr_id_without_version)
+#       ]
+#       isoform_quants_filtered[is.na(TPM_rec), TPM_rec := 0]
+#       isoform_quants_filtered[,
+#         TPM_scale := 1000000 * TPM / sum(TPM, na.rm = TRUE),
+#         .(uuid, epirr_id_without_version)
+#       ]
+#     },
+#     simplify = FALSE
+#   ),
+#   idcol = "transcript_filter"
+# )
+# # manually change gene_id for ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13 from the manual ids that were kept
+# # aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
+# # §4.12a — gene_quants is at transcript level (one row per transcript per
+# # sample); aggregate to gene level before joining, otherwise data.table's
+# # last-write-wins `:=` join picks an arbitrary single transcript's TPM_scale
+# # instead of the gene-level sum across all transcripts.
+# gene_quants_agg <- gene_quants[,
+#   .(gene_expression = sum(TPM_scale, na.rm = TRUE)),
+#   by = .(transcript_filter, uuid, gene_id)
+# ]
 
-# manually change gene_id for ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13 from the manual ids that were kept
-# aggregated_dt[gene_id == "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13", gene_id := "ENSG00000198561.13"]
+gene_quants_agg <- fread("processed_data/gene_expression_normalised.csv.gz")
+
+# §4.12b — keep BOTH normalised representations under explicit names; there
+# is deliberately no ambiguous `gene_expression` column. Consumers pick by
+# column structure (see revision/PLAN.md §4.12b, file-changes specs):
+#   - gene_expression_getmm : GeTMM-CPM, length- AND composition-corrected,
+#     cross-gene comparable WITHOUT per-gene z-scoring. Use where the feature
+#     is one column with many different host genes stacked in the rows and no
+#     per-gene rescaling happens -> the genome-wide pooled table
+#     (splicing_ml). Also the correct scale for any raw >=0 / log1p / ==0 /
+#     threshold check (the §4.12e mask uses it below).
+#   - gene_expression_vst : DESeq2 vst, variance-stabilised, cross-SAMPLE
+#     comparable only (NOT length-corrected). Use where each column is a
+#     single gene varying across samples and gets z-scored per column anyway
+#     -> event-specific models (07/09) and every RBP expression column.
+#     Roughly log2-scale, CAN BE NEGATIVE: never apply log1p/log to it.
 aggregated_dt[
-  gene_quants,
+  gene_quants_agg,
   on = .(transcript_filter, uuid, gene_id),
-  gene_expression := TPM_scale
+  c("gene_expression_vst", "gene_expression_getmm") := .(
+    i.gene_expression_vst,
+    i.gene_expression_getmm
+  )
 ]
+
+# §4.12e — decision check: do AS-event-hosting genes even need a
+# low-expression filter, or are they already pre-selected for expression by
+# rMATS (an event needs junction reads spanning it to be called at all)?
+# Compares the per-gene expression distribution of AS-event genes against
+# ALL annotation-passing genes (the same universe gene_quants_agg is built
+# from, genome-wide -- see 02-SUPPA2-analysis.Rmd filter-annotation chunk --
+# NOT restricted to AS events). Classic genome-wide expression is bimodal
+# (on/off: housekeeping/expressed vs silenced genes); if AS-event genes are
+# already unimodal and clear of the low mode, masking low-expression rows
+# below is redundant and can be dropped.
+#
+# Granularity: one point per (gene_id, transcript_filter), median expression
+# across samples -- the natural granularity for "is this gene on or off",
+# as opposed to the per-(gene,sample) granularity the old masking applied.
+# Checked on BOTH representations: gene_expression_getmm (CPM-like, >= 0,
+# what the old threshold was meant for) and gene_expression_vst (the actual
+# feature fed to models -- variance-stabilised, roughly log2-scale, can be
+# negative, so it gets no log1p and no comparable raw threshold line).
+min_gene_expression <- getOption("EpiATLAS_AS_MIN_GENE_EXPRESSION", 1)
+
+event_genes <- unique(event_annotations_dt[, .(transcript_filter, gene_id)])
+event_genes[, gene_id := gsub("\\.\\d+$", "", gene_id)]
+
+gene_median_expr <- gene_quants_agg[,
+  .(
+    median_getmm = median(gene_expression_getmm, na.rm = TRUE),
+    median_vst = median(gene_expression_vst, na.rm = TRUE)
+  ),
+  by = .(transcript_filter, gene_id)
+]
+gene_median_expr[, gene_id_stripped := gsub("\\.\\d+$", "", gene_id)]
+gene_median_expr[,
+  group := fifelse(
+    paste(transcript_filter, gene_id_stripped) %in%
+      event_genes[, paste(transcript_filter, gene_id)],
+    "AS-event gene",
+    "background (all genes)"
+  )
+]
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+
+# shared plot + Hartigan dip test (unimodality) logic for a given
+# representation column -- same dip test already used in
+# 03-prepare-aggregation.Rmd for variability measures. p > 0.05 -> can't
+# reject unimodal null; p < 0.05 -> bimodal signal.
+run_need_filter_check <- function(
+  value_col,
+  x_expr,
+  x_lab,
+  vline_val,
+  out_suffix
+) {
+  plot_dt <- copy(gene_median_expr)
+  plot_dt[, x_val := x_expr(get(value_col))]
+
+  p <- ggplot(plot_dt, aes(x = x_val, fill = group, color = group)) +
+    geom_density(alpha = 0.3) +
+    facet_wrap(~transcript_filter, ncol = 1, scales = "free_y") +
+    labs(
+      title = sprintf(
+        "per-gene median %s: AS-event genes vs all genes",
+        value_col
+      ),
+      x = x_lab
+    )
+  if (!is.null(vline_val)) {
+    p <- p +
+      geom_vline(xintercept = vline_val, linetype = "dashed", color = "black") +
+      labs(subtitle = "dashed line = former §4.12e masking threshold")
+  }
+  print(p)
+  ggsave(
+    sprintf("qc/distributions/gene_expression_need_filter_check_%s.pdf", out_suffix),
+    p,
+    width = 8,
+    height = 3 * length(transcript_filters)
+  )
+
+  if (requireNamespace("diptest", quietly = TRUE)) {
+    dip_results <- plot_dt[,
+      {
+        d <- diptest::dip.test(x_val)
+        list(dip_statistic = unname(d$statistic), p_value = d$p.value, n = .N)
+      },
+      by = .(transcript_filter, group)
+    ]
+    print(dip_results)
+    fwrite(
+      dip_results,
+      sprintf("qc/gene_expression_need_filter_dip_test_%s.csv", out_suffix)
+    )
+  } else {
+    warning("diptest package not available; skipping bimodality dip test")
+  }
+}
+
+run_need_filter_check(
+  value_col = "median_getmm",
+  x_expr = log1p,
+  x_lab = "log1p(median gene_expression_getmm)",
+  vline_val = log1p(min_gene_expression),
+  out_suffix = "getmm"
+)
+run_need_filter_check(
+  value_col = "median_vst",
+  x_expr = identity,
+  x_lab = "median gene_expression_vst",
+  vline_val = NULL,
+  out_suffix = "vst"
+)
+
+min_samples_per_event <- getOption("EpiATLAS_AS_MIN_SAMPLES_PER_EVENT", 10)
+
+# --- coverage-vs-expression overlap check --------------------------------
+# IJC/SJC (junction-read sample weighting, §4.8) already down-weights noisy
+# low-coverage rows in the loss. If gene_expression_getmm is highly
+# correlated with junction coverage, expression masking would be largely
+# redundant with that weighting; if the correlation is weak, the two catch
+# different noise sources (whole-gene expression vs event-specific junction
+# reads) and masking adds something coverage-weighting doesn't.
+coverage_expr_cor <- aggregated_dt[,
+  {
+    keep <- !is.na(gene_expression_getmm) & !is.na(IJC) & !is.na(SJC)
+    list(
+      spearman_r = cor(
+        log1p(gene_expression_getmm[keep]),
+        log1p(IJC[keep] + SJC[keep]),
+        method = "spearman"
+      ),
+      n = sum(keep)
+    )
+  },
+  by = transcript_filter
+]
+print(coverage_expr_cor)
+fwrite(coverage_expr_cor, "qc/gene_expression_vs_junction_coverage_cor.csv")
+
+# --- masking impact check (simulated, not applied) -----------------------
+# how many events (ID x transcript_filter) would drop below
+# min_samples_per_event if the §4.12e low-expression mask were applied --
+# quantifies data loss before committing to the mask.
+event_mask_impact <- aggregated_dt[,
+  .(
+    n_samples = .N,
+    n_after_mask = sum(gene_expression_getmm >= min_gene_expression, na.rm = TRUE)
+  ),
+  by = .(ID, transcript_filter, `Event Type`)
+]
+event_mask_impact[, would_drop := n_after_mask < min_samples_per_event]
+
+masking_impact_summary <- event_mask_impact[,
+  .(
+    n_events = .N,
+    n_events_would_drop = sum(would_drop),
+    frac_events_would_drop = mean(would_drop)
+  ),
+  by = .(transcript_filter, `Event Type`)
+]
+print(masking_impact_summary)
+fwrite(masking_impact_summary, "qc/gene_expression_masking_impact.csv")
+
+row_mask_frac <- aggregated_dt[,
+  .(frac_rows_would_mask = mean(gene_expression_getmm < min_gene_expression, na.rm = TRUE)),
+  by = transcript_filter
+]
+print(row_mask_frac)
+fwrite(row_mask_frac, "qc/gene_expression_masking_row_frac.csv")
+
+# Decision: KEEP masking. Evidence from the checks above:
+#  - dip test: AS-event genes are MORE bimodal than the genome-wide
+#    background (e.g. biotype_filtered getmm: dip=0.050 p<0.001 for event
+#    genes vs dip=0.0085 for background) -- a real low-expression
+#    subpopulation survives among event-hosting genes, contrary to the
+#    "already pre-selected for expression by rMATS" hypothesis.
+#  - coverage overlap: spearman r(gene_expression_getmm, IJC+SJC) ~ 0.70-0.72
+#    across filters -- correlated with junction-read sample weighting
+#    (§4.8) but far from redundant (30%+ unexplained variance), so masking
+#    catches noise the coverage weighting doesn't.
+#  - impact: cheap to apply -- only 8.5-12.8% of (event, sample) rows get
+#    masked, and only 0.3-1.9% of events are lost entirely to the
+#    min_samples_per_event floor below.
+# PSI in the masked (low-expression) rows is a noisy estimate (few
+# informative reads to derive inclusion/skip ratio from), so mask it to NA
+# rather than trusting it. Masking (not dropping the row outright) lets the
+# sample-count check below decide per-event whether enough non-masked
+# samples remain to keep modelling the event at all.
+#
+# Threshold is checked against gene_expression_getmm (CPM-like, >= 0, same
+# convention as the old TPM>=1 cutoff), NOT gene_expression (vst): vst is
+# variance-stabilised, roughly log2-scale, and can be negative, so
+# comparing it to a raw threshold of 1 doesn't correspond to "low
+# expression".
+aggregated_dt[gene_expression_getmm < min_gene_expression, PSI := NA]
+
+event_sample_counts <- aggregated_dt[
+  !is.na(PSI),
+  .N,
+  by = .(ID, transcript_filter)
+]
+low_sample_events <- event_sample_counts[
+  N < min_samples_per_event,
+  .(ID, transcript_filter)
+]
+if (nrow(low_sample_events) > 0) {
+  aggregated_dt <- aggregated_dt[
+    !low_sample_events,
+    on = .(ID, transcript_filter)
+  ]
+}
+# drop rows masked to NA above (and any events removed entirely by the
+# sample-count check, which have no remaining non-NA rows anyway)
+aggregated_dt <- aggregated_dt[!is.na(PSI)]
 
 # make sure all of the gene_expression values are at least one: (deprecated because we don't have the suppa tpm filter anymore)
 # stopifnot(all(aggregated_dt[, gene_expression >= 1]))
@@ -243,7 +586,456 @@ aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
 # aggregated_dt[promoter_merged, on = .(IHEC, gene_id), c("summed_enhancer", "max_promoter") := .(summed_enhancer, max_promoter)]
 ```
 
+```{r, gene-expression-sanity}
+# §4.13d — gene expression distribution sanity (post §4.12a fix)
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+
+# 1. log1p(gene_expression_getmm) boxplot by protocol
+# getmm (CPM-like, >= 0) is the log1p-safe representation; vst can be
+# negative and would produce NaNs under log().
+p_gene_expr <- ggplot(
+  unique(aggregated_dt[, .(uuid, protocol, gene_expression_getmm)]),
+  aes(x = protocol, y = log1p(gene_expression_getmm))
+) +
+  geom_boxplot() +
+  labs(
+    title = "log1p(gene_expression_getmm) by protocol",
+    x = "protocol",
+    y = "log1p(gene_expression_getmm)"
+  )
+print(p_gene_expr)
+ggsave(
+  "qc/distributions/gene_expression_by_protocol.pdf",
+  p_gene_expr,
+  width = 7,
+  height = 5
+)
+
+# 2. rank correlation across transcript_filter levels (getmm = expression
+# level; the §4.12a bug check)
+expr_by_filter <- unique(aggregated_dt[, .(
+  uuid,
+  gene_id,
+  transcript_filter,
+  gene_expression_getmm
+)])
+expr_wide <- dcast(
+  expr_by_filter,
+  uuid + gene_id ~ transcript_filter,
+  value.var = "gene_expression_getmm"
+)
+filter_cols <- setdiff(names(expr_wide), c("uuid", "gene_id"))
+if (length(filter_cols) >= 2) {
+  rank_cor <- cor(
+    expr_wide[[filter_cols[1]]],
+    expr_wide[[filter_cols[2]]],
+    method = "spearman",
+    use = "complete.obs"
+  )
+  append_sanity(
+    "gene_expression_rank_cor_across_filters",
+    ifelse(rank_cor > 0.95, "PASS", "WARN"),
+    rank_cor,
+    0.95,
+    "if < 0.5, §4.12a bug still active"
+  )
+}
+
+# 3. % zero-expression events per sample (getmm: CPM-like, can be exactly 0;
+# vst never is, so == 0 is only meaningful on getmm)
+zero_frac_by_sample <- aggregated_dt[,
+  .(zero_frac = mean(gene_expression_getmm == 0, na.rm = TRUE)),
+  by = uuid
+]
+pct_over_thresh <- zero_frac_by_sample[, mean(zero_frac >= 0.30)]
+append_sanity(
+  "gene_expression_zero_frac_per_sample",
+  ifelse(pct_over_thresh < 0.30, "PASS", "WARN"),
+  pct_over_thresh,
+  0.30,
+  "fraction of samples with >=30% zero-expression events"
+)
+
+# 4. §4.12e post-mask verification -- confirms no row with
+# gene_expression_getmm below threshold survived masking (catches join/unit
+# mistakes like the previous vst-vs-getmm mismatch), and logs how many
+# events (ID x transcript_filter) were dropped entirely because
+# low-expression masking left them under min_samples_per_event. Compare
+# against the pre-mask simulated estimate in
+# qc/gene_expression_masking_impact.csv (should match).
+stopifnot(all(aggregated_dt$gene_expression_getmm >= min_gene_expression))
+append_sanity(
+  "gene_expression_getmm_below_threshold_postmask",
+  "PASS",
+  0,
+  min_gene_expression,
+  "rows remaining below masking threshold after §4.12e (should always be 0; assertion above enforces it)"
+)
+
+n_events_dropped_low_expr <- low_sample_events[, uniqueN(paste(
+  ID,
+  transcript_filter
+))]
+append_sanity(
+  "gene_expression_events_dropped_low_expression",
+  "INFO",
+  n_events_dropped_low_expr,
+  min_samples_per_event,
+  "events (ID x transcript_filter) dropped after low-expression masking left < min_samples_per_event non-NA samples"
+)
+```
+
+
+```{r, junction-coverage-sanity}
+# §4.13i — junction read coverage sanity. Complements §4.8: verifies the
+# IJC/SJC counts just joined in are high enough that PSI is a trustworthy
+# ratio rather than noise from a handful of reads.
+bf_dt <- aggregated_dt[transcript_filter == "biotype_filtered"]
+
+p_junction_cov <- ggplot(bf_dt, aes(x = log10(IJC + SJC + 1))) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  facet_wrap(~`Event Type`, scales = "free_y") +
+  labs(
+    title = "log10(IJC + SJC + 1), biotype_filtered",
+    x = "log10(IJC + SJC + 1)"
+  )
+print(p_junction_cov)
+ggsave(
+  "qc/distributions/junction_coverage.pdf",
+  p_junction_cov,
+  width = 9,
+  height = 5
+)
+
+# Conditional median (across expressing samples only, IJC+SJC > 0) per
+# event. Zeros excluded: IJC = SJC = 0 means rMATS reported PSI = NA for
+# that sample (unexpressed), not a low-coverage quantification — including
+# them would understate coverage for tissue-specific events that are
+# unexpressed in most samples but well-covered where they are expressed.
+event_coverage <- bf_dt[
+  IJC + SJC > 0,
+  .(median_coverage = median(as.double(IJC + SJC))),
+  by = ID
+]
+frac_below_10 <- event_coverage[, mean(median_coverage < 10)]
+append_sanity(
+  "junction_coverage_median",
+  ifelse(frac_below_10 <= 0.10, "PASS", "WARN"),
+  frac_below_10,
+  0.10,
+  "fraction of biotype_filtered events with conditional median IJC+SJC < 10"
+)
+```
+
+
+```{r, ri-protocol-sanity}
+# §4.13k — check that the known RI PSI~protocol bias (total-RNA-Seq
+# inflates RI PSI by ~0.05 vs mRNA-Seq) isn't concentrated in specific
+# ontologies. An ontology sampled almost entirely by one protocol would let
+# protocol bias masquerade as a genuine tissue effect downstream, since
+# protocol and ontology become statistically inseparable in that subgroup.
+#
+# Two things actually need showing here, and neither is "residuals from
+# lm(PSI~protocol)" (tried first, dropped): that shows leftover PSI
+# variance with the protocol effect removed, which is bounded/skewed and
+# not what a confound check needs to see.
+#  1. sample composition per ontology (the confound itself: is one protocol
+#     dominant?) - what protocol_balance below already computes, now
+#     visualized instead of hiding in a CSV row.
+#  2. the protocol effect size per ontology (does the known ~0.05 bias hold
+#     everywhere, or blow up in specific tissues?) - a quantity the old
+#     residual plot never showed at all, since it subtracted the effect out
+#     before plotting.
+ri_dt_all <- rbindlist(lapply(transcript_filters, function(tf) {
+  aggregated_dt[transcript_filter == tf & `Event Type` == "RI"]
+}))
+
+# --- 1. protocol composition per ontology ---------------------------------
+protocol_composition <- unique(
+  ri_dt_all[, .(uuid, ontology, protocol, transcript_filter)]
+)[, .N, by = .(transcript_filter, ontology, protocol)]
+
+p_protocol_composition <- ggplot(
+  protocol_composition,
+  aes(x = ontology, y = N, fill = protocol)
+) +
+  geom_col(position = "fill") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  facet_wrap(~transcript_filter, ncol = 1) +
+  labs(
+    title = "RNA-Seq protocol composition by ontology",
+    x = "ontology",
+    y = "fraction of samples"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+print(p_protocol_composition)
+ggsave(
+  "qc/distributions/protocol_composition_by_ontology.pdf",
+  p_protocol_composition,
+  width = 9,
+  height = 5 * length(transcript_filters)
+)
+
+# --- 2. protocol effect size (total-RNA-Seq - mRNA-Seq) per ontology ------
+# single-protocol ontologies (no contrast to estimate) get NA_real_ here and
+# are still caught by the composition plot/confounded_ontologies check
+# below - keep type consistent (NA_real_, not NA) so this doesn't hit the
+# same integer/double by-group mismatch as the median() fix above.
+protocol_effect <- ri_dt_all[,
+  {
+    if (uniqueN(protocol) < 2) {
+      list(
+        effect = NA_real_,
+        ci_lo = NA_real_,
+        ci_hi = NA_real_,
+        n_samples = uniqueN(uuid)
+      )
+    } else {
+      psi_total <- PSI[protocol == "total-RNA-Seq"]
+      psi_mrna <- PSI[protocol == "mRNA-Seq"]
+      effect <- mean(psi_total) - mean(psi_mrna)
+      se <- sqrt(
+        var(psi_total) / length(psi_total) + var(psi_mrna) / length(psi_mrna)
+      )
+      list(
+        effect = effect,
+        ci_lo = effect - 1.96 * se,
+        ci_hi = effect + 1.96 * se,
+        n_samples = uniqueN(uuid)
+      )
+    }
+  },
+  by = .(transcript_filter, ontology)
+]
+
+p_protocol_effect <- ggplot(
+  protocol_effect,
+  aes(
+    x = ontology,
+    y = effect,
+    ymin = ci_lo,
+    ymax = ci_hi,
+    color = transcript_filter
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "grey50") +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  geom_pointrange(position = position_dodge(width = 0.6)) +
+  labs(
+    title = "RI PSI protocol effect (total-RNA-Seq - mRNA-Seq) by ontology",
+    subtitle = "dashed red line = known global bias (~0.05)",
+    x = "ontology",
+    y = "mean PSI difference",
+    color = "transcript_filter"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+print(p_protocol_effect)
+ggsave(
+  "qc/distributions/ri_protocol_effect_by_ontology.pdf",
+  p_protocol_effect,
+  width = 9,
+  height = 5
+)
+
+# flag ontologies where one protocol accounts for > 50% of samples (among
+# ontologies with > 50 samples total, per spec) — below that size a
+# single-protocol skew is expected sampling noise, not a real confound
+for (tf in transcript_filters) {
+  protocol_balance <- protocol_composition[
+    transcript_filter == tf,
+    .(max_frac = max(N) / sum(N), n_samples = sum(N)),
+    by = ontology
+  ]
+  confounded_ontologies <- protocol_balance[
+    max_frac > 0.5 & n_samples > 50,
+    ontology
+  ]
+  append_sanity(
+    sprintf("ri_protocol_ontology_confound_%s", tf),
+    ifelse(length(confounded_ontologies) == 0, "PASS", "WARN"),
+    length(confounded_ontologies),
+    0,
+    paste(
+      "confounded ontologies:",
+      paste(confounded_ontologies, collapse = ", ")
+    )
+  )
+}
+```
+
+
+```{r, join-maxentscan}
+# §4.13e — MaxEntScan splice-site scores (written by maxentscan_scores rule).
+# Score files are row-order-aligned with their source FASTA; IDs come from
+# the FASTA headers (">ID").
+scores3 <- fread("processed_data/3scores.txt", col.names = c("sequence", "3ss"))
+scores3down <- fread(
+  "processed_data/3down_scores.txt",
+  col.names = c("sequence", "3ssdown")
+)
+scores5 <- fread("processed_data/5scores.txt", col.names = c("sequence", "5ss"))
+scores5up <- fread(
+  "processed_data/5up_scores.txt",
+  col.names = c("sequence", "5ssup")
+)
+
+scores3[,
+  ID := as.integer(substr(
+    grep("^>", readLines("processed_data/3ss.fasta"), value = TRUE),
+    2,
+    .Machine$integer.max
+  ))
+]
+scores5[,
+  ID := as.integer(substr(
+    grep("^>", readLines("processed_data/5ss.fasta"), value = TRUE),
+    2,
+    .Machine$integer.max
+  ))
+]
+scores3[, `3ssdown` := scores3down[["3ssdown"]]]
+scores5[, `5ssup` := scores5up[["5ssup"]]]
+scores3[, sequence := NULL]
+scores5[, sequence := NULL]
+ss_dt <- merge(scores3, scores5, by = "ID", all = TRUE)
+
+ss_cols <- c("3ss", "3ssdown", "5ss", "5ssup")
+aggregated_dt[ss_dt, on = .(ID), (ss_cols) := mget(paste0("i.", ss_cols))]
+
+# sanity: distributions + NA fraction
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+ss_cols <- c("3ss", "3ssdown", "5ss", "5ssup")
+# scores are per-event (constant across all sample rows sharing an ID), so
+# dedupe on (ID, transcript_filter) before plotting - otherwise the
+# histogram would be weighted by per-event sample count rather than by
+# event, and that weighting differs across transcript_filter/Event Type.
+ss_plot_cols <- c("ID", ss_cols, "Event Type", "transcript_filter")
+ss_dedup <- unique(
+  aggregated_dt[, ..ss_plot_cols],
+  by = c("ID", "transcript_filter")
+)
+ss_long <- melt(
+  ss_dedup,
+  id.vars = c("Event Type", "transcript_filter"),
+  measure.vars = ss_cols,
+  variable.name = "site",
+  value.name = "score"
+)
+p_splice_scores <- ggplot(ss_long, aes(x = score)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  facet_grid(transcript_filter + `Event Type` ~ site, scales = "free") +
+  labs(title = "MaxEntScan score distributions", x = "score")
+print(p_splice_scores)
+ggsave(
+  "qc/distributions/splice_site_scores.pdf",
+  p_splice_scores,
+  width = 12,
+  height = 14
+)
+ss_na_frac <- aggregated_dt[, mean(
+  is.na(`3ss`) | is.na(`3ssdown`) | is.na(`5ss`) | is.na(`5ssup`)
+)]
+stopifnot(ss_na_frac < 0.01)
+```
+
+
+```{r, join-pangolin}
+# §4.13e-ext — Pangolin splice-site usage scores (written by pangolin_scores
+# rule). Guarded: rule may not have finished yet.
+if (file.exists("processed_data/pangolin_scores.csv")) {
+  pangolin_raw <- fread("processed_data/pangolin_scores.csv")
+  pangolin_raw[,
+    site_class := fcase(
+      site_type %in% c("donor", "upstream_donor", "alt_donor")            , "donor"    ,
+      site_type %in% c("acceptor", "alt_acceptor", "downstream_acceptor") , "acceptor" ,
+      default = NA_character_
+    )
+  ]
+  pangolin_donor <- pangolin_raw[
+    site_class == "donor",
+    .(
+      pangolin_donor_mean = mean(mean_usage, na.rm = TRUE),
+      pangolin_donor_tissue_cv = mean(tissue_cv, na.rm = TRUE)
+    ),
+    by = event_id
+  ]
+  pangolin_acceptor <- pangolin_raw[
+    site_class == "acceptor",
+    .(
+      pangolin_acceptor_mean = mean(mean_usage, na.rm = TRUE),
+      pangolin_acceptor_tissue_cv = mean(tissue_cv, na.rm = TRUE)
+    ),
+    by = event_id
+  ]
+
+  id_map <- unique(event_annotations_dt[, .(event_id, ID)])
+  pangolin_dt <- id_map[pangolin_donor, on = .(event_id)]
+  pangolin_dt[
+    pangolin_acceptor,
+    on = .(event_id),
+    c("pangolin_acceptor_mean", "pangolin_acceptor_tissue_cv") := .(
+      i.pangolin_acceptor_mean,
+      i.pangolin_acceptor_tissue_cv
+    )
+  ]
+
+  aggregated_dt[
+    pangolin_dt,
+    on = .(ID),
+    c(
+      "pangolin_donor_mean",
+      "pangolin_donor_tissue_cv",
+      "pangolin_acceptor_mean",
+      "pangolin_acceptor_tissue_cv"
+    ) := .(
+      i.pangolin_donor_mean,
+      i.pangolin_donor_tissue_cv,
+      i.pangolin_acceptor_mean,
+      i.pangolin_acceptor_tissue_cv
+    )
+  ]
+
+  cor_5ss_pangolin <- cor(
+    aggregated_dt[!duplicated(ID), `5ss`],
+    aggregated_dt[!duplicated(ID), pangolin_donor_mean],
+    method = "spearman",
+    use = "complete.obs"
+  )
+  cat(sprintf(
+    "Spearman r(5ss, pangolin_donor_mean) = %.3f (must be > 0.2)\n",
+    cor_5ss_pangolin
+  ))
+  stopifnot(cor_5ss_pangolin > 0.2)
+} else {
+  warning(
+    "processed_data/pangolin_scores.csv not found — skipping Pangolin join (§4.13e-ext)"
+  )
+}
+```
+
+
 ```{r, write-filtered}
+# §4.13a — PSI range assertion before write
+stopifnot(
+  all(aggregated_dt$PSI >= 0 & aggregated_dt$PSI <= 1, na.rm = TRUE),
+  !any(is.infinite(aggregated_dt$PSI))
+)
+
 # write the filtered and augmented table to file
 fwrite(aggregated_dt, "processed_data/aggregated_dt_filtered.csv.gz")
 ```

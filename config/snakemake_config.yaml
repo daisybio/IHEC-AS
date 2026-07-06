@@ -66,10 +66,10 @@ resources:
     threads: 1
     gpu: 0
   pangolin_scores:
-    mem_mb: 16000
-    runtime: 180    # ~2 hr CPU; ~30 min GPU
+    mem_mb: 48000
+    runtime: 240    # ~106k events / ~300-400k sites; per-site Python encoding is CPU-bound
     threads: 4
-    gpu: 0
+    gpu: 1
   aggregate_chip_one:
     mem_mb: 500
     runtime: 15
@@ -81,9 +81,19 @@ resources:
     threads: 1
     gpu: 0
   aggregate_wgbs:
-    mem_mb: 32000
+    mem_mb: 64000
     runtime: 180
+    threads: 8
+    gpu: 0
+  rnaseq_normalisation:
+    mem_mb: 96000   # bumped 2026-07-02: 3 transcript_filters now run via mclapply (one fork each) instead of serially, so peak memory is ~3x a single filter's count/getmm/vst matrices, not 1x — still unbenchmarked, revisit after first real run
+    runtime: 120    # DESeq2 vst() + ComBat_seq() run per transcript_filter, both raw and combat branches — wall-clock halved from parallelising across filters, still unbenchmarked
     threads: 4
+    gpu: 0
+  rbp_binding_sites:
+    mem_mb: 16000   # data/human.txt.gz ~38M rows loaded once via fread+GRanges; reduce(split(...)) before findOverlaps keeps peak well under this, unbenchmarked on real SLURM allocation
+    runtime: 60
+    threads: 1
     gpu: 0
   create_aggregated_dt:
     mem_mb: 32000

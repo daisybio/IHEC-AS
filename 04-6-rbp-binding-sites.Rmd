@@ -1,0 +1,379 @@
+---
+title: "RBP binding-site annotation prototype (revision/file-changes/04-6-rbp-binding-sites.Rmd.md)"
+output: html_document
+---
+
+```{r, setup}
+# Prototype for revision/file-changes/04-6-rbp-binding-sites.Rmd.md, Step 1.
+#
+# Builds two artifacts used downstream (05-create-aggregated-dt.Rmd,
+# 09-1-ml-local.R):
+#   - processed_data/rbp_per_event.rds : ID -> list of nearby RBP names
+#   - processed_data/rbp_gene_ids.rds  : rbp_name -> gencode.v29 gene_id
+#
+# RBP identity source: POSTAR3 human CLIPdb (data/human.txt.gz), columns
+#   1 seqnames, 2 start(0-based), 3 end, 4 peak_id, 5 strand,
+#   6 rbp name (or literal "RBP_occupancy" for PIP-seq rows with no
+#     RBP identity -> dropped), 7 technique, 8 cell_line, 9 accession, 10 score
+# ~220 distinct RBPs are CLIP-profiled in this file; that set (not a
+# separate ATtRACT/curated list) is used directly as the RBP universe
+# for this prototype.
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  fwrite(
+    data.table(
+      check_name = check_name,
+      status = status,
+      value = value,
+      threshold = threshold,
+      notes = notes
+    ),
+    sanity_csv,
+    append = TRUE
+  )
+}
+
+# matches the 200bp splice-site-proximal window already used for ChIP
+# features in 03-prepare-aggregation.Rmd's make_window() (5up/5down/3up/3down)
+window_bp <- 200L
+```
+
+
+```{r, load-postar3-binding-sites}
+postar_dt <- fread(
+  cmd = "zcat data/human.txt.gz | awk -F'\t' '$6 != \"RBP_occupancy\"'",
+  header = FALSE,
+  select = 1:6,
+  col.names = c("seqnames", "start0", "end", "peak_id", "strand", "rbp")
+)
+
+n_postar_raw <- nrow(postar_dt) # after RBP_occupancy drop, before merge
+n_rbp_raw <- uniqueN(postar_dt$rbp)
+append_sanity(
+  "postar3_rbp_universe_size",
+  ifelse(n_rbp_raw >= 150 & n_rbp_raw <= 300, "PASS", "WARN"),
+  n_rbp_raw, 220,
+  "distinct CLIP-profiled RBP names after dropping generic 'RBP_occupancy' rows"
+)
+
+# BED is 0-based half-open -> GRanges is 1-based closed
+postar_gr <- GRanges(
+  seqnames = postar_dt$seqnames,
+  ranges = IRanges(start = postar_dt$start0 + 1L, end = postar_dt$end),
+  strand = postar_dt$strand,
+  rbp = postar_dt$rbp
+)
+rm(postar_dt)
+gc()
+
+# CLIP peaks are massively redundant across experiments/cell lines; merge
+# overlapping intervals per RBP before findOverlaps to shrink the object.
+peaks_per_rbp_raw <- table(postar_gr$rbp)
+postar_gr <- unlist(reduce(split(postar_gr, postar_gr$rbp)))
+postar_gr$rbp <- names(postar_gr)
+names(postar_gr) <- NULL
+peaks_per_rbp_merged <- table(postar_gr$rbp)
+
+cat(
+  "POSTAR3 rows retained (RBP-named):", n_postar_raw, "\n",
+  "-> merged intervals:", length(postar_gr),
+  sprintf("(%.1f%% reduction)\n", 100 * (1 - length(postar_gr) / n_postar_raw))
+)
+```
+
+
+```{r, viz-postar3-top-rbps, fig.width=8, fig.height=6}
+# viz 1: which RBPs have the most binding evidence in POSTAR3 (pre-overlap;
+# a sanity check on the input data itself, not yet event-specific).
+top20 <- sort(peaks_per_rbp_merged, decreasing = TRUE)[1:20]
+draw_top_rbps <- function() {
+  par(mar = c(8, 4, 4, 2))
+  barplot(
+    top20,
+    las = 2, col = "steelblue",
+    main = "Top 20 RBPs by merged POSTAR3 interval count",
+    ylab = "merged binding intervals (genome-wide)"
+  )
+}
+draw_top_rbps() # inline, alongside the saved PDF below
+pdf("qc/distributions/rbp_postar3_top_rbps.pdf", width = 8, height = 6)
+draw_top_rbps()
+dev.off()
+```
+
+
+```{r, event-coordinates}
+event_annotations_dt <- fread("processed_data/event_annotations_dt.csv.gz")
+
+# event_id encodes coords as "<gene_id>;<TYPE>:<chr>:<coords>:<strand>" (SUPPA2
+# format: SE = gene;SE:chr:e1-s2:e2-s3:strand, e2=exon body [s2,e2];
+# RI = gene;RI:chr:e1:s2-e2:s3:strand, retained intron body = [s2,e2]).
+# NB: taking min/max of ALL 4 numbers (e1..s3) instead would span both full
+# flanking introns (median ~6.4kb, up to >1Mb) rather than just the regulated
+# exon/intron -> confirmed via a test run that inflated median RBPs/event to
+# 34 by pulling in binding sites from the entire neighboring introns, not
+# just the ±200bp flank the plan intends. Must extract the inner [s2, e2]
+# body specifically, per event type.
+extract_core <- function(event_id, event_type) {
+  coord_part <- vapply(strsplit(event_id, ";", fixed = TRUE), `[`, character(1), 2)
+  coord_part <- sub("^[A-Z0-9]+:[^:]+:", "", coord_part) # drop "TYPE:chr:"
+  coord_part <- sub(":[+-]$", "", coord_part) # drop ":strand"
+  segments <- strsplit(coord_part, ":")
+  core <- mapply(
+    function(segs, type) {
+      if (type == "SE") {
+        # segs = c("e1-s2", "e2-s3") -> core = [s2, e2]
+        s2 <- as.numeric(strsplit(segs[1], "-")[[1]][2])
+        e2 <- as.numeric(strsplit(segs[2], "-")[[1]][1])
+      } else if (type == "RI") {
+        # segs = c("e1", "s2-e2", "s3") -> core = [s2, e2]
+        pair <- as.numeric(strsplit(segs[2], "-")[[1]])
+        s2 <- pair[1]
+        e2 <- pair[2]
+      } else {
+        stop("extract_core: unhandled Event Type: ", type)
+      }
+      c(s2, e2)
+    },
+    segments, event_type
+  )
+  list(start_core = core[1, ], end_core = core[2, ])
+}
+event_annotations_dt[, c("start_core", "end_core") := extract_core(event_id, `Event Type`)]
+event_annotations_dt[, core_width := end_core - start_core]
+
+# All analysis below is stratified by (Event Type, transcript_filter) -- the
+# same granularity 04-2-chip-signal-sanity.Rmd uses and the granularity
+# 09-1-ml-local.R models at (transcripts is a superset of tsl_filtered, which
+# is a superset of biotype_filtered -- same underlying genomic events under
+# different annotation filters, so pooling across filters would silently
+# triple-count/mix them).
+strata <- unique(event_annotations_dt[, .(`Event Type`, transcript_filter)])
+setorder(strata, `Event Type`, transcript_filter)
+
+# check: core width is a small exon/intron body, not a multi-kb span. SE
+# core = a single exon (human median ~120-150bp); RI core = the retained
+# intron itself (can be several hundred bp to a few kb, but not megabases).
+for (i in seq_len(nrow(strata))) {
+  this_et <- strata$`Event Type`[i]
+  this_tf <- strata$transcript_filter[i]
+  stratum_key <- paste(this_et, this_tf, sep = "_")
+  sub_dt <- event_annotations_dt[`Event Type` == this_et & transcript_filter == this_tf]
+  threshold <- if (this_et == "SE") 5000 else 50000
+  bad_width <- sub_dt[core_width > threshold]
+  append_sanity(
+    paste0("rbp_event_core_width_plausible_", stratum_key),
+    ifelse(nrow(bad_width) == 0, "PASS", "WARN"),
+    nrow(bad_width), 0,
+    sprintf(
+      "%s: events with implausibly large core width (>%d bp): %d/%d",
+      stratum_key, threshold, nrow(bad_width), nrow(sub_dt)
+    )
+  )
+}
+```
+
+
+```{r, viz-core-width, fig.width=12, fig.height=8}
+# viz 2: core (exon/intron body) width distribution, per (Event Type,
+# transcript_filter) stratum -- the quantity the ±200bp window is actually
+# built around. Directly documents the bug found/fixed above: this should
+# look like exon/intron lengths, not the multi-kb-to-Mb flanking-intron-
+# inclusive span a naive min/max parse of the event_id would produce.
+draw_core_width <- function() {
+  par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+  for (i in seq_len(nrow(strata))) {
+    this_et <- strata$`Event Type`[i]
+    this_tf <- strata$transcript_filter[i]
+    vals <- event_annotations_dt[`Event Type` == this_et & transcript_filter == this_tf, core_width]
+    hist(
+      pmin(vals, quantile(vals, 0.99)), # clip extreme tail for a readable axis
+      breaks = 50, col = "steelblue", border = "white",
+      main = paste(this_et, this_tf, "\n(99th pctile clipped)"),
+      xlab = "width (bp)"
+    )
+  }
+  par(mfrow = c(1, 1))
+}
+draw_core_width() # inline, alongside the saved PDF below
+pdf("qc/distributions/rbp_event_core_width.pdf", width = 12, height = 8)
+draw_core_width()
+dev.off()
+```
+
+
+```{r, event-overlap}
+events_gr <- GRanges(
+  seqnames = event_annotations_dt$seqnames,
+  ranges = IRanges(
+    start = event_annotations_dt$start_core - window_bp,
+    end   = event_annotations_dt$end_core + window_bp
+  ),
+  strand = event_annotations_dt$strand,
+  ID = event_annotations_dt$ID
+)
+
+# ignore.strand = TRUE: CLIP peak strand reflects the sequencing library,
+# not necessarily the regulated transcript's strand -> don't drop signal by
+# requiring a strand match in this prototype.
+hits <- findOverlaps(events_gr, postar_gr, ignore.strand = TRUE)
+rbp_per_event <- data.table(
+  ID  = events_gr$ID[queryHits(hits)],
+  rbp = postar_gr$rbp[subjectHits(hits)]
+)[, .(rbp = list(unique(rbp))), by = ID]
+
+saveRDS(rbp_per_event, "processed_data/rbp_per_event.rds")
+
+# n_rbp per event, 0 for events with no overlap (rbp_per_event only has rows
+# with >=1 hit) -- needed so per-stratum medians/coverage aren't biased
+# upward by silently dropping the zero-hit events from the denominator.
+event_annotations_dt[, n_rbp := 0L]
+event_annotations_dt[
+  rbp_per_event[, .(ID, n_rbp_hit = lengths(rbp))],
+  on = "ID",
+  n_rbp := i.n_rbp_hit
+]
+
+for (i in seq_len(nrow(strata))) {
+  this_et <- strata$`Event Type`[i]
+  this_tf <- strata$transcript_filter[i]
+  stratum_key <- paste(this_et, this_tf, sep = "_")
+  sub_dt <- event_annotations_dt[`Event Type` == this_et & transcript_filter == this_tf]
+
+  frac_with_rbp <- sub_dt[, mean(n_rbp > 0)]
+  append_sanity(
+    paste0("rbp_event_coverage_", stratum_key),
+    ifelse(frac_with_rbp > 0.5, "PASS", "WARN"),
+    frac_with_rbp, 0.5,
+    sprintf("%s: %d/%d events have >=1 nearby RBP", stratum_key, sub_dt[, sum(n_rbp > 0)], nrow(sub_dt))
+  )
+
+  # check: per plan §"Filter by binding site first" -- should be a modest
+  # per-event feature count (~20-100), not the full ~220-RBP universe (no
+  # filtering happened) and not near-zero (window/overlap logic broken).
+  med_n <- median(sub_dt$n_rbp)
+  append_sanity(
+    paste0("rbp_per_event_count_plausible_", stratum_key),
+    ifelse(med_n >= 2 & med_n <= 150, "PASS", "WARN"),
+    med_n, "[2, 150]",
+    sprintf(
+      "%s: median %d, mean %.1f, max %d RBPs/event",
+      stratum_key, med_n, mean(sub_dt$n_rbp), max(sub_dt$n_rbp)
+    )
+  )
+}
+```
+
+
+```{r, viz-rbp-per-event, fig.width=12, fig.height=8}
+# viz 3: distribution of RBP-count-per-event, per (Event Type,
+# transcript_filter) stratum -- the plan's central design decision (filter
+# by binding site first) is only doing useful work if this is meaningfully
+# less than the full ~220-RBP universe for most events.
+draw_rbp_per_event <- function() {
+  par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+  for (i in seq_len(nrow(strata))) {
+    this_et <- strata$`Event Type`[i]
+    this_tf <- strata$transcript_filter[i]
+    vals <- event_annotations_dt[`Event Type` == this_et & transcript_filter == this_tf, n_rbp]
+    hist(
+      vals,
+      breaks = 50, col = "darkorange", border = "white",
+      main = paste(this_et, this_tf),
+      xlab = "number of distinct RBPs"
+    )
+    abline(v = median(vals), col = "red", lty = 2)
+    legend("topright", legend = sprintf("median = %d", median(vals)), lty = 2, col = "red", bty = "n")
+  }
+  par(mfrow = c(1, 1))
+}
+draw_rbp_per_event() # inline, alongside the saved PDF below
+pdf("qc/distributions/rbp_count_per_event.pdf", width = 12, height = 8)
+draw_rbp_per_event()
+dev.off()
+```
+
+
+```{r, rbp-gene-mapping}
+# Map RBP names -> gencode.v29 gene_id (same annotation used in
+# 03-prepare-aggregation.Rmd) for the gene_quants join in 05.
+all_rbp_names <- unique(unlist(rbp_per_event$rbp))
+
+gtf_genes <- fread(
+  cmd = "awk -F'\t' '$3==\"gene\"' splicing_analysis/gencode.v29.annotation.gtf",
+  header = FALSE, sep = "\t", select = 9
+)
+gene_lookup <- data.table(
+  gene_id   = sub('.*gene_id "([^"]+)".*', "\\1", gtf_genes$V9),
+  gene_name = sub('.*gene_name "([^"]+)".*', "\\1", gtf_genes$V9)
+)
+
+rbp_gene_ids <- gene_lookup[gene_name %in% all_rbp_names]
+setnames(rbp_gene_ids, "gene_name", "rbp_name")
+
+# Manual alias map for POSTAR3 RBP names not present in gencode.v29 under
+# that exact string. Confirmed these are naming mismatches, not missing
+# genes or an Ensembl-version issue -- gencode.v29 has all 8 target genes,
+# just under a different symbol:
+#   U2AF65 -> U2AF2    protein-subunit name for the U2AF2 gene
+#   HNRNPH -> HNRNPH1  ambiguous shorthand; H1 is the dominant paralog
+#   DDX3   -> DDX3X    ambiguous vs Y-linked DDX3Y; X is the standard pick
+#   SMN    -> SMN1     ambiguous vs paralog SMN2; SMN1 is the disease-relevant copy
+#   TDP43  -> TARDBP   old protein nickname (TARDBP itself already matches
+#                      separately under its own POSTAR3 label -- this adds
+#                      a second, fully redundant rbp_TDP43 feature pointing
+#                      at the same gene_id; harmless, lasso will shrink one)
+#   UNR    -> CSDE1    old protein nickname
+#   ACI    -> ACIN1    "Acinus"; confirmed via GSE81460 iCLIP study title
+#   SDOS   -> NUDT16L1 "Syndesmos"; confirmed via GSE118049 iCLIP study title
+rbp_alias_map <- c(
+  U2AF65 = "U2AF2",
+  HNRNPH = "HNRNPH1",
+  DDX3   = "DDX3X",
+  SMN    = "SMN1",
+  TDP43  = "TARDBP",
+  UNR    = "CSDE1",
+  ACI    = "ACIN1",
+  SDOS   = "NUDT16L1"
+)
+aliased_names <- intersect(names(rbp_alias_map), all_rbp_names)
+if (length(aliased_names) > 0) {
+  aliased_rows <- gene_lookup[gene_name %in% rbp_alias_map[aliased_names]]
+  aliased_rows[, rbp_name := names(rbp_alias_map)[match(gene_name, rbp_alias_map)]]
+  aliased_rows[, gene_name := NULL]
+  rbp_gene_ids <- rbind(rbp_gene_ids, aliased_rows)
+}
+
+unmatched <- setdiff(all_rbp_names, rbp_gene_ids$rbp_name)
+append_sanity(
+  "rbp_gene_id_mapping_complete",
+  ifelse(length(unmatched) == 0, "PASS", "WARN"),
+  length(unmatched), 0,
+  sprintf("RBP names unmatched to gencode.v29 gene_name: %s", paste(unmatched, collapse = ", "))
+)
+
+saveRDS(rbp_gene_ids, "processed_data/rbp_gene_ids.rds")
+```
+
+
+```{r, summary}
+cat(
+  "Events with >=1 nearby RBP:", event_annotations_dt[, sum(n_rbp > 0)], "/", nrow(event_annotations_dt), "\n",
+  "Distinct RBPs found near any event:", length(all_rbp_names), "\n",
+  "Distinct RBPs mapped to gencode.v29 gene_id:", nrow(rbp_gene_ids), "\n",
+  "Median RBPs per event (overall):", median(event_annotations_dt$n_rbp), "\n"
+)
+
+knitr::kable(event_annotations_dt[, .(
+  n_events = .N,
+  events_with_rbp = sum(n_rbp > 0),
+  median_n_rbp = as.numeric(median(n_rbp)),
+  mean_n_rbp = round(mean(n_rbp), 1),
+  max_n_rbp = max(n_rbp)
+), by = .(`Event Type`, transcript_filter)][order(`Event Type`, transcript_filter)])
+
+knitr::kable(fread(sanity_csv)[grepl("^rbp_|^postar3_", check_name)])
+```
