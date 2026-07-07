@@ -86,8 +86,8 @@ resources:
     threads: 8
     gpu: 0
   rnaseq_normalisation:
-    mem_mb: 96000   # bumped 2026-07-02: 3 transcript_filters now run via mclapply (one fork each) instead of serially, so peak memory is ~3x a single filter's count/getmm/vst matrices, not 1x — still unbenchmarked, revisit after first real run
-    runtime: 120    # DESeq2 vst() + ComBat_seq() run per transcript_filter, both raw and combat branches — wall-clock halved from parallelising across filters, still unbenchmarked
+    mem_mb: 96000   # per-filter Snakemake job; single filter's count/getmm/vst matrices. DESeq2 vst() is bottleneck — all 4 threads used for dispersion MLE + vst via BiocParallel
+    runtime: 120    # vst() + early stopping per transcript_filter — parallelised gene-wise via BiocParallel, not across filters (filters run as separate Snakemake jobs)
     threads: 4
     gpu: 0
   rbp_binding_sites:

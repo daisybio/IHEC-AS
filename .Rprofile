@@ -14,6 +14,38 @@ renv::settings$ignored.packages(
 # global seed
 options(EpiATLAS_AS_SEED = 42L)
 
+# --- pipeline scope + VST gene-expression gate (PLAN §4.12b/§4.12e) ----------
+# All overridable via environment variable (Snakemake passes them per rule);
+# defaults reproduce standard behaviour for interactive / un-migrated runs.
+.epiatlas_env_chr <- function(name, default) {
+  v <- Sys.getenv(name, unset = "")
+  if (nchar(v) > 0L) v else default
+}
+.epiatlas_env_num <- function(name, default) {
+  v <- Sys.getenv(name, unset = "")
+  if (nchar(v) > 0L) as.numeric(v) else default
+}
+options(
+  # default transcript_filter when TRANSCRIPT_FILTER env is unset (interactive)
+  EpiATLAS_AS_PRIMARY_FILTER = .epiatlas_env_chr(
+    "EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered"
+  ),
+  # VST low-expression gate used to build the high-confidence event set in
+  # 02-3-rmats-event-filtering.Rmd and asserted in 05-create-aggregated-dt.Rmd
+  EpiATLAS_AS_VST_CUTOFF_METHOD = .epiatlas_env_chr(
+    "EpiATLAS_AS_VST_CUTOFF_METHOD", "gmm"
+  ), # {"gmm","fixed","percentile"}
+  EpiATLAS_AS_VST_CUTOFF_VALUE = .epiatlas_env_num(
+    "EpiATLAS_AS_VST_CUTOFF_VALUE", NA_real_
+  ), # used when method="fixed" or as gmm fallback
+  EpiATLAS_AS_VST_CUTOFF_PERCENTILE = .epiatlas_env_num(
+    "EpiATLAS_AS_VST_CUTOFF_PERCENTILE", 0.25
+  ), # used when method="percentile" or as final fallback
+  EpiATLAS_AS_VST_NA_POLICY = .epiatlas_env_chr(
+    "EpiATLAS_AS_VST_NA_POLICY", "keep"
+  ) # {"keep","drop"}: (event,sample) with no host-gene VST
+)
+
 # vscode specific libraries
 if (interactive()) {
   library(jsonlite)

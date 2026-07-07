@@ -1,9 +1,23 @@
 ---
-title: "Splicing Analysis Preparation"
+title: "Transcript filters, GTFs & isoform quantification (stage 02-1)"
 output:
   html_document:
     df_print: paged
 ---
+
+Stage 02-1 (was `02-SUPPA2-analysis.Rmd`). Cohort-wide (not per-transcript_filter):
+runs once and produces the shared inputs the per-filter stages consume —
+`filtered_transcript_ids.rds` (the three transcript filters: `transcripts`,
+`tsl_filtered`, `biotype_filtered`), the per-filter `gencode.v29.{tf}.gtf`, and
+`isoform_quantifications_subset.tsv.gz` (RSEM isoform quants restricted to the
+`rna_to_use` cohort = samples with both RNA-Seq and epigenomic data). These feed
+`02-2-rnaseq-normalisation` (isoform quants + filter IDs), the external rMATS run
+(GTFs), and `03-prepare-aggregation`.
+
+**SUPPA2 is reference-only:** the `generateEvents`/`psiPerEvent` chunks below are
+`eval=FALSE` and NOT part of the active pipeline — rMATS (via
+`02-3-rmats-event-filtering`) is the PSI-quantification tool. The SUPPA2 output is
+kept for cross-checking only.
 
 Make Splicing Analysis folder:
 
@@ -22,35 +36,74 @@ Load Isoform Quantifications:
 # read the file table
 download_metadata <- fread("processed_data/file_table.csv.gz")
 # get the isoform quantification files
-isoform_files <- download_metadata[assay_type == "RNA-Seq", file.path(rna_data_dir, basename(file_path))]
-cols_to_keep <- c("transcript_id", "gene_id", "effective_length", "expected_count", "TPM")
+isoform_files <- download_metadata[
+  assay_type == "RNA-Seq",
+  file.path(rna_data_dir, basename(file_path))
+]
+cols_to_keep <- c(
+  "transcript_id",
+  "gene_id",
+  "effective_length",
+  "expected_count",
+  "TPM"
+)
 # load the isoform quantification files
-iso_quants_list <- pbmcapply::pbmclapply(isoform_files, data.table::fread, stringsAsFactor = TRUE, fill = TRUE, select = cols_to_keep)
+iso_quants_list <- pbmcapply::pbmclapply(
+  isoform_files,
+  data.table::fread,
+  stringsAsFactor = TRUE,
+  fill = TRUE,
+  select = cols_to_keep
+)
 
 names(iso_quants_list) <- download_metadata[assay_type == "RNA-Seq", uuid]
 
 # make one isoform quantification table
 isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = "uuid")
 isoform_quants[, uuid := as.factor(uuid)]
-tpms <- isoform_quants[download_metadata[assay_type == "RNA-Seq", .(uuid, epirr_id_without_version, experiment_type)], on = .(uuid), c("experiment_type", "epirr_id_without_version") := .(experiment_type, epirr_id_without_version)][, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)]
+tpms <- isoform_quants[
+  download_metadata[
+    assay_type == "RNA-Seq",
+    .(uuid, epirr_id_without_version, experiment_type)
+  ],
+  on = .(uuid),
+  c("experiment_type", "epirr_id_without_version") := .(
+    experiment_type,
+    epirr_id_without_version
+  )
+][, .(tpm = sum(TPM)), by = .(uuid, epirr_id_without_version, experiment_type)]
 ggplot(tpms, aes(x = tpm, fill = experiment_type)) +
   geom_histogram()
 
-fwrite(isoform_quants, "splicing_analysis/isoform_quantifications.tsv.gz", sep = "\t")
+fwrite(
+  isoform_quants,
+  "splicing_analysis/isoform_quantifications.tsv.gz",
+  sep = "\t"
+)
 
 # also write subset of samples for which we have both RNA-Seq and epigenomic data
 rna_to_use <- download_metadata[
   assay_type == "RNA-Seq" &
-    epirr_id_without_version %in% download_metadata[,
-      if (.N >= 8) .SD,
-      by = epirr_id_without_version
-    ][, epirr_id_without_version],
+    epirr_id_without_version %in%
+      download_metadata[,
+        if (.N >= 8) .SD,
+        by = epirr_id_without_version
+      ][, epirr_id_without_version],
   uuid
 ]
-fwrite(isoform_quants[uuid %in% rna_to_use], "splicing_analysis/isoform_quantifications_subset.tsv.gz", sep = "\t")
+fwrite(
+  isoform_quants[uuid %in% rna_to_use],
+  "splicing_analysis/isoform_quantifications_subset.tsv.gz",
+  sep = "\t"
+)
 
 # bring tpms to wide format
-tpm_dt <- data.table::dcast(isoform_quants, transcript_id ~ uuid, value.var = "TPM", fill = 0)
+tpm_dt <- data.table::dcast(
+  isoform_quants,
+  transcript_id ~ uuid,
+  value.var = "TPM",
+  fill = 0
+)
 
 # export expression for analysis with suppa
 suppa_expr_filename <- "splicing_analysis/suppa/tpm_expressions.tsv.gz"
@@ -62,18 +115,23 @@ fwrite(tpm_dt, suppa_expr_filename, sep = "\t", append = TRUE)
 
 ```{r, filter-annotation}
 # load annotation file
-unfiltered_annotation <- rtracklayer::import("splicing_analysis/gencode.v29.annotation.gtf")
+unfiltered_annotation <- rtracklayer::import(
+  "splicing_analysis/gencode.v29.annotation.gtf"
+)
 
 confidence_tsls <- c("1", "2")
 polyA_biotypes <- c(
-  "protein_coding", "retained_intron"
+  "protein_coding",
+  "retained_intron"
   # "lincRNA", "processed_transcript",
   # "antisense", "sense_intronic", "sense_overlapping", "transcribed_unprocessed_pseudogene"
 )
 
 tx_filter <- unfiltered_annotation$type == "transcript"
-tsl_tx_filter <- tx_filter & unfiltered_annotation$transcript_support_level %in% confidence_tsls
-biotype_tx_filter <- tsl_tx_filter & unfiltered_annotation$transcript_type %in% polyA_biotypes
+tsl_tx_filter <- tx_filter &
+  unfiltered_annotation$transcript_support_level %in% confidence_tsls
+biotype_tx_filter <- tsl_tx_filter &
+  unfiltered_annotation$transcript_type %in% polyA_biotypes
 
 filter_list <- list(
   transcripts = tx_filter,
@@ -81,16 +139,26 @@ filter_list <- list(
   biotype_filtered = biotype_tx_filter
 )
 
-saveRDS(sapply(names(filter_list), function(tx_filter_name) {
-  unfiltered_annotation[filter_list[[tx_filter_name]]]$transcript_id
-}, simplify = FALSE), "splicing_analysis/filtered_transcript_ids.rds")
+saveRDS(
+  sapply(
+    names(filter_list),
+    function(tx_filter_name) {
+      unfiltered_annotation[filter_list[[tx_filter_name]]]$transcript_id
+    },
+    simplify = FALSE
+  ),
+  "splicing_analysis/filtered_transcript_ids.rds"
+)
 
 for (tx_filter_name in names(filter_list)) {
   this_filter <- filter_list[[tx_filter_name]]
   # filter the annotation
   annotation <- unfiltered_annotation[
-    unfiltered_annotation$transcript_id %in% unfiltered_annotation[this_filter]$transcript_id |
-      (unfiltered_annotation$type == "gene" & unfiltered_annotation$gene_id %in% unfiltered_annotation[this_filter]$gene_id)
+    unfiltered_annotation$transcript_id %in%
+      unfiltered_annotation[this_filter]$transcript_id |
+      (unfiltered_annotation$type == "gene" &
+        unfiltered_annotation$gene_id %in%
+          unfiltered_annotation[this_filter]$gene_id)
   ]
   # filter autosomes
   # standard_chroms <- paste0("chr", c(1:22))
@@ -139,7 +207,7 @@ SUPPA2 analysis:
 conda env create -f env.yml
 ```
 
-```{bash, engine.opts="-l", runSUPPA}
+```{bash, engine.opts="-l", eval=FALSE, runSUPPA}
 cd splicing_analysis
 conda activate ihec-as
 for suffix in transcripts tsl_filtered biotype_filtered

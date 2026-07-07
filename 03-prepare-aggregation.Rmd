@@ -29,10 +29,19 @@ bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
 
 ```{r, load-events}
 rmats_event_dir <- "splicing_analysis/rmats"
-transcript_filters <- c("transcripts", "tsl_filtered", "biotype_filtered")
+# Per-filter invocation (PLAN §4.12e per-filter incremental outputs): 03 now
+# processes one transcript_filter per run and writes per-filter outputs
+# (`*_{transcript_filter}` suffix). Snakemake passes TRANSCRIPT_FILTER;
+# interactive runs fall back to the primary filter. All internal loops over
+# `transcript_filters` therefore iterate a single element.
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+transcript_filters <- this_transcript_filter
 id_col <- "event_id"
 
-transcript_filter <- "biotype_filtered" # "transcripts" #
+transcript_filter <- this_transcript_filter
 event_type <- "SE"
 
 event_res <- setNames(
@@ -973,7 +982,7 @@ aggregateOver <- c(
 )
 rtracklayer::export(
   aggregateOver,
-  "processed_data/aggregateOver.bed"
+  sprintf("processed_data/aggregateOver_%s.bed", this_transcript_filter)
 )
 ```
 
@@ -1263,21 +1272,22 @@ ss3down <- ss3down[sapply(vmatchPattern("N", ss3down), function(x) {
   length(x) == 0
 })]
 
-# Write FASTAs
-ss5_file <- "processed_data/5ss.fasta"
-ss5up_file <- "processed_data/5ss_up.fasta"
-ss3_file <- "processed_data/3ss.fasta"
-ss3down_file <- "processed_data/3ss_down.fasta"
+# Write FASTAs (per-filter: feed the per-filter maxentscan/pangolin rules)
+tf <- this_transcript_filter
+ss5_file <- sprintf("processed_data/5ss_%s.fasta", tf)
+ss5up_file <- sprintf("processed_data/5ss_up_%s.fasta", tf)
+ss3_file <- sprintf("processed_data/3ss_%s.fasta", tf)
+ss3down_file <- sprintf("processed_data/3ss_down_%s.fasta", tf)
 writeXStringSet(ss5, filepath = ss5_file)
 writeXStringSet(ss5up, filepath = ss5up_file)
 writeXStringSet(ss3, filepath = ss3_file)
 writeXStringSet(ss3down, filepath = ss3down_file)
 
-# Score file paths (written by maxentscan_scores Snakefile rule)
-ss3_score_file <- "processed_data/3scores.txt"
-ss3down_score_file <- "processed_data/3down_scores.txt"
-ss5_score_file <- "processed_data/5scores.txt"
-ss5up_score_file <- "processed_data/5up_scores.txt"
+# Score file paths (written per-filter by the maxentscan_scores Snakefile rule)
+ss3_score_file <- sprintf("processed_data/3scores_%s.txt", tf)
+ss3down_score_file <- sprintf("processed_data/3down_scores_%s.txt", tf)
+ss5_score_file <- sprintf("processed_data/5scores_%s.txt", tf)
+ss5up_score_file <- sprintf("processed_data/5up_scores_%s.txt", tf)
 
 rm(genome)
 gc()
@@ -1288,7 +1298,7 @@ gc()
 # Only keep_rows_manual events; event_id string contains all coordinate info.
 fwrite(
   event_annotations_dt[ID %in% keep_rows_manual, .(event_id, `Event Type`, ID)],
-  "processed_data/pangolin_events.csv"
+  sprintf("processed_data/pangolin_events_%s.csv", this_transcript_filter)
 )
 ```
 
@@ -1322,7 +1332,10 @@ jc_list[id_map, on = .(suppa_id = event_id, transcript_filter), ID := i.ID]
 stopifnot(nrow(jc_list[is.na(ID)]) == 0L)
 stopifnot(nrow(jc_list[is.na(IJC) | is.na(SJC)]) == 0L)
 ijc_sjc_dt <- jc_list[, .(ID, uuid, IJC, SJC)]
-fwrite(ijc_sjc_dt, "processed_data/ijc_sjc_dt.csv.gz")
+fwrite(
+  ijc_sjc_dt,
+  sprintf("processed_data/ijc_sjc_dt_%s.csv.gz", this_transcript_filter)
+)
 ```
 
 ```{r, psi-distribution-sanity}
@@ -1620,12 +1633,29 @@ for (tf in levels(event_annotations_dt$transcript_filter)) {
 ```
 
 ```{r, save-workspace}
-fwrite(event_annotations_dt, "processed_data/event_annotations_dt.csv.gz")
-fwrite(psi_long_dt, "processed_data/psi_long_dt.csv.gz")
-# ijc_sjc_dt already written by load-ijc-sjc chunk
-# aggregateOver.bed already written by assign-variability chunk (rtracklayer::export)
+# Per-filter outputs (PLAN §4.12e per-filter incremental). sample_cols is the
+# sample (uuid) axis — near filter-invariant, but the present-sample set can
+# differ slightly by filter (different event files), and a wildcard Snakemake
+# rule cannot safely share one non-wildcard output across parallel per-filter
+# jobs — so it is written per-filter too.
+fwrite(
+  event_annotations_dt,
+  sprintf("processed_data/event_annotations_dt_%s.csv.gz", this_transcript_filter)
+)
+fwrite(
+  psi_long_dt,
+  sprintf("processed_data/psi_long_dt_%s.csv.gz", this_transcript_filter)
+)
+# ijc_sjc_dt already written (per-filter) by load-ijc-sjc chunk
+# aggregateOver_{tf}.bed already written by assign-variability chunk
 # to_analyze    → defined in .Rprofile, no save needed
 # file_metadata → unmodified in 03; downstream scripts fread("processed_data/file_table.csv.gz")
-saveRDS(sample_cols, "processed_data/sample_cols.rds")
-saveRDS(keep_rows_manual, "processed_data/keep_rows_manual.rds")
+saveRDS(
+  sample_cols,
+  sprintf("processed_data/sample_cols_%s.rds", this_transcript_filter)
+)
+saveRDS(
+  keep_rows_manual,
+  sprintf("processed_data/keep_rows_manual_%s.rds", this_transcript_filter)
+)
 ```

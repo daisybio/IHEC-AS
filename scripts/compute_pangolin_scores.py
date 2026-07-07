@@ -72,9 +72,15 @@ TISSUES = ["heart", "liver", "brain", "testis"]
 # P(splice site) output channel per tissue (softmax second class from each output head)
 TISSUE_CHANNELS = [1, 4, 7, 10]
 
+# Per-filter invocation (PLAN §4.12e per-filter incremental outputs): the
+# transcript_filter comes from the TRANSCRIPT_FILTER env var (Snakemake passes
+# it per rule instance); interactive runs default to biotype_filtered. All
+# event-set-specific inputs/outputs are suffixed with it.
+TRANSCRIPT_FILTER = os.environ.get("TRANSCRIPT_FILTER", "biotype_filtered")
+
 FASTA_PATH = Path("data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz")
-OUTPUT_PATH = Path("processed_data/pangolin_scores.csv")
-RMATS_DIR   = Path("splicing_analysis/rmats/biotype_filtered")
+OUTPUT_PATH = Path(f"processed_data/pangolin_scores_{TRANSCRIPT_FILTER}.csv")
+RMATS_DIR   = Path(f"splicing_analysis/rmats/{TRANSCRIPT_FILTER}")
 
 _BASE_LUT = np.zeros(256, dtype=np.int8)
 for _char, _idx in (("A", 1), ("a", 1), ("C", 2), ("c", 2),
@@ -335,9 +341,9 @@ def compare_to_maxentscan(all_sites: list, fa: "pyfastx.Fasta", id_map: dict) ->
     id_map: event_id (str) → integer ID from pangolin_events.csv.
     Only events with a known ID can be cross-checked.
     """
-    mes5_path    = Path("processed_data/5ss.fasta")
-    mes5up_path  = Path("processed_data/5ss_up.fasta")
-    mes3_path    = Path("processed_data/3ss.fasta")
+    mes5_path    = Path(f"processed_data/5ss_{TRANSCRIPT_FILTER}.fasta")
+    mes5up_path  = Path(f"processed_data/5ss_up_{TRANSCRIPT_FILTER}.fasta")
+    mes3_path    = Path(f"processed_data/3ss_{TRANSCRIPT_FILTER}.fasta")
 
     if not (mes5_path.exists() and mes3_path.exists()):
         warnings.warn(
@@ -442,7 +448,7 @@ def load_events() -> tuple[list, dict]:
     all_sites: list = []
     id_map:    dict = {}
 
-    events_csv = Path("processed_data/pangolin_events.csv")
+    events_csv = Path(f"processed_data/pangolin_events_{TRANSCRIPT_FILTER}.csv")
     if events_csv.exists():
         df = pl.read_csv(events_csv)
         for row in df.iter_rows(named=True):

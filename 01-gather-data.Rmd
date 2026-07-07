@@ -174,7 +174,7 @@ rna_qc[is.na(trimmed_read_length), trimmed_read_length := 36L]
 rna_qc[,
   epirr_id_without_version := tstrsplit(epirr_id, ".", fixed = TRUE, keep = 1)
 ]
-# Mirror the logic from 02z-rmats-analysis.Rmd:
+# Mirror the logic from 02-3-rmats-event-filtering.Rmd:
 #   rna_to_use = RNA-Seq UUIDs for epirrs with full epigenetic panel
 #   intersect with PSI column names = UUIDs that were actually processed by rMATS
 rna_to_use_01 <- download_metadata[

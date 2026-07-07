@@ -9,6 +9,31 @@ Some analyses use other languages. For those, we have a mamba/conda environment 
 
 The full pipeline is managed by [Snakemake](https://snakemake.readthedocs.io/) (installed in the `ihec-as` mamba environment). Steps are numbered 01–10; `08-*` global ML models are replaced by the `splicing_ml` Python package.
 
+Stage order (restructured 2026-07-06):
+
+```
+01-gather-data
+  → 02-1-transcript-filters      (SUPPA2-derived event coordinates)
+  → 02-2-rnaseq-normalisation    (GeTMM + DESeq2 vst gene expression)
+  → 02-3-rmats-event-filtering   (Procedure-2 + VST gene-expression gate)
+  → 03-prepare-aggregation
+  → 04-*  (WGBS / ChIP / MaxEntScan / Pangolin)
+  → 05-create-aggregated-dt
+  → 06 / 07 / 09  (+ splicing_ml)
+```
+
+### Per-transcript-filter architecture
+
+Every stage from `02-2` onward runs **once per `transcript_filter`**. Snakemake supplies the
+active filter as the `{transcript_filter}` wildcard (exported to R/Python scripts as the
+`TRANSCRIPT_FILTER` env var; interactive runs fall back to
+`getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")`). All per-filter outputs carry a
+`_{transcript_filter}` suffix (e.g. `processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz`).
+
+Because each filter is an independent DAG branch, the filters **build in parallel** and
+rebuilding one filter leaves the others untouched. Only the cohort-wide roots (`01`, `02-1`) run
+once and are shared across filters.
+
 ### Dry run (check DAG, no execution)
 
 ```bash
@@ -122,7 +147,7 @@ Example:
 
 ```bash
 mamba run -n ihec-as python run_splicing_ml.py \
-	--data-path processed_data/aggregated_dt_filtered.csv.gz \
+	--data-path processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz \
 	--output-dir splicing_ml/output/ml_splicing_outputs \
 	--wandb --wandb-project splicing-ml
 ```

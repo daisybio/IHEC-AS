@@ -1,9 +1,29 @@
 ---
-title: "rMATS to SUPPA"
+title: "rMATS event filtering + VST gene-expression gate (stage 02-3)"
 author: "Quirin Manz"
 date: "`r Sys.Date()`"
 output: html_document
 ---
+
+Stage 02-3 (was `02z-rmats-analysis.Rmd`). Per-`transcript_filter` (env
+`TRANSCRIPT_FILTER`). Post-processes the external rMATS output into the
+high-confidence event set and writes SUPPA-format `event_{et}.psi` +
+`event_{et}.jc.csv.gz` under `splicing_analysis/rmats/{tf}/` (consumed by `03`).
+
+Two filters combine into the high-confidence set:
+
+1. **Wang et al. 2024 (Nat Protoc) Procedure 2** — average junction count ≥ 20
+   AND 5th-percentile PSI ≥ 0.05 AND 95th-percentile PSI ≤ 0.95.
+2. **VST gene-expression gate (§4.12e)** — per (event, sample), keep only where
+   the host gene's `gene_expression_vst` (from `02-2`) is ≥ an on/off cutoff (the
+   antimode of a 2-component Gaussian mixture over all genome-wide (gene, sample)
+   VST for this filter). Masked cells become NA in `.psi` and are dropped from
+   `.jc`. No minimum-sample floor (removed at data construction; `09-1` keeps its
+   own CV-fittability guard).
+
+Auditability: cutoff + GMM params → `qc/vst_expression_cutoff_{tf}.csv`; gate
+effect (events dropped by VST vs Procedure 2, % cells masked) →
+`qc/vst_gate_effect_{tf}.csv`; density plot in `qc/distributions/`.
 
 ```{r}
 set.seed(getOption("EpiATLAS_AS_SEED", 42L))
@@ -22,6 +42,15 @@ rna_to_use <- file_metadata[
   uuid
 ]
 # bam_dt[experiment_metadata[, epirr := epirr_id], on = .NATURAL, uuid := uuid]
+
+# Per-filter invocation (PLAN §4.12e per-filter incremental outputs): this
+# notebook post-processes exactly one transcript_filter per run. Snakemake
+# passes TRANSCRIPT_FILTER as an env var; interactive runs fall back to the
+# primary filter.
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
 ```
 
 ```{r, fig.width=12, fig.height=8}
@@ -29,29 +58,174 @@ library(UpSetR)
 library(grid)
 
 # ID format for suppa: "ENSG00000000419.12;SE:chr20:50940933-50941129:50941209-50942031:-"
-average_read_coverage <- 20
-min_average_PSI <- .05
+# Wang et al. 2024 (Nat Protoc) Procedure 2 thresholds — getOption-driven so a
+# rerun can vary them without editing this file.
+average_read_coverage <- getOption("EpiATLAS_AS_AVG_READ_COVERAGE", 20)
+min_average_PSI <- getOption("EpiATLAS_AS_MIN_AVG_PSI", 0.05)
 max_average_PSI <- 1 - min_average_PSI
-min_read_coverage <- 10
-min_samples_coverage <- 3
+min_read_coverage <- 10 # diagnostic only (keep_ids_min_sample), not applied
+min_samples_coverage <- 3 # diagnostic only
 splicing_dir <- file.path("splicing_analysis", "rmats")
 dir.create(splicing_dir, recursive = TRUE, showWarnings = FALSE)
 
-rmats_dir <- file.path(data_dir, "rmats", "biotype_filtered")
+# --- VST low-expression gate (PLAN §4.12e) ----------------------------------
+# High-confidence event set = Procedure 2 (read coverage + PSI percentiles)
+# AND a per-(event,sample) gene-expression gate: a sample's PSI is trusted
+# only if its host gene is expressed above an on/off cutoff. The cutoff is the
+# antimode (valley) of a 2-component Gaussian mixture fit on the WHOLE
+# genome-wide (gene,sample) VST distribution for this filter — an absolute
+# expressed/not boundary, not one drawn from the pre-selected event genes.
+gene_vst <- fread(
+  sprintf(
+    "processed_data/gene_expression_normalised_%s.csv.gz",
+    this_transcript_filter
+  ),
+  select = c("gene_id", "uuid", "gene_expression_vst")
+)
+gene_vst[, gene_id_stripped := sub("\\.\\d+$", "", gene_id)]
+# collapse any version-strip collisions (one value per (gene,sample))
+gene_vst <- unique(gene_vst, by = c("gene_id_stripped", "uuid"))
+
+compute_vst_cutoff <- function(
+  vst_values,
+  method = getOption("EpiATLAS_AS_VST_CUTOFF_METHOD", "gmm"),
+  fixed_value = getOption("EpiATLAS_AS_VST_CUTOFF_VALUE", NA_real_),
+  percentile = getOption("EpiATLAS_AS_VST_CUTOFF_PERCENTILE", 0.25)
+) {
+  vst_values <- vst_values[is.finite(vst_values)]
+  pctl <- function() as.numeric(stats::quantile(vst_values, percentile))
+  if (identical(method, "fixed")) {
+    if (is.na(fixed_value)) {
+      stop("VST cutoff method 'fixed' but EpiATLAS_AS_VST_CUTOFF_VALUE unset")
+    }
+    return(list(cutoff = fixed_value, method = "fixed"))
+  }
+  if (identical(method, "percentile")) {
+    return(list(cutoff = pctl(), method = "percentile"))
+  }
+  # gmm (default): 2-component 1-D Gaussian mixture, cutoff = density antimode.
+  # mclust EM over millions of (gene,sample) points is slow and can fail/OOM,
+  # which silently forces the fallback — fit on a representative subsample
+  # instead (seed set at notebook top → reproducible).
+  n_fit <- getOption("EpiATLAS_AS_VST_GMM_MAX_N", 1e5L)
+  fit_values <- if (length(vst_values) > n_fit) {
+    sample(vst_values, n_fit)
+  } else {
+    vst_values
+  }
+  fit_err <- NULL
+  fit <- tryCatch(
+    mclust::Mclust(fit_values, G = 2, modelNames = "V", verbose = FALSE),
+    error = function(e) {
+      fit_err <<- conditionMessage(e)
+      NULL
+    }
+  )
+  degenerate <- is.null(fit) ||
+    is.null(fit$parameters) ||
+    length(unique(fit$parameters$mean)) < 2L
+  if (degenerate) {
+    reason <- if (!is.null(fit_err)) {
+      sprintf("mclust error: %s", fit_err)
+    } else if (is.null(fit)) {
+      "mclust returned NULL"
+    } else {
+      "fit not 2-component (means collapsed)"
+    }
+    message(sprintf("VST GMM cutoff fell back (%s)", reason))
+    if (!is.na(fixed_value)) {
+      return(list(cutoff = fixed_value, method = "gmm->fixed", reason = reason))
+    }
+    return(list(cutoff = pctl(), method = "gmm->percentile", reason = reason))
+  }
+  mus <- fit$parameters$mean
+  sds <- sqrt(fit$parameters$variance$sigmasq)
+  if (length(sds) == 1L) sds <- rep(sds, 2L)
+  pro <- fit$parameters$pro
+  o <- order(mus)
+  mus <- mus[o]
+  sds <- sds[o]
+  pro <- pro[o]
+  grid <- seq(mus[1], mus[2], length.out = 2000L)
+  dens <- pro[1] * dnorm(grid, mus[1], sds[1]) +
+    pro[2] * dnorm(grid, mus[2], sds[2])
+  # return the fitted 2-component params so the antimode placement (cutoff
+  # between the two modes) is auditable straight from qc/vst_expression_cutoff_*
+  list(
+    cutoff = grid[which.min(dens)], method = "gmm",
+    mu_low = mus[1], mu_high = mus[2],
+    sd_low = sds[1], sd_high = sds[2],
+    pro_low = pro[1], pro_high = pro[2],
+    bic = tryCatch(as.numeric(fit$bic), error = function(e) NA_real_)
+  )
+}
+
+vst_cut <- compute_vst_cutoff(gene_vst$gene_expression_vst)
+vst_cutoff <- vst_cut$cutoff
+vst_na_policy <- getOption("EpiATLAS_AS_VST_NA_POLICY", "keep")
+dir.create("qc", showWarnings = FALSE)
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+# NULL-safe getter: fallback methods (fixed/percentile) return no GMM params
+.nz <- function(x) if (is.null(x)) NA_real_ else as.numeric(x)
+fwrite(
+  data.table(
+    transcript_filter = this_transcript_filter,
+    method = vst_cut$method,
+    cutoff = vst_cutoff,
+    na_policy = vst_na_policy,
+    mu_low = .nz(vst_cut$mu_low),
+    mu_high = .nz(vst_cut$mu_high),
+    sd_low = .nz(vst_cut$sd_low),
+    sd_high = .nz(vst_cut$sd_high),
+    pro_low = .nz(vst_cut$pro_low),
+    pro_high = .nz(vst_cut$pro_high),
+    bic = .nz(vst_cut$bic)
+  ),
+  sprintf("qc/vst_expression_cutoff_%s.csv", this_transcript_filter)
+)
+if (vst_cut$method != "gmm") {
+  warning(sprintf(
+    "VST cutoff for %s used fallback method '%s' (cutoff = %.3f)%s",
+    this_transcript_filter, vst_cut$method, vst_cutoff,
+    if (!is.null(vst_cut$reason)) sprintf(" - reason: %s", vst_cut$reason) else ""
+  ))
+}
+# fresh gate-effect log for this run (appended once per event type below)
+unlink(sprintf("qc/vst_gate_effect_%s.csv", this_transcript_filter))
+p_vst_cut <- ggplot(
+  gene_vst[is.finite(gene_expression_vst)],
+  aes(x = gene_expression_vst)
+) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = vst_cutoff, colour = "red", linetype = "dashed") +
+  labs(
+    title = sprintf(
+      "Genome-wide VST distribution (%s) - cutoff %.3f (%s)",
+      this_transcript_filter, vst_cutoff, vst_cut$method
+    ),
+    x = "gene_expression_vst", y = "count (gene x sample)"
+  )
+ggsave(
+  sprintf(
+    "qc/distributions/vst_expression_cutoff_%s.pdf", this_transcript_filter
+  ),
+  p_vst_cut, width = 7, height = 5
+)
+
 event_type <- "SE"
 junction_counts <- "MATS.JC.txt"
 run_name <- "paired_fr-firststrand_75"
 plot_dist <- TRUE
 
+# restrict to the single requested transcript_filter (per-filter incremental)
+rmats_dirs <- list.dirs(file.path(data_dir, "rmats"), recursive = FALSE)
+rmats_dirs <- rmats_dirs[basename(rmats_dirs) == this_transcript_filter]
+stopifnot(length(rmats_dirs) == 1L)
+rmats_dir <- rmats_dirs
+
 for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
   print(event_type)
-  # c( # "rmats_out_all", "rmats_out_2",
-  #   "rmats_out" # , "rmats_out_3"
-  # )
-  for (rmats_dir in list.dirs(
-    file.path(data_dir, "rmats"),
-    recursive = FALSE
-  )) {
+  for (rmats_dir in rmats_dirs) {
     print(basename(rmats_dir))
     this_splicing_dir <- file.path(splicing_dir, basename(rmats_dir))
     dir.create(this_splicing_dir, recursive = TRUE, showWarnings = FALSE)
@@ -253,8 +427,10 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
 
       # compute average counts per event and per experiment type and event
       # recompute for the RNA used in this analysis as well
+      # Only the epigenome cohort is written now: it is the set VST was
+      # computed on and the only output 03 consumes (the old diagnostic "all"
+      # variant is dropped — PLAN §4.12e).
       uuids_to_filter_on <- list(
-        all = event_sample_data[, unique(uuid)],
         full_epigenomes = rna_to_use
       )
       mapply(
@@ -263,6 +439,38 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
         FUN = function(filter_name, uuids_to_filter) {
           print(filter_name)
           filtered_dt <- event_sample_data[uuid %in% uuids_to_filter]
+
+          # --- VST low-expression gate (per (event,sample)) ---------------
+          # Attach host gene_id (from rMATS GeneID, version-stripped to match
+          # the normalisation table) and its VST; a sample passes only if its
+          # host gene is expressed at/above the cutoff. NA VST (host gene
+          # absent from normalisation) is handled per EpiATLAS_AS_VST_NA_POLICY.
+          id_gene <- unique(event_annotation[, .(
+            ID,
+            gene_id_stripped = sub("\\.\\d+$", "", GeneID)
+          )])
+          filtered_dt[id_gene, on = .(ID), gene_id_stripped := i.gene_id_stripped]
+          filtered_dt[
+            gene_vst,
+            on = .(gene_id_stripped, uuid),
+            vst := i.gene_expression_vst
+          ]
+          if (identical(vst_na_policy, "drop")) {
+            filtered_dt[, expr_pass := !is.na(vst) & vst >= vst_cutoff]
+          } else {
+            filtered_dt[, expr_pass := is.na(vst) | vst >= vst_cutoff]
+          }
+          # report events lost SOLELY to missing VST (every sample NA), so the
+          # loss is visible rather than silent
+          na_only_events <- filtered_dt[,
+            .(all_na = all(is.na(vst))),
+            by = ID
+          ][all_na == TRUE, .N]
+          message(sprintf(
+            "%s %s: VST cutoff %.3f (%s); %d events have no VST for any sample (na_policy=%s)",
+            event_type, basename(rmats_dir), vst_cutoff, vst_cut$method,
+            na_only_events, vst_na_policy
+          ))
           average_dt <- rbind(
             filtered_dt[,
               .(
@@ -487,12 +695,15 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
             by = ID
           ][N >= min_samples_coverage, ID]
 
-          # Wang et al. 2024 (Nature Protocols) Procedure 2 filter:
-          # average count >= 20 + 5th/95th PSI percentiles across all samples.
-          # Removes constitutively included (psi_q05 > max_average_PSI) and
-          # constitutively excluded (psi_q95 < min_average_PSI) events.
-          keep_ids_percentile <- {
-            tmp <- filtered_dt[!is.na(psi)]
+          # Wang et al. 2024 (Nature Protocols) Procedure 2 filter, applied to
+          # the VST-passing samples only: average count >= 20 + 5th/95th PSI
+          # percentiles. Removes constitutively included (psi_q05 >
+          # max_average_PSI) and excluded (psi_q95 < min_average_PSI) events.
+          # NB: computed on expr_pass samples, so percentiles/coverage reflect
+          # the high-confidence subset. No minimum-sample floor (PLAN: removed
+          # at data-construction; 09-1 keeps its CV-fittability guard).
+          proc2_ids <- function(dt) {
+            tmp <- dt[!is.na(psi)]
             setorder(tmp, ID, psi)
             tmp[,
               .(
@@ -508,6 +719,11 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
               ID
             ]
           }
+          # applied filter: Procedure 2 on VST-passing samples
+          keep_ids_percentile <- proc2_ids(filtered_dt[expr_pass == TRUE])
+          # counterfactual: Procedure 2 ignoring the VST gate — isolates what
+          # the VST gate removes vs what Procedure 2 removes on its own
+          keep_ids_percentile_novst <- proc2_ids(filtered_dt)
 
           upset <- upset(
             fromList(list(
@@ -528,19 +744,52 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
             gp = gpar(fontsize = 20)
           )
 
-          event_sample_data[event_annotation, on = .(ID), suppa_id := suppa_id]
-          # long_long_dt[bam_dt, on = .NATURAL, uuid := uuid]
+          # --- VST gate-effect summary (auditable) -------------------------
+          # Decompose event loss: Procedure 2 alone vs the added VST gate.
+          #   dropped_proc2 : fail Procedure 2 even without VST
+          #   dropped_vst   : pass Procedure 2 on full samples, lost after VST
+          #   kept          : survive both (= keep_ids_percentile)
+          n_total <- filtered_dt[!is.na(psi), uniqueN(ID)]
+          n_kept <- length(keep_ids_percentile)
+          n_pass_novst <- length(keep_ids_percentile_novst)
+          n_dropped_proc2 <- n_total - n_pass_novst
+          n_dropped_vst <- length(setdiff(
+            keep_ids_percentile_novst, keep_ids_percentile
+          ))
+          frac_cells_masked <- filtered_dt[!is.na(psi), mean(!expr_pass)]
+          gate_effect <- data.table(
+            transcript_filter = this_transcript_filter,
+            event_type = event_type,
+            n_events_total = n_total,
+            n_events_kept = n_kept,
+            n_dropped_proc2_only = n_dropped_proc2,
+            n_dropped_vst_gate = n_dropped_vst,
+            frac_cells_vst_masked = frac_cells_masked,
+            vst_cutoff = vst_cutoff,
+            na_policy = vst_na_policy
+          )
+          print(gate_effect)
+          gate_effect_file <- sprintf(
+            "qc/vst_gate_effect_%s.csv", this_transcript_filter
+          )
+          fwrite(gate_effect, gate_effect_file, append = file.exists(gate_effect_file))
+
+          # Emit only cells that pass BOTH the Procedure 2 event filter and the
+          # per-(event,sample) VST gate. Build from filtered_dt (which carries
+          # expr_pass); VST-masked cells are simply absent, so dcast fills them
+          # NA in the .psi matrix, and they are dropped from the .jc file.
+          filtered_dt[event_annotation, on = .(ID), suppa_id := i.suppa_id]
+          write_dt <- filtered_dt[
+            ID %in% keep_ids_percentile & expr_pass == TRUE
+          ]
           suppa_format_dt <- dcast(
-            event_sample_data[
-              ID %in% keep_ids_percentile & uuid %in% uuids_to_filter
-            ],
+            write_dt,
             suppa_id ~ uuid,
             value.var = "psi"
           )
           suppa_file <- file.path(
             this_splicing_dir,
             paste0(
-              ifelse(filter_name == "all", filter_name, ""),
               "event_",
               substr(event_type, 1, 2),
               ".psi"
@@ -561,10 +810,7 @@ for (event_type in c("SE", "RI", "A3SS", "A5SS", "MXE")) {
           )
           # Write IJC/SJC junction counts for downstream coverage weighting (§4.8/§4.12f)
           fwrite(
-            event_sample_data[
-              ID %in% keep_ids_percentile & uuid %in% uuids_to_filter,
-              .(suppa_id, uuid, IJC = incl_count, SJC = skip_count)
-            ],
+            write_dt[, .(suppa_id, uuid, IJC = incl_count, SJC = skip_count)],
             sub("\\.psi$", ".jc.csv.gz", suppa_file)
           )
         }

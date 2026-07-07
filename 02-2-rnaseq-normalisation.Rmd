@@ -13,12 +13,15 @@ knitr::opts_chunk$set(fig.width = 9, fig.height = 5)
 # Raw TPM has closed-sum composition bias: a handful of highly expressed
 # transcripts/genes suppress the TPM of everything else in the same sample,
 # which distorts cross-sample x cross-gene comparisons (exactly the
-# comparison `gene_expression` is used for downstream, e.g. §4.13d,
-# §4.12e's low-expression filter). Two standard methods are computed and
-# written side by side so they can be compared before picking one for the
-# manuscript (see spec notes: GeTMM-CPM is generally preferred for
-# prediction tasks; vst is the canonical choice for differential
-# expression). 05 consumes this file when `use_normalised_expression = TRUE`.
+# comparison `gene_expression` is used for downstream, e.g. §4.13d, and the
+# §4.12e VST low-expression gate now applied in 02-3-rmats-event-filtering).
+# Both methods are written side by side; the column-routing is DECIDED (PLAN
+# §4.12b): getmm → the pooled genome-wide splicing_ml table (cross-gene
+# comparable without per-gene z-scoring), vst → event-specific 07/09 + RBP
+# columns AND the 02-3 event gate (single-gene, z-scored per column).
+# Consumers read this file per-transcript_filter directly
+# (gene_expression_normalised_{tf}.csv.gz) — 02-3 for the gate, 05 for the
+# ML feature columns; there is no on/off flag.
 #
 # §4.12c — ComBat-seq protocol batch correction (Zhang et al. 2020, NAR
 # Genom Bioinform) was attempted here 2026-07-02 and ABANDONED after running
@@ -28,7 +31,7 @@ knitr::opts_chunk$set(fig.width = 9, fig.height = 5)
 # cause confirmed empirically, not just suspected: most `ontology` (group)
 # levels are single-protocol (batch)-dominated, so ComBat-seq's
 # `~ batch + group` design is degenerate for them — batch and biology aren't
-# separable. See revision/file-changes/04-5-rnaseq-normalisation.Rmd.md for
+# separable. See revision/file-changes/02-2-rnaseq-normalisation.Rmd.md for
 # the full writeup. Decision: use raw (uncorrected) getmm/vst; rely on the
 # existing protocol + protocol×gene_expression ML interaction term instead,
 # which works per-sample and doesn't need balanced protocol/ontology groups.
@@ -36,6 +39,7 @@ set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 library(edgeR)
 library(DESeq2)
 library(parallel)
+library(BiocParallel)
 
 # Same standalone append_sanity() pattern as `04-2-chip-signal-sanity.Rmd` —
 # each sanity-checking notebook defines its own local copy rather than
@@ -66,7 +70,21 @@ isoform_quants <- fread(
 filtered_transcript_ids <- readRDS(
   "splicing_analysis/filtered_transcript_ids.rds"
 )
-transcript_filters <- names(filtered_transcript_ids)
+# Per-filter invocation (PLAN §4.12b per-filter incremental outputs): process
+# only the requested transcript_filter. Snakemake passes TRANSCRIPT_FILTER as
+# an env var (one rule instance per {tf}); interactive runs fall back to the
+# primary filter. Output is written to a per-filter file so building one
+# filter never recomputes or clobbers another.
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+stopifnot(this_transcript_filter %in% names(filtered_transcript_ids))
+
+# NOTE: the "gene expression by hosted event type" diagnostic that used to
+# live at the end of this file has moved to 05-create-aggregated-dt.Rmd, which
+# already reads both this file's output and the event annotations — keeping
+# 02-2 free of any dependency on 03 (it now runs before 03).
 
 # sample metadata for the vst design (~ ontology + protocol): protocol comes
 # from file_table (per-uuid), ontology from the sample metadata sheet
@@ -77,7 +95,7 @@ sample_metadata <- fread(sample_metadata_file)
 
 sample_design <- unique(file_metadata[
   assay_type == "RNA-Seq",
-  .(uuid, epirr_id_without_version, protocol = experiment_type)
+  .(uuid, epirr_id_without_version, protocol = factor(experiment_type))
 ])
 sample_design[
   sample_metadata,
@@ -90,7 +108,7 @@ sample_design <- sample_design[!is.na(ontology) & !is.na(protocol)]
 # 1467 epirr) — most of which have no matching epigenomic data and are
 # irrelevant to this analysis. `isoform_quants` is already restricted to the
 # "both RNA-Seq and epigenomic data" cohort (441 uuid / 405 epirr, see
-# `02-SUPPA2-analysis.Rmd`'s `rna_to_use` filter), so intersecting here keeps
+# `02-1-transcript-filters.Rmd`'s `rna_to_use` filter), so intersecting here keeps
 # `sample_design` — and everything downstream that reads it, e.g. the
 # per-ontology protocol balance a reader would compute from it — scoped to
 # the samples actually used, instead of a much larger, mostly-irrelevant
@@ -142,6 +160,7 @@ compute_getmm_and_vst <- function(count_mat, efflen_mat, col_data) {
     design = ~ ontology + protocol
   )
   dds <- estimateSizeFactors(dds)
+  dds <- estimateDispersions(dds, parallel = TRUE)
   vst_mat <- assay(vst(dds, blind = FALSE))
 
   # Mean-variance trend per gene, per representation (§4.12b column-choice
@@ -264,41 +283,50 @@ normalise_one_filter <- function(this_transcript_filter) {
 ```
 
 ```{r, run-normalisation}
-# getmm and vst columns are written side by side so they can be compared
-# (§4.12b step 3, CV R² re-run) before picking one for the manuscript.
+# getmm and vst columns are written side by side; routing is decided (getmm →
+# splicing_ml, vst → 07/09/RBP + the 02-3 event gate — see load-packages).
 # ComBat-seq (_combat) sibling columns were also computed here through
 # 2026-07-02 but removed after failing on real data — see load-packages.
 #
-# transcript_filters are independent (each builds its own gene x sample
-# matrix from isoform_quants, filtered separately) — forked one process per
-# filter via mclapply rather than run serially, since each filter pays for
-# its own DESeq2 vst() fit, the most expensive step in this file. mc.cores
-# capped at
-# length(transcript_filters) (3) since there's nothing to gain forking more
-# workers than there are independent tasks; matches the 4 threads this
-# rule already requests in config/snakemake_config.yaml (1 held in
-# reserve for the parent process / GC). isoform_quants (the ~1.1GB shared
-# input) is not duplicated per fork — Linux fork() is copy-on-write and
-# this file never mutates it in place.
-filter_results <- mclapply(
-  transcript_filters,
-  normalise_one_filter,
-  mc.cores = min(length(transcript_filters), detectCores())
-)
+# Per-filter Snakemake job invocation: TRANSCRIPT_FILTER env var (lines 74–79)
+# routes one transcript_filter per rule execution. DESeq2's vst() is the
+# bottleneck — parallelise gene-wise dispersion fitting within this filter
+# via BiocParallel (estimateDispersions + vst use all 4 SLURM threads from
+# config/snakemake_config.yaml line 91).
+register(MulticoreParam(4))
+filter_result <- normalise_one_filter(this_transcript_filter)
 
-normalised_dt <- rbindlist(lapply(filter_results, `[[`, "main"))
-fwrite(normalised_dt, "processed_data/gene_expression_normalised.csv.gz")
+normalised_dt <- filter_result$main
+fwrite(
+  normalised_dt,
+  sprintf(
+    "processed_data/gene_expression_normalised_%s.csv.gz",
+    this_transcript_filter
+  )
+)
 
 # §4.12b column-choice diagnostics (discussed 2026-07-02): kept as separate,
 # much smaller tables (one row per gene, one row per sample — not per
 # gene x sample like `normalised_dt`) rather than widening the production
 # output, since these columns (raw count/TPM mean+sd, TMM factors) exist to
 # decide which of getmm/vst to adopt, not to ship to `05`.
-gene_mean_var_dt <- rbindlist(lapply(filter_results, `[[`, "gene_mean_var"))
-fwrite(gene_mean_var_dt, "qc/gene_expression_mean_variance.csv.gz")
+gene_mean_var_dt <- filter_result$gene_mean_var
+fwrite(
+  gene_mean_var_dt,
+  sprintf(
+    "qc/gene_expression_mean_variance_%s.csv.gz",
+    this_transcript_filter
+  )
+)
 
-norm_factors_dt <- rbindlist(lapply(filter_results, `[[`, "norm_factors"))
-fwrite(norm_factors_dt, "qc/gene_expression_tmm_norm_factors.csv.gz")
+norm_factors_dt <- filter_result$norm_factors
+fwrite(
+  norm_factors_dt,
+  sprintf(
+    "qc/gene_expression_tmm_norm_factors_%s.csv.gz",
+    this_transcript_filter
+  )
+)
 ```
 
 ## Column-choice diagnostics (§4.12b): mean-variance trend and TMM factor spread
@@ -508,192 +536,6 @@ ggsave(
 )
 ```
 
-## Gene expression by hosted event type
-
-The remaining sections check whether GeTMM-CPM and vst behave sensibly once
-genes are split by which kind of alternative-splicing event they host — not
-because expression is expected to *cause* an event type, but as a sanity
-check that neither normalisation method introduces an event-type-specific
-artifact, and as a first look at whether SE/RI-hosting genes differ in
-expression level at all.
-
-```{r, join-event-type}
-# Event Type is an event-level attribute (SE/RI), not a gene-level one — a
-# gene can host events of either or both types. Classify each gene, per
-# transcript_filter (event sets differ slightly by filter), by which
-# type(s) it hosts, then join onto the per-gene summarised expression.
-event_annotations_dt <- fread(
-  "processed_data/event_annotations_dt.csv.gz",
-  select = c("gene_id", "Event Type", "transcript_filter")
-)
-
-gene_event_types <- event_annotations_dt[,
-  .(
-    has_se = any(`Event Type` == "SE"),
-    has_ri = any(`Event Type` == "RI")
-  ),
-  by = .(gene_id, transcript_filter)
-]
-gene_event_types[,
-  event_type_class := fcase(
-    has_se & has_ri , "Both"    ,
-    has_se          , "SE only" ,
-    has_ri          , "RI only"
-  )
-]
-
-# per-gene summary across samples (median, not mean — expression is
-# right-skewed and a single high-library-size sample shouldn't dominate the
-# per-gene summary used for a distributional comparison)
-gene_median_expr <- normalised_dt[,
-  .(
-    median_getmm = median(gene_expression_getmm, na.rm = TRUE),
-    median_vst = median(gene_expression_vst, na.rm = TRUE)
-  ),
-  by = .(gene_id, transcript_filter)
-]
-
-# Update-join (not `gene_median_expr[gene_event_types, on=...]`, which was
-# the bug here through 2026-07-02): `X[Y, on=]` takes Y's row count, so a
-# select-join against `gene_event_types` silently kept only event-hosting
-# genes, contradicting the "kept as an explicit reference category" comment
-# below — the `is.na(event_type_class)` coalesce never fired since a select
-# join's `i` columns are never NA for i's own rows. An update-join instead
-# keeps ALL of `gene_median_expr`'s rows (every gene surviving this
-# transcript_filter, per `run-normalisation`), filling event_type_class from
-# `gene_event_types` where matched and leaving it NA — coalesced below —
-# for genes that host no annotated event. Same update-join pattern already
-# used correctly elsewhere for this data (see git history/PLAN for prior
-# use in the now-removed combat-beta-protocol-check chunk).
-gene_median_expr[
-  gene_event_types,
-  on = .(gene_id, transcript_filter),
-  event_type_class := i.event_type_class
-]
-plot_dt <- gene_median_expr
-# genes with no annotated SE/RI event in this transcript_filter are kept as
-# an explicit reference category, not dropped — comparing against them is
-# what makes "do event-hosting genes differ" a meaningful question
-plot_dt[is.na(event_type_class), event_type_class := "No annotated event"]
-plot_dt[,
-  event_type_class := factor(
-    event_type_class,
-    levels = c("No annotated event", "SE only", "RI only", "Both")
-  )
-]
-plot_dt[,
-  transcript_filter := factor(
-    transcript_filter,
-    levels = c("transcripts", "tsl_filtered", "biotype_filtered")
-  )
-]
-```
-
-```{r, group-sizes}
-group_sizes <- plot_dt[, .N, by = .(transcript_filter, event_type_class)]
-knitr::kable(
-  dcast(
-    group_sizes,
-    event_type_class ~ transcript_filter,
-    value.var = "N",
-    fill = 0
-  ),
-  caption = "Number of genes per (Event Type, transcript_filter) group"
-)
-```
-
-```{r, viz-getmm-by-event-type}
-# GeTMM-CPM is non-negative (like TPM/RPKM) and right-skewed — log1p is the
-# standard transform for visualizing this shape without a pseudocount
-# distorting the zero end (log1p(0) = 0, not -Inf).
-# violin (full distribution shape) + narrow boxplot overlay (median/IQR at a
-# glance) is the standard combination for comparing a continuous
-# distribution across a handful of groups — better than a boxplot alone
-# (hides multimodality) or a violin alone (harder to read exact quartiles).
-p_getmm <- ggplot(
-  plot_dt,
-  aes(x = event_type_class, y = log1p(median_getmm), fill = event_type_class)
-) +
-  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
-  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
-  facet_wrap(~transcript_filter, nrow = 1) +
-  scale_fill_viridis_d(option = "D", guide = "none") +
-  labs(
-    title = "Gene-level GeTMM-CPM expression by hosted event type",
-    subtitle = "Per-gene median across samples, log1p-transformed",
-    x = NULL,
-    y = "log1p(GeTMM-CPM)"
-  ) +
-  theme(axis.text.x = element_text(angle = 30, hjust = 1))
-print(p_getmm)
-ggsave(
-  "qc/distributions/gene_expression_getmm_by_event_type.pdf",
-  p_getmm,
-  width = 9,
-  height = 5
-)
-```
-
-```{r, viz-vst-by-event-type}
-# vst output is already variance-stabilised (roughly log2-like scale,
-# centered near 0, can be negative) — no further transform is appropriate;
-# transforming it again (e.g. log1p) would be a mistake specific to vst
-# that does not apply to GeTMM-CPM, which is why the two methods get
-# separate plots rather than being combined on one shared y-axis.
-p_vst <- ggplot(
-  plot_dt,
-  aes(x = event_type_class, y = median_vst, fill = event_type_class)
-) +
-  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
-  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
-  facet_wrap(~transcript_filter, nrow = 1) +
-  scale_fill_viridis_d(option = "D", guide = "none") +
-  labs(
-    title = "Gene-level vst expression by hosted event type",
-    subtitle = "Per-gene median across samples",
-    x = NULL,
-    y = "vst(expression)"
-  ) +
-  theme(axis.text.x = element_text(angle = 30, hjust = 1))
-print(p_vst)
-ggsave(
-  "qc/distributions/gene_expression_vst_by_event_type.pdf",
-  p_vst,
-  width = 9,
-  height = 5
-)
-```
-
-```{r, viz-method-agreement}
-# Direct method-agreement check per gene: GeTMM-CPM and vst are different
-# transforms of the same underlying counts, so per-gene values should be
-# monotonically related even though the two axes aren't on the same scale.
-# Colored by event_type_class to check the agreement holds within each
-# group, not just in aggregate (a divergence isolated to one event-type
-# class would suggest a normalisation artifact specific to that group).
-p_compare <- ggplot(
-  plot_dt,
-  aes(x = log1p(median_getmm), y = median_vst, color = event_type_class)
-) +
-  geom_point(alpha = 0.25, size = 0.6) +
-  facet_wrap(~transcript_filter, nrow = 1) +
-  scale_color_viridis_d(option = "D") +
-  labs(
-    title = "GeTMM-CPM vs vst agreement per gene",
-    x = "log1p(GeTMM-CPM)",
-    y = "vst(expression)",
-    color = "Hosted event type"
-  ) +
-  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2)))
-print(p_compare)
-ggsave(
-  "qc/distributions/gene_expression_getmm_vs_vst.pdf",
-  p_compare,
-  width = 9,
-  height = 5
-)
-```
-
 ## ComBat-seq protocol correction — attempted, abandoned
 
 ComBat-seq batch correction (§4.12c) was implemented here 2026-07-02 as
@@ -701,7 +543,7 @@ ComBat-seq batch correction (§4.12c) was implemented here 2026-07-02 as
 after running on real data: `ComBat_seq()` failed (its `~ batch + group`
 design matrix is degenerate for most `ontology` groups, which are
 single-`protocol`-dominated — confirmed via the file_table cross-tab, not
-just suspected). See `revision/file-changes/04-5-rnaseq-normalisation.Rmd.md`
+just suspected). See `revision/file-changes/02-2-rnaseq-normalisation.Rmd.md`
 for the full writeup and the real sanity-check evidence
 (`qc/sanity_summary.csv`'s `combat_ri_protocol_beta_reduction` row, logged
 before this branch was removed). Decision: use raw getmm/vst; the existing
