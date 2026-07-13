@@ -1,0 +1,652 @@
+---
+title: "IRFinder vs rMATS RI concordance (diagnostic only, revision/file-changes/02-4-irfinder-concordance.Rmd.md)"
+output: html_document
+---
+
+```{r, setup}
+# Diagnostic-only stage: compares rMATS RI PSI (02-3 output) against IRFinder
+# IRratio for the same retained introns. Does NOT modify 02-3's output and does
+# NOT feed into 03 - purely a side report answering reviewer must-do #2
+# ("use IRFinder for RI or justify rMATS"). No override/replace logic here by
+# design - see revision/file-changes/02-4-irfinder-concordance.Rmd.md.
+library(data.table)
+library(GenomicRanges)
+library(pbmcapply)
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
+  )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
+}
+```
+
+```{r, load-rmats-ri}
+# 02-3's RI output for this filter: event_RI.psi (wide, first col = suppa_id,
+# rownames-as-column so fread auto-names it "V1"), event_RI.psi.annot (ID,
+# geneSymbol, suppa_id - superset before percentile filtering, join by
+# suppa_id not ID/row-position).
+ri_dir <- sprintf("splicing_analysis/rmats/%s", this_transcript_filter)
+psi_wide <- fread(file.path(ri_dir, "event_RI.psi"))
+setnames(psi_wide, 1, "suppa_id")
+psi_long <- melt(
+  psi_wide,
+  id.vars = "suppa_id",
+  variable.name = "uuid",
+  value.name = "psi",
+  variable.factor = FALSE
+)[!is.na(psi)]
+
+cat(sprintf(
+  "Loaded %d RI events x %d samples (%d non-NA psi cells) for %s\n",
+  nrow(psi_wide),
+  ncol(psi_wide) - 1L,
+  nrow(psi_long),
+  this_transcript_filter
+))
+```
+
+```{r, parse-ri-coordinates}
+# RI suppa_id: gene;RI:chr:e1:s2-e2:s3:strand -> retained intron = [s2, e2].
+# Simple string split, no need for 03's full event_gr machinery (that also
+# handles SE upstream/downstream introns, irrelevant here).
+ri_coords <- unique(psi_long[, .(suppa_id)])
+ri_coords[,
+  c("gene", "et", "chr", "e1", "s2e2", "s3", "strand") := tstrsplit(
+    suppa_id,
+    "[:;]",
+    fixed = FALSE
+  )
+]
+ri_coords[, c("s2", "e2") := tstrsplit(s2e2, "-", type.convert = TRUE)]
+ri_coords[, `:=`(e1 = NULL, s2e2 = NULL, s3 = NULL, gene = NULL, et = NULL)]
+
+# Coordinate-system check against IRFinder's raw output (verified empirically
+# 2026-07-12 against 2 independent real introns, both strands): IRFinder's
+# Start matches our s2 EXACTLY (no offset - not 0-based BED as first assumed),
+# but IRFinder's End is consistently s2/e2's e2 MINUS 1 (IRFinder reports the
+# intron as a half-open-at-the-end interval, or an off-by-one in its own
+# annotation extraction - the "why" doesn't matter, the empirical transform
+# does: match on (chr, s2, e2-1, strand), not (chr, s2, e2, strand).
+ri_coords[, e2_irfinder := e2 - 1L]
+
+ri_gr <- ri_coords[, GRanges(
+  seqnames = chr,
+  ranges = IRanges(start = s2, end = e2),
+  strand = strand
+)]
+names(ri_gr) <- ri_coords$suppa_id
+
+cat(sprintf("%d unique RI intron coordinates parsed\n", length(ri_gr)))
+```
+
+```{r, pre-filter-candidates}
+# Pre-Procedure-2-filter candidate RI event set (event_RI.psi.annot) - a
+# SUPERSET of the ~2085 events actually modelled (02-3's percentile filter
+# drops some). All of this is rMATS output - no SUPPA2 data is used anywhere
+# in this pipeline; `suppa_id` is just the column-naming convention the
+# pipeline's own code applies to rMATS's event coordinates via sprintf(), not
+# evidence SUPPA2 was ever run. Used below to distinguish, among introns
+# IRFinder finds real signal at but rMATS never modelled: (a) rMATS DID
+# consider this intron as an RI candidate but Procedure-2 filtered it out
+# (recoverable by relaxing the filter) vs (b) rMATS's structural annotation
+# never considered this intron an RI candidate AT ALL (no alternative
+# spliced-out isoform in the annotation - structurally invisible to rMATS,
+# not a coverage artifact).
+annot_dt <- fread(file.path(ri_dir, "event_RI.psi.annot"))
+annot_dt[,
+  c("gene", "et", "chr", "e1", "s2e2", "s3", "strand") := tstrsplit(
+    suppa_id, "[:;]", fixed = FALSE
+  )
+]
+annot_dt[, c("s2", "e2") := tstrsplit(s2e2, "-", type.convert = TRUE)]
+annot_dt[, e2_irfinder := e2 - 1L]
+annot_key_dt <- unique(annot_dt[, .(
+  match_key = paste(chr, s2, e2_irfinder, strand, sep = "_"),
+  suppa_id
+)])
+cat(sprintf(
+  "%d candidate RI events pre-Procedure-2-filter (vs %d post-filter, modelled)\n",
+  nrow(annot_key_dt), nrow(ri_coords)
+))
+```
+
+```{r, event-metrics}
+# Per-event intrinsic metrics, independent of which IRFinder tree we compare
+# against - used below to check WHY some events are/aren't found by IRFinder
+# (is it just coverage? intron length? PSI level/variability?), not just
+# report a bare found/not-found count.
+jc_dt <- fread(file.path(ri_dir, "event_RI.jc.csv.gz"))
+jc_dt[, coverage := IJC + SJC]
+event_coverage <- jc_dt[,
+  .(mean_coverage = mean(coverage, na.rm = TRUE)),
+  by = suppa_id
+]
+
+event_metrics <- psi_long[,
+  .(n_samples = .N, mean_psi = mean(psi), sd_psi = sd(psi)),
+  by = suppa_id
+]
+event_metrics[ri_coords, on = "suppa_id", intron_length := i.e2 - i.s2 + 1L]
+event_metrics[event_coverage, on = "suppa_id", mean_coverage := i.mean_coverage]
+
+cat(sprintf(
+  "Computed intrinsic metrics for %d RI events\n",
+  nrow(event_metrics)
+))
+```
+
+```{r, analyze-tree-function}
+# Run the full IRFinder-vs-rMATS comparison for ONE reference tree. Returns
+# everything needed for the event/cell-level breakdown, concordance, and
+# per-event category assignment - called once per tree below (both
+# `annotation` and `TSL12`, not just a guessed mapping) so we can compare
+# them directly instead of assuming which one is right.
+ri_keys <- ri_coords[, paste(chr, s2, e2_irfinder, strand, sep = "_")]
+ri_key_dt <- data.table(match_key = ri_keys, suppa_id = ri_coords$suppa_id)
+setkey(ri_key_dt, match_key)
+rmats_uuids <- unique(psi_long$uuid)
+
+analyze_tree <- function(irfinder_tree) {
+  irfinder_dir <- sprintf(
+    "/nfs/data/IHEC/RNAseq/irfinder/%s/irfinder_output",
+    irfinder_tree
+  )
+  uuid_dirs <- list.dirs(irfinder_dir, recursive = FALSE)
+  uuid_dirs <- uuid_dirs[basename(uuid_dirs) %in% rmats_uuids]
+  cat(sprintf(
+    "\n=== IRFinder tree: %s (%d overlapping sample dirs) ===\n",
+    irfinder_tree,
+    length(uuid_dirs)
+  ))
+
+  # Fast per-sample filter: build a "chr_start_end_strand" key set ONCE, then
+  # for each sample's genome-wide IRFinder file, keep only rows matching a
+  # key in that set (before rbinding across samples) - keeps peak memory
+  # small even though IRFinder scores ~250k introns/sample genome-wide. Does
+  # NOT pre-filter by confidence - keeps every matched row + a `high_conf`
+  # flag so "annotated at all" vs "high-confidence" vs "used in concordance"
+  # can be reported separately.
+  # Reads the FULL genome-wide table once per sample (unavoidable - IRFinder
+  # scores ~250k introns/sample, no per-intron index) and returns TWO slices
+  # from the same in-memory read (no second file read): (1) rows matching our
+  # rMATS RI candidate coordinates (as before), and (2) genome-wide introns
+  # NOT in that set but with real, high-confidence retention signal (IRratio
+  # > 0.1) - candidates for "IRFinder finds retention rMATS never called".
+  read_one_sample <- function(d) {
+    f <- file.path(d, "IRFinder-IR-nondir.txt")
+    if (!file.exists(f)) {
+      return(NULL)
+    }
+    dt <- fread(f, showProgress = FALSE)
+    # Start/End used AS-IS (raw, no offset) - matched against s2/e2_irfinder
+    # (see coordinate-system note in parse-ri-coordinates above).
+    dt[, match_key := paste(Chr, Start, End, Strand, sep = "_")]
+    dt[, uuid := basename(d)]
+    # high-confidence per file-changes/scripts/irfinder_array.sh.md policy:
+    # Warnings == "-", Name tag clean/known-exon only, never
+    # anti-near/anti-over (antisense-confounded).
+    dt[,
+      high_conf := Warnings == "-" &
+        grepl("clean|known-exon", Name) &
+        !grepl("anti-near|anti-over", Name)
+    ]
+    in_rmats <- dt$match_key %in% ri_key_dt$match_key
+    list(
+      matched = dt[in_rmats, .(match_key, uuid, IRratio, high_conf)],
+      unmatched_signal = dt[
+        !in_rmats & high_conf == TRUE & IRratio > 0.1,
+        .(match_key, uuid, IRratio, Name)
+      ]
+    )
+  }
+
+  raw_results <- Filter(
+    Negate(is.null),
+    pbmclapply(uuid_dirs, read_one_sample, mc.cores = min(8L, getOption("mc.cores", 4L)))
+  )
+  irfinder_all <- rbindlist(lapply(raw_results, `[[`, "matched"))
+  irfinder_all[ri_key_dt, on = "match_key", suppa_id := i.suppa_id]
+  irfinder_hc <- irfinder_all[high_conf == TRUE]
+
+  # Genome-wide introns with recurring real signal (>=3 samples, matching the
+  # per-event min-sample threshold used elsewhere) but NO rMATS RI candidate
+  # at that exact coordinate at all.
+  irfinder_unmatched <- rbindlist(lapply(raw_results, `[[`, "unmatched_signal"))
+  irfinder_only_agg <- irfinder_unmatched[, .(
+    n_samples_signal = .N,
+    mean_IRratio = mean(IRratio),
+    gene_name = Name[1]
+  ), by = match_key]
+  irfinder_only_recurring <- irfinder_only_agg[n_samples_signal >= 3]
+  irfinder_only_recurring[,
+    in_pre_filter_candidates := match_key %in% annot_key_dt$match_key
+  ]
+  n_filtered_by_proc2 <- sum(irfinder_only_recurring$in_pre_filter_candidates)
+  n_not_suppa_candidate <- sum(!irfinder_only_recurring$in_pre_filter_candidates)
+
+  cat(sprintf(
+    "IRFinder-only introns (>=3 samples, IRratio>0.1, no rMATS RI candidate at all): %d\n",
+    nrow(irfinder_only_recurring)
+  ))
+  cat(sprintf(
+    "  Of those: %d WERE a pre-Procedure-2-filter rMATS candidate (rMATS considered it, then filtered it out)\n",
+    n_filtered_by_proc2
+  ))
+  cat(sprintf(
+    "  Of those: %d were NEVER an rMATS RI candidate at all (no alternative spliced isoform in the annotation)\n",
+    n_not_suppa_candidate
+  ))
+
+  # event-level counts
+  n_events_total <- length(ri_gr)
+  n_events_any_annotation <- uniqueN(irfinder_all$suppa_id)
+  n_events_high_conf <- uniqueN(irfinder_hc$suppa_id)
+
+  # per-event category, used for the stratified plots below
+  event_category <- data.table(suppa_id = ri_coords$suppa_id)
+  event_category[, category := "rmats_only"]
+  event_category[
+    suppa_id %in% unique(irfinder_all$suppa_id),
+    category := "annotated_never_confident"
+  ]
+  event_category[
+    suppa_id %in% unique(irfinder_hc$suppa_id),
+    category := "high_conf"
+  ]
+  event_category[,
+    category := factor(
+      category,
+      levels = c("rmats_only", "annotated_never_confident", "high_conf")
+    )
+  ]
+
+  # cell-level breakdown
+  irfinder_hc_key <- irfinder_hc[, .(suppa_id, uuid, IRratio)]
+  setkey(irfinder_hc_key, suppa_id, uuid)
+  psi_key <- copy(psi_long)
+  setkey(psi_key, suppa_id, uuid)
+  both <- merge(
+    psi_key,
+    irfinder_hc_key,
+    by = c("suppa_id", "uuid"),
+    all = FALSE
+  )
+  n_irfinder_only_cells <- nrow(irfinder_hc_key[
+    !psi_key,
+    on = .(suppa_id, uuid)
+  ])
+
+  matched_any_conf <- merge(
+    psi_key,
+    irfinder_all[, .(suppa_id, uuid, IRratio)],
+    by = c("suppa_id", "uuid"),
+    all = FALSE
+  )
+
+  event_concordance <- both[,
+    .(
+      r = if (.N >= 3) {
+        cor(psi, IRratio, method = "spearman", use = "complete.obs")
+      } else {
+        NA_real_
+      },
+      n_samples = .N
+    ),
+    by = suppa_id
+  ]
+  fwrite(
+    event_concordance,
+    sprintf(
+      "qc/irfinder_concordance_%s_%s.csv.gz",
+      irfinder_tree,
+      this_transcript_filter
+    )
+  )
+  agg_r <- both[, cor(psi, IRratio, method = "spearman", use = "complete.obs")]
+  agg_r_any_conf <- matched_any_conf[,
+    cor(psi, IRratio, method = "spearman", use = "complete.obs")
+  ]
+
+  cat(sprintf(
+    "Events: total=%d any_annotation=%d (%.1f%%) high_conf=%d (%.1f%%)\n",
+    n_events_total,
+    n_events_any_annotation,
+    100 * n_events_any_annotation / n_events_total,
+    n_events_high_conf,
+    100 * n_events_high_conf / n_events_total
+  ))
+  cat(sprintf(
+    "Cells: rMATS non-NA=%d, usable-high-conf-match=%d (%.1f%%), IRFinder-only=%d\n",
+    nrow(psi_long),
+    nrow(both),
+    100 * nrow(both) / nrow(psi_long),
+    n_irfinder_only_cells
+  ))
+  cat(sprintf(
+    "Concordance: high-conf r=%.3f (n=%d); no-conf-filter r=%.3f (n=%d)\n",
+    agg_r,
+    nrow(both),
+    agg_r_any_conf,
+    nrow(matched_any_conf)
+  ))
+
+  fwrite(
+    irfinder_only_recurring,
+    sprintf("qc/irfinder_only_introns_%s_%s.csv.gz", irfinder_tree, this_transcript_filter)
+  )
+  append_sanity(
+    sprintf("irfinder_only_introns_%s_%s", irfinder_tree, this_transcript_filter),
+    "INFO", nrow(irfinder_only_recurring), NA_real_,
+    sprintf(
+      "tree=%s: %d genome-wide introns have recurring (>=3 sample) high-confidence IRFinder retention signal (IRratio>0.1) with NO rMATS RI candidate at that coordinate; %d of those WERE a pre-Procedure-2-filter rMATS candidate (filtered out, recoverable), %d were NEVER an rMATS RI candidate at all (no alternative isoform in the annotation)",
+      irfinder_tree, nrow(irfinder_only_recurring), n_filtered_by_proc2, n_not_suppa_candidate
+    )
+  )
+
+  list(
+    tree = irfinder_tree,
+    n_events_total = n_events_total,
+    n_events_any_annotation = n_events_any_annotation,
+    n_events_high_conf = n_events_high_conf,
+    event_category = event_category,
+    both = both,
+    matched_any_conf = matched_any_conf,
+    n_irfinder_only_cells = n_irfinder_only_cells,
+    event_concordance = event_concordance,
+    agg_r = agg_r,
+    agg_r_any_conf = agg_r_any_conf,
+    irfinder_only_recurring = irfinder_only_recurring,
+    n_filtered_by_proc2 = n_filtered_by_proc2,
+    n_not_suppa_candidate = n_not_suppa_candidate
+  )
+}
+
+# Try BOTH trees for real, rather than assume the placeholder
+# tsl_filtered->TSL12/else->annotation mapping is correct.
+tree_results <- list(
+  annotation = analyze_tree("annotation"),
+  TSL12 = analyze_tree("TSL12")
+)
+```
+
+```{r, tree-comparison}
+# Which folder is actually the better match for THIS transcript_filter's
+# rMATS event set? Compare both trees head-to-head instead of guessing.
+tree_summary <- rbindlist(lapply(tree_results, function(res) {
+  data.table(
+    tree = res$tree,
+    events_any_annotation = res$n_events_any_annotation,
+    events_high_conf = res$n_events_high_conf,
+    pct_high_conf = 100 * res$n_events_high_conf / res$n_events_total,
+    n_matched_cells = nrow(res$both),
+    concordance_r = res$agg_r,
+    concordance_r_no_conf_filter = res$agg_r_any_conf,
+    irfinder_only_introns = nrow(res$irfinder_only_recurring),
+    irfinder_only_filtered_by_proc2 = res$n_filtered_by_proc2,
+    irfinder_only_never_suppa_candidate = res$n_not_suppa_candidate
+  )
+}))
+print(tree_summary)
+fwrite(
+  tree_summary,
+  sprintf("qc/irfinder_tree_comparison_%s.csv.gz", this_transcript_filter)
+)
+
+for (tn in names(tree_results)) {
+  res <- tree_results[[tn]]
+  append_sanity(
+    sprintf("irfinder_exact_match_frac_%s_%s", tn, this_transcript_filter),
+    ifelse(res$n_events_high_conf / res$n_events_total > 0.5, "PASS", "WARN"),
+    res$n_events_high_conf / res$n_events_total,
+    0.5,
+    sprintf(
+      "tree=%s: %d/%d rMATS RI events have >=1 high-confidence IRFinder cell",
+      tn,
+      res$n_events_high_conf,
+      res$n_events_total
+    )
+  )
+  append_sanity(
+    sprintf("irfinder_rmats_concordance_%s_%s", tn, this_transcript_filter),
+    ifelse(res$agg_r > 0.5, "PASS", "WARN"),
+    res$agg_r,
+    0.5,
+    sprintf(
+      "tree=%s: aggregate Spearman r=%.3f (n=%d matched high-confidence cells); r=%.3f without confidence filter (n=%d)",
+      tn,
+      res$agg_r,
+      nrow(res$both),
+      res$agg_r_any_conf,
+      nrow(res$matched_any_conf)
+    )
+  )
+}
+
+# Do the two trees agree on WHICH events are high-confidence? Direct evidence
+# for/against the annotation<->transcript_filter mapping guess.
+cat_compare <- merge(
+  tree_results$annotation$event_category[, .(
+    suppa_id,
+    cat_annotation = category
+  )],
+  tree_results$TSL12$event_category[, .(suppa_id, cat_TSL12 = category)],
+  by = "suppa_id"
+)
+category_agreement_tab <- table(
+  cat_compare$cat_annotation,
+  cat_compare$cat_TSL12
+)
+print(category_agreement_tab)
+agreement_frac <- mean(cat_compare$cat_annotation == cat_compare$cat_TSL12)
+cat(sprintf(
+  "Event-category agreement between annotation and TSL12 trees: %.1f%%\n",
+  100 * agreement_frac
+))
+append_sanity(
+  sprintf("irfinder_tree_category_agreement_%s", this_transcript_filter),
+  "INFO",
+  agreement_frac,
+  NA_real_,
+  sprintf(
+    "fraction of RI events with the SAME found-by-IRFinder category (rmats_only/annotated_never_confident/high_conf) in both annotation and TSL12 trees; annotation high_conf=%d, TSL12 high_conf=%d, concordance r annotation=%.3f TSL12=%.3f",
+    tree_results$annotation$n_events_high_conf,
+    tree_results$TSL12$n_events_high_conf,
+    tree_results$annotation$agg_r,
+    tree_results$TSL12$agg_r
+  )
+)
+
+# Use the tree with higher concordance (more real signal, not just more
+# matches) as "primary" for the stratified metrics/plots below - report both
+# regardless.
+primary_tree <- names(tree_results)[
+  which.max(sapply(tree_results, function(r) r$agg_r))
+]
+cat(sprintf(
+  "Higher-concordance tree for %s: %s (r=%.3f vs %.3f)\n",
+  this_transcript_filter,
+  primary_tree,
+  tree_results[[primary_tree]]$agg_r,
+  tree_results[[setdiff(names(tree_results), primary_tree)]]$agg_r
+))
+```
+
+```{r, stratified-metrics}
+# Does WHETHER an event is found by IRFinder (and at what confidence) track
+# any intrinsic property of the event - coverage, intron length, PSI level,
+# PSI variability? Answers "why aren't they [found]" with data, not a guess.
+strat_summary <- rbindlist(lapply(names(tree_results), function(tn) {
+  ec <- tree_results[[tn]]$event_category
+  dt <- merge(event_metrics, ec, by = "suppa_id")
+  dt[, tree := tn]
+  dt
+}))
+
+metric_cols <- c(
+  "mean_coverage",
+  "intron_length",
+  "mean_psi",
+  "sd_psi",
+  "n_samples"
+)
+strat_table <- strat_summary[,
+  lapply(.SD, median, na.rm = TRUE),
+  by = .(tree, category),
+  .SDcols = metric_cols
+]
+setorder(strat_table, tree, category)
+print(strat_table)
+fwrite(
+  strat_table,
+  sprintf("qc/irfinder_stratified_metrics_%s.csv.gz", this_transcript_filter)
+)
+
+# Kruskal-Wallis across the 3 categories per metric per tree - is the
+# difference actually significant, or just noise?
+kw_results <- rbindlist(lapply(names(tree_results), function(tn) {
+  dt <- strat_summary[tree == tn]
+  rbindlist(lapply(metric_cols, function(m) {
+    kw <- kruskal.test(dt[[m]] ~ dt$category)
+    data.table(tree = tn, metric = m, kw_p = kw$p.value)
+  }))
+}))
+print(kw_results)
+
+for (i in seq_len(nrow(kw_results))) {
+  append_sanity(
+    sprintf(
+      "irfinder_stratified_%s_%s_%s",
+      kw_results$tree[i],
+      kw_results$metric[i],
+      this_transcript_filter
+    ),
+    ifelse(kw_results$kw_p[i] < 0.05, "INFO", "INFO"),
+    kw_results$kw_p[i],
+    0.05,
+    sprintf(
+      "Kruskal-Wallis p=%.3g for %s across found-by-IRFinder category (rmats_only/annotated_never_confident/high_conf), tree=%s",
+      kw_results$kw_p[i],
+      kw_results$metric[i],
+      kw_results$tree[i]
+    )
+  )
+}
+```
+
+```{r, plots}
+library(ggplot2)
+for (tn in names(tree_results)) {
+  res <- tree_results[[tn]]
+
+  p_hist <- ggplot(res$event_concordance[!is.na(r)], aes(x = r)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+      title = sprintf(
+        "Per-event Spearman(rMATS PSI, IRFinder IRratio) - %s (tree=%s)",
+        this_transcript_filter,
+        tn
+      ),
+      x = "Spearman r",
+      y = "count"
+    )
+  print(p_hist)
+  ggsave(
+    sprintf(
+      "qc/distributions/irfinder_concordance_%s_%s.pdf",
+      tn,
+      this_transcript_filter
+    ),
+    p_hist,
+    width = 7,
+    height = 5
+  )
+
+  p_scatter <- ggplot(
+    res$both[sample.int(.N, min(.N, 20000))],
+    aes(x = psi, y = IRratio)
+  ) +
+    geom_point(alpha = 0.15, size = 0.5) +
+    geom_smooth(method = "lm", color = "red") +
+    labs(
+      title = sprintf(
+        "rMATS RI PSI vs IRFinder IRratio (pooled r=%.3f) - %s (tree=%s)",
+        res$agg_r,
+        this_transcript_filter,
+        tn
+      ),
+      x = "rMATS RI PSI",
+      y = "IRFinder IRratio"
+    )
+  print(p_scatter)
+  ggsave(
+    sprintf(
+      "qc/distributions/irfinder_scatter_%s_%s.pdf",
+      tn,
+      this_transcript_filter
+    ),
+    p_scatter,
+    width = 6,
+    height = 6
+  )
+}
+
+# Stratified plots: does the found-by-IRFinder category track intrinsic
+# event properties? One plot per metric, faceted by tree. Only intron_length
+# and mean_coverage are strictly-positive, wide-dynamic-range metrics that
+# benefit from log scale; mean_psi/sd_psi are bounded [0,1] (often exactly 0)
+# and n_samples is a small count - log10(0) = -Inf would silently drop rows.
+log_scale_metrics <- c("mean_coverage", "intron_length")
+for (m in metric_cols) {
+  p <- ggplot(strat_summary, aes(x = category, y = .data[[m]])) +
+    geom_violin(fill = "steelblue", alpha = 0.5) +
+    geom_boxplot(width = 0.15, outlier.size = 0.3) +
+    facet_wrap(~tree) +
+    labs(
+      title = sprintf(
+        "%s by found-by-IRFinder category - %s",
+        m,
+        this_transcript_filter
+      ),
+      x = "category",
+      y = m
+    ) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  if (m %in% log_scale_metrics) {
+    p <- p + scale_y_log10()
+  }
+  print(p)
+  ggsave(
+    sprintf(
+      "qc/distributions/irfinder_stratified_%s_%s.pdf",
+      m,
+      this_transcript_filter
+    ),
+    p,
+    width = 8,
+    height = 5
+  )
+}
+```

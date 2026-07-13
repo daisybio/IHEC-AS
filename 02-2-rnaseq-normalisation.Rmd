@@ -38,8 +38,6 @@ knitr::opts_chunk$set(fig.width = 9, fig.height = 5)
 set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 library(edgeR)
 library(DESeq2)
-library(parallel)
-library(BiocParallel)
 
 # Same standalone append_sanity() pattern as `04-2-chip-signal-sanity.Rmd` —
 # each sanity-checking notebook defines its own local copy rather than
@@ -47,17 +45,23 @@ library(BiocParallel)
 # dependency for sample_design/isoform_quants too, see `load-data` below).
 sanity_csv <- "qc/sanity_summary.csv"
 append_sanity <- function(check_name, status, value, threshold, notes = "") {
-  fwrite(
-    data.table(
-      check_name = check_name,
-      status = status,
-      value = value,
-      threshold = threshold,
-      notes = notes
-    ),
-    sanity_csv,
-    append = TRUE
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
   )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
 }
 ```
 
@@ -160,8 +164,22 @@ compute_getmm_and_vst <- function(count_mat, efflen_mat, col_data) {
     design = ~ ontology + protocol
   )
   dds <- estimateSizeFactors(dds)
-  dds <- estimateDispersions(dds, parallel = TRUE)
-  vst_mat <- assay(vst(dds, blind = FALSE))
+  # vst() fits its own dispersion trend on a gene subsample (fast path) — do NOT
+  # pre-run estimateDispersions(): that adds the per-gene MAP-shrinkage MLE that
+  # vst never uses, only slowing it down. (An estimateDispersions(parallel=TRUE)
+  # line here previously both errored — no such arg — and was redundant.)
+  #
+  # blind = TRUE (not FALSE): the dispersion-mean trend is fit under ~1, so the
+  # transform owes NOTHING to ontology/protocol. This VST is a per-(gene,sample)
+  # EXPRESSION FEATURE (on/off gate in 02-3; features in 07/09/RBP), and
+  # downstream ML models `protocol` as a feature and group-CVs on `ontology` —
+  # both of which are in the design above. blind=FALSE would let those (very
+  # unbalanced ontology) factors tune the feature transform; blind=TRUE keeps
+  # the feature independent of the labels we model/split on. (blind=FALSE only
+  # ever tunes the trend, never removes design effects from values, so protocol
+  # signal is retained either way — and at this scale the two are near-identical;
+  # TRUE is simply the cleaner choice for a label-agnostic feature transform.)
+  vst_mat <- assay(vst(dds, blind = TRUE))
 
   # Mean-variance trend per gene, per representation (§4.12b column-choice
   # decision, discussed 2026-07-02): raw counts, raw TPM (pre-TMM, the
@@ -289,11 +307,10 @@ normalise_one_filter <- function(this_transcript_filter) {
 # 2026-07-02 but removed after failing on real data — see load-packages.
 #
 # Per-filter Snakemake job invocation: TRANSCRIPT_FILTER env var (lines 74–79)
-# routes one transcript_filter per rule execution. DESeq2's vst() is the
-# bottleneck — parallelise gene-wise dispersion fitting within this filter
-# via BiocParallel (estimateDispersions + vst use all 4 SLURM threads from
-# config/snakemake_config.yaml line 91).
-register(MulticoreParam(4))
+# routes one transcript_filter per rule execution. NB: DESeq2's
+# estimateDispersions()/vst() do NOT honour a registered BiocParallel backend
+# (only DESeq()/nbinomWaldTest() use BPPARAM), so the vst dispersion fit runs
+# serially — the rule's threads are used by edgeR/data.table, not vst.
 filter_result <- normalise_one_filter(this_transcript_filter)
 
 normalised_dt <- filter_result$main
@@ -457,7 +474,8 @@ ggsave(
   "qc/distributions/gene_expression_meanvar_count_tpm_getmm.pdf",
   p_meanvar_nonneg,
   width = 9,
-  height = 5
+  height = 5,
+  create.dir = TRUE
 )
 
 p_meanvar_vst <- ggplot(

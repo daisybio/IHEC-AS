@@ -15,23 +15,42 @@ output: html_document
 # one mark's running window-accumulator (~3.4 MB) in memory at a time.
 set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 
+# Per-filter (PLAN §4.12e): run against one transcript_filter's ChIP aggregation
+# (sample_dts/chip_agg_{tf}/) and its aggregateOver_{tf}.bed. Snakemake passes
+# TRANSCRIPT_FILTER; interactive falls back to the primary filter. `sfx` suffixes
+# every output so filters don't clobber each other.
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+tf <- this_transcript_filter
+sfx <- sprintf("_%s", tf)
+
 dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
 sanity_csv <- "qc/sanity_summary.csv"
 append_sanity <- function(check_name, status, value, threshold, notes = "") {
-  fwrite(
-    data.table(
-      check_name = check_name,
-      status = status,
-      value = value,
-      threshold = threshold,
-      notes = notes
-    ),
-    sanity_csv,
-    append = TRUE
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
   )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
 }
 
-aggregateOver <- rtracklayer::import("processed_data/aggregateOver.bed")
+aggregateOver <- rtracklayer::import(
+  sprintf("processed_data/aggregateOver_%s.bed", tf)
+)
 # chromhmm windows are excluded from every downstream ChIP table (05, and
 # the aggregation script itself never dropped them at source) — restrict
 # to the same window set everything else operates on, so the row-count
@@ -43,11 +62,30 @@ names(window_width) <- window_names
 n_windows <- length(window_names)
 
 file_metadata <- fread("processed_data/file_table.csv.gz")
+# per-filter ChIP aggregation dir (aggregate_chip_one rule output)
+chip_agg_dir <- file.path("sample_dts", sprintf("chip_agg_%s", tf))
 file_metadata[,
-  local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))
+  local_file := file.path(chip_agg_dir, paste0(basename(file_path), ".tab.gz"))
 ]
 chip_files <- file_metadata[assay_type == "ChIP-Seq"]
-stopifnot(all(file.exists(chip_files$local_file)))
+# Every ChIP metadata entry MUST have an aggregated tab. All ChIP source bigwigs
+# exist on disk — observed (…pval.signal.bigwig) AND ChromImpute imputed
+# (impute_*.pval.bw) — so a missing tab = INCOMPLETE aggregation (a bug, e.g. a
+# glob that misses the 135 imputed), NOT a genuine data gap. Fail hard + log
+# FAIL, rather than silently QC-ing a subset (which masked the imputed miss).
+n_meta <- nrow(chip_files)
+n_have <- chip_files[file.exists(local_file), .N]
+append_sanity(
+  sprintf("chip_sanity_files_present__%s", tf),
+  if (n_have == n_meta) "PASS" else "FAIL", n_have, n_meta,
+  "ALL ChIP metadata entries must have an aggregated tab (missing = incomplete aggregation)"
+)
+if (n_have < n_meta) {
+  stop(sprintf(
+    "chip_signal_sanity: %d/%d ChIP tabs present — aggregation INCOMPLETE (check aggregate_chip_one/aggregate_chip_imp globs)",
+    n_have, n_meta
+  ))
+}
 marks <- sort(unique(chip_files$experiment_type))
 ```
 
@@ -104,7 +142,7 @@ per_file_summary <- rbindlist(pbmcapply::pbmcmapply(
   SIMPLIFY = FALSE
 ))
 
-fwrite(per_file_summary, "qc/chip_per_file_summary.csv.gz")
+fwrite(per_file_summary, sprintf("qc/chip_per_file_summary%s.csv.gz", sfx))
 ```
 
 
@@ -267,10 +305,14 @@ window_position <- sub("_[0-9]+$", "", window_names)
 # exactly 3 times, once per filter, each with its own ID), so this join is
 # exact, not an approximation.
 window_id <- as.integer(tstrsplit(window_names, "_", fixed = TRUE)[[2]])
+# per-filter event_annotations has no transcript_filter column (implicit) —
+# read ID + Event Type and stamp the filter so the stratification below still
+# keys on (Event Type, transcript_filter) with a single filter value.
 event_annotations_dt <- fread(
-  "processed_data/event_annotations_dt.csv.gz",
-  select = c("ID", "Event Type", "transcript_filter")
+  sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf),
+  select = c("ID", "Event Type")
 )
+event_annotations_dt[, transcript_filter := tf]
 window_strata <- event_annotations_dt[
   data.table(ID = window_id),
   on = "ID",
@@ -285,24 +327,35 @@ window_strata <- event_annotations_dt[
 # (H3K4me3, H3K27ac) should show a bimodal log1p distribution (background
 # lobe near 0 + signal lobe); broad marks (H3K27me3, H3K36me3, H3K9me3)
 # should be unimodal with broader spread.
-pdf("qc/distributions/chip_signal_distributions.pdf", width = 9, height = 5)
+library(ggplot2)
 for (mark in marks) {
   for (pos in unique(window_position)) {
     vals <- window_mean_by_mark[window_position == pos, mark]
     if (length(vals) < 2 || all(vals == 0)) next
-    par(mfrow = c(1, 2))
-    hist(vals,
-      breaks = 50, col = "steelblue", border = "white",
-      main = paste(mark, pos, "- raw"), xlab = "mean signal"
+
+    df <- data.frame(value = vals)
+
+    p_raw <- ggplot(df, aes(x = value)) +
+      geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+      labs(title = paste(mark, pos, "- raw"), x = "mean signal", y = "count")
+
+    p_log <- ggplot(df, aes(x = log1p(value))) +
+      geom_histogram(bins = 50, fill = "darkorange", color = "white") +
+      labs(title = paste(mark, pos, "- log1p"), x = "log1p(mean signal)", y = "count")
+
+    print(p_raw)
+    ggsave(
+      sprintf("qc/distributions/chip_signal_%s_%s_raw%s.png", mark, pos, sfx),
+      plot = p_raw, width = 9, height = 5
     )
-    hist(log1p(vals),
-      breaks = 50, col = "darkorange", border = "white",
-      main = paste(mark, pos, "- log1p"), xlab = "log1p(mean signal)"
+
+    print(p_log)
+    ggsave(
+      sprintf("qc/distributions/chip_signal_%s_%s_log1p%s.png", mark, pos, sfx),
+      plot = p_log, width = 9, height = 5
     )
-    par(mfrow = c(1, 1))
   }
 }
-dev.off()
 ```
 
 
@@ -321,9 +374,8 @@ dev.off()
 # this independently; a negative pair within a stratum is more informative
 # than one from a pooled computation, since it isn't attributable to
 # cross-stratum mixing.
+library(ggplot2)
 strata <- unique(window_strata[!is.na(`Event Type`)])
-
-pdf("qc/distributions/chip_mark_correlation.pdf", width = 6, height = 6)
 mark_cor_all <- list()
 for (i in seq_len(nrow(strata))) {
   this_event_type <- strata$`Event Type`[i]
@@ -337,16 +389,23 @@ for (i in seq_len(nrow(strata))) {
   stratum_key <- paste(this_event_type, this_filter, sep = "_")
   mark_cor_all[[stratum_key]] <- mark_cor
 
-  image(
-    mark_cor,
-    col = colorRampPalette(c("blue", "white", "red"))(50),
-    breaks = seq(-1, 1, length.out = 51),
-    axes = FALSE,
-    main = sprintf("Mark-mark signal correlation (Spearman)\n%s / %s (n=%d windows)",
-      this_event_type, this_filter, sum(in_stratum))
+  m_df <- as.data.table(mark_cor, keep.rownames = "mark_row")
+  m_long <- melt(m_df, id.vars = "mark_row", variable.name = "mark_col", value.name = "rho")
+  p <- ggplot(m_long, aes(x = mark_col, y = mark_row, fill = rho)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+    labs(
+      title = sprintf("Mark-mark signal correlation (Spearman)\n%s / %s (n=%d windows)",
+        this_event_type, this_filter, sum(in_stratum)),
+      x = NULL, y = NULL
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+  ggsave(
+    sprintf("qc/distributions/chip_mark_correlation_%s%s.png", gsub("[ /\\\\]", "_", stratum_key), sfx),
+    plot = p, width = 6, height = 6
   )
-  axis(1, at = seq(0, 1, length.out = ncol(mark_cor)), labels = colnames(mark_cor), las = 2)
-  axis(2, at = seq(0, 1, length.out = nrow(mark_cor)), labels = rownames(mark_cor), las = 2)
 
   n_negative_pairs <- sum(mark_cor[upper.tri(mark_cor)] < 0)
   append_sanity(
@@ -357,7 +416,6 @@ for (i in seq_len(nrow(strata))) {
       this_event_type, this_filter, sum(in_stratum))
   )
 }
-dev.off()
 
 fwrite(
   rbindlist(lapply(names(mark_cor_all), function(k) {
@@ -365,7 +423,7 @@ fwrite(
     dt <- as.data.table(m, keep.rownames = "mark_row")
     dt[, stratum := k]
   })),
-  "qc/chip_mark_correlation.csv"
+  sprintf("qc/chip_mark_correlation%s.csv", sfx)
 )
 ```
 
@@ -474,7 +532,7 @@ fwrite(
     dt <- as.data.table(m, keep.rownames = "mark_row")
     dt[, stratum := k]
   })),
-  "qc/chip_sample_axis_correlation.csv"
+  sprintf("qc/chip_sample_axis_correlation%s.csv", sfx)
 )
 ```
 
@@ -483,6 +541,7 @@ fwrite(
 # Direct comparison, per mark pair per stratum: window-axis r vs
 # sample-axis r. This is the actual test of the hypothesis above — not
 # just plausible reasoning, real numbers from the same data.
+library(ggplot2)
 comparison_rows <- list()
 mark_pairs <- combn(marks, 2)
 for (stratum_key in names(mark_cor_all)) {
@@ -499,23 +558,22 @@ for (stratum_key in names(mark_cor_all)) {
   }
 }
 axis_comparison <- rbindlist(comparison_rows)
-fwrite(axis_comparison, "qc/chip_axis_comparison.csv")
+fwrite(axis_comparison, sprintf("qc/chip_axis_comparison%s.csv", sfx))
 
-pdf("qc/distributions/chip_axis_comparison.pdf", width = 7, height = 6)
-plot(
-  axis_comparison$window_axis_r, axis_comparison$sample_axis_r,
-  xlab = "window axis (spatial) correlation", ylab = "sample axis (fingerprint) correlation",
-  pch = 16, xlim = c(-1, 1), ylim = c(-1, 1),
-  main = "Window-axis vs sample-axis mark correlation"
-)
-abline(h = 0, v = 0, lty = 2, col = "grey")
-abline(a = 0, b = 1, lty = 3, col = "blue")
-text(
-  axis_comparison$window_axis_r, axis_comparison$sample_axis_r,
-  labels = paste(axis_comparison$mark1, axis_comparison$mark2, sep = "-"),
-  cex = 0.6, pos = 3
-)
-dev.off()
+p_comp <- ggplot(axis_comparison, aes(x = window_axis_r, y = sample_axis_r, label = paste(mark1, mark2, sep = "-"))) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey") +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1)) +
+  labs(
+    title = "Window-axis vs sample-axis mark correlation",
+    x = "window axis (spatial) correlation",
+    y = "sample axis (fingerprint) correlation"
+  )
+
+print(p_comp)
+ggsave(sprintf("qc/distributions/chip_axis_comparison%s.png", sfx), plot = p_comp, width = 7, height = 6)
 
 n_sample_axis_negative <- axis_comparison[, sum(sample_axis_r < 0, na.rm = TRUE)]
 n_window_axis_negative <- axis_comparison[, sum(window_axis_r < 0, na.rm = TRUE)]
@@ -534,50 +592,45 @@ append_sanity(
 ```{r, viz-per-sample}
 # viz 3: per-sample outlier scatter — median signal per sample, faceted by
 # mark, outliers (|z|>3, checks 5/6/8) highlighted.
-pdf("qc/distributions/chip_per_sample_outliers.pdf", width = 9, height = 6)
-for (this_mark in marks) {
-  sub_dt <- per_file_summary[mark == this_mark]
-  is_outlier <- abs(sub_dt$median_z) > 3
-  plot(
-    seq_len(nrow(sub_dt)), sub_dt$median_score,
-    col = ifelse(is_outlier, "red", "black"),
-    pch = ifelse(is_outlier, 17, 16),
-    main = paste("Per-sample median signal -", this_mark),
-    xlab = "sample index", ylab = "median signal"
-  )
-  if (any(is_outlier)) {
-    legend("topright", legend = "outlier (|z|>3)", pch = 17, col = "red", bty = "n")
-  }
-}
-dev.off()
+library(ggplot2)
+# NB: `mark` comes from `by=` — do NOT also list it in `.()` or the result has
+# two `mark` columns and ggplot aborts ("data must be uniquely named").
+sub_df <- per_file_summary[, .(
+  median_score,
+  median_z,
+  is_outlier = abs(median_z) > 3,
+  sample_index = seq_len(.N)
+), by = mark]
+p_per_sample <- ggplot(sub_df, aes(x = sample_index, y = median_score, color = is_outlier, shape = is_outlier)) +
+  geom_point() +
+  facet_wrap(~mark, scales = "free_x") +
+  scale_color_manual(values = c(`FALSE` = "black", `TRUE` = "red")) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17)) +
+  labs(title = "Per-sample median signal by mark", x = "sample index", y = "median signal") +
+  theme(legend.position = "none")
+print(p_per_sample)
+ggsave(sprintf("qc/distributions/chip_per_sample_outliers%s.png", sfx), plot = p_per_sample, width = 9, height = 6)
 
 # viz 4: coverage completeness (per-file fraction of low-coverage windows)
-pdf("qc/distributions/chip_coverage_completeness.pdf", width = 7, height = 5)
-hist(
-  per_file_summary$coverage_low_frac,
-  breaks = 50, col = "steelblue", border = "white",
-  main = "Per-file fraction of windows with covered/size < 0.5",
-  xlab = "fraction of low-coverage windows"
-)
-dev.off()
+p_cov <- ggplot(per_file_summary, aes(x = coverage_low_frac)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Per-file fraction of windows with covered/size < 0.5", x = "fraction of low-coverage windows", y = "count")
+print(p_cov)
+ggsave(sprintf("qc/distributions/chip_coverage_completeness%s.png", sfx), plot = p_cov, width = 7, height = 5)
 
 # viz 5: zero-inflation per mark
-pdf("qc/distributions/chip_zero_inflation.pdf", width = 7, height = 5)
-boxplot(
-  zero_frac ~ mark,
-  data = per_file_summary,
-  main = "Per-sample zero-signal fraction by mark",
-  xlab = "mark", ylab = "fraction of windows with mean == 0", las = 2
-)
-dev.off()
+p_zero <- ggplot(per_file_summary, aes(x = mark, y = zero_frac)) +
+  geom_boxplot() +
+  labs(title = "Per-sample zero-signal fraction by mark", x = "mark", y = "fraction of windows with mean == 0") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_zero)
+ggsave(sprintf("qc/distributions/chip_zero_inflation%s.png", sfx), plot = p_zero, width = 7, height = 5)
 
 # viz 6: observed vs imputed signal scale
-pdf("qc/distributions/chip_observed_vs_imputed.pdf", width = 8, height = 5)
-boxplot(
-  median_score ~ interaction(mark, is_imputed, sep = " / "),
-  data = per_file_summary,
-  main = "Per-sample median signal: observed vs imputed",
-  xlab = "mark / is_imputed", ylab = "median signal", las = 2
-)
-dev.off()
+p_obsimp <- ggplot(per_file_summary, aes(x = interaction(mark, is_imputed, sep = " / "), y = median_score)) +
+  geom_boxplot() +
+  labs(title = "Per-sample median signal: observed vs imputed", x = "mark / is_imputed", y = "median signal") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_obsimp)
+ggsave(sprintf("qc/distributions/chip_observed_vs_imputed%s.png", sfx), plot = p_obsimp, width = 8, height = 5)
 ```

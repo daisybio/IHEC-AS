@@ -23,3 +23,6 @@ splicing_ml/output/
 *.pyc
 wandb
 event_glmnet_logs
+old_*
+logs
+.snakemake

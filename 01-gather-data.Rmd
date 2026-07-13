@@ -6,20 +6,44 @@ output:
 ---
 
 
-```{bash, download-metadata, eval=FALSE}
+```{bash, download-metadata}
 mkdir -p data
 # download the sample metadata v1.4 from GitHub, make sure you download this into "sample_metadata_file" defined in .Rprofile
-wget -nc -O data/IHEC_sample_metadata_harmonization.v1.4_extended.csv https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
-# download experiment metadata and qc summaries from sftp
-echo "get IHEC/readme/EpiATLAS_experiment_metadata.csv data/" | sftp sftp.bcgsc.ca
-echo "get IHEC/readme/*_qc_summary.csv data/" | sftp sftp.bcgsc.ca
-echo "get IHEC/post_processed_data/ChIP-Seq_imputed/imputation_primarymetrics.txt data/" | sftp sftp.bcgsc.ca
+wget -nc -P data https://raw.githubusercontent.com/IHEC/epiATLAS-metadata-harmonization/748afe0bd4167235f09c857937c5c8b62f9f49f5/openrefine/v1.4/IHEC_sample_metadata_harmonization.v1.4_extended.csv
+# download experiment metadata + per-assay QC summaries. NB: wget does NOT
+# expand '*' globs over HTTP (only FTP), so each file must be named explicitly.
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_experiment_metadata.csv
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_rnaseq_qc_summary.csv
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_chipseq_qc_summary.csv
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_wgbs_qc_summary.csv
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/EpiATLAS_imputed_experiment_metadata.csv
+wget -nc -P data https://ihec.sd4h.ca/IHEC/post_processed_data/ChIP-Seq_imputed/imputation_primarymetrics.txt
+wget -nc -P data https://ihec.sd4h.ca/IHEC/readme/IHEC_EpiATLAS_IA_colors_Apl01_2024.json
 
 mkdir -p processed_data
+mkdir -p qc
 ```
 
 ```{r, find-epirr-ids}
 set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+# Initialise the pipeline-wide sanity log fresh (§4.13 convention). Downstream
+# stages append rows via their local append_sanity() helper; truncating here at
+# stage 01 means a full rerun starts clean instead of accumulating stale rows
+# across runs. (Caveat: when several transcript_filters run 02-2/02-3/03 in
+# PARALLEL they all append to this one file — fine sequentially / single-filter,
+# but concurrent appends can interleave; a per-filter sanity_summary_{tf}.csv
+# merged by qc/00-sanity-checks.Rmd is the eventual fix.)
+fwrite(
+  data.table(
+    check_name = character(),
+    status = character(),
+    value = numeric(),
+    threshold = numeric(),
+    notes = character()
+  ),
+  "qc/sanity_summary.csv"
+)
 
 # Load sample metadata
 metadata <- fread(sample_metadata_file)
@@ -193,9 +217,9 @@ rna_qc[uuid %in% rmats_uuids, included := "with rMATS data"]
 # RNA-Seq QC thresholds (used in both plots and flag computation)
 rna_thr <- list(
   total = 50e6, # IHEC standard
-  mapped = 0.7, # ENCODE ≥70%; < 0.5 previous (too lenient)
+  mapped = 0.7, # ENCODE ≥70%;
   intergenic = 0.15,
-  rrna = 0.25, # ENCODE total RNA <25%; < 0.3 previous (too lenient)
+  rrna = 0.25, # ENCODE total RNA <25%;
   duplicates = 0.7 # ENCODE <80%; conservative
 )
 
@@ -314,7 +338,7 @@ chip_qc[
 
 # ChIP-Seq QC thresholds (used in both plots and flag computation)
 chip_thr <- list(
-  mapped_pct = 80, # ENCODE >80%; < 60 previous (too lenient)
+  mapped_pct = 80, # ENCODE >80%;
   dupes_pct = 0.80, # ENCODE <80%; stored as fraction (0-1), not percent
   nrf = 0.5, # ENCODE minimum (compliant: 0.8, ideal: 0.9)
   pbc1 = 0.5, # ENCODE minimum (compliant: 0.8)

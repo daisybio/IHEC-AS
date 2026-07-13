@@ -7,31 +7,69 @@ Run (dry-run):
 Run (SLURM):
     mamba run -n ihec-as snakemake --profile profiles/slurm
 
-Run single filter (e.g. biotype_filtered only):
+Run a single filter / several in parallel — each transcript_filter is an
+independent DAG branch (shared roots 01, 02-1 run once). Default target =
+primary_filter; build others by requesting their targets or extending
+config["transcript_filters"]:
     mamba run -n ihec-as snakemake --profile profiles/slurm \
-        --config transcript_filters='["biotype_filtered"]'
+        processed_data/aggregated_dt_filtered_transcripts.csv.gz
 
-Steps:
-    01  gather-data          →  processed_data/file_table.csv.gz
-    02  SUPPA2-analysis      →  splicing_analysis/filtered_transcript_ids.rds
-    02z rmats-analysis       →  splicing_analysis/rmats/{tf}/event_{et}.{psi,jc.csv.gz}
-    03  prepare-aggregation  →  processed_data/{aggregateOver,file_metadata,sample_cols,keep_rows_manual}.rds, processed_data/ijc_sjc_dt.csv.gz, event_annotations_dt.csv.gz, psi_long_dt.csv.gz
-    04  aggregate-WGBS       →  processed_data/sample_dts/WGBS_agg.csv.gz
-    05  create-aggregated-dt →  processed_data/aggregated_dt_filtered.csv.gz  (all transcript_filters as rows)
-    06  correlation          →  processed_data/correlation_intrinsic.csv.gz
-    08  splicing_ml          →  splicing_ml/output/{et}_{tf}_{var}_{gc}/
-    09-1 event-models        →  processed_data/event_models/{tf}/.done
-    09-2 ml-analysis         →  reports/09-2-ml-local-new_{primary}.html
-    10  experimental-events  →  reports/10-experimental-events.html
+Steps (everything from 02-2 on is per-transcript_filter, suffix _{tf}):
+    01   gather-data              →  processed_data/file_table.csv.gz          (cohort-wide)
+    02-1 transcript-filters       →  splicing_analysis/filtered_transcript_ids.rds, gencode.v29.{tf}.gtf  (cohort-wide)
+    02-2 rnaseq-normalisation     →  processed_data/gene_expression_normalised_{tf}.csv.gz  (getmm+vst)
+    02-3 rmats-event-filtering    →  splicing_analysis/rmats/{tf}/event_{et}.{psi,jc.csv.gz} (Procedure 2 + VST gate), qc/vst_expression_cutoff_{tf}.csv
+    03   prepare-aggregation      →  processed_data/{aggregateOver,keep_rows_manual,sample_cols,ijc_sjc_dt,event_annotations_dt,psi_long_dt,pangolin_events,*ss}_{tf}.*
+    04-1 aggregate-WGBS           →  sample_dts/WGBS_agg_{tf}.csv.gz
+    04-2 aggregate-ChIP           →  sample_dts/chip_agg_{tf}/… , chip_agg_{tf}.done
+    04-3 maxentscan               →  processed_data/{3,3down,5,5up}scores_{tf}.txt
+    04-4 pangolin                 →  processed_data/pangolin_scores_{tf}.csv
+    04-5 rbp-binding-sites        →  processed_data/rbp_per_event.rds  (standalone; not in rule all)
+    05   create-aggregated-dt     →  processed_data/aggregated_dt_filtered_{tf}.csv.gz
+    05b  feature-pca-sanity       →  reports/05b-feature-pca-sanity_{primary}.html  (standalone; not in rule all)
+    06   correlation              →  processed_data/correlation_intrinsic_{tf}.csv.gz  (primary filter)
+    08   splicing_ml              →  splicing_ml/output/{et}_{tf}_{var}_{gc}/
+    09-1 event-models             →  processed_data/event_models/{tf}/.done
+    09-2 ml-analysis              →  reports/09-2-ml-local-new_{primary}.html
+    10   experimental-events      →  reports/10-experimental-events_{tf}.html
+
+Rule → SLURM: the slurm executor plugin submits each job as its own `sbatch`,
+translating threads→--cpus-per-task, resources.mem_mb→--mem, runtime→--time,
+slurm_partition/qos/gres→flags, slurm_extra→appended verbatim. The rule shell
+(wrapped by shell.prefix below) is the job script. aggregate_chip_one is the
+one exception: it is collapsed into a single `sbatch --array` via the profile's
+`slurm-array-jobs` setting (see that rule).
 """
 
 from itertools import product
+from glob import glob
 
 configfile: "config/snakemake_config.yaml"
+
+# splicing_ml source files: entry script + whole package. Declared as `input:`
+# of the splicing_ml rule so any code edit enters Snakemake's rerun-triggers
+# (the shell string alone is opaque to change detection).
+SPLICING_ML_SRC = ["run_splicing_ml.py"] + sorted(glob("splicing_ml/**/*.py", recursive=True))
 
 CONDA_BASE = "/nfs/data/cluster/software/miniforge3/24.7.1/miniforge3"
 shell.prefix(
     "source /usr/share/modules/init/bash 2>/dev/null || true && "
+    # pandoc is needed by every rmarkdown::render rule and is absent on compute
+    # nodes (only login has /usr/bin/pandoc) — load the module so it is on PATH
+    # for all SLURM jobs (.Rprofile then finds it). Guarded so a node without
+    # the module doesn't abort the shell.
+    "module load pandoc/3.6.2 2>/dev/null || true && "
+    # Load R 4.2.1 for ALL rules here (bash, where `module` is defined). Nodes
+    # differ in default R (compms = 3.6.3, others = 4.2.1); the renv library is
+    # built for 4.2.1, so a 3.6.3 node sees "no packages installed". Doing it in
+    # the prefix (not `sh -c 'module load …'`, where `module` is undefined and
+    # silently no-ops — the real cause of the compms WGBS failures) guarantees
+    # 4.2.1 + a complete renv on every node for bare-Rscript rules.
+    "module load r/4.2.1 2>/dev/null || true && "
+    # Cap multithreaded OpenBLAS/OMP to the SLURM allocation (read at BLAS load,
+    # before R). Unset, openblas-pthread uses the whole node's cores, ignoring
+    # the cgroup → oversubscription on matrix-heavy stages (vst, rowSds, joins).
+    "export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK && "
     f"source {CONDA_BASE}/etc/profile.d/conda.sh && "
     f"source {CONDA_BASE}/etc/profile.d/mamba.sh && "
 )
@@ -39,11 +77,31 @@ shell.prefix(
 localrules: all, clean
 
 # ── Wildcard values ────────────────────────────────────────────────────────────
+# ALL_* = universe of valid filters (wildcard constraints → any is buildable by
+# explicit target). TRANSCRIPT_FILTERS = default build set (rule all / ML space).
+ALL_TRANSCRIPT_FILTERS = config.get("all_transcript_filters", config["transcript_filters"])
 TRANSCRIPT_FILTERS = config["transcript_filters"]
 EVENT_TYPES        = config["event_types"]
 VARIABILITIES      = config["variabilities"]
 GROUP_COLS         = config["group_cols"]
 PRIMARY            = config["primary_filter"]
+
+# Pangolin device toggle (no file edit): `--config pangolin_use_gpu=true` for GPU,
+# default CPU. Derive the pangolin_scores gpu flag + threads so the existing
+# _partition()/_gres()/_qos()/R() helpers route it correctly. CPU -> 16 threads
+# (encoding parallelises over cores); GPU -> 4.
+_pangolin_gpu = str(config.get("pangolin_use_gpu", True)).lower() in ("true", "1", "yes")
+config["resources"]["pangolin_scores"]["gpu"] = 1 if _pangolin_gpu else 0
+config["resources"]["pangolin_scores"]["threads"] = 4 if _pangolin_gpu else 16
+# Pangolin GPU gres/env. Default = idle gpu01 titans via the cu121 pangolin-titan
+# env (Titan V sm_70 verified). a40 path uses ihec-as (cu128). See config.
+PANGOLIN_GRES = config.get("pangolin_gpu_gres", "gpu:a40:1") if _pangolin_gpu else None
+_pangolin_titan = bool(_pangolin_gpu) and "titan" in (PANGOLIN_GRES or "")
+PANGOLIN_ENV = config.get(
+    "pangolin_env", "pangolin-titan" if _pangolin_titan else "ihec-as"
+)
+# batch: 4096 on the 48G a40; 1024 on the 12G titan or on CPU (host-RAM fit).
+PANGOLIN_BATCH = 4096 if (_pangolin_gpu and not _pangolin_titan) else 1024
 
 # ML configs: all combos minus excluded ones
 EXCLUDE_ML = {
@@ -59,7 +117,7 @@ def _ml_configs():
 ML_CONFIGS = list(_ml_configs())
 
 wildcard_constraints:
-    transcript_filter = "|".join(TRANSCRIPT_FILTERS),
+    transcript_filter = "|".join(ALL_TRANSCRIPT_FILTERS),
     event_type        = "|".join(EVENT_TYPES),
     variability       = "|".join(VARIABILITIES),
     group_col         = "|".join(GROUP_COLS),
@@ -83,7 +141,7 @@ def _partition(rule_key):
             else config["slurm_cpu_partition"])
 
 def _extra(rule_key):
-    base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
+    base = "--mail-type=END,FAIL --mail-user=quirin.manz@tum.de"
     if config["resources"][rule_key]["gpu"]:
         return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
@@ -99,7 +157,7 @@ def _ml_partition(wc):
     return config["slurm_gpu_partition"] if gpu else config["slurm_cpu_partition"]
 
 def _ml_extra(wc):
-    base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
+    base = "--mail-type=END,FAIL --mail-user=quirin.manz@tum.de"
     if ml_resource(wc.event_type, wc.variability, "gpu"):
         return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
@@ -114,15 +172,22 @@ def _ml_gres(wc):
 
 
 # ── ChIP BigWig file list (for aggregate_chip_one wildcard) ───────────────────
-CHIP_BW, = glob_wildcards("/nfs/data3/IHEC/ChIP-Seq/{bw}.pval.signal.bigwig")
+# ChIP tracks come in TWO namings: observed (ihec.chipseq…{uuid}.pval.signal.bigwig,
+# ~2295) and ChromImpute imputed (impute_{epirr}_{mark}.pval.bw, ~135). Two globs
+# → both aggregated (05 §4.13l flags the observed/imputed source per mark). The
+# single observed glob previously missed all 135 imputed tracks.
+CHIP_BW,  = glob_wildcards("/nfs/data3/IHEC/ChIP-Seq/{bw}.pval.signal.bigwig")
+CHIP_IMP, = glob_wildcards("/nfs/data3/IHEC/ChIP-Seq/impute_{bw}.pval.bw")
 
 
 # ── Rule all ──────────────────────────────────────────────────────────────────
 rule all:
     input:
-        # Combined aggregated data and correlations (all transcript_filters as rows)
-        "processed_data/aggregated_dt_filtered.csv.gz",
-        "processed_data/correlation_intrinsic.csv.gz",
+        # Per-filter aggregated data (default: primary filter only — request
+        # other filters' targets or extend config["transcript_filters"] to
+        # build them; each is an independent, parallel DAG branch).
+        f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
+        f"processed_data/correlation_intrinsic_{PRIMARY}.csv.gz",
         # ML global models (all configs)
         [f"splicing_ml/output/{et}_{tf}_{var}_{gc}/splicing_ml_results_classification.pkl.gz"
          for et, tf, var, gc in ML_CONFIGS],
@@ -130,11 +195,13 @@ rule all:
         f"processed_data/event_models/{PRIMARY}/.done",
         # Final analysis reports
         f"reports/09-2-ml-local-new_{PRIMARY}.html",
-        "reports/10-experimental-events.html",
+        f"reports/10-experimental-events_{PRIMARY}.html",
 
 
-# ── Step 01: gather data ───────────────────────────────────────────────────────
+# ── Step 01: gather data ──────────────────────────────────────────────────────
 rule gather_data:
+    input:
+        rmd = "01-gather-data.Rmd",
     output:
         file_table      = "processed_data/file_table.csv.gz",
         qc_summary      = "processed_data/qc_summary.csv",
@@ -156,186 +223,56 @@ rule gather_data:
         """
 
 
-# ── Step 02: SUPPA2 isoform quants + GTF annotation filter ────────────────────
-rule suppa_analysis:
+# ── Step 02-1: transcript filters + isoform quants + GTF annotation ───────────
+# Cohort-wide (runs once). SUPPA2 reference GTFs + filtered transcript ids +
+# the rna_to_use isoform-quant subset consumed by 02-2.
+rule transcript_filters:
     input:
+        rmd = "02-1-transcript-filters.Rmd",
         file_table = "processed_data/file_table.csv.gz",
     output:
         filtered_tx_ids = "splicing_analysis/filtered_transcript_ids.rds",
         tpm_expr        = "splicing_analysis/suppa/tpm_expressions.tsv.gz",
+        # isoform_quants subset is consumed by rnaseq_normalisation (02-2) — declare
+        # it so the DAG can produce it (was an undeclared side-output before).
+        isoform_quants  = "splicing_analysis/isoform_quantifications_subset.tsv.gz",
         gencode_gtfs    = expand(
             "splicing_analysis/gencode.v29.{tf}.gtf",
-            tf=TRANSCRIPT_FILTERS,
+            tf=ALL_TRANSCRIPT_FILTERS,
         ),
-    log: "logs/02_suppa_analysis.log"
-    threads: R("suppa_analysis", "threads")
+    log: "logs/02-1_transcript_filters.log"
+    threads: R("transcript_filters", "threads")
     resources:
-        mem_mb          = R("suppa_analysis", "mem_mb"),
-        runtime         = R("suppa_analysis", "runtime"),
-        slurm_partition = _partition("suppa_analysis"),
-        slurm_extra     = _extra("suppa_analysis"),
-        qos             = _qos("suppa_analysis"),
-        gres            = _gres("suppa_analysis"),
+        mem_mb          = R("transcript_filters", "mem_mb"),
+        runtime         = R("transcript_filters", "runtime"),
+        slurm_partition = _partition("transcript_filters"),
+        slurm_extra     = _extra("transcript_filters"),
+        qos             = _qos("transcript_filters"),
+        gres            = _gres("transcript_filters"),
     shell:
         """
-        Rscript -e "rmarkdown::render('02-SUPPA2-analysis.Rmd',
-            output_file = normalizePath('reports/02-SUPPA2-analysis.html', mustWork = FALSE)
+        Rscript -e "rmarkdown::render('02-1-transcript-filters.Rmd',
+            output_file = normalizePath('reports/02-1-transcript-filters.html', mustWork = FALSE)
         )" > {log} 2>&1
         """
 
 
-# ── Step 02z: rMATS PSI + junction-count filter (PLAN §4.12d, §4.8) ──────────
-rule rmats_analysis:
-    input:
-        file_table = "processed_data/file_table.csv.gz",
-    output:
-        psi_files = expand(
-            "splicing_analysis/rmats/{tf}/event_{et}.psi",
-            tf=TRANSCRIPT_FILTERS, et=EVENT_TYPES,
-        ),
-        jc_files = expand(
-            "splicing_analysis/rmats/{tf}/event_{et}.jc.csv.gz",
-            tf=TRANSCRIPT_FILTERS, et=EVENT_TYPES,
-        ),
-    log: "logs/02z_rmats_analysis.log"
-    threads: R("rmats_analysis", "threads")
-    resources:
-        mem_mb          = R("rmats_analysis", "mem_mb"),
-        runtime         = R("rmats_analysis", "runtime"),
-        slurm_partition = _partition("rmats_analysis"),
-        slurm_extra     = _extra("rmats_analysis"),
-        qos             = _qos("rmats_analysis"),
-        gres            = _gres("rmats_analysis"),
-    shell:
-        """
-        Rscript -e "rmarkdown::render('02z-rmats-analysis.Rmd',
-            output_file = normalizePath('reports/02z-rmats-analysis.html', mustWork = FALSE)
-        )" > {log} 2>&1
-        """
-
-
-# ── Step 03: prepare aggregation workspace ────────────────────────────────────
-rule prepare_aggregation:
-    input:
-        psi_files = expand(
-            "splicing_analysis/rmats/{tf}/event_{et}.psi",
-            tf=TRANSCRIPT_FILTERS, et=EVENT_TYPES,
-        ),
-        jc_files = expand(
-            "splicing_analysis/rmats/{tf}/event_{et}.jc.csv.gz",
-            tf=TRANSCRIPT_FILTERS, et=EVENT_TYPES,
-        ),
-        filtered_tx_ids = "splicing_analysis/filtered_transcript_ids.rds",
-        gencode_gtfs = expand(
-            "splicing_analysis/gencode.v29.{tf}.gtf",
-            tf=TRANSCRIPT_FILTERS,
-        ),
-    output:
-        aggregateOver_bed = "processed_data/aggregateOver.bed",
-        sample_cols      = "processed_data/sample_cols.rds",
-        keep_rows_manual = "processed_data/keep_rows_manual.rds",
-        ijc_sjc_dt            = "processed_data/ijc_sjc_dt.csv.gz",
-        event_annotations_dt  = "processed_data/event_annotations_dt.csv.gz",
-        psi_long_dt           = "processed_data/psi_long_dt.csv.gz",
-        pangolin_events       = "processed_data/pangolin_events.csv",
-        ss5_fasta             = "processed_data/5ss.fasta",
-        ss5up_fasta           = "processed_data/5ss_up.fasta",
-        ss3_fasta             = "processed_data/3ss.fasta",
-        ss3down_fasta         = "processed_data/3ss_down.fasta",
-    log: "logs/03_prepare_aggregation.log"
-    threads: R("prepare_aggregation", "threads")
-    resources:
-        mem_mb          = R("prepare_aggregation", "mem_mb"),
-        runtime         = R("prepare_aggregation", "runtime"),
-        slurm_partition = _partition("prepare_aggregation"),
-        slurm_extra     = _extra("prepare_aggregation"),
-        qos             = _qos("prepare_aggregation"),
-        gres            = _gres("prepare_aggregation"),
-    shell:
-        """
-        Rscript -e "rmarkdown::render('03-prepare-aggregation.Rmd',
-            output_file = normalizePath('reports/03-prepare-aggregation.html', mustWork = FALSE)
-        )" > {log} 2>&1
-        """
-
-
-# ── Step 04-3: MaxEntScan splice-site scores ─────────────────────────────────
-rule maxentscan_scores:
-    input:
-        ss3      = "processed_data/3ss.fasta",
-        ss3down  = "processed_data/3ss_down.fasta",
-        ss5      = "processed_data/5ss.fasta",
-        ss5up    = "processed_data/5ss_up.fasta",
-    output:
-        score3     = "processed_data/3scores.txt",
-        score3down = "processed_data/3down_scores.txt",
-        score5     = "processed_data/5scores.txt",
-        score5up   = "processed_data/5up_scores.txt",
-    log: "logs/04-3_maxentscan_scores.log"
-    threads: R("maxentscan_scores", "threads")
-    resources:
-        mem_mb          = R("maxentscan_scores", "mem_mb"),
-        runtime         = R("maxentscan_scores", "runtime"),
-        slurm_partition = _partition("maxentscan_scores"),
-        slurm_extra     = _extra("maxentscan_scores"),
-        qos             = _qos("maxentscan_scores"),
-        gres            = _gres("maxentscan_scores"),
-    shell:
-        """
-        mamba run -n ihec-as bash 04-3-maxentscan-scores.sh > {log} 2>&1
-        """
-
-
-# ── Step 04-4: Pangolin splice-site scores ───────────────────────────────────
-rule pangolin_scores:
-    input:
-        events_csv = "processed_data/pangolin_events.csv",
-        fasta      = "data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz",
-    output:
-        scores_csv = "processed_data/pangolin_scores.csv",
-    log: "logs/04-4_pangolin_scores.log"
-    threads: R("pangolin_scores", "threads")
-    resources:
-        mem_mb          = R("pangolin_scores", "mem_mb"),
-        runtime         = R("pangolin_scores", "runtime"),
-        slurm_partition = _partition("pangolin_scores"),
-        slurm_extra     = _extra("pangolin_scores"),
-        qos             = _qos("pangolin_scores"),
-        gres            = _gres("pangolin_scores"),
-    shell:
-        """
-        bash 04-4-pangolin-scores.sh --batch-size 4096 > {log} 2>&1
-        """
-
-
-# ── Step 04-5: RNA-Seq gene expression normalisation (PLAN §4.12b, §4.12c) ──
-# Standalone target, NOT in `rule all` and NOT an input to create_aggregated_dt
-# yet: output is exploratory (compares getmm/vst x raw/combat) until `05`'s
-# `use_normalised_expression` flag is wired up (see file-changes/
-# 05-create-aggregated-dt.Rmd.md §4.12b). Run explicitly with
-# `snakemake processed_data/gene_expression_normalised.csv.gz`.
-# `filtered_tx_ids` is the only declared-output input (mirrors
-# create_aggregated_dt's existing pattern) even though the notebook also
-# reads `splicing_analysis/isoform_quantifications_subset.tsv.gz`, an
-# undeclared side-output of `suppa_analysis` — same pre-existing gap
-# `create_aggregated_dt` has, not fixed here.
-#
-# Future consumer (not wired yet, PLAN §3.4, file-changes/
-# 04-6-rbp-binding-sites.Rmd.md Step 2): once implemented, this rule's
-# output also becomes an input to `rbp_binding_sites` below (RBP-score +
-# core-spliceosome-factor expression need the normalised values) — making
-# rnaseq_normalisation a real (transitive) create_aggregated_dt dependency
-# via 04-6, even before `05`'s own `use_normalised_expression` flag lands.
+# ── Step 02-2: RNA-Seq gene expression normalisation (PLAN §4.12b) ────────────
+# Per-transcript_filter. Runs BEFORE 02-3 (its VST output is the input to the
+# 02-3 event-expression gate) — depends only on 02-1 outputs + file_table, so
+# it sits at stage 02 in the reorder. GeTMM-CPM + DESeq2 vst side by side
+# (routing: getmm→splicing_ml, vst→07/09/RBP).
 rule rnaseq_normalisation:
     input:
-        filtered_tx_ids      = "splicing_analysis/filtered_transcript_ids.rds",
-        file_table           = "processed_data/file_table.csv.gz",
-        event_annotations_dt = "processed_data/event_annotations_dt.csv.gz",
-        psi_long_dt          = "processed_data/psi_long_dt.csv.gz",
+        rmd = "02-2-rnaseq-normalisation.Rmd",
+        filtered_tx_ids = "splicing_analysis/filtered_transcript_ids.rds",
+        file_table      = "processed_data/file_table.csv.gz",
+        isoform_quants  = "splicing_analysis/isoform_quantifications_subset.tsv.gz",
     output:
-        gene_expression_normalised = "processed_data/gene_expression_normalised.csv.gz",
-        html                       = "reports/04-5-rnaseq-normalisation.html",
-    log: "logs/04-5_rnaseq_normalisation.log"
+        gene_expression_normalised =
+            "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
+        html = "reports/02-2-rnaseq-normalisation_{transcript_filter}.html",
+    log: "logs/02-2_rnaseq_normalisation_{transcript_filter}.log"
     threads: R("rnaseq_normalisation", "threads")
     resources:
         mem_mb          = R("rnaseq_normalisation", "mem_mb"),
@@ -346,38 +283,377 @@ rule rnaseq_normalisation:
         gres            = _gres("rnaseq_normalisation"),
     shell:
         """
-        Rscript -e "rmarkdown::render('04-5-rnaseq-normalisation.Rmd',
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('02-2-rnaseq-normalisation.Rmd',
             output_file = normalizePath('{output.html}', mustWork = FALSE)
         )" > {log} 2>&1
         """
 
 
-# ── Step 04-6: RBP binding-site annotation (PLAN §3.4) ───────────────────────
-# Standalone target, NOT in `rule all` and NOT an input to create_aggregated_dt
-# yet — mirrors rnaseq_normalisation's own pattern above. Currently only
-# Step 1 (binding-site annotation, genomic/expression-independent) is
-# implemented; declared outputs below cover only what the notebook actually
-# writes today. Step 2 (RBP-score + core-spliceosome-factor expression
-# features, file-changes/04-6-rbp-binding-sites.Rmd.md) is NOT YET DONE and
-# will add `gene_expression_normalised.csv.gz` (rnaseq_normalisation's
-# output) as a new input here, plus `rbp_score_dt.csv.gz` /
-# `splicing_factor_expression.csv.gz` / `rbp_wide_expression.csv.gz` as new
-# outputs — at that point this rule becomes a real create_aggregated_dt
-# input, forming the chain create_aggregated_dt -> rbp_binding_sites ->
-# rnaseq_normalisation. Don't add those inputs/outputs before the R code
-# exists — Snakemake requires declared outputs to actually be written.
+# ── Step 02-3: rMATS PSI + Procedure-2 + VST gene-expression gate ─────────────
+# Per-transcript_filter (PLAN §4.12e). Depends on 02-2's per-filter normalised
+# expression (the VST gate) — this is the edge that sequences normalisation
+# before event filtering.
+rule rmats_event_filtering:
+    input:
+        rmd = "02-3-rmats-event-filtering.Rmd",
+        file_table = "processed_data/file_table.csv.gz",
+        gene_expression_normalised =
+            "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
+    output:
+        psi_files = expand(
+            "splicing_analysis/rmats/{{transcript_filter}}/event_{et}.psi",
+            et=EVENT_TYPES,
+        ),
+        jc_files = expand(
+            "splicing_analysis/rmats/{{transcript_filter}}/event_{et}.jc.csv.gz",
+            et=EVENT_TYPES,
+        ),
+        vst_cutoff = "qc/vst_expression_cutoff_{transcript_filter}.csv",
+    log: "logs/02-3_rmats_event_filtering_{transcript_filter}.log"
+    threads: R("rmats_event_filtering", "threads")
+    resources:
+        mem_mb          = R("rmats_event_filtering", "mem_mb"),
+        runtime         = R("rmats_event_filtering", "runtime"),
+        slurm_partition = _partition("rmats_event_filtering"),
+        slurm_extra     = _extra("rmats_event_filtering"),
+        qos             = _qos("rmats_event_filtering"),
+        gres            = _gres("rmats_event_filtering"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('02-3-rmats-event-filtering.Rmd',
+            output_file = normalizePath('reports/02-3-rmats-event-filtering_{wildcards.transcript_filter}.html', mustWork = FALSE)
+        )" > {log} 2>&1
+        """
+
+
+# ── Step 02-4: IRFinder vs rMATS RI concordance (diagnostic only) ─────────────
+# Standalone target, NOT in rule all / not on 03's critical path (03 keeps
+# reading 02-3's RI .psi unchanged) - see revision/file-changes/
+# 02-4-irfinder-concordance.Rmd.md. IRFinder data itself
+# (/nfs/data/IHEC/RNAseq/irfinder/) is external, pre-computed, not a Snakemake
+# input (thousands of per-sample files, static reference data - not tracked).
+rule irfinder_concordance:
+    input:
+        rmd = "02-4-irfinder-concordance.Rmd",
+        rmats_ri_psi = "splicing_analysis/rmats/{transcript_filter}/event_RI.psi",
+        rmats_ri_jc  = "splicing_analysis/rmats/{transcript_filter}/event_RI.jc.csv.gz",
+    output:
+        # Runs BOTH IRFinder reference trees (annotation, TSL12) for real
+        # rather than assuming one - see file-changes/02-4-irfinder-concordance.Rmd.md.
+        concordance = expand(
+            "qc/irfinder_concordance_{tree}_{{transcript_filter}}.csv.gz",
+            tree=["annotation", "TSL12"],
+        ),
+        tree_comparison = "qc/irfinder_tree_comparison_{transcript_filter}.csv.gz",
+        stratified      = "qc/irfinder_stratified_metrics_{transcript_filter}.csv.gz",
+        # reverse direction: introns IRFinder finds with recurring signal that
+        # have no rMATS RI candidate at all (see file-changes doc "reverse
+        # direction" section).
+        irfinder_only = expand(
+            "qc/irfinder_only_introns_{tree}_{{transcript_filter}}.csv.gz",
+            tree=["annotation", "TSL12"],
+        ),
+        hist_pdfs = expand(
+            "qc/distributions/irfinder_concordance_{tree}_{{transcript_filter}}.pdf",
+            tree=["annotation", "TSL12"],
+        ),
+        scatter_pdfs = expand(
+            "qc/distributions/irfinder_scatter_{tree}_{{transcript_filter}}.pdf",
+            tree=["annotation", "TSL12"],
+        ),
+        stratified_pdfs = expand(
+            "qc/distributions/irfinder_stratified_{metric}_{{transcript_filter}}.pdf",
+            metric=["mean_coverage", "intron_length", "mean_psi", "sd_psi", "n_samples"],
+        ),
+        html = "reports/02-4-irfinder-concordance_{transcript_filter}.html",
+    log: "logs/02-4_irfinder_concordance_{transcript_filter}.log"
+    threads: R("irfinder_concordance", "threads")
+    resources:
+        mem_mb          = R("irfinder_concordance", "mem_mb"),
+        runtime         = R("irfinder_concordance", "runtime"),
+        slurm_partition = _partition("irfinder_concordance"),
+        slurm_extra     = _extra("irfinder_concordance"),
+        qos             = _qos("irfinder_concordance"),
+        gres            = _gres("irfinder_concordance"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('02-4-irfinder-concordance.Rmd',
+            output_file = normalizePath('{output.html}', mustWork = FALSE)
+        )" > {log} 2>&1
+        """
+
+
+# ── Step 03: prepare aggregation workspace ────────────────────────────────────
+rule prepare_aggregation:
+    input:
+        rmd = "03-prepare-aggregation.Rmd",
+        psi_files = expand(
+            "splicing_analysis/rmats/{{transcript_filter}}/event_{et}.psi",
+            et=EVENT_TYPES,
+        ),
+        jc_files = expand(
+            "splicing_analysis/rmats/{{transcript_filter}}/event_{et}.jc.csv.gz",
+            et=EVENT_TYPES,
+        ),
+        filtered_tx_ids = "splicing_analysis/filtered_transcript_ids.rds",
+        gencode_gtf = "splicing_analysis/gencode.v29.{transcript_filter}.gtf",
+    output:
+        aggregateOver_bed     = "processed_data/aggregateOver_{transcript_filter}.bed",
+        keep_rows_manual      = "processed_data/keep_rows_manual_{transcript_filter}.rds",
+        ijc_sjc_dt            = "processed_data/ijc_sjc_dt_{transcript_filter}.csv.gz",
+        event_annotations_dt  = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        psi_long_dt           = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
+        pangolin_events       = "processed_data/pangolin_events_{transcript_filter}.csv",
+        ss5_fasta             = "processed_data/5ss_{transcript_filter}.fasta",
+        ss5up_fasta           = "processed_data/5ss_up_{transcript_filter}.fasta",
+        ss3_fasta             = "processed_data/3ss_{transcript_filter}.fasta",
+        ss3down_fasta         = "processed_data/3ss_down_{transcript_filter}.fasta",
+        sample_cols           = "processed_data/sample_cols_{transcript_filter}.rds",
+        # 09-1's chromHMM-vicinity per-event feature engineering (a separate
+        # local-modelling path from splicing_ml's pooled genome-wide route) —
+        # these 3 used to leave 03's session only via the removed aggregating.rda
+        # workspace dump; now persisted directly. Must come from the SAME run as
+        # keep_rows_manual (see 03's saveRDS comment: internal index consistency).
+        event_gr              = "processed_data/event_gr_{transcript_filter}.rds",
+        active_chromhmm       = "processed_data/activeChromHMM_{transcript_filter}.rds",
+        chromhmm_hits         = "processed_data/chromhmm_hits_{transcript_filter}.rds",
+    log: "logs/03_prepare_aggregation_{transcript_filter}.log"
+    threads: R("prepare_aggregation", "threads")
+    resources:
+        mem_mb          = R("prepare_aggregation", "mem_mb"),
+        runtime         = R("prepare_aggregation", "runtime"),
+        slurm_partition = _partition("prepare_aggregation"),
+        slurm_extra     = _extra("prepare_aggregation"),
+        qos             = _qos("prepare_aggregation"),
+        gres            = _gres("prepare_aggregation"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('03-prepare-aggregation.Rmd',
+            output_file = normalizePath('reports/03-prepare-aggregation_{wildcards.transcript_filter}.html', mustWork = FALSE)
+        )" > {log} 2>&1
+        """
+
+
+# ── Step 04-1: aggregate WGBS ─────────────────────────────────────────────────
+rule aggregate_wgbs:
+    input:
+        script = "04-1-aggregate-WGBS-matrix.R",
+        aggregateOver = "processed_data/aggregateOver_{transcript_filter}.bed",
+    output:
+        wgbs = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
+    log: "logs/04-1_aggregate_wgbs_{transcript_filter}.log"
+    threads: R("aggregate_wgbs", "threads")
+    resources:
+        mem_mb          = R("aggregate_wgbs", "mem_mb"),
+        runtime         = R("aggregate_wgbs", "runtime"),
+        slurm_partition = _partition("aggregate_wgbs"),
+        slurm_extra     = _extra("aggregate_wgbs"),
+        qos             = _qos("aggregate_wgbs"),
+        gres            = _gres("aggregate_wgbs"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript 04-1-aggregate-WGBS-matrix.R > {log} 2>&1
+        """
+
+
+# ── Step 04-2: aggregate ChIP-Seq signal ──────────────────────────────────────
+# One aggregate_chip_one job per bigwig (~2295). Submitted as INDIVIDUAL SLURM
+# jobs, throttled by the profile's `jobs` (concurrency) + `max-jobs-per-second`
+# (submit rate). The SLURM-array grouping (`slurm-array-jobs`) was tried but
+# stalled the scheduler on this cluster and is disabled — see
+# profiles/slurm/config.yaml. Per-bigwig outputs stay independent, so a rerun
+# only rebuilds missing tabs. CHIP_BW is discovered at parse time via
+# glob_wildcards. aggregate_chip is a sentinel that fans the per-bigwig tabs
+# into a single .done for 05.
+rule aggregate_chip_one:
+    input:
+        bw  = "/nfs/data3/IHEC/ChIP-Seq/{bw}.pval.signal.bigwig",
+        bed = "processed_data/aggregateOver_{transcript_filter}.bed",
+    output:
+        tab = "sample_dts/chip_agg_{transcript_filter}/{bw}.pval.signal.bigwig.tab.gz",
+    log: "logs/chip/{transcript_filter}/{bw}.log"
+    threads: R("aggregate_chip_one", "threads")
+    resources:
+        mem_mb          = R("aggregate_chip_one", "mem_mb"),
+        runtime         = R("aggregate_chip_one", "runtime"),
+        slurm_partition = _partition("aggregate_chip_one"),
+        slurm_extra     = "--mail-type=NONE",
+    shell:
+        """
+        set -euo pipefail
+        out=sample_dts/chip_agg_{wildcards.transcript_filter}/{wildcards.bw}.pval.signal.bigwig.tab
+        mkdir -p "$(dirname "$out")"
+        # mamba run: shell.prefix sources conda/mamba but does NOT activate an
+        # env, so a bare `bigWigAverageOverBed` on a compute node resolves to a
+        # broken/incompatible binary (dies after "processing chromosomes"). Force
+        # the ihec-as ucsc-bigwigaverageoverbed.
+        # set -e above: if bigWig fails (e.g. OOM-Killed) the script aborts BEFORE
+        # gzip, so no partial/empty .tab.gz is left at the output path.
+        mamba run -n ihec-as bigWigAverageOverBed {input.bw} {input.bed} "$out" -minMax > {log} 2>&1
+        gzip -f "$out"
+        """
+
+# Imputed ChIP tracks (impute_{bw}.pval.bw) — same aggregation, different naming.
+# Output basename matches file_table's basename(file_path) so 05 finds them.
+rule aggregate_chip_imp:
+    input:
+        bw  = "/nfs/data3/IHEC/ChIP-Seq/impute_{bw}.pval.bw",
+        bed = "processed_data/aggregateOver_{transcript_filter}.bed",
+    output:
+        tab = "sample_dts/chip_agg_{transcript_filter}/impute_{bw}.pval.bw.tab.gz",
+    log: "logs/chip/{transcript_filter}/impute_{bw}.log"
+    threads: R("aggregate_chip_one", "threads")
+    resources:
+        mem_mb          = R("aggregate_chip_one", "mem_mb"),
+        runtime         = R("aggregate_chip_one", "runtime"),
+        slurm_partition = _partition("aggregate_chip_one"),
+        slurm_extra     = "--mail-type=NONE",
+    shell:
+        """
+        set -euo pipefail
+        out=sample_dts/chip_agg_{wildcards.transcript_filter}/impute_{wildcards.bw}.pval.bw.tab
+        mkdir -p "$(dirname "$out")"
+        mamba run -n ihec-as bigWigAverageOverBed {input.bw} {input.bed} "$out" -minMax > {log} 2>&1
+        gzip -f "$out"
+        """
+
+rule aggregate_chip:
+    input:
+        expand(
+            "sample_dts/chip_agg_{{transcript_filter}}/{bw}.pval.signal.bigwig.tab.gz",
+            bw=CHIP_BW,
+        ),
+        expand(
+            "sample_dts/chip_agg_{{transcript_filter}}/impute_{bw}.pval.bw.tab.gz",
+            bw=CHIP_IMP,
+        ),
+    output:
+        done = touch("sample_dts/chip_agg_{transcript_filter}.done"),
+    localrule: True
+
+# §4.13b ChIP signal sanity — STANDALONE QC (like rbp_binding_sites): NOT in
+# `rule all` and NOT an input to create_aggregated_dt, so it never gates the
+# data build. Needs the whole per-filter ChIP aggregation together (streams each
+# tab once), hence a real compute job downstream of the aggregate_chip sentinel —
+# not folded into that localrule. Request explicitly to run it.
+rule chip_signal_sanity:
+    input:
+        rmd = "04-2-chip-signal-sanity.Rmd",
+        chip_done = "sample_dts/chip_agg_{transcript_filter}.done",
+        bed = "processed_data/aggregateOver_{transcript_filter}.bed",
+        event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        file_table = "processed_data/file_table.csv.gz",
+    output:
+        html = "reports/04-2-chip-signal-sanity_{transcript_filter}.html",
+        per_file_summary = "qc/chip_per_file_summary_{transcript_filter}.csv.gz",
+    log: "logs/04-2_chip_signal_sanity_{transcript_filter}.log"
+    threads: R("chip_signal_sanity", "threads")
+    resources:
+        mem_mb          = R("chip_signal_sanity", "mem_mb"),
+        runtime         = R("chip_signal_sanity", "runtime"),
+        slurm_partition = _partition("chip_signal_sanity"),
+        slurm_extra     = _extra("chip_signal_sanity"),
+        qos             = _qos("chip_signal_sanity"),
+        gres            = _gres("chip_signal_sanity"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('04-2-chip-signal-sanity.Rmd',
+            output_file = normalizePath('{output.html}', mustWork = FALSE)
+        )" > {log} 2>&1
+        """
+
+
+# ── Step 04-3: MaxEntScan splice-site scores ──────────────────────────────────
+rule maxentscan_scores:
+    input:
+        script   = "04-3-maxentscan-scores.sh",
+        ss3      = "processed_data/3ss_{transcript_filter}.fasta",
+        ss3down  = "processed_data/3ss_down_{transcript_filter}.fasta",
+        ss5      = "processed_data/5ss_{transcript_filter}.fasta",
+        ss5up    = "processed_data/5ss_up_{transcript_filter}.fasta",
+    output:
+        score3     = "processed_data/3scores_{transcript_filter}.txt",
+        score3down = "processed_data/3down_scores_{transcript_filter}.txt",
+        score5     = "processed_data/5scores_{transcript_filter}.txt",
+        score5up   = "processed_data/5up_scores_{transcript_filter}.txt",
+    log: "logs/04-3_maxentscan_scores_{transcript_filter}.log"
+    threads: R("maxentscan_scores", "threads")
+    resources:
+        mem_mb          = R("maxentscan_scores", "mem_mb"),
+        runtime         = R("maxentscan_scores", "runtime"),
+        slurm_partition = _partition("maxentscan_scores"),
+        slurm_extra     = _extra("maxentscan_scores"),
+        qos             = _qos("maxentscan_scores"),
+        gres            = _gres("maxentscan_scores"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        mamba run -n ihec-as bash 04-3-maxentscan-scores.sh > {log} 2>&1
+        """
+
+
+# ── Step 04-4: Pangolin splice-site scores ────────────────────────────────────
+rule pangolin_scores:
+    input:
+        script     = "04-4-pangolin-scores.sh",
+        events_csv = "processed_data/pangolin_events_{transcript_filter}.csv",
+        fasta      = "data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz",
+    output:
+        scores_csv = "processed_data/pangolin_scores_{transcript_filter}.csv",
+    log: "logs/04-4_pangolin_scores_{transcript_filter}.log"
+    params:
+        batch = PANGOLIN_BATCH,   # 4096 a40 / 1024 titan|CPU
+        env   = PANGOLIN_ENV,     # pangolin-titan (cu121, titan) or ihec-as (cu128, a40)
+    threads: R("pangolin_scores", "threads")
+    resources:
+        mem_mb          = R("pangolin_scores", "mem_mb"),
+        runtime         = R("pangolin_scores", "runtime"),
+        slurm_partition = _partition("pangolin_scores"),
+        slurm_extra     = _extra("pangolin_scores"),
+        qos             = _qos("pangolin_scores"),
+        gres            = PANGOLIN_GRES,   # titan (gpu01), not the a40 default
+    shell:
+        """
+        PANGOLIN_ENV={params.env} TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        bash 04-4-pangolin-scores.sh --batch-size {params.batch} > {log} 2>&1
+        """
+
+
+# ── Step 04-6: RBP binding-site annotation (PLAN §3.4) ────────────────────────
+# Step 1 (binding-site annotation) AND Step 2 (RBP-score + core-spliceosome-factor
+# expression features, on gene_expression_vst) are BOTH implemented. This rule
+# takes `gene_expression_normalised_{tf}.csv.gz` (from rnaseq_normalisation) +
+# `event_annotations_dt_{tf}` (from 03) as inputs and writes the Step 2 feature
+# tables (`rbp_score_dt`, `splicing_factor_expression`, `rbp_wide_expression`),
+# which create_aggregated_dt consumes (see its input block) — so the DAG chain is
+# rnaseq_normalisation + prepare_aggregation -> rbp_binding_sites -> create_aggregated_dt.
 # `gencode_gtf` is a static reference file (like `human_postar3`), not a
 # pipeline-generated artifact — no upstream rule produces it.
 rule rbp_binding_sites:
     input:
-        event_annotations_dt = "processed_data/event_annotations_dt.csv.gz",
+        rmd = "04-5-rbp-binding-sites.Rmd",
+        event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        # Step 2 turns binding sites into per-sample expression features -> needs
+        # the per-filter normalised expression (uses gene_expression_vst).
+        gene_expr             = "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
         human_postar3         = "data/human.txt.gz",
         gencode_gtf            = "splicing_analysis/gencode.v29.annotation.gtf",
     output:
-        rbp_per_event = "processed_data/rbp_per_event.rds",
-        rbp_gene_ids  = "processed_data/rbp_gene_ids.rds",
-        html          = "reports/04-6-rbp-binding-sites.html",
-    log: "logs/04-6_rbp_binding_sites.log"
+        rbp_per_event    = "processed_data/rbp_per_event_{transcript_filter}.rds",
+        rbp_gene_ids     = "processed_data/rbp_gene_ids_{transcript_filter}.rds",
+        # Step 2 feature tables (all on gene_expression_vst):
+        rbp_score        = "processed_data/rbp_score_dt_{transcript_filter}.csv.gz",
+        spliceosome_expr = "processed_data/splicing_factor_expression_{transcript_filter}.csv.gz",
+        rbp_wide         = "processed_data/rbp_wide_expression_{transcript_filter}.csv.gz",
+        spliceosome_ids  = "processed_data/spliceosome_gene_ids_{transcript_filter}.rds",
+        html             = "reports/04-5-rbp-binding-sites_{transcript_filter}.html",
+    log: "logs/04-5_rbp_binding_sites_{transcript_filter}.log"
     threads: R("rbp_binding_sites", "threads")
     resources:
         mem_mb          = R("rbp_binding_sites", "mem_mb"),
@@ -388,87 +664,43 @@ rule rbp_binding_sites:
         gres            = _gres("rbp_binding_sites"),
     shell:
         """
-        Rscript -e "rmarkdown::render('04-6-rbp-binding-sites.Rmd',
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript -e "rmarkdown::render('04-5-rbp-binding-sites.Rmd',
             output_file = normalizePath('{output.html}', mustWork = FALSE)
         )" > {log} 2>&1
         """
 
 
-# ── Step 04b: aggregate ChIP-Seq signal ──────────────────────────────────────
-# aggregate_chip_one submitted as SLURM arrays (slurm-array-jobs in profile).
-# CHIP_BW discovered at parse time via glob_wildcards.
-
-rule aggregate_chip_one:
-    input:
-        bw  = "/nfs/data3/IHEC/ChIP-Seq/{bw}.pval.signal.bigwig",
-        bed = "processed_data/aggregateOver.bed",
-    output:
-        tab = "sample_dts/{bw}.pval.signal.bigwig.tab.gz",
-    log: "logs/chip/{bw}.log"
-    threads: R("aggregate_chip_one", "threads")
-    resources:
-        mem_mb          = R("aggregate_chip_one", "mem_mb"),
-        runtime         = R("aggregate_chip_one", "runtime"),
-        slurm_partition = _partition("aggregate_chip_one"),
-        slurm_extra     = "--mail-type=NONE",
-    shell:
-        """
-        bigWigAverageOverBed {input.bw} {input.bed} \
-            sample_dts/{wildcards.bw}.pval.signal.bigwig.tab -minMax \
-            > {log} 2>&1
-        gzip -f sample_dts/{wildcards.bw}.pval.signal.bigwig.tab
-        """
-
-rule aggregate_chip:
-    input:
-        expand("sample_dts/{bw}.pval.signal.bigwig.tab.gz", bw=CHIP_BW),
-    output:
-        done = touch("sample_dts/chip_agg.done"),
-    localrule: True
-
-
-# ── Step 04: aggregate WGBS ───────────────────────────────────────────────────
-rule aggregate_wgbs:
-    input:
-        aggregateOver = "processed_data/aggregateOver.bed",
-    output:
-        wgbs = "sample_dts/WGBS_agg.csv.gz",
-    log: "logs/04_aggregate_wgbs.log"
-    threads: R("aggregate_wgbs", "threads")
-    resources:
-        mem_mb          = R("aggregate_wgbs", "mem_mb"),
-        runtime         = R("aggregate_wgbs", "runtime"),
-        slurm_partition = _partition("aggregate_wgbs"),
-        slurm_extra     = _extra("aggregate_wgbs"),
-        qos             = _qos("aggregate_wgbs"),
-        gres            = _gres("aggregate_wgbs"),
-    shell:
-        "module load r/4.2.1 2>/dev/null; Rscript 04-1-aggregate-WGBS-matrix.R > {log} 2>&1"
-
-
-# ── Step 05: create aggregated dataset (all transcript_filters as rows) ────────
+# ── Step 05: create aggregated dataset (per transcript_filter) ────────────────
 rule create_aggregated_dt:
     input:
-        keep_rows_manual      = "processed_data/keep_rows_manual.rds",
+        rmd                   = "05-create-aggregated-dt.Rmd",
+        keep_rows_manual      = "processed_data/keep_rows_manual_{transcript_filter}.rds",
+        sample_cols           = "processed_data/sample_cols_{transcript_filter}.rds",
         file_table            = "processed_data/file_table.csv.gz",
-        ijc_sjc_dt            = "processed_data/ijc_sjc_dt.csv.gz",
-        event_annotations_dt  = "processed_data/event_annotations_dt.csv.gz",
-        psi_long_dt           = "processed_data/psi_long_dt.csv.gz",
-        wgbs                  = "sample_dts/WGBS_agg.csv.gz",
-        chip_done             = "sample_dts/chip_agg.done",
+        ijc_sjc_dt            = "processed_data/ijc_sjc_dt_{transcript_filter}.csv.gz",
+        event_annotations_dt  = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        psi_long_dt           = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
+        gene_expr             = "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
+        vst_cutoff            = "qc/vst_expression_cutoff_{transcript_filter}.csv",
+        wgbs                  = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
+        chip_done             = "sample_dts/chip_agg_{transcript_filter}.done",
         qc_covariates         = "processed_data/qc_flag_covariates.csv",
         filtered_tx_ids       = "splicing_analysis/filtered_transcript_ids.rds",
-        maxentscan_score3     = "processed_data/3scores.txt",
-        maxentscan_score3down = "processed_data/3down_scores.txt",
-        maxentscan_score5     = "processed_data/5scores.txt",
-        maxentscan_score5up   = "processed_data/5up_scores.txt",
-        ss3_fasta             = "processed_data/3ss.fasta",
-        ss5_fasta             = "processed_data/5ss.fasta",
-        pangolin_scores       = "processed_data/pangolin_scores.csv",
+        maxentscan_score3     = "processed_data/3scores_{transcript_filter}.txt",
+        maxentscan_score3down = "processed_data/3down_scores_{transcript_filter}.txt",
+        maxentscan_score5     = "processed_data/5scores_{transcript_filter}.txt",
+        maxentscan_score5up   = "processed_data/5up_scores_{transcript_filter}.txt",
+        ss3_fasta             = "processed_data/3ss_{transcript_filter}.fasta",
+        ss5_fasta             = "processed_data/5ss_{transcript_filter}.fasta",
+        pangolin_scores       = "processed_data/pangolin_scores_{transcript_filter}.csv",
+        # RBP + core-spliceosome expression features (04-6 Step 2, §3.4/§4.12f)
+        rbp_score             = "processed_data/rbp_score_dt_{transcript_filter}.csv.gz",
+        spliceosome_expr      = "processed_data/splicing_factor_expression_{transcript_filter}.csv.gz",
     output:
-        csv  = "processed_data/aggregated_dt_filtered.csv.gz",
-        html = "reports/05-create-aggregated-dt.html",
-    log: "logs/05_create_aggregated_dt.log"
+        csv  = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        html = "reports/05-create-aggregated-dt_{transcript_filter}.html",
+    log: "logs/05_create_aggregated_dt_{transcript_filter}.log"
     threads: R("create_aggregated_dt", "threads")
     resources:
         mem_mb          = R("create_aggregated_dt", "mem_mb"),
@@ -479,22 +711,63 @@ rule create_aggregated_dt:
         gres            = _gres("create_aggregated_dt"),
     shell:
         """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
         Rscript -e "rmarkdown::render('05-create-aggregated-dt.Rmd',
             output_file = normalizePath('{output.html}', mustWork = FALSE)
         )" > {log} 2>&1
         """
 
 
-# ── Step 06: correlation analysis ────────────────────────────────────────────
+# ── Step 05b: feature matrix PCA/UMAP sanity + embedding gallery ──────────────
+# Fixed to PRIMARY (not wildcarded), same pattern as correlation/ml_analysis —
+# 05b is per-filter (TRANSCRIPT_FILTER env) but only the primary filter is
+# wired into the DAG today. Per-(Event Type x Variability) plot files under
+# plot_dir/{feature_umap_pca,psi_embedding}/ are runtime-discovered from the
+# data (not statically enumerable) -- html report is the tracked output, same
+# treatment as irfinder_concordance's report vs its per-tree/per-metric plots.
+rule feature_pca_sanity:
+    input:
+        rmd            = "05b-feature-pca-sanity.Rmd",
+        preprocessing  = "05zz-feature-preprocessing.R",
+        aggregated_dt  = f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
+    output:
+        html = f"reports/05b-feature-pca-sanity_{PRIMARY}.html",
+    log: f"logs/05b_feature_pca_sanity_{PRIMARY}.log"
+    threads: R("feature_pca_sanity", "threads")
+    resources:
+        mem_mb          = R("feature_pca_sanity", "mem_mb"),
+        runtime         = R("feature_pca_sanity", "runtime"),
+        slurm_partition = _partition("feature_pca_sanity"),
+        slurm_extra     = _extra("feature_pca_sanity"),
+        qos             = _qos("feature_pca_sanity"),
+        gres            = _gres("feature_pca_sanity"),
+    shell:
+        f"""
+        TRANSCRIPT_FILTER={PRIMARY} \\
+        Rscript -e "rmarkdown::render('05b-feature-pca-sanity.Rmd',
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
+        """
+
+
+# ── Step 06: correlation analysis ─────────────────────────────────────────────
+# Fixed to PRIMARY (not wildcarded), same pattern as ml_analysis — 06-correlation.Rmd
+# is per-filter (TRANSCRIPT_FILTER env) but only the primary filter's correlation is
+# wired into the DAG today.
 rule correlation:
     input:
-        aggregated_dt = "processed_data/aggregated_dt_filtered.csv.gz",
+        rmd = "06-correlation.Rmd",
+        # shared preprocessing helper source()d by 06 — declare so edits to it
+        # trigger a correlation rerun (the render shell string is opaque to
+        # Snakemake's code trigger). Same helper feeds 05b (not a rule; 05z deprecated).
+        preprocessing = "05zz-feature-preprocessing.R",
+        aggregated_dt = f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
         file_table    = "processed_data/file_table.csv.gz",
     output:
-        corr_raw     = "processed_data/correlation_intrinsic.csv.gz",
-        corr_preproc = "processed_data/correlation_intrinsic_preproc.csv.gz",
-        html         = "reports/06-correlation.html",
-    log: "logs/06_correlation.log"
+        corr_raw     = f"processed_data/correlation_intrinsic_{PRIMARY}.csv.gz",
+        corr_preproc = f"processed_data/correlation_intrinsic_preproc_{PRIMARY}.csv.gz",
+        html         = f"reports/06-correlation_{PRIMARY}.html",
+    log: f"logs/06_correlation_{PRIMARY}.log"
     threads: R("correlation", "threads")
     resources:
         mem_mb          = R("correlation", "mem_mb"),
@@ -504,17 +777,19 @@ rule correlation:
         qos             = _qos("correlation"),
         gres            = _gres("correlation"),
     shell:
-        """
+        f"""
+        TRANSCRIPT_FILTER={PRIMARY} \\
         Rscript -e "rmarkdown::render('06-correlation.Rmd',
-            output_file = normalizePath('{output.html}', mustWork = FALSE)
-        )" > {log} 2>&1
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
         """
 
 
 # ── Step 08: splicing_ml global models ────────────────────────────────────────
 rule splicing_ml:
     input:
-        data = "processed_data/aggregated_dt_filtered.csv.gz",
+        src  = SPLICING_ML_SRC,
+        data = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
     output:
         pkl  = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.pkl.gz",
         json = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.json.gz",
@@ -547,9 +822,17 @@ rule splicing_ml:
 # ── Step 09-1: event-specific glmnet models ───────────────────────────────────
 rule event_models:
     input:
-        aggregated_dt    = "processed_data/aggregated_dt_filtered.csv.gz",
-        keep_rows_manual = "processed_data/keep_rows_manual.rds",
-        sample_cols      = "processed_data/sample_cols.rds",
+        script           = "09-1-ml-local.R",
+        local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
+        aggregated_dt    = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        keep_rows_manual = "processed_data/keep_rows_manual_{transcript_filter}.rds",
+        sample_cols      = "processed_data/sample_cols_{transcript_filter}.rds",
+        event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        psi_long_dt      = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
+        event_gr         = "processed_data/event_gr_{transcript_filter}.rds",
+        active_chromhmm  = "processed_data/activeChromHMM_{transcript_filter}.rds",
+        chromhmm_hits    = "processed_data/chromhmm_hits_{transcript_filter}.rds",
+        wgbs             = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
         file_table       = "processed_data/file_table.csv.gz",
     output:
         session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
@@ -573,9 +856,11 @@ rule event_models:
 # ── Step 09-2: ML analysis report ─────────────────────────────────────────────
 rule ml_analysis:
     input:
-        aggregated_dt = "processed_data/aggregated_dt_filtered.csv.gz",
-        session       = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
-        event_models  = f"processed_data/event_models/{PRIMARY}/.done",
+        aggregated_dt   = f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
+        session         = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
+        active_chromhmm = f"processed_data/activeChromHMM_{PRIMARY}.rds",
+        event_models    = f"processed_data/event_models/{PRIMARY}/.done",
+        rmd             = "09-2-ml-local-new.Rmd",
         # global model results (all configs for primary filter)
         splicing_ml = [
             f"splicing_ml/output/{et}_{PRIMARY}_{var}_{gc}/splicing_ml_results_classification.pkl.gz"
@@ -593,23 +878,28 @@ rule ml_analysis:
         qos             = _qos("analysis"),
         gres            = _gres("analysis"),
     shell:
-        """
+        f"""
+        TRANSCRIPT_FILTER={PRIMARY} \\
         Rscript -e "rmarkdown::render('09-2-ml-local-new.Rmd',
-            output_file = normalizePath('{output.html}', mustWork = FALSE)
-        )" > {log} 2>&1
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
         """
 
 
 # ── Step 10: experimental events ──────────────────────────────────────────────
 rule experimental_events:
     input:
-        aggregated_dt = "processed_data/aggregated_dt_filtered.csv.gz",
-        sample_cols   = "processed_data/sample_cols.rds",
-        session       = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
-        event_models  = f"processed_data/event_models/{PRIMARY}/.done",
+        rmd = "10-experimental-events.Rmd",
+        aggregated_dt         = f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
+        event_annotations_dt  = f"processed_data/event_annotations_dt_{PRIMARY}.csv.gz",
+        active_chromhmm       = f"processed_data/activeChromHMM_{PRIMARY}.rds",
+        event_gr              = f"processed_data/event_gr_{PRIMARY}.rds",
+        chromhmm_hits         = f"processed_data/chromhmm_hits_{PRIMARY}.rds",
+        keep_rows_manual      = f"processed_data/keep_rows_manual_{PRIMARY}.rds",
+        event_models          = f"processed_data/event_models/{PRIMARY}/.done",
     output:
-        html = "reports/10-experimental-events.html",
-    log: "logs/10_experimental_events.log"
+        html = f"reports/10-experimental-events_{PRIMARY}.html",
+    log: f"logs/10_experimental_events_{PRIMARY}.log"
     threads: R("analysis", "threads")
     resources:
         mem_mb          = R("analysis", "mem_mb"),
@@ -619,10 +909,11 @@ rule experimental_events:
         qos             = _qos("analysis"),
         gres            = _gres("analysis"),
     shell:
-        """
+        f"""
+        TRANSCRIPT_FILTER={PRIMARY} \\
         Rscript -e "rmarkdown::render('10-experimental-events.Rmd',
-            output_file = normalizePath('{output.html}', mustWork = FALSE)
-        )" > {log} 2>&1
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
         """
 
 
@@ -630,9 +921,9 @@ rule experimental_events:
 rule clean:
     shell:
         """
-        rm -f processed_data/aggregated_dt_filtered.csv.gz
-        rm -f processed_data/correlation_intrinsic.csv.gz
-        rm -f processed_data/correlation_intrinsic_preproc.csv.gz
+        rm -f processed_data/aggregated_dt_filtered_*.csv.gz
+        rm -f processed_data/correlation_intrinsic_*.csv.gz
+        rm -f processed_data/correlation_intrinsic_preproc_*.csv.gz
         rm -rf processed_data/event_models/*/
         rm -rf processed_data/session_09_1_ml_local_*.rds
         rm -rf reports/

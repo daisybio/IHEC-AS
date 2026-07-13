@@ -40,6 +40,45 @@ def _model_outputs_psi_scale(estimator: Any) -> bool:
     return isinstance(model, BetaRegressor)
 
 
+def _compute_xgb_shap(
+    best_estimator: Pipeline,
+    x_test: pd.DataFrame,
+    verbose: bool,
+) -> dict[str, Any] | None:
+    """Return per-test-sample SHAP values for an XGBoost outer-fold model.
+
+    Only applies to XGB (detected via the sklearn API's ``get_booster``
+    method) — other model types return None. Uses ``best_estimator`` (the
+    tuned pre-calibration Pipeline), never the Platt-calibrated wrapper:
+    TreeExplainer needs the raw booster, not ``CalibratedClassifierCV``.
+    """
+    if not isinstance(best_estimator, Pipeline) or "model" not in best_estimator.named_steps:
+        return None
+    model = best_estimator.named_steps["model"]
+    if not hasattr(model, "get_booster"):
+        return None
+
+    try:
+        import shap
+
+        prep = best_estimator.named_steps["prep"]
+        x_test_t = prep.transform(x_test)
+        feature_names = (
+            list(prep.get_feature_names_out())
+            if hasattr(prep, "get_feature_names_out")
+            else None
+        )
+        explainer = shap.TreeExplainer(model)
+        shap_values = np.asarray(explainer.shap_values(x_test_t))
+        return {"shap_values": shap_values, "feature_names": feature_names}
+    except Exception as exc:
+        compact = (
+            str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+        )
+        vlog(verbose, f"SHAP computation failed, skipping: {compact}", level="info")
+        return None
+
+
 def tune_threshold_balanced_accuracy(
     estimator: Pipeline,
     x_train: pd.DataFrame,
@@ -97,12 +136,19 @@ def _eval_classification(
     calibrate: bool,
     tune_threshold: bool,
     verbose: bool,
+    calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a classifier on one outer fold.
 
     Optionally tunes the decision threshold on inner validation predictions
     (never on outer test data), optionally calibrates probabilities with Platt
     scaling, and returns all classification metrics.
+
+    calibration_holdout, when provided (XGB only — see
+    ``_fit_tree_early_stopping``'s ``reserve_calibration_holdout``), is a
+    (X, y) slice the fitted estimator has never seen; calibration then uses
+    ``cv="prefit"`` on that slice instead of ``cv=inner_splits``, which would
+    otherwise reuse the exact folds that already selected the hyperparameters.
     """
     if tune_threshold:
         threshold = tune_threshold_balanced_accuracy(
@@ -114,14 +160,29 @@ def _eval_classification(
         vlog(verbose, f"Threshold tuning disabled; threshold={threshold:.4f}")
 
     if calibrate:
-        # Fit Platt-scaled calibration using the inner splits as CV folds.
-        calibrated = CalibratedClassifierCV(
-            estimator=best_estimator,
-            method="sigmoid",
-            cv=inner_splits,
-            n_jobs=max_cores,
-        )
-        calibrated.fit(x_train, y_train)
+        if calibration_holdout is not None:
+            # Leakage-free path (XGB): calibrate on the ES-val slice the
+            # fitted estimator never trained on, instead of cv=inner_splits
+            # (which would reuse the folds that already picked the HPs).
+            # sklearn >=1.6 removed cv="prefit"; FrozenEstimator is the
+            # replacement for wrapping an already-fitted estimator.
+            from sklearn.frozen import FrozenEstimator
+
+            x_cal, y_cal = calibration_holdout
+            calibrated = CalibratedClassifierCV(
+                estimator=FrozenEstimator(best_estimator),
+                method="sigmoid",
+            )
+            calibrated.fit(x_cal, y_cal)
+        else:
+            # Fit Platt-scaled calibration using the inner splits as CV folds.
+            calibrated = CalibratedClassifierCV(
+                estimator=best_estimator,
+                method="sigmoid",
+                cv=inner_splits,
+                n_jobs=max_cores,
+            )
+            calibrated.fit(x_train, y_train)
         _set_xgb_cpu_predictor_for_inference(calibrated)
         y_prob = calibrated.predict_proba(x_test)[:, 1]
         final_estimator = calibrated
@@ -141,6 +202,7 @@ def _eval_classification(
         "y_true": y_test,
         "y_pred": y_prob,
         "estimator": final_estimator,
+        "shap": _compute_xgb_shap(best_estimator, x_test, verbose),
     }
 
 
@@ -215,6 +277,7 @@ def _eval_regression(
         "y_pred_logit": y_pred_logit,
         "estimator": best_estimator,
         "psi_bin_metrics": psi_bin_metrics,
+        "shap": _compute_xgb_shap(best_estimator, x_test, verbose),
     }
 
 
@@ -232,12 +295,14 @@ def evaluate_outer_fold(
     verbose: bool = False,
     psi_low: float = 0.2,
     psi_high: float = 0.8,
+    calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a tuned estimator on one outer fold.
 
     Dispatches to ``_eval_classification`` or ``_eval_regression`` based on
     task. Both return a dict with keys: scores, threshold, y_true, y_pred,
-    estimator (plus y_true_logit / y_pred_logit for regression).
+    estimator, shap (plus y_true_logit / y_pred_logit for regression). ``shap``
+    is a ``{"shap_values", "feature_names"}`` dict for XGB models, else None.
 
     Parameters
     ----------
@@ -247,6 +312,10 @@ def evaluate_outer_fold(
     tune_threshold
         Whether to search for the optimal decision threshold on inner-fold
         predictions.  When False, threshold is fixed at 0.5.
+    calibration_holdout
+        Optional (X, y) slice unseen by ``best_estimator`` (XGB only, from
+        ``tuning_info["calibration_holdout"]``); when present, calibration
+        uses ``cv="prefit"`` on it instead of ``cv=inner_splits``.
     """
     if task == "classification":
         return _eval_classification(
@@ -260,6 +329,7 @@ def evaluate_outer_fold(
             calibrate=calibrate,
             tune_threshold=tune_threshold,
             verbose=verbose,
+            calibration_holdout=calibration_holdout,
         )
     return _eval_regression(
         best_estimator=best_estimator,

@@ -1342,7 +1342,8 @@ def _fit_tree_early_stopping(
     y_train: np.ndarray,
     inner_cv: list[tuple[np.ndarray, np.ndarray]],
     verbose: bool,
-) -> tuple[Pipeline, bool, int | None]:
+    reserve_calibration_holdout: bool = False,
+) -> tuple[Pipeline, bool, int | None, tuple[pd.DataFrame, np.ndarray] | None]:
     """Post-search refit with early stopping on final model (XGB and MLP only).
 
     Uses the globally smallest inner-fold val as the ES hold-out, then trains
@@ -1361,7 +1362,17 @@ def _fit_tree_early_stopping(
     For MLP: Stores validation data in _es_pp_val_context for the model to read.
     For RF: Standard fit (no early stopping available for random forests).
 
-    Returns (pipe, applied, optimal_n).
+    reserve_calibration_holdout (XGB only): instead of refitting the final
+    model on ALL outer-train data, keep the ES-val partition held out and
+    return it (raw, pre-preprocessing) as the 4th tuple element so the caller
+    can fit ``CalibratedClassifierCV(..., cv="prefit")`` on a slice that was
+    never seen by the fitted model — unlike calibrating via ``cv=inner_splits``,
+    which reuses the exact folds that already selected the hyperparameters.
+    Costs the final model that one held-out slice of training data; ignored
+    for model_name != "xgb" (no other model routes through this reservation
+    path today).
+
+    Returns (pipe, applied, optimal_n, calibration_holdout).
     """
     try:
         prep_fitted = fitted_pipe.named_steps["prep"]
@@ -1454,23 +1465,36 @@ def _fit_tree_early_stopping(
             model_final.set_params(n_estimators=optimal_n, early_stopping_rounds=None)
         elif optimal_n is not None and model_name == "mlp":
             model_final.set_params(max_epochs=optimal_n, restore_best_weights=False)
-        X_all_train_t = prep_fitted.transform(x_train)
-        model_final.fit(X_all_train_t, y_train)
+
+        calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
+        if reserve_calibration_holdout and model_name == "xgb":
+            # Keep the ES-val slice held out instead of folding it back in, so
+            # it can serve as a leakage-free cv="prefit" calibration set below.
+            model_final.fit(X_final_train_t, y_final_train)
+            calibration_holdout = (x_train.iloc[es_val_idx], y_final_val)
+        else:
+            X_all_train_t = prep_fitted.transform(x_train)
+            model_final.fit(X_all_train_t, y_train)
 
         pipe_final = Pipeline([("prep", prep_fitted), ("model", model_final)])
 
         vlog(
             verbose,
             f"{model_name.upper()} post-search ES: optimal_n={optimal_n} "
-            f"(final-fold validation)",
+            f"(final-fold validation)"
+            + (
+                ", calibration_holdout reserved"
+                if calibration_holdout is not None
+                else ""
+            ),
         )
-        return pipe_final, True, optimal_n
+        return pipe_final, True, optimal_n, calibration_holdout
 
     except Exception as exc:
         vlog(
             verbose, f"{model_name.upper()} post-search ES failed ({exc})", level="info"
         )
-        return fitted_pipe, False, None
+        return fitted_pipe, False, None, None
 
 
 def _log_early_stopping_fold_sizes(
@@ -1516,6 +1540,7 @@ def _fit_grid_search(
     cuml_use_gpu: bool | None,
     verbose: bool,
     debug_grid_progress: bool,
+    calibrate: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit all non-ElasticNet, non-Beta models via GridSearchCV.
 
@@ -1524,6 +1549,8 @@ def _fit_grid_search(
     - GPU retry: on CUDA failure, automatically falls back to CPU.
     - XGBoost post-search refit: after tuning with a reduced n_estimators
       budget, the final estimator is re-trained with a larger tree budget.
+    - calibrate=True (XGB only): reserves the ES-val slice as a dedicated
+      calibration holdout instead of folding it into the final refit.
     """
     # Limit concurrent GPU jobs to avoid VRAM contention.
     # For RF, split cores between search-level and tree-level parallelism:
@@ -1663,15 +1690,19 @@ def _fit_grid_search(
     # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
+    calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
     if model_name in {"xgb", "mlp"}:
-        pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
-            model_name=model_name,
-            task=task,
-            fitted_pipe=search.best_estimator_,
-            x_train=x_train,
-            y_train=y_train,
-            inner_cv=inner_cv,
-            verbose=verbose,
+        pipe_es, tree_es_applied, tree_es_n_estimators, calibration_holdout = (
+            _fit_tree_early_stopping(
+                model_name=model_name,
+                task=task,
+                fitted_pipe=search.best_estimator_,
+                x_train=x_train,
+                y_train=y_train,
+                inner_cv=inner_cv,
+                verbose=verbose,
+                reserve_calibration_holdout=calibrate and model_name == "xgb",
+            )
         )
         search.best_estimator_ = pipe_es
 
@@ -1703,6 +1734,8 @@ def _fit_grid_search(
     if model_name in {"xgb", "mlp", "rf"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
+    if calibration_holdout is not None:
+        tuning_info["calibration_holdout"] = calibration_holdout
 
     try:
         cv_res = search.cv_results_
@@ -1753,11 +1786,14 @@ def _fit_optuna_search(
     cuml_use_gpu: bool | None,
     verbose: bool,
     optuna_wandb_callback: bool = False,
+    calibrate: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit a model via Optuna Bayesian optimisation (TPE or CMA-ES).
 
     Uses ``OptunaSearchCV`` as a drop-in for GridSearchCV.  GPU retry logic
     and XGBoost post-search refit are preserved from ``_fit_grid_search``.
+    calibrate=True (XGB only): reserves the ES-val slice as a dedicated
+    calibration holdout instead of folding it into the final refit.
     """
     try:
         import optuna
@@ -2011,15 +2047,19 @@ def _fit_optuna_search(
     # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
+    calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
     if model_name in {"xgb", "mlp"}:
-        pipe_es, tree_es_applied, tree_es_n_estimators = _fit_tree_early_stopping(
-            model_name=model_name,
-            task=task,
-            fitted_pipe=search.best_estimator_,
-            x_train=x_train,
-            y_train=y_train,
-            inner_cv=inner_cv,
-            verbose=verbose,
+        pipe_es, tree_es_applied, tree_es_n_estimators, calibration_holdout = (
+            _fit_tree_early_stopping(
+                model_name=model_name,
+                task=task,
+                fitted_pipe=search.best_estimator_,
+                x_train=x_train,
+                y_train=y_train,
+                inner_cv=inner_cv,
+                verbose=verbose,
+                reserve_calibration_holdout=calibrate and model_name == "xgb",
+            )
         )
         search.best_estimator_ = pipe_es
 
@@ -2041,6 +2081,8 @@ def _fit_optuna_search(
     if model_name in {"xgb", "mlp", "rf"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
+    if calibration_holdout is not None:
+        tuning_info["calibration_holdout"] = calibration_holdout
 
     try:
         cv_res = search.cv_results_
@@ -2102,6 +2144,7 @@ def fit_best_estimator(
     optuna_n_startup_trials: int = 5,
     optuna_multivariate: bool = True,
     optuna_wandb_callback: bool = False,
+    calibrate: bool = False,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Tune hyperparameters via grouped inner CV and return the best estimator.
 
@@ -2109,6 +2152,10 @@ def fit_best_estimator(
     - "elasticnet": ElasticNetCV / LogisticRegressionCV self-select alpha (C) and l1_ratio.
     - "beta": no hyperparameters; cross_validate + refit.
     - All others: GridSearchCV with grid or LHS candidates.
+
+    calibrate (XGB only, via GridSearchCV/Optuna paths): reserves the ES-val
+    slice as a dedicated leakage-free calibration holdout — see
+    ``_fit_tree_early_stopping``'s ``reserve_calibration_holdout``.
 
     Returns
     -------
@@ -2190,6 +2237,7 @@ def fit_best_estimator(
             cuml_use_gpu=cuml_use_gpu,
             verbose=verbose,
             optuna_wandb_callback=optuna_wandb_callback,
+            calibrate=calibrate,
         )
 
     return _fit_grid_search(
@@ -2207,4 +2255,5 @@ def fit_best_estimator(
         cuml_use_gpu=cuml_use_gpu,
         verbose=verbose,
         debug_grid_progress=debug_grid_progress,
+        calibrate=calibrate,
     )

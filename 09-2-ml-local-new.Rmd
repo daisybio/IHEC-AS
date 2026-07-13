@@ -20,34 +20,43 @@ library(pbmcapply)
 ```
 
 ```{r load-session}
-# Load session objects produced by 09-1-ml-local.R
-sess <- readRDS("processed_data/session_09_1_ml_local.rds")
+# Per-filter (matches 09-1 and everything from 02-2 on): one transcript_filter
+# per invocation, chosen by TRANSCRIPT_FILTER (standalone falls back to the
+# primary filter).
+tf <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+
+# Load session objects produced by 09-1-ml-local.R (same tf)
+sess <- readRDS(sprintf("processed_data/session_09_1_ml_local_%s.rds", tf))
 event_dt <- sess$event_dt # trimmed: ID, Event Type, seqnames, Variability, transcript_filter
 keep_rows <- sess$keep_rows_manual
 rm(sess)
 gc()
 
-
-# load aggregating.rda and aggregated_dt
-load("processed_data/aggregating.rda", verbose = TRUE)
+# `aggregating.rda` is GONE (removed by the per-filter refactor). aggregated_dt
+# is per-filter; activeChromHMM (only other object 09-2 needs from that old
+# workspace — see the chromhmm-region-annotation chunk below) is now persisted
+# directly by 03 (same run as keep_rows_manual, so index-consistent).
 aggregated_dt <- fread(
-  "processed_data/aggregated_dt_filtered.csv.gz",
+  sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf),
   stringsAsFactors = TRUE
 )
+activeChromHMM <- readRDS(sprintf("processed_data/activeChromHMM_%s.rds", tf))
 
-# Restrict to biotype_filtered events only
-keep_rows <- keep_rows[
-  keep_rows %in% event_dt[transcript_filter == "biotype_filtered", ID]
-]
+# NB: no "restrict to biotype_filtered" subset needed anymore — event_dt (from
+# 09-1's session, built off event_annotations_dt_{tf}) and aggregated_dt are
+# already scoped to exactly `tf`.
 ```
 
 ## Hyperparameter diagnostics
 
 ```{r load-data, cache = TRUE}
-event_dir <- file.path("processed_data", "event_models")
+event_dir <- file.path("processed_data", "event_models", tf)
 
-plot_dir_ev <- file.path(plot_dir, "event_models")
-dir.create(plot_dir_ev, showWarnings = FALSE)
+plot_dir_ev <- file.path(plot_dir, "event_models", tf)
+dir.create(plot_dir_ev, showWarnings = FALSE, recursive = TRUE)
 
 # Helper: aggregate per-event CSVs saved by worker
 read_event_csvs <- function(pattern) {
@@ -1123,7 +1132,7 @@ ggsave(file.path(plot_dir_ev, "lambda_switching.pdf"), width = 8, height = 4)
 Which specific histone marks drive prediction in Epigenetic Only models? Comparing real vs rotated mark usage tests whether the mark composition reflects genuine epigenetic–splicing associations or chance feature selection. Events where the same marks are selected for both real and rotated PSI are less convincing.
 
 ```{r plot-mark-counts}
-# NOTE: activeChromHMM must be loaded in the session (defined in earlier notebooks 01-08).
+# activeChromHMM loaded per-filter in the load-session chunk above.
 # Research question: which epigenetic marks are robustly selected in Epigenetic Only models?
 # Does mark usage differ between real PSI and rotated controls?
 # Similar mark profiles for real and rotated would imply chance selection.

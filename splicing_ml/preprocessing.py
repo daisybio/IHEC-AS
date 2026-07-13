@@ -36,11 +36,24 @@ _LOG_COLUMN_PATTERNS: tuple[str, ...] = ("width", "distance")
 
 
 def detect_gene_expression_column(df: pd.DataFrame) -> str | None:
-    """Infer likely gene-expression column from available numeric columns."""
+    """Infer likely gene-expression column from available numeric columns.
+
+    §4.12b routing: `05-create-aggregated-dt.Rmd` emits BOTH
+    `gene_expression_getmm` (cross-gene comparable, pooled route — what
+    splicing_ml uses) and `gene_expression_vst` (event-specific route, used by
+    06/07/09-1 instead). Both match the old fuzzy `contains_gene_expr` fallback
+    below (("gene" in c) and ("expr" in c)) and it just returned whichever
+    happened to sort first in `df.columns` — non-deterministic w.r.t. which of
+    the two is picked, and could silently pick vst (wrong for the pooled route:
+    vst can be negative, breaking the log1p classification in
+    `classify_numeric_columns`). Checking `gene_expression_getmm` exactly,
+    before the fuzzy fallback, makes this deterministic.
+    """
     cols = list(df.columns)
     lower_to_original = {c.lower(): c for c in cols}
 
     preferred_exact = [
+        "gene_expression_getmm",
         "gene_expression",
         "gene_expr",
         "expression",
@@ -107,7 +120,14 @@ def add_protocol_expression_interactions(
     protocol_series = out["protocol"].astype("string").fillna("__MISSING__")
     expr = pd.to_numeric(out[expr_col], errors="coerce").fillna(0.0).astype(float)
 
-    protocol_dummies = pd.get_dummies(protocol_series, prefix="protocol", dtype=float)
+    # drop_first: computed once globally over the whole dataset (before any CV
+    # split), so unlike the per-fold OneHotEncoder in _make_one_hot_encoder(),
+    # there's no fold-schema-drift risk here — only the collinearity of
+    # building both protocol dummies (they sum to 1), which fed straight into
+    # both interaction columns and made their coefficients non-identifiable.
+    protocol_dummies = pd.get_dummies(
+        protocol_series, prefix="protocol", dtype=float, drop_first=True
+    )
     interactions = protocol_dummies.mul(expr, axis=0)
     interactions.columns = [f"{c}__x__{expr_col}" for c in interactions.columns]
 
@@ -259,20 +279,27 @@ def _make_one_hot_encoder() -> OneHotEncoder:
 
     Uses sparse_output=False to ensure consistent feature counts across different
     data subsets (e.g., train/test folds with different category distributions).
+
+    drop="first" (§2.5b fix): categories_ is fixed at fit time and
+    handle_unknown="ignore" already guarantees fold-shape consistency on its
+    own (unseen categories at transform time become all-zero rows, not new
+    columns) — drop has no bearing on that. Without it, a 2-level column like
+    `protocol` produced BOTH dummy columns, which are perfectly anti-correlated
+    (r=1.00 co-occurrence), inflating/splitting feature importance between them.
     """
     try:
         # sparse_output=False ensures consistent dense output shape across folds
         return OneHotEncoder(
             handle_unknown="ignore",
             sparse_output=False,
-            drop=None,  # Keep all categories to prevent shape variations
+            drop="first",
         )
     except TypeError:
         # Older sklearn versions use sparse=True/False instead of sparse_output
         return OneHotEncoder(
             handle_unknown="ignore",
             sparse=False,
-            drop=None,
+            drop="first",
         )
 
 

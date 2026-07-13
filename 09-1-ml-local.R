@@ -1,12 +1,40 @@
 # =============================================================================
 # Session data and config
 # =============================================================================
-load("processed_data/aggregating.rda", verbose = TRUE)
+# Per-filter (matches 02-2 .. 05): one transcript_filter per invocation, chosen
+# by TRANSCRIPT_FILTER (Snakemake `event_models` rule sets it; standalone falls
+# back to the primary filter). `aggregating.rda` is GONE (removed by the
+# per-filter refactor); every object it used to supply is now read explicitly
+# from the per-filter artifacts 02-3/03/05 write.
+tf <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
 
 aggregated_dt <- fread(
-  "processed_data/aggregated_dt_filtered.csv.gz",
+  sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf),
   stringsAsFactors = TRUE
 )
+# event-level metadata (ID, Event Type, seqnames, Variability, transcript_filter,
+# is_autosome, cluster_representative_annotated, ...) — replaces the old
+# aggregating.rda wide event_dt for everything EXCEPT per-sample PSI columns
+# (those now live in psi_long_dt, long format, read below).
+event_annotations_dt <- fread(
+  sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf)
+)
+psi_long_dt <- fread(sprintf("processed_data/psi_long_dt_%s.csv.gz", tf))
+keep_rows_manual <- readRDS(
+  sprintf("processed_data/keep_rows_manual_%s.rds", tf)
+)
+sample_cols <- readRDS(sprintf("processed_data/sample_cols_%s.rds", tf))
+# chromHMM-vicinity objects (09-1's own feature engineering, separate from the
+# pooled aggregated_dt/splicing_ml route) — see 03's saveRDS comment for why
+# these 3 must come from the SAME 03 run (internal index consistency: event_gr
+# row position == ID; chromhmm_hits' from() indexes into
+# event_gr[keep_rows_manual] positions).
+event_gr <- readRDS(sprintf("processed_data/event_gr_%s.rds", tf))
+activeChromHMM <- readRDS(sprintf("processed_data/activeChromHMM_%s.rds", tf))
+chromhmm_hits <- readRDS(sprintf("processed_data/chromhmm_hits_%s.rds", tf))
 
 response <- "PSI"
 grouping_col <- "ontology" # CV fold grouping column
@@ -14,12 +42,15 @@ nfolds <- 5L # number of CV folds = ontology supergroups
 nrotations <- 10L # negative-control rotations per event
 feature_sets <- c("long", "short", "local") # explanatory-set names and dir suffixes
 
-source("07-ml-event-glmnet-tidymodels.R")
+source("09zz-ml-event-glmnet-tidymodels.R")
 
 # =============================================================================
 # Output directory
 # =============================================================================
-event_dir <- file.path("processed_data", "event_models")
+# Per-filter: matches the Snakemake event_models rule's declared
+# processed_data/event_models/{transcript_filter}/.done sentinel.
+event_dir <- file.path("processed_data", "event_models", tf)
+dir.create(event_dir, recursive = TRUE, showWarnings = FALSE)
 # setNames(
 #   file.path("processed_data", paste0("event_models_", feature_sets)),
 #   feature_sets
@@ -55,34 +86,39 @@ already_computed_ids <- as.integer(
 # =============================================================================
 # Load shared data needed for feature table construction
 # =============================================================================
+# file_table.csv.gz (cohort-wide, unchanged) has NO local_file column itself —
+# construct it the same way 05-create-aggregated-dt.Rmd does, pointing at the
+# per-filter ChIP aggregation output (whose window set — aggregateOver_{tf}.bed
+# — already includes activeChromHMM[chromhmm_in_vicinity], so these .tab.gz
+# files carry the chromhmm_* rows this script needs, same files 05 uses).
 file_table <- fread("processed_data/file_table.csv.gz")
+chip_agg_dir <- file.path(sample_dt_dir, sprintf("chip_agg_%s", tf))
+file_table[,
+  local_file := file.path(chip_agg_dir, paste0(basename(file_path), ".tab.gz"))
+]
 setkey(file_table, "local_file")
 
-# WGBS chromHMM coverage — cached as .fst for fast re-read
-wgbs_chromhmm_file <- file.path(sample_dt_dir, "WGBS_chromhmm.fst")
+# WGBS chromHMM coverage — cached as .fst for fast re-read (per-filter)
+wgbs_chromhmm_file <- file.path(sample_dt_dir, sprintf("WGBS_chromhmm_%s.fst", tf))
 if (file.exists(wgbs_chromhmm_file)) {
   wgbs_chromhmm <- fst::read_fst(wgbs_chromhmm_file, as.data.table = TRUE)
 } else {
-  col_idx <- c(2L, 3L, 4L, 5L)
+  # WGBS_agg_{tf}.csv.gz columns (fixed order): ID, ihec, score, n, name.
+  # col 1 (ID) dropped, cols 2:5 kept, renamed to IHEC (capital — required by
+  # the CJ(name=..., IHEC=...) join in the Phase 1 feature-table chunk below;
+  # the on-disk header uses lowercase "ihec", unlike the old bare WGBS_agg.csv.gz
+  # this replaced). egrep on a header-bearing stream drops the header line (no
+  # "chromhmm_" text in it), so select-by-name isn't possible — select by
+  # position + hardcode names instead of the old separate header-fetch dance.
   wgbs_chromhmm <- fread(
     cmd = sprintf(
       "zcat %s | egrep 'chromhmm_'",
-      file.path(sample_dt_dir, "WGBS_agg.csv.gz")
+      file.path(sample_dt_dir, sprintf("WGBS_agg_%s.csv.gz", tf))
     ),
-    select = col_idx,
+    select = c(2L, 3L, 4L, 5L),
+    col.names = c("IHEC", "score", "n", "name"),
     stringsAsFactors = TRUE
   )
-  col_names <- strsplit(
-    system(
-      sprintf(
-        "zcat %s | head -n 1",
-        file.path(sample_dt_dir, "WGBS_agg.csv.gz")
-      ),
-      intern = TRUE
-    ),
-    ","
-  )[[1]]
-  setnames(wgbs_chromhmm, col_names[col_idx])
   wgbs_chromhmm <- melt(
     wgbs_chromhmm,
     id.vars = c("IHEC", "name"),
@@ -101,12 +137,18 @@ setkey(wgbs_chromhmm, name, IHEC)
 # Determine events to process
 # =============================================================================
 # Events in aggregated_dt that have sufficient samples and non-zero PSI variance.
-# Sanity check: events in keep_rows_manual but not aggregated_dt should have no
-# sample-level data (they were filtered out upstream for a legitimate reason).
-stopifnot(all(is.na(event_dt[
-  ID %in% setdiff(keep_rows_manual, aggregated_dt[, unique(ID)]),
-  ..sample_cols
-])))
+# Sanity check: events in keep_rows_manual but not aggregated_dt should have
+# INSUFFICIENT sample-level data (< 2 non-NA PSI samples), not necessarily ZERO
+# — 03's keep_rows_manual (is_autosome & cluster_representative_annotated) does
+# not itself require >=2 non-NA samples, but 05 additionally drops events with
+# unset Variability (== NA sd_psi == <2 non-NA PSI samples after the 02-3
+# read-coverage/VST masking; see 05-create-aggregated-dt.Rmd.md's NA-Variability
+# note). A dropped event can have exactly 1 non-NA sample (sd undefined, not
+# all-NA), so the old all-NA stopifnot no longer holds — relaxed to <2 here,
+# checked against psi_long_dt (same 02-3 masking as aggregated_dt's source).
+.dropped_ids <- setdiff(keep_rows_manual, aggregated_dt[, unique(ID)])
+.n_non_na <- psi_long_dt[ID %in% .dropped_ids & !is.na(psi), .N, by = ID]
+stopifnot(all(.n_non_na$N < 2L))
 
 ids_to_build <- aggregated_dt[, unique(ID)]
 ids_to_build <- ids_to_build[
@@ -120,11 +162,10 @@ ids_to_build <- ids_to_build[
       ID
     ]
 ]
-# first only make biotype_filtered ids
-ids_to_build <- ids_to_build[
-  ids_to_build %in% event_dt[transcript_filter == "biotype_filtered", ID]
-]
-event_dt[ID %in% ids_to_build, table(transcript_filter, `Event Type`)]
+# NB: no "first only make biotype_filtered ids" subset needed anymore —
+# aggregated_dt is already scoped to exactly `tf` (per-filter architecture),
+# unlike the old combined-filters event_dt this line used to subset from.
+event_annotations_dt[ID %in% ids_to_build, table(transcript_filter, `Event Type`)]
 
 
 # PSI matrix (events × samples) used inside each SLURM job to select
@@ -144,7 +185,10 @@ ids_to_build <- setdiff(ids_to_build, already_computed_ids)
 # Build chip_matrix — rows = chromHMM regions, cols = ChIP-Seq files (cached)
 # =============================================================================
 # Pre-slicing the full matrix once avoids re-reading ~2,262 files per event.
-feature_table_dir <- file.path("processed_data", "event_feature_tables")
+feature_table_dir <- file.path(
+  "processed_data",
+  sprintf("event_feature_tables_%s", tf)
+)
 dir.create(feature_table_dir, showWarnings = FALSE)
 
 chip_files <- file_table[assay_type == "ChIP-Seq", unique(local_file)]
@@ -152,7 +196,10 @@ active_chrom_ids <- sort(unique(to(chromhmm_hits[
   from(chromhmm_hits) %in% which(keep_rows_manual %in% ids_to_build)
 ])))
 
-chip_matrix_cache <- file.path("processed_data", "chip_matrix.rds")
+chip_matrix_cache <- file.path(
+  "processed_data",
+  sprintf("chip_matrix_%s.rds", tf)
+)
 if (file.exists(chip_matrix_cache)) {
   chip_matrix <- readRDS(chip_matrix_cache)
 } else {
@@ -276,11 +323,17 @@ pbmcapply::pbmclapply(ids_to_build, function(id) {
 #   • session_rds                — psi_table + event_dt + hits objects (~300 MB)
 # aggregated_dt, chip_matrix, wgbs_chromhmm, file_table are NOT needed.
 
-session_rds <- file.path("processed_data", "session_09_1_ml_local.rds")
+session_rds <- file.path(
+  "processed_data",
+  sprintf("session_09_1_ml_local_%s.rds", tf)
+)
 saveRDS(
   list(
     psi_table = psi_table,
-    event_dt = event_dt[, .(
+    # 07 reads sess$event_dt with exactly these 5 columns (ID/Event
+    # Type/seqnames/Variability/transcript_filter) — event_annotations_dt has
+    # them all under the same names, so 07 itself needs no change here.
+    event_dt = event_annotations_dt[, .(
       ID,
       `Event Type`,
       seqnames,
@@ -309,11 +362,11 @@ dir.create(event_dir, showWarnings = FALSE)
 dir.create("event_glmnet_logs", showWarnings = FALSE)
 
 ids_file <- normalizePath(
-  file.path("processed_data", "event_glmnet_ids.txt"),
+  file.path("processed_data", sprintf("event_glmnet_ids_%s.txt", tf)),
   mustWork = FALSE
 )
 cfg_file <- normalizePath(
-  file.path("processed_data", "event_glmnet_cfg.rds"),
+  file.path("processed_data", sprintf("event_glmnet_cfg_%s.rds", tf)),
   mustWork = FALSE
 )
 writeLines(as.character(ids_to_build), ids_file)
@@ -345,7 +398,7 @@ if (n_local_test > 0L) {
       system2(
         "Rscript",
         args = c(
-          shQuote(normalizePath("07-ml-event-glmnet-tidymodels.R")),
+          shQuote(normalizePath("09zz-ml-event-glmnet-tidymodels.R")),
           shQuote(cfg_file),
           as.character(id),
           as.character(n_inner_cores)

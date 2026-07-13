@@ -1,23 +1,35 @@
 ---
-title: "Feature matrix PCA/UMAP sanity checks (§4.13g)"
+title: "Feature matrix PCA/UMAP sanity checks + embedding gallery (§4.13g)"
 output: html_document
 ---
 
 ```{r, setup}
 # §4.13g — quantitative sanity gate on the full feature matrix: does cell-type
-# identity (ontology) dominate, as expected (fingerprint confound); does
-# protocol or imputation status dominate any PC (would indicate a technical
-# artefact rather than biology).
+# identity (ontology) dominate, as expected (fingerprint confound); does a
+# technical factor -- protocol, imputation status, or cohort/project (batch) --
+# dominate any PC (would indicate an artefact rather than biology)?
 #
-# Reuses the same standardized-PCA/UMAP machinery as 05z-visualize-features.Rmd
-# (05zz-feature-preprocessing.R's preprocess_feature_matrix(mode="embedding"))
-# but is a pass/fail sanity notebook (04-2-chip-signal-sanity.Rmd convention:
-# append_sanity(), qc/sanity_summary.csv, WARN not stopifnot), not an
-# exploratory plot gallery -- 05z already covers the gallery use case.
+# GATES (append_sanity() -> qc/sanity_summary.csv; WARN, not stopifnot) run per
+# (Event Type × transcript_filter) stratum -- matching what 09-1-ml-local.R
+# models at. The confound question is tested UNBIASED via PC1-dominance:
+#   - pca_{protocol,project,imputation}_dominance : PC1 not driven by a confound
+#     (protocol/imputation via |cor|; multi-level project via eta^2)
+# Group silhouettes (ontology/protocol/project/imputed) are logged INFO only
+# (pca_silhouette_*) -- NOT gated relative to each other: silhouette is biased
+# toward few/large clusters, so a ~40-level ontology would always lose a race to
+# 2-level protocol regardless of biology. PC1-dominance is the unbiased test.
 #
-# All checks run per (Event Type, transcript_filter) stratum, not pooled and
-# not further split by Variability (unlike 05z) -- matches the stratification
-# level 04-2/05b use and what 09-1-ml-local.R models at.
+# GALLERY (feature-gallery chunk; plots only, not gates) is folded in from the
+# now-deprecated 05z-visualize-features.Rmd: PCA/UMAP per (Event Type ×
+# transcript_filter × Variability incl. "Both"), colored by ontology(palette)/
+# project/protocol/PSI/chromosome, plus top PC1/PC2 feature loadings.
+#
+# PSI (target) EMBEDDING (psi-embedding chunk): (A) samples in PSI-space
+# (pairwise-cor -> PCoA) with UNBIASED protocol |cor| / project eta^2 dominance
+# gates (RI protocol dominance expected -> INFO); (B) events in PSI-space.
+#
+# Shared standardized-PCA/UMAP machinery: 05zz-feature-preprocessing.R's
+# preprocess_feature_matrix(mode="embedding").
 library(cluster)
 library(uwot)
 library(rsvd)
@@ -27,31 +39,56 @@ set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
 sanity_csv <- "qc/sanity_summary.csv"
 append_sanity <- function(check_name, status, value, threshold, notes = "") {
-  fwrite(
-    data.table(
-      check_name = check_name,
-      status = status,
-      value = value,
-      threshold = threshold,
-      notes = notes
-    ),
-    sanity_csv,
-    append = TRUE
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
   )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
 }
 
 source("05zz-feature-preprocessing.R")
-aggregated_dt <- fread("processed_data/aggregated_dt_filtered.csv.gz")
+# Per-filter (matches 02-2 .. 05): one transcript_filter per invocation, chosen
+# by the TRANSCRIPT_FILTER env var (Snakemake would set it; standalone falls back
+# to the primary filter). The combined pre-per-filter file no longer exists.
+tf <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  unset = getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+aggregated_dt <- fread(sprintf(
+  "processed_data/aggregated_dt_filtered_%s.csv.gz",
+  tf
+))
 
 meta_cols <- c(
-  "ID", "IHEC", "uuid", "transcript_filter", "PSI",
-  "Event Type", "gene_id", "seqnames", "Variability",
-  "ontology", "project", "protocol"
+  "ID",
+  "IHEC",
+  "uuid",
+  "transcript_filter",
+  "PSI",
+  "Event Type",
+  "gene_id",
+  "seqnames",
+  "Variability",
+  "ontology",
+  "project",
+  "protocol"
 )
 feature_cols <- setdiff(names(aggregated_dt), meta_cols)
 
 # §4.13l's per-mark H3K*_source columns (observed/imputed) may not exist yet
-# if aggregated_dt_filtered.csv.gz predates that change -- degrade gracefully
+# if aggregated_dt_filtered_{tf}.csv.gz predates that change -- degrade gracefully
 # rather than error, and record that item 4 was skipped.
 source_cols <- grep("_source$", names(aggregated_dt), value = TRUE)
 has_imputed_info <- length(source_cols) > 0
@@ -59,26 +96,62 @@ if (!has_imputed_info) {
   message(
     "No *_source columns found in aggregated_dt -- imputation-dominance ",
     "check (item 4) will be skipped. Re-run 05-create-aggregated-dt.Rmd ",
-    "(§4.13l) and rebuild aggregated_dt_filtered.csv.gz to enable it."
+    "(§4.13l) and rebuild aggregated_dt_filtered_{tf}.csv.gz to enable it."
   )
 }
 
 strata <- unique(aggregated_dt[, .(`Event Type`, transcript_filter)])
 setorder(strata, `Event Type`, transcript_filter)
 
-N_PCS             <- 30
+N_PCS <- 30
 DOWNSAMPLE_TARGET <- 100000L
-SIL_SAMPLE_N      <- 3000L # silhouette is O(n^2) in memory/time; subsample further
-UMAP_NEIGHBORS    <- 30
-UMAP_MIN_DIST     <- 0.05
-UMAP_METRIC       <- "cosine"
+SIL_SAMPLE_N <- 3000L # silhouette is O(n^2) in memory/time; subsample further
+UMAP_NEIGHBORS <- 30
+UMAP_MIN_DIST <- 0.05
+UMAP_METRIC <- "cosine"
+
+# --- gallery constants (folded in from the deprecated 05z-visualize-features) --
+TOP_LOADINGS <- 20
+COMBINED_VARIABILITY_LABEL <- "Both"
+DOWNSAMPLE_SEED <- 123L
+DOWNSAMPLE_STRATA <- c("ontology", "project", "protocol")
+
+# deterministic per-combo seed so a given stratum always downsamples the same way
+combo_seed <- function(...) {
+  combo_txt <- paste(..., collapse = "|")
+  as.integer(
+    (sum(utf8ToInt(combo_txt)) + DOWNSAMPLE_SEED) %% .Machine$integer.max
+  )
+}
+
+# correlation ratio eta^2 of a continuous y across a categorical g (0..1):
+# the multi-level analogue of |cor| used for the 2-level protocol check, so
+# `project` (many cohorts) can be tested for PC1 dominance the same way.
+eta_sq <- function(y, g) {
+  g <- factor(g)
+  ok <- !is.na(y) & !is.na(g)
+  y <- y[ok]
+  g <- droplevels(g[ok])
+  if (nlevels(g) < 2L || length(y) < 2L) {
+    return(NA_real_)
+  }
+  grand <- mean(y)
+  ss_tot <- sum((y - grand)^2)
+  if (ss_tot == 0) {
+    return(NA_real_)
+  }
+  ss_between <- sum(tapply(y, g, function(v) length(v) * (mean(v) - grand)^2))
+  ss_between / ss_tot
+}
 ```
 
 
 ```{r, per-stratum-pca-checks, fig.width=12, fig.height=9}
 run_stratum <- function(this_et, this_tf) {
   stratum_key <- paste(this_et, this_tf, sep = "_")
-  sub_dt <- aggregated_dt[`Event Type` == this_et & transcript_filter == this_tf]
+  sub_dt <- aggregated_dt[
+    `Event Type` == this_et & transcript_filter == this_tf
+  ]
 
   if (nrow(sub_dt) > DOWNSAMPLE_TARGET) {
     set.seed(getOption("EpiATLAS_AS_SEED", 42L))
@@ -107,8 +180,14 @@ run_stratum <- function(this_et, this_tf) {
   append_sanity(
     paste0("pca_cumulative_variance_pc1_5_", stratum_key),
     "PASS", # informational, not a gate
-    cum_var5, NA,
-    sprintf("%s: PC1 var=%.1f%%, cumulative PC1-5=%.1f%%", stratum_key, var_pct[1], cum_var5)
+    cum_var5,
+    NA,
+    sprintf(
+      "%s: PC1 var=%.1f%%, cumulative PC1-5=%.1f%%",
+      stratum_key,
+      var_pct[1],
+      cum_var5
+    )
   )
 
   # --- item 3: protocol should not dominate PC1 ------------------------------
@@ -117,15 +196,42 @@ run_stratum <- function(this_et, this_tf) {
   # since protocol itself isn't a PCA input feature (it's metadata used only
   # for coloring/grouping), a literal PCA loading doesn't exist for it.
   protocol_num <- as.integer(factor(sub_dt$protocol))
-  protocol_cor_pc1 <- suppressWarnings(cor(pc_scores[, 1], protocol_num, use = "complete.obs"))
+  protocol_cor_pc1 <- suppressWarnings(cor(
+    pc_scores[, 1],
+    protocol_num,
+    use = "complete.obs"
+  ))
   protocol_dominates <- var_pct[1] > 50 & abs(protocol_cor_pc1) > 0.5
   append_sanity(
     paste0("pca_protocol_dominance_", stratum_key),
     ifelse(!protocol_dominates, "PASS", "WARN"),
-    protocol_cor_pc1, 0.5,
+    protocol_cor_pc1,
+    0.5,
     sprintf(
       "%s: PC1 var=%.1f%%, |cor(PC1, protocol)|=%.3f (flag if PC1>50%% var AND |cor|>0.5)",
-      stratum_key, var_pct[1], abs(protocol_cor_pc1)
+      stratum_key,
+      var_pct[1],
+      abs(protocol_cor_pc1)
+    )
+  )
+
+  # --- item 3b: project/cohort (batch) should not dominate PC1 ---------------
+  # `project` is multi-level (BLUEPRINT/DEEP/AMED-CREST/...), so use eta^2
+  # (correlation ratio) instead of the 2-level |cor| used for protocol. A large
+  # eta^2 on a high-variance PC1 would indicate a cohort batch effect driving
+  # the feature matrix rather than biology.
+  project_eta_pc1 <- eta_sq(pc_scores[, 1], sub_dt$project)
+  project_dominates <- isTRUE(var_pct[1] > 50 & project_eta_pc1 > 0.5)
+  append_sanity(
+    paste0("pca_project_dominance_", stratum_key),
+    ifelse(!project_dominates, "PASS", "WARN"),
+    project_eta_pc1,
+    0.5,
+    sprintf(
+      "%s: PC1 var=%.1f%%, eta^2(PC1 ~ project)=%.3f (flag if PC1>50%% var AND eta^2>0.5)",
+      stratum_key,
+      var_pct[1],
+      ifelse(is.na(project_eta_pc1), NA_real_, project_eta_pc1)
     )
   )
 
@@ -133,31 +239,51 @@ run_stratum <- function(this_et, this_tf) {
   imputed_any <- NULL
   if (has_imputed_info) {
     source_mat <- as.matrix(sub_dt[, ..source_cols])
-    imputed_any <- as.integer(apply(source_mat == "imputed", 1, any, na.rm = TRUE))
+    imputed_any <- as.integer(apply(
+      source_mat == "imputed",
+      1,
+      any,
+      na.rm = TRUE
+    ))
     if (length(unique(imputed_any)) > 1) {
-      imputed_cor_pc1 <- suppressWarnings(cor(pc_scores[, 1], imputed_any, use = "complete.obs"))
+      imputed_cor_pc1 <- suppressWarnings(cor(
+        pc_scores[, 1],
+        imputed_any,
+        use = "complete.obs"
+      ))
       imputed_dominates <- var_pct[1] > 50 & abs(imputed_cor_pc1) > 0.5
       append_sanity(
         paste0("pca_imputation_dominance_", stratum_key),
         ifelse(!imputed_dominates, "PASS", "WARN"),
-        imputed_cor_pc1, 0.5,
+        imputed_cor_pc1,
+        0.5,
         sprintf(
           "%s: PC1 var=%.1f%%, |cor(PC1, imputed_any)|=%.3f (flag if PC1>50%% var AND |cor|>0.5)",
-          stratum_key, var_pct[1], abs(imputed_cor_pc1)
+          stratum_key,
+          var_pct[1],
+          abs(imputed_cor_pc1)
         )
       )
     } else {
       append_sanity(
         paste0("pca_imputation_dominance_", stratum_key),
         "PASS",
-        NA, 0.5,
-        sprintf("%s: all sampled rows have the same imputed/observed status, nothing to compare", stratum_key)
+        NA,
+        0.5,
+        sprintf(
+          "%s: all sampled rows have the same imputed/observed status, nothing to compare",
+          stratum_key
+        )
       )
     }
   }
 
   # --- item 5: silhouette by group, on a further subsample (dist() is O(n^2)) -
-  sil_idx <- if (nrow(pc_scores) > SIL_SAMPLE_N) sample(nrow(pc_scores), SIL_SAMPLE_N) else seq_len(nrow(pc_scores))
+  sil_idx <- if (nrow(pc_scores) > SIL_SAMPLE_N) {
+    sample(nrow(pc_scores), SIL_SAMPLE_N)
+  } else {
+    seq_len(nrow(pc_scores))
+  }
   sil_pcs <- pc_scores[sil_idx, seq_len(min(10, ncol(pc_scores))), drop = FALSE]
   sil_dist <- dist(sil_pcs)
 
@@ -166,58 +292,47 @@ run_stratum <- function(this_et, this_tf) {
     if (length(unique(grouping)) < 2) {
       return(NA_real_)
     }
-    mean(cluster::silhouette(as.integer(factor(grouping)), sil_dist)[, "sil_width"])
+    mean(cluster::silhouette(as.integer(factor(grouping)), sil_dist)[,
+      "sil_width"
+    ])
   }
 
   sil_ontology <- mean_silhouette(sub_dt$ontology)
   sil_protocol <- mean_silhouette(sub_dt$protocol)
-  sil_imputed  <- if (has_imputed_info) mean_silhouette(imputed_any) else NA_real_
+  sil_project <- mean_silhouette(sub_dt$project)
+  sil_imputed <- if (has_imputed_info) {
+    mean_silhouette(imputed_any)
+  } else {
+    NA_real_
+  }
 
   append_sanity(
     paste0("pca_silhouette_", stratum_key),
     "PASS", # informational -- reports which variable best explains PC separation, not a gate
-    NA, NA,
+    NA,
+    NA,
     sprintf(
-      "%s: mean silhouette (first 10 PCs, n=%d) -- ontology=%.3f, protocol=%.3f, imputed=%s",
-      stratum_key, length(sil_idx), sil_ontology, sil_protocol,
+      "%s: mean silhouette (first 10 PCs, n=%d) -- ontology=%.3f, protocol=%.3f, project=%.3f, imputed=%s",
+      stratum_key,
+      length(sil_idx),
+      sil_ontology,
+      sil_protocol,
+      sil_project,
       ifelse(is.na(sil_imputed), "NA", sprintf("%.3f", sil_imputed))
     )
   )
 
-  # --- visualization: PC1/PC2 + UMAP colored by ontology/protocol/imputed ----
-  umap_res <- uwot::umap(
-    feat_mat,
-    n_neighbors = UMAP_NEIGHBORS, min_dist = UMAP_MIN_DIST,
-    metric = UMAP_METRIC, n_threads = 2L, seed = getOption("EpiATLAS_AS_SEED", 42L)
-  )
+  # NB: intentionally NO ontology-vs-confound silhouette GATE. Silhouette is
+  # biased toward few/large clusters, so a ~40-level `ontology` grouping
+  # systematically loses to 2-level `protocol`/`imputed` regardless of biology
+  # (ontology silhouette goes ~0/negative from cluster count alone) -- a relative
+  # comparison here is rigged to fail. The real "is a confound driving the
+  # embedding?" question is answered UNBIASED by the PC1-dominance checks above
+  # (protocol/imputation |cor|, project eta^2). Silhouettes stay INFO only.
 
-  plot_df <- data.table(
-    PC1 = pc_scores[, 1], PC2 = pc_scores[, 2],
-    U1 = umap_res[, 1], U2 = umap_res[, 2],
-    ontology = sub_dt$ontology, protocol = sub_dt$protocol,
-    imputed = if (has_imputed_info) factor(imputed_any) else NA
-  )
-
-  legend_theme <- theme(legend.key.size = unit(3, "mm"), legend.text = element_text(size = 6))
-  make_panel <- function(x, y, color, xlab, ylab) {
-    ggplot(plot_df, aes(x = .data[[x]], y = .data[[y]], color = .data[[color]])) +
-      geom_point(alpha = 0.3, size = 0.6) +
-      labs(x = xlab, y = ylab, color = color, title = color) +
-      theme_bw(base_size = 9) + legend_theme
-  }
-
-  color_vars <- c("ontology", "protocol", if (has_imputed_info) "imputed")
-  pca_panels <- lapply(color_vars, function(v) make_panel("PC1", "PC2", v, sprintf("PC1 (%.1f%%)", var_pct[1]), sprintf("PC2 (%.1f%%)", var_pct[2])))
-  umap_panels <- lapply(color_vars, function(v) make_panel("U1", "U2", v, "UMAP1", "UMAP2"))
-
-  fig <- (wrap_plots(pca_panels, nrow = 1) / wrap_plots(umap_panels, nrow = 1)) +
-    plot_annotation(title = sprintf("%s -- PCA (top) / UMAP (bottom)", stratum_key))
-  print(fig) # inline, alongside the saved PDF below
-  ggsave(
-    file.path("qc/distributions", sprintf("feature_pca_%s.pdf", stratum_key)),
-    plot = fig, width = 12, height = 9
-  )
-
+  # Rich visualization (colorings + PC loadings, per-Variability) is produced by
+  # the gallery chunk below; the gates here are stratified only by Event Type ×
+  # filter (matching what 09-1 models at).
   invisible(NULL)
 }
 
@@ -227,6 +342,451 @@ for (i in seq_len(nrow(strata))) {
 ```
 
 
+```{r, feature-gallery, fig.width=12, fig.height=9}
+# Exploratory PCA/UMAP gallery folded in from the deprecated
+# 05z-visualize-features.Rmd. Unlike the sanity gates above, this runs per
+# (Event Type × transcript_filter × Variability) INCLUDING a combined "Both",
+# and shows richer colorings (ontology[palette]/project/protocol/PSI/chromosome)
+# plus the top PC1/PC2 feature LOADINGS. Plots saved to
+# plot_dir/feature_umap_pca/{ET}_{tf}_{var}.{pdf,png}; not a pass/fail gate.
+dir.create(
+  file.path(plot_dir, "feature_umap_pca"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+run_gallery <- function(
+  this_et,
+  this_tf,
+  this_variability,
+  print_plot = FALSE
+) {
+  if (identical(this_variability, COMBINED_VARIABILITY_LABEL)) {
+    sub_dt <- aggregated_dt[
+      transcript_filter == this_tf & `Event Type` == this_et
+    ]
+  } else {
+    sub_dt <- aggregated_dt[
+      transcript_filter == this_tf &
+        `Event Type` == this_et &
+        Variability == this_variability
+    ]
+  }
+  if (nrow(sub_dt) < 10) {
+    return(invisible(NULL))
+  }
+
+  # stratified downsample of very large groups (composition-preserving)
+  if (nrow(sub_dt) > DOWNSAMPLE_TARGET) {
+    set.seed(combo_seed(this_tf, this_et, this_variability))
+    strata_cols <- intersect(DOWNSAMPLE_STRATA, names(sub_dt))
+    if (length(strata_cols) > 0L) {
+      sub_dt[, row_idx__ := .I]
+      sample_frac <- DOWNSAMPLE_TARGET / nrow(sub_dt)
+      sampled_dt <- sub_dt[,
+        {
+          take_n <- min(.N, max(1L, as.integer(round(.N * sample_frac))))
+          .SD[sample(.N, take_n)]
+        },
+        by = strata_cols
+      ]
+      if (nrow(sampled_dt) > DOWNSAMPLE_TARGET) {
+        sampled_dt <- sampled_dt[sample(.N, DOWNSAMPLE_TARGET)]
+      } else if (nrow(sampled_dt) < DOWNSAMPLE_TARGET) {
+        remainder <- sub_dt[!sampled_dt, on = "row_idx__"]
+        if (nrow(remainder) > 0L) {
+          sampled_dt <- rbind(
+            sampled_dt,
+            remainder[sample(
+              .N,
+              min(DOWNSAMPLE_TARGET - nrow(sampled_dt), .N)
+            )],
+            use.names = TRUE
+          )
+        }
+      }
+      sub_dt <- sampled_dt[, !"row_idx__", with = FALSE]
+    } else {
+      sub_dt <- sub_dt[sample(.N, DOWNSAMPLE_TARGET)]
+    }
+  }
+
+  preprocessed <- preprocess_feature_matrix(
+    feat_mat = as.matrix(sub_dt[, ..feature_cols]),
+    histone_marks = histone_marks,
+    mode = "embedding",
+    drop_sparse = FALSE
+  )
+  feat_mat <- preprocessed$feat_mat
+  if (ncol(feat_mat) < 2) {
+    return(invisible(NULL))
+  }
+
+  title_str <- paste(this_et, this_tf, this_variability, sep = " | ")
+
+  k <- min(N_PCS, nrow(feat_mat) - 1L, ncol(feat_mat))
+  pca_res <- rsvd(feat_mat, k = k)
+  var_pct <- pca_res$d^2 / sum(pca_res$d^2) * 100
+  pca_df <- data.table(
+    PC1 = pca_res$u[, 1] * pca_res$d[1],
+    PC2 = pca_res$u[, 2] * pca_res$d[2],
+    ontology = sub_dt$ontology,
+    project = sub_dt$project,
+    protocol = sub_dt$protocol,
+    psi = sub_dt$PSI,
+    chr = sub_dt$seqnames
+  )
+  load_df <- data.table(
+    feature = colnames(feat_mat),
+    PC1 = pca_res$v[, 1],
+    PC2 = pca_res$v[, 2]
+  )
+
+  legend_theme <- theme(
+    legend.key.size = unit(3, "mm"),
+    legend.text = element_text(size = 6),
+    legend.title = element_text(size = 7)
+  )
+  plot_loadings <- function(pc) {
+    top <- load_df[order(-abs(get(pc)))][seq_len(min(TOP_LOADINGS, .N))]
+    top[, feature := factor(feature, levels = feature[order(get(pc))])]
+    ggplot(top, aes(x = .data[[pc]], y = feature, fill = .data[[pc]] > 0)) +
+      geom_col(show.legend = FALSE) +
+      scale_fill_manual(values = c(`TRUE` = "#2166ac", `FALSE` = "#d6604d")) +
+      labs(
+        x = sprintf("%s loading", pc),
+        y = NULL,
+        title = sprintf(
+          "Top %d %s loadings (%.1f%% var)",
+          TOP_LOADINGS,
+          pc,
+          var_pct[as.integer(sub("PC", "", pc))]
+        )
+      ) +
+      theme_bw(base_size = 9)
+  }
+
+  umap_res <- uwot::umap(
+    feat_mat,
+    n_neighbors = UMAP_NEIGHBORS,
+    min_dist = UMAP_MIN_DIST,
+    metric = UMAP_METRIC,
+    n_threads = 2L,
+    seed = getOption("EpiATLAS_AS_SEED", 42L)
+  )
+  umap_df <- data.table(
+    U1 = umap_res[, 1],
+    U2 = umap_res[, 2],
+    ontology = sub_dt$ontology,
+    project = sub_dt$project,
+    protocol = sub_dt$protocol,
+    psi = sub_dt$PSI,
+    chr = sub_dt$seqnames
+  )
+
+  make_embed <- function(df, x, y, col, xlab, ylab) {
+    p <- ggplot(df, aes(x = .data[[x]], y = .data[[y]], color = .data[[col]])) +
+      geom_point(alpha = 0.3, size = 0.7) +
+      labs(x = xlab, y = ylab, color = col) +
+      theme_bw(base_size = 9) +
+      legend_theme
+    if (col == "ontology" && !is.null(sample_hex_colors)) {
+      p <- p + scale_color_manual(values = sample_hex_colors)
+    }
+    p
+  }
+  make_paired_plot <- function(col) {
+    (make_embed(
+      pca_df,
+      "PC1",
+      "PC2",
+      col,
+      sprintf("PC1 (%.1f%%)", var_pct[1]),
+      sprintf("PC2 (%.1f%%)", var_pct[2])
+    ) +
+      make_embed(umap_df, "U1", "U2", col, "UMAP 1", "UMAP 2") +
+      plot_layout(guides = "collect")) &
+      theme(legend.position = "bottom")
+  }
+
+  fig_loadings <- plot_loadings("PC1") | plot_loadings("PC2")
+  fig <- ((make_paired_plot("psi") | fig_loadings) /
+    (make_paired_plot("project") | make_paired_plot("protocol")) /
+    (make_paired_plot("chr") | make_paired_plot("ontology"))) +
+    plot_annotation(title = title_str)
+  if (print_plot) {
+    print(fig)
+  }
+
+  for (ext in c("pdf", "png")) {
+    ggsave(
+      file.path(
+        plot_dir,
+        "feature_umap_pca",
+        sprintf("%s_%s_%s.%s", this_et, this_tf, this_variability, ext)
+      ),
+      plot = fig,
+      height = 210,
+      width = 297,
+      units = "mm"
+    )
+  }
+  invisible(NULL)
+}
+
+gallery_combos <- CJ(
+  event_type = unique(strata$`Event Type`),
+  variability = c(
+    as.character(aggregated_dt[, unique(Variability)]),
+    COMBINED_VARIABILITY_LABEL
+  ),
+  sorted = FALSE
+)
+for (i in seq_len(nrow(gallery_combos))) {
+  run_gallery(
+    gallery_combos$event_type[i],
+    tf,
+    gallery_combos$variability[i],
+    print_plot = TRUE
+  )
+}
+```
+
+
+```{r, psi-embedding, fig.width=12, fig.height=6}
+# Embed the TARGET (PSI) itself — complementary to the epigenetic-feature
+# embedding above. Per (Event Type × transcript_filter). PSI is heavily missing
+# (expr_pass masking + tissue-specific non-expression), handled per view.
+#   (A) SAMPLES in PSI-space: does the splicing landscape separate samples by
+#       biology (ontology) or a confound (protocol/project)? Target-side analogue
+#       of the feature fingerprint. NA-native via pairwise-complete correlation
+#       → PCoA (cmdscale) + a silhouette gate. NB for RI, protocol separation is
+#       the EXPECTED documented bias (total-RNA inflates RI Ψ ~0.05), so an RI
+#       protocol > ontology result is informational, not a true artefact.
+#   (B) EVENTS in PSI-space: co-regulation structure (which events co-vary).
+#       Event×event pairwise-cor is too large (~event² ) → coverage-filter
+#       (event present in ≥50% samples) + per-event mean-impute, then PCA/UMAP.
+dir.create(
+  file.path(plot_dir, "psi_embedding"),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+SEED <- getOption("EpiATLAS_AS_SEED", 42L)
+
+sil_by <- function(grp, d) {
+  grp <- factor(grp)
+  if (nlevels(grp) < 2L) {
+    return(NA_real_)
+  }
+  mean(cluster::silhouette(as.integer(grp), d)[, "sil_width"])
+}
+
+run_psi_embedding <- function(this_et, this_tf) {
+  key <- paste(this_et, this_tf, sep = "_")
+  sub <- aggregated_dt[
+    `Event Type` == this_et & transcript_filter == this_tf,
+    .(ID, uuid, PSI, ontology, protocol, project, Variability, seqnames)
+  ]
+  psi_wide <- dcast(sub, ID ~ uuid, value.var = "PSI")
+  m <- as.matrix(psi_wide[, -1L]) # events × samples
+  rownames(m) <- psi_wide$ID
+  if (nrow(m) < 10L || ncol(m) < 4L) {
+    message(key, ": PSI matrix too small, skipping")
+    return(invisible(NULL))
+  }
+  smeta <- unique(sub[, .(uuid, ontology, protocol, project)])
+  setkey(smeta, uuid)
+  smeta <- smeta[colnames(m)]
+
+  # focus on well-covered events (≥50% samples) — sparse events add noise and
+  # slow the pairwise correlation
+  cover <- rowMeans(!is.na(m))
+  m_cov <- m[cover >= 0.5, , drop = FALSE]
+
+  # --- (A) SAMPLES in PSI-space --------------------------------------------
+  if (nrow(m_cov) >= 10L) {
+    samp_cor <- cor(m_cov, use = "pairwise.complete.obs")
+    samp_cor[is.na(samp_cor)] <- 0
+    samp_dist <- as.dist(1 - samp_cor)
+    mds <- cmdscale(samp_dist, k = 2)
+    sdf <- data.table(
+      MDS1 = mds[, 1],
+      MDS2 = mds[, 2],
+      ontology = smeta$ontology,
+      protocol = smeta$protocol,
+      project = smeta$project
+    )
+
+    # UNBIASED confound checks on PCoA1 (mirror the feature-space PC1-dominance
+    # gates; avoid silhouette's cluster-count bias — a ~40-level ontology would
+    # always lose a silhouette race to 2-level protocol regardless of biology).
+    # protocol is 2-level -> |cor|; project is multi-level -> eta^2. For RI,
+    # protocol dominating the PSI landscape is the EXPECTED documented bias
+    # (total-RNA inflates RI Ψ ~0.05) -> INFO, not WARN.
+    mds1 <- mds[, 1]
+    prot_num <- as.integer(factor(smeta$protocol))
+    psi_prot_cor <- if (length(unique(na.omit(prot_num))) > 1L) {
+      abs(suppressWarnings(cor(mds1, prot_num, use = "complete.obs")))
+    } else {
+      NA_real_
+    }
+    psi_proj_eta <- eta_sq(mds1, smeta$project)
+
+    append_sanity(
+      paste0("psi_sample_protocol_dominance_", key),
+      if (this_et == "RI") "INFO" else if (isTRUE(psi_prot_cor > 0.5)) "WARN" else "PASS",
+      psi_prot_cor,
+      0.5,
+      sprintf(
+        "%s: |cor(PCoA1, protocol)|=%.3f over %d well-covered events%s",
+        key,
+        ifelse(is.na(psi_prot_cor), NA_real_, psi_prot_cor),
+        nrow(m_cov),
+        if (this_et == "RI") " [RI protocol bias expected -> INFO]" else " (flag > 0.5)"
+      )
+    )
+    append_sanity(
+      paste0("psi_sample_project_dominance_", key),
+      if (isTRUE(psi_proj_eta > 0.5)) "WARN" else "PASS",
+      psi_proj_eta,
+      0.5,
+      sprintf(
+        "%s: eta^2(PCoA1 ~ project)=%.3f (flag > 0.5 = cohort batch drives PSI landscape)",
+        key,
+        ifelse(is.na(psi_proj_eta), NA_real_, psi_proj_eta)
+      )
+    )
+    # ontology silhouette kept as INFO context only (cluster-count-biased; not a gate)
+    append_sanity(
+      paste0("psi_sample_ontology_silhouette_", key),
+      "INFO",
+      sil_by(smeta$ontology, samp_dist),
+      NA_real_,
+      sprintf(
+        "%s: PSI-space ontology silhouette (INFO; biased by #levels, not a gate)",
+        key
+      )
+    )
+
+    mk_a <- function(col) {
+      p <- ggplot(sdf, aes(x = MDS1, y = MDS2, color = .data[[col]])) +
+        geom_point(alpha = 0.6, size = 1.2) +
+        labs(
+          title = paste("samples in PSI-space:", col),
+          x = "PCoA1",
+          y = "PCoA2",
+          color = col
+        ) +
+        theme_bw(base_size = 9) +
+        theme(
+          legend.key.size = unit(3, "mm"),
+          legend.text = element_text(size = 6)
+        )
+      if (col == "ontology" && !is.null(sample_hex_colors)) {
+        p <- p + scale_color_manual(values = sample_hex_colors)
+      }
+      p
+    }
+    fig_a <- (mk_a("ontology") | mk_a("protocol") | mk_a("project")) +
+      plot_annotation(
+        title = sprintf("%s — samples embedded by PSI profile", key)
+      )
+    print(fig_a)
+    ggsave(
+      file.path(plot_dir, "psi_embedding", sprintf("psi_samples_%s.pdf", key)),
+      plot = fig_a,
+      width = 12,
+      height = 4.5
+    )
+  }
+
+  # --- (B) EVENTS in PSI-space ---------------------------------------------
+  if (nrow(m_cov) >= 10L) {
+    m_ev <- m_cov
+    if (nrow(m_ev) > DOWNSAMPLE_TARGET) {
+      set.seed(SEED)
+      m_ev <- m_ev[sample(nrow(m_ev), DOWNSAMPLE_TARGET), , drop = FALSE]
+    }
+    rmean <- rowMeans(m_ev, na.rm = TRUE)
+    na_idx <- which(is.na(m_ev), arr.ind = TRUE)
+    if (nrow(na_idx)) {
+      m_ev[na_idx] <- rmean[na_idx[, 1L]]
+    }
+    ev_meta <- unique(sub[, .(ID, Variability, seqnames)])
+    setkey(ev_meta, ID)
+    ev_meta <- ev_meta[as.integer(rownames(m_ev))]
+
+    k <- min(N_PCS, nrow(m_ev) - 1L, ncol(m_ev))
+    pev <- rsvd(m_ev, k = k)
+    vp <- pev$d^2 / sum(pev$d^2) * 100
+    ev_scores <- sweep(pev$u, 2, pev$d, `*`)
+    ue <- uwot::umap(
+      m_ev,
+      n_neighbors = UMAP_NEIGHBORS,
+      min_dist = UMAP_MIN_DIST,
+      metric = UMAP_METRIC,
+      n_threads = 2L,
+      seed = SEED
+    )
+    edf <- data.table(
+      PC1 = ev_scores[, 1],
+      PC2 = ev_scores[, 2],
+      U1 = ue[, 1],
+      U2 = ue[, 2],
+      Variability = ev_meta$Variability,
+      seqnames = ev_meta$seqnames,
+      mean_psi = rmean[rownames(m_ev)]
+    )
+    mk_b <- function(x, y, col, xl, yl) {
+      ggplot(edf, aes(x = .data[[x]], y = .data[[y]], color = .data[[col]])) +
+        geom_point(alpha = 0.3, size = 0.5) +
+        labs(title = col, x = xl, y = yl, color = col) +
+        theme_bw(base_size = 9) +
+        theme(
+          legend.key.size = unit(3, "mm"),
+          legend.text = element_text(size = 6)
+        )
+    }
+    fig_b <- ((mk_b(
+      "PC1",
+      "PC2",
+      "Variability",
+      sprintf("PC1 (%.1f%%)", vp[1]),
+      sprintf("PC2 (%.1f%%)", vp[2])
+    ) |
+      mk_b(
+        "PC1",
+        "PC2",
+        "mean_psi",
+        sprintf("PC1 (%.1f%%)", vp[1]),
+        sprintf("PC2 (%.1f%%)", vp[2])
+      )) /
+      (mk_b("U1", "U2", "Variability", "UMAP1", "UMAP2") |
+        mk_b("U1", "U2", "mean_psi", "UMAP1", "UMAP2"))) +
+      plot_annotation(
+        title = sprintf(
+          "%s — events embedded by PSI profile (n=%d, cover≥50%%)",
+          key,
+          nrow(m_ev)
+        )
+      )
+    print(fig_b)
+    ggsave(
+      file.path(plot_dir, "psi_embedding", sprintf("psi_events_%s.pdf", key)),
+      plot = fig_b,
+      width = 11,
+      height = 8
+    )
+  }
+  invisible(NULL)
+}
+
+for (i in seq_len(nrow(strata))) {
+  run_psi_embedding(strata$`Event Type`[i], strata$transcript_filter[i])
+}
+```
+
+
 ```{r, summary}
-knitr::kable(fread(sanity_csv)[grepl("^pca_", check_name)])
+knitr::kable(fread(sanity_csv)[grepl("^(pca|psi)_", check_name)])
 ```

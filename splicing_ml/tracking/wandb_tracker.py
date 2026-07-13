@@ -260,6 +260,16 @@ class WandbTracker:
         }
         self._fold_rows = []
         self._cv_results_by_model = {}
+        # Without this, every logged metric is plotted against W&B's internal
+        # auto-incrementing _step (i.e. call order), not the fold number — since
+        # each fold triggers 2-3 separate .log() calls (scores, tuning_summary,
+        # sklearn diagnostics) across multiple models, the default charts end up
+        # as scrambled/sawtooth lines that don't compare across models at all.
+        # Declaring fold_id as the step metric makes every chart use it as the
+        # x-axis instead, regardless of call order.
+        with contextlib.suppress(Exception):
+            self._child_run.define_metric("fold_id")
+            self._child_run.define_metric("*", step_metric="fold_id")
         with contextlib.suppress(Exception):
             prep_table = self._wandb.Table(columns=["key", "value"])
             for key, value in prep_details.items():
@@ -293,6 +303,10 @@ class WandbTracker:
             if isinstance(v, (int, float)) and np.isfinite(float(v))
         }
         payload[f"{model_name}/fold_id"] = int(fold_id)
+        # Unprefixed fold_id (paired with the define_metric step_metric wiring
+        # in start_config_task) so every chart in this run uses fold number as
+        # its x-axis instead of call order.
+        payload["fold_id"] = int(fold_id)
         # Log training scores (prefixed train/) to expose overfitting gap.
         if train_scores:
             for k, v in train_scores.items():
@@ -308,8 +322,12 @@ class WandbTracker:
         self._child_run.log(payload)
 
         if bool(getattr(self._run_cfg, "wandb_log_tuning_details", True)):
-            with contextlib.suppress(Exception):
-                self._child_run.log({f"{model_name}/tuning": tuning_info})
+            # Previously also logged the raw tuning_info dict wholesale
+            # (f"{model_name}/tuning") — nested dicts (best_params objects,
+            # full cv_results arrays) don't render as a chart, just clutter as
+            # unreadable panels. The flat summary below is the useful part;
+            # _log_cv_result_tables() already exposes the full cv_results as a
+            # proper Table.
             with contextlib.suppress(Exception):
                 tuning_summary = self._extract_tuning_summary(tuning_info)
                 self._child_run.log({f"{model_name}/tuning_summary": tuning_summary})
@@ -447,19 +465,52 @@ class WandbTracker:
                     float(v),
                 )
 
+        # One multi-line chart (all models, x=fold_id) instead of relying on
+        # the per-model auto-generated single-line panels from log_fold_result
+        # — those land at different points on W&B's default x-axis whenever
+        # models are logged in different .log() calls, so they were never
+        # visually comparable without this. Sort each model's (fold_id, score)
+        # pairs by fold_id first so the line doesn't zigzag if folds completed
+        # out of order (parallel fitting).
+        fold_score_pairs_by_model: dict[str, list[tuple[int, float]]] = defaultdict(
+            list
+        )
+        for row in self._fold_rows:
+            v = row.get("primary_metric_value")
+            if v is not None:
+                fold_score_pairs_by_model[str(row["model_name"])].append(
+                    (int(row["fold_id"]), float(v))
+                )
+        model_names_sorted = sorted(fold_score_pairs_by_model)
+        line_chart = None
         with contextlib.suppress(Exception):
-            self._child_run.log(
-                {
-                    "comparison/model_summary": summary_table,
-                    "comparison/model_fold_detail": detail_table,
-                    "comparison/bar_chart": self._wandb.plot.bar(
-                        summary_table,
-                        "model",
-                        "mean",
-                        title=f"Model comparison — mean {primary_metric} (outer folds)",
-                    ),
-                }
+            xs, ys = [], []
+            for m in model_names_sorted:
+                pairs = sorted(fold_score_pairs_by_model[m])
+                xs.append([p[0] for p in pairs])
+                ys.append([p[1] for p in pairs])
+            line_chart = self._wandb.plot.line_series(
+                xs=xs,
+                ys=ys,
+                keys=model_names_sorted,
+                title=f"{primary_metric} by fold, per model",
+                xname="fold_id",
             )
+
+        payload = {
+            "comparison/model_summary": summary_table,
+            "comparison/model_fold_detail": detail_table,
+            "comparison/bar_chart": self._wandb.plot.bar(
+                summary_table,
+                "model",
+                "mean",
+                title=f"Model comparison — mean {primary_metric} (outer folds)",
+            ),
+        }
+        if line_chart is not None:
+            payload["comparison/line_chart"] = line_chart
+        with contextlib.suppress(Exception):
+            self._child_run.log(payload)
 
     def _log_cv_result_tables(self) -> None:
         """Log one aggregated inner-CV results Table per model (across all outer folds)."""

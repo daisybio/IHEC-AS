@@ -457,6 +457,7 @@ def run_single_configuration(
                     optuna_n_startup_trials=run_cfg.optuna_n_startup_trials,
                     optuna_multivariate=run_cfg.optuna_multivariate,
                     optuna_wandb_callback=run_cfg.optuna_wandb_callback,
+                    calibrate=run_cfg.calibrate_classifiers,
                 )
 
                 ev = evaluate_outer_fold(
@@ -469,6 +470,7 @@ def run_single_configuration(
                     inner_splits=inner_splits,
                     max_cores=run_cfg.max_cores,
                     calibrate=run_cfg.calibrate_classifiers,
+                    calibration_holdout=tuning_info.get("calibration_holdout"),
                     tune_threshold=run_cfg.tune_threshold,
                     verbose=run_cfg.verbose,
                     psi_low=run_cfg.psi_low_threshold,

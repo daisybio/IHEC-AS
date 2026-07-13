@@ -2,13 +2,37 @@
 # Run from project root: mamba run -n ihec-as snakemake --profile profiles/slurm
 
 # ── Wildcards ─────────────────────────────────────────────────────────────────
-transcript_filters:
+# all_transcript_filters = the UNIVERSE of valid filters (drives wildcard
+# constraints, so any of these is still buildable by an explicit target /
+# --config override). transcript_filters = the DEFAULT build set that `rule all`
+# and the ML config space expand over. Default is biotype_filtered only; add
+# the others here (or request their targets directly) to build them.
+all_transcript_filters:
   - transcripts
   - tsl_filtered
   - biotype_filtered
 
+transcript_filters:
+  - biotype_filtered
+
 # Primary filter used for main analyses (09-2, 10)
 primary_filter: biotype_filtered
+
+# Pangolin device. true = GPU (default). CPU is technically supported but
+# IMPRACTICAL here: the 12-model CNN over 10,001bp windows runs ~1000s/batch on
+# CPU -> ~36h for 127k sites (measured). GPU does it in minutes, so even a long
+# a40 queue wait wins. Force CPU (only if you must) WITHOUT editing this file:
+#   snakemake --config pangolin_use_gpu=false ...
+# The Snakefile derives pangolin_scores gpu/threads/batch-size from this.
+pangolin_use_gpu: true
+# Pangolin GPU gres + env. Default: the idle gpu01 titans via the pangolin-titan
+# env (torch cu121 2.4.1, which keeps sm_70 = Titan V — verified: kernel runs).
+# The main ihec-as torch (cu128) dropped those archs, so it needs the a40s (which
+# are heavily contended). NOTE: cu121's arch list lacks sm_61, so the 1 Titan Xp
+# on gpu01 would fail; the 2 Titan V's work. To use the a40 instead:
+#   --config pangolin_gpu_gres=gpu:a40:1 pangolin_env=ihec-as
+# pangolin_gpu_gres: "gpu:titan:1"
+# pangolin_env: "pangolin-titan"
 
 event_types:
   - SE
@@ -29,10 +53,12 @@ exclude_ml_configs:
     variability: both
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# Pre-existing inputs (not managed by Snakemake)
-rmats_filtered_dir: "splicing_analysis"   # contains {tf}/event_{et}.psi files
-gencode_gtf_dir: "splicing_analysis"      # contains gencode.v29.{tf}.gtf
-wgbs_bed_dir: "processed_data/wgbs_beds"
+# (Removed rmats_filtered_dir / gencode_gtf_dir / wgbs_bed_dir 2026-07-06: all
+# three were unused dead config — no rule/script referenced them, and their
+# comment was stale. gencode.v29.{tf}.gtf and rmats/{tf}/event_{et}.psi are
+# rule-produced (02-1 / 02-3) with hardcoded "splicing_analysis" paths; WGBS
+# reads the external wgbs_matrices_data_dir from .Rprofile and writes
+# sample_dts/WGBS_agg_{tf}.csv.gz — nothing used processed_data/wgbs_beds.)
 
 # Output root for ML results
 ml_output_root: "splicing_ml/output"
@@ -45,20 +71,33 @@ resources:
     runtime: 60
     threads: 2
     gpu: 0
-  suppa_analysis:
-    mem_mb: 48000
+  transcript_filters:
+    mem_mb:
+      48000 # load-isoform-quants now reads only the ~441 rna_to_use
+      # cohort (not the ~1555 full pool that OOM-killed job
+      # 6280493 at 48G), so this is comfortable again.
     runtime: 120
     threads: 4
     gpu: 0
-  rmats_analysis:
-    mem_mb: 32000
+  rmats_event_filtering:
+    mem_mb:
+      96000 # SE cohort JC table (~66M rows = ~150k events x 441 samples) is
+      # inherently large. MaxRSS climbed 49G(@48G cap)->61G(@64G cap) —
+      # both OOM, so real need is ~65G+, driven by the build's triple
+      # copy (dt_list + long_dt_list + event_sample_data), NOT fork
+      # count (mc.cores 8->4 didn't lower it). rm()+gc() now free each
+      # copy as consumed; 96G (= rnaseq tier) gives margin. keep= +
+      # 4 JC-read forks (EpiATLAS_AS_RMATS_JC_CORES) still apply.
     runtime: 180
     threads: 8
     gpu: 0
   prepare_aggregation:
     mem_mb: 64000
     runtime: 360
-    threads: 8
+    # per-filter: event-loading now parallelises over event types (SE/RI, ~2
+    # cores) + data.table threads; the old 8 was sized for a cross-filter
+    # mclapply that no longer exists per job. 4 = 2 event-type forks + headroom.
+    threads: 4
     gpu: 0
   maxentscan_scores:
     mem_mb: 4000
@@ -66,37 +105,79 @@ resources:
     threads: 1
     gpu: 0
   pangolin_scores:
-    mem_mb: 48000
-    runtime: 240    # ~106k events / ~300-400k sites; per-site Python encoding is CPU-bound
-    threads: 4
-    gpu: 1
+    mem_mb:
+      48000 # host RAM. n_workers(=threads) each encode one-hot batches
+      # (10001bp x 4) + on CPU the model activations live in host RAM
+      # too. 16 workers x batch 4096 OOM'd at 16G (killed at batch 0).
+      # 48G covers 16 workers at the reduced batch (see --batch-size).
+    runtime:
+      300 # ~106k events / ~300-400k sites. Per-site encoding is CPU-bound
+      # and parallelised over SLURM_CPUS_PER_TASK (n_workers). CPU run
+      # ~40min-2hr; 300min buffer.
+    # CPU, not GPU: the a40 queue is heavily contended (indefinite Priority wait),
+    # and the script auto-falls back to CPU (torch.cuda.is_available()). Routing to
+    # shared-cpu + more threads (encoding scales with cores) starts sooner and
+    # finishes in ~1-2hr. Flip gpu:1 + threads:4 to go back to GPU if the queue frees.
+    threads: 16
+    gpu: 0
   aggregate_chip_one:
-    mem_mb: 500
+    mem_mb:
+      10000 # bigWigAverageOverBed loads the whole pval bigwig; OOM-Killed
+      # at 500M. The old standalone 04-2-aggregate-ChIP.sh used 10G.
     runtime: 15
     threads: 1
     gpu: 0
   aggregate_chip:
-    mem_mb: 500     # sentinel rule — negligible; kept for R() compatibility
+    mem_mb: 500 # sentinel rule — negligible; kept for R() compatibility
     runtime: 5
     threads: 1
     gpu: 0
+  chip_signal_sanity:
+    mem_mb:
+      16000 # §4.13b QC: streams each chip_agg tab once (never the full
+      # long table); one-file columns + one-mark accumulator only.
+    runtime:
+      300 # ~3 sequential passes over all 2430 tabs (per-file summary,
+      # window accumulation, stratified axis test) — single-threaded,
+      # TIMED OUT at 90 (reached 18/22). 300 covers the full render.
+    threads: 1
+    gpu: 0
   aggregate_wgbs:
-    mem_mb: 64000
+    mem_mb:
+      96000 # big chromosomes peak ~48G in ONE fork (chr1: 1.15M in-window
+      # CpGs x 645 samples; melt+merge+copies). 4 forks -> ~100G, 2
+      # forks -> 97G (both OOM at 96G). mc.cores=1 (EpiATLAS_AS_WGBS_CORES,
+      # serial) -> ~48G peak, ~2x margin under 96G.
     runtime: 180
     threads: 8
     gpu: 0
   rnaseq_normalisation:
-    mem_mb: 96000   # per-filter Snakemake job; single filter's count/getmm/vst matrices. DESeq2 vst() is bottleneck — all 4 threads used for dispersion MLE + vst via BiocParallel
-    runtime: 120    # vst() + early stopping per transcript_filter — parallelised gene-wise via BiocParallel, not across filters (filters run as separate Snakemake jobs)
-    threads: 4
+    mem_mb: 96000 # per-filter Snakemake job; single filter's count/getmm/vst matrices.
+    runtime:
+      120 # dominant cost is the data.table fread+aggregation of the ~88M-row
+      # isoform subset (scales with threads + capped OpenBLAS); DESeq2 vst()
+      # itself runs SERIALLY (no BPPARAM path) but is the fast-wrapper.
+      # Cross-filter parallelism = separate Snakemake jobs.
+    threads: 8
     gpu: 0
   rbp_binding_sites:
-    mem_mb: 16000   # data/human.txt.gz ~38M rows loaded once via fread+GRanges; reduce(split(...)) before findOverlaps keeps peak well under this, unbenchmarked on real SLURM allocation
-    runtime: 60
+    mem_mb: 32000 # data/human.txt.gz ~38M rows loaded once via fread+GRanges. step 18/20 [rbp-expression-features] Step 2a used to OOM here (32.6G MaxRSS at 32G): the rbp_name join fanned out to event x sample x RBP (100s of M rows) before the by=(ID,uuid) collapse. Now chunked over event batches (~1/n_chunks peak) + slimmed to 3 cols -> peak well under 32000.
+    runtime: 120
     threads: 1
     gpu: 0
+  irfinder_concordance:
+    mem_mb: 8000 # ~1GB RSS observed on a real biotype_filtered run (415 samples, 250k introns/sample fread+filtered before rbind - peak stays small since only matched rows are kept per sample).
+    runtime: 60 # runs BOTH annotation + TSL12 trees (415 files read twice) - real run ~ a few minutes locally, doubled + buffer for slower cluster I/O.
+    threads: 8 # matches the min(8L, mc.cores) cap in the Rmd's pbmclapply over IRFinder sample files.
+    gpu: 0
   create_aggregated_dt:
-    mem_mb: 32000
+    mem_mb:
+      128000 # histone_dt = 2430 ChIP tabs x ~424k windows ~= 1e9-row long
+      # table (~30G) + WGBS/feature joins + the dcast to wide (rbind + tstrsplit
+      # + dcast all hold copies at chunk 4 build-aggregated-dt). OOM'd at 32G
+      # (mcmapply forks: "names[2430] vs vector[608]") then AGAIN at 96G
+      # (98.2G MaxRSS, real full-scale run 2026-07-09) — the 96G was an
+      # untested estimate. 128G gives headroom over the measured 98G peak.
     runtime: 90
     threads: 4
     gpu: 0
@@ -105,17 +186,26 @@ resources:
     runtime: 180
     threads: 8
     gpu: 0
-  splicing_ml_S:    # RI + High/Low
+  feature_pca_sanity:
+    mem_mb: 48000 # reads the full aggregated_dt_filtered_{tf}.csv.gz (~2.2G/9M rows)
+    # once, then runs rsvd PCA + UMAP (up to ~10 fits: feature-gallery ET x
+    # Variability incl "Both", + PSI sample/event embeddings) on ~100k-row
+    # downsampled subsets per stratum -- same order of magnitude as `correlation`.
+    runtime: 180
+    threads: 8 # UMAP itself hardcodes n_threads=2L; extra threads help the
+    # CSV read + rsvd/data.table ops, not UMAP directly.
+    gpu: 0
+  splicing_ml_S: # RI + High/Low
     mem_mb: 32000
     runtime: 360
     threads: 8
     gpu: 1
-  splicing_ml_M:    # SE + High/Low | RI + both
+  splicing_ml_M: # SE + High/Low | RI + both
     mem_mb: 64000
     runtime: 720
     threads: 8
     gpu: 1
-  splicing_ml_L:    # SE + both
+  splicing_ml_L: # SE + both
     mem_mb: 128000
     runtime: 1440
     threads: 12

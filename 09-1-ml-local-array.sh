@@ -21,4 +21,4 @@ module load r/4.2.1
 id=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$IDS_FILE")
 
 cd "$PROJECT_DIR"
-Rscript "${PROJECT_DIR}/07-ml-event-glmnet-tidymodels.R" "$CFG_FILE" "$id"
+Rscript "${PROJECT_DIR}/09zz-ml-event-glmnet-tidymodels.R" "$CFG_FILE" "$id"

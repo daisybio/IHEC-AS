@@ -70,7 +70,8 @@ IN_MAP = np.asarray(
 
 TISSUES = ["heart", "liver", "brain", "testis"]
 # P(splice site) output channel per tissue (softmax second class from each output head)
-TISSUE_CHANNELS = [1, 4, 7, 10]
+SCORE_CHANNELS = [1, 4, 7, 10]
+USAGE_CHANNELS = [2, 5, 8, 11]
 
 # Per-filter invocation (PLAN §4.12e per-filter incremental outputs): the
 # transcript_filter comes from the TRANSCRIPT_FILTER env var (Snakemake passes
@@ -80,6 +81,7 @@ TRANSCRIPT_FILTER = os.environ.get("TRANSCRIPT_FILTER", "biotype_filtered")
 
 FASTA_PATH = Path("data/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz")
 OUTPUT_PATH = Path(f"processed_data/pangolin_scores_{TRANSCRIPT_FILTER}.csv")
+TEST_OUTPUT_PATH = Path(f"processed_data/pangolin_scores_{TRANSCRIPT_FILTER}.smoke_test.csv")
 RMATS_DIR   = Path(f"splicing_analysis/rmats/{TRANSCRIPT_FILTER}")
 
 _BASE_LUT = np.zeros(256, dtype=np.int8)
@@ -92,13 +94,21 @@ for _char, _idx in (("A", 1), ("a", 1), ("C", 2), ("c", 2),
 
 def load_models(device: torch.device) -> list:
     """
-    Load 12 Pangolin models: for i in [0,2,4,6] (tissue), j in [1,2,3] (ensemble).
+    Load Pangolin models: for i in [0,1,...,7] (tissue, score), j in [1,2,3] (ensemble).
+    0 = Heart, P(splice)
+    1 = Heart, usage
+    2 = Liver, P(splice)
+    3 = Liver, usage
+    4 = Brain, P(splice)
+    5 = Brain, usage
+    6 = Testis, P(splice)
+    7 = Testis, usage
     Weight path: pangolin/models/final.{j}.{i}.3.v2
     Returned list order: [tissue0_j1, tissue0_j2, tissue0_j3, tissue1_j1, ...]
     i.e. models[t*3 : (t+1)*3] = 3-member ensemble for tissue t.
     """
     models = []
-    for i in [0, 2, 4, 6]:          # tissue index
+    for i in range(8):          # (tissue, value) index
         for j in range(1, 4):        # ensemble member
             m = Pangolin(L, W, AR)
             weight_path = str(
@@ -168,7 +178,16 @@ def _init_worker(fasta_path: Path) -> None:
     _worker_fa = pyfastx.Fasta(str(fasta_path))
 
 def _encode_one(site: dict) -> np.ndarray:
-    seq = extract_context(_worker_fa, site["chrom"], site["pos"])
+    # parse_suppa_sites puts donors on the first-INTRON base (the G of GT) — good
+    # for the GT/AG + MaxEntScan sequence checks. But Pangolin annotates the donor
+    # at the last-EXON base (SpliceAI/GTF convention: exon end = donor), where
+    # P(splice) peaks; scoring the intronic base gives ~0.05 (verified). Shift the
+    # SCORING position one base toward the exon: -1 on + strand, +1 on - strand.
+    # Acceptors already sit on the first-exon base (correct) — leave them.
+    pos = site["pos"]
+    if site["site_type"].endswith("donor"):
+        pos += -1 if site["strand"] == "+" else 1
+    seq = extract_context(_worker_fa, site["chrom"], pos)
     return encode_site(seq, site["strand"])
 
 
@@ -251,7 +270,7 @@ def score_batch(
     device: torch.device,
 ) -> np.ndarray:
     """
-    Score a batch of encoded sequences.
+    Score a batch of encoded sequences. splice is high
 
     encodings : (B, 4, SEQ_LEN)
     returns   : (B, 4) — mean P(splice site) across 3 ensemble members, per tissue.
@@ -259,16 +278,26 @@ def score_batch(
     For SEQ_LEN=10,001 input, model output has shape (B, 12, 1); we read [:, channel, 0].
     """
     tensor = torch.tensor(encodings, dtype=torch.float32, device=device)
-    tissue_scores = np.zeros((len(encodings), 4), dtype=np.float32)
+    tissue_scores = np.zeros((len(encodings), 4, 2), dtype=np.float32)
 
-    for t, channel in enumerate(TISSUE_CHANNELS):
+    # first the scoring 
+    for t, channel in enumerate(SCORE_CHANNELS):
         preds = []
-        for model in models[t * 3: (t + 1) * 3]:
+        # skip usage models, i.e., 0-2 is Heart, P(splice); 3-5 is Heart, usage; 6-8 is Liver, P(splice); 9-11 is Liver, usage; etc.
+        for model in models[t * 6: (t * 6) + 3]:
             out = model(tensor)                       # (B, 12, 1)
             preds.append(out[:, channel, 0].cpu().numpy())
-        tissue_scores[:, t] = np.mean(preds, axis=0)
+        tissue_scores[:, t, 0] = np.mean(preds, axis=0)
 
-    return tissue_scores   # (B, 4)
+    # now the usage
+    for t, channel in enumerate(USAGE_CHANNELS):
+        preds = []
+        for model in models[t * 6 + 3: (t * 6) + 6]:  # usage models are the second half of each tissue's 6 models
+            out = model(tensor)                       # (B, 12, 1)
+            preds.append(out[:, channel, 0].cpu().numpy())
+        tissue_scores[:, t, 1] = np.mean(preds, axis=0)
+
+    return tissue_scores   # (B, 4, 2)
 
 
 # ── Validation: GT/AG dinucleotide check ──────────────────────────────────────
@@ -520,9 +549,9 @@ def main() -> None:
         print(f"  GPU: {torch.cuda.get_device_name(0)} "
               f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)", flush=True)
 
-    print("Loading 12 Pangolin models...", flush=True)
+    print("Loading Pangolin models...", flush=True)
     models = load_models(device)
-    print("  models loaded.", flush=True)
+    print(f"{len(models)}  models loaded.", flush=True)
 
     print(f"Opening FASTA: {FASTA_PATH}", flush=True)
     if not FASTA_PATH.exists():
@@ -569,31 +598,41 @@ def main() -> None:
             axis=0,
         )  # (B, 4, SEQ_LEN)
 
-        ts = score_batch(encodings, models, device)   # (B, 4)
+        ts = score_batch(encodings, models, device)   # (B, 4, 2)
 
         for i, s in enumerate(batch):
-            row_ts = ts[i]
-            mean_p = float(np.mean(row_ts))
+            p = ts[i, :, 0]   # (4,) P(splice site) per tissue (Heart/Liver/Brain/Testis)
+            u = ts[i, :, 1]   # (4,) usage per tissue (PSI-analog)
+            p_mean = float(np.mean(p))
+            u_mean = float(np.mean(u))
             results.append({
-                "event_id":       s["event_id"],
-                "event_type":     s["event_type"],
-                "site_type":      s["site_type"],
-                "tissue_heart":   float(row_ts[0]),
-                "tissue_liver":   float(row_ts[1]),
-                "tissue_brain":   float(row_ts[2]),
-                "tissue_testis":  float(row_ts[3]),
-                "mean_usage":     mean_p,
-                "tissue_cv":      (float(np.std(row_ts) / mean_p)
-                                   if mean_p > 0 else float("nan")),
+                "event_id":         s["event_id"],
+                "event_type":       s["event_type"],
+                "site_type":        s["site_type"],
+                # P(splice site) — sequence-intrinsic site strength (MaxEntScan-comparable)
+                "psite_heart":      float(p[0]),
+                "psite_liver":      float(p[1]),
+                "psite_brain":      float(p[2]),
+                "psite_testis":     float(p[3]),
+                "psite_mean":       p_mean,
+                "psite_tissue_cv":  (float(np.std(p) / p_mean) if p_mean > 0 else float("nan")),
+                # usage — tissue-specific predicted splicing level (PSI-comparable)
+                "usage_heart":      float(u[0]),
+                "usage_liver":      float(u[1]),
+                "usage_brain":      float(u[2]),
+                "usage_testis":     float(u[3]),
+                "usage_mean":       u_mean,
+                "usage_tissue_cv":  (float(np.std(u) / u_mean) if u_mean > 0 else float("nan")),
             })
 
     pool.shutdown()
 
     # ── Write output ─────────────────────────────────────────────────────────────
     print("Writing output...", flush=True)
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame(results).write_csv(OUTPUT_PATH)
-    print(f"Saved {len(results)} scores → {OUTPUT_PATH}", flush=True)
+    this_out_path = TEST_OUTPUT_PATH if args.n_events is not None else OUTPUT_PATH
+    this_out_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(results).write_csv(this_out_path)
+    print(f"Saved {len(results)} scores → {this_out_path}", flush=True)
 
 
 if __name__ == "__main__":

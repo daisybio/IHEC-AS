@@ -1,76 +1,215 @@
 ---
-title: "07-manual_ids"
+title: "Experimental / manually-tracked events (CD45, FN1, CTNND1 + neighbours)"
 output: html_document
 date: "2024-08-14"
 ---
 
+```{r, setup}
+# Per-filter (matches everything from 02-2 on): one transcript_filter per
+# invocation. TRANSCRIPT_FILTER env unset when run standalone -> primary filter.
+tf <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
 
-```{r}
-library(glmnet)
-library(ranger)
-library(caret)
-library(MLmetrics)
+# `aggregating.rda` is GONE (removed by the per-filter refactor). Every object
+# it used to supply is read explicitly, per-filter, same pattern as 09-1/09-2.
+aggregated_dt <- fread(
+  sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf),
+  stringsAsFactors = TRUE
+)
+event_annotations_dt <- fread(
+  sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf)
+)
+activeChromHMM <- readRDS(sprintf("processed_data/activeChromHMM_%s.rds", tf))
+event_gr <- readRDS(sprintf("processed_data/event_gr_%s.rds", tf))
+chromhmm_hits <- readRDS(sprintf("processed_data/chromhmm_hits_%s.rds", tf))
+keep_rows_manual <- readRDS(sprintf("processed_data/keep_rows_manual_%s.rds", tf))
+event_dir <- file.path("processed_data", "event_models", tf)
+
+# Manual event list, ID RECOVERY (2026-07-12): the old hardcoded numeric IDs
+# below (309-314, 459-463, 979, 1048-1049, 1658, 4019-4022, 8201-8202,
+# 13896-13897) are from the pre-per-filter COMBINED multi-filter ID space and
+# are meaningless on their own -- `03` assigns fresh 1-indexed IDs per filter
+# per run (`event_dt[, ID := seq.int(.N)]`), so they change every rerun. What IS
+# stable is the SUPPA `event_id` genomic-coordinate string (same gencode.v29
+# build) -- embedded literally below (traced via git history + a recovered
+# `manual_dt.csv` export, see revision/file-changes/09-1-ml-local.R.md for the
+# full recovery trace) and re-resolved against the CURRENT `event_annotations_dt`
+# at runtime every render, rather than ever hardcoding a current ID.
+#
+# `old_id` is kept only as a display label tying back to the original
+# analysis/images below -- it plays no role in the current-ID lookup.
+manual_events <- data.table(
+  old_id = c(
+    309L, 310L, 311L, 312L, 313L, 314L,
+    459L, 460L, 461L, 462L, 463L,
+    979L,
+    1048L, 1049L,
+    1658L,
+    4019L, 4020L, 4021L, 4022L,
+    8201L, 8202L,
+    13896L, 13897L
+  ),
+  gene_symbol = c(
+    "BRCA1", "BRCA1", "BRCA1", "BRCA1", "BRCA1", "BRCA1",
+    "CD44", "CD44", "CD44", "CD44", "CD44",
+    NA_character_,
+    NA_character_, NA_character_,
+    "PTPRC/CD45",
+    "FN1", "FN1", "FN1", "FN1",
+    NA_character_, NA_character_,
+    "CTNND1", "CTNND1"
+  ),
+  event_id = c(
+    "ENSG00000012048.21;SE:chr17:43047703-43049121:43049194-43051063:-",
+    "ENSG00000012048.21;SE:chr17:43076611-43079334:43079399-43082404:-",
+    "ENSG00000012048.21;SE:chr17:43104956-43106456:43106533-43115726:-",
+    "ENSG00000012048.21;SE:chr17:43104956-43106478:43106533-43115726:-",
+    "ENSG00000012048.21;SE:chr17:43106533-43110465:43110580-43115726:-",
+    "ENSG00000012048.21;SE:chr17:43106533-43115726:43115779-43124017:-",
+    "ENSG00000026508.18;SE:chr11:35176740-35180274:35180407-35186832:+",
+    "ENSG00000026508.18;SE:chr11:35190065-35196746:35196874-35198121:+",
+    "ENSG00000026508.18;SE:chr11:35190065-35198121:35198246-35208105:+",
+    "ENSG00000026508.18;SE:chr11:35190065-35211246:35211449-35214852:+",
+    "ENSG00000026508.18;SE:chr11:35190065-35214852:35214914-35219316:+",
+    "ENSG00000065243.19;SE:chr1:88786213-88804391:88804534-88804846:+",
+    "ENSG00000066468.22;SE:chr10:121515319-121517319:121517463-121518682:-",
+    "ENSG00000066468.22;SE:chr10:121517463-121518682:121518829-121519979:-",
+    "ENSG00000081237.19;SE:chr1:198699704-198702387:198702530-198703298:+",
+    "ENSG00000115414.18;SE:chr2:215372015-215372109:215372300-215373322:-",
+    "ENSG00000115414.18;SE:chr2:215372015-215372109:215372375-215373322:-",
+    "ENSG00000115414.18;SE:chr2:215379317-215380811:215381080-215382212:-",
+    "ENSG00000115414.18;SE:chr2:215391814-215392931:215393203-215394528:-",
+    "ENSG00000149636.15;SE:chr20:36768042-36770873:36771193-36771425:-",
+    "ENSG00000149636.15;SE:chr20:36771193-36771425:36771473-36773662:-",
+    # CTNND1's gene_id was a merged multi-gene string in the old table
+    # (ENSG00000213593.9_and_..._and_ENSG00000198561.13) -- the exact event_id
+    # string therefore does NOT match current annotation; resolved below via
+    # genomic-coordinate fallback instead (current gene_id is cleanly
+    # ENSG00000198561.13 alone).
+    "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13;SE:chr11:57762046-57789037:57789155-57791385:+",
+    "ENSG00000213593.9_and_ENSG00000254462.1_and_ENSG00000211450.9_and_ENSG00000198561.13;SE:chr11:57762046-57789037:57789155-57791494:+"
+  )
+)
+
+# --- resolve old event_id -> current ID (exact string match, then a genomic-
+# coordinate-only fallback for the merged-gene-id cases like CTNND1) ---------
+.parse_se_coords <- function(eid) {
+  m <- regmatches(eid, regexpr("(chr\\w+):(\\d+)-(\\d+):(\\d+)-(\\d+):([+-])$", eid))
+  if (length(m) == 0 || m == -1) return(NA_character_)
+  sub("^.*(chr\\w+:\\d+-\\d+:\\d+-\\d+:[+-])$", "\\1", eid)
+}
+manual_events[, coord_key := vapply(event_id, .parse_se_coords, character(1))]
+event_annotations_dt[, coord_key := vapply(event_id, .parse_se_coords, character(1))]
+
+exact_map <- event_annotations_dt[, .(event_id, ID)]
+manual_events[exact_map, on = "event_id", current_id := i.ID]
+coord_map <- unique(event_annotations_dt[!is.na(coord_key), .(coord_key, ID)])
+manual_events[
+  is.na(current_id) & !is.na(coord_key),
+  current_id := coord_map[.SD, on = "coord_key", x.ID]
+]
+
+knitr::kable(
+  manual_events[, .(old_id, gene_symbol, current_id)],
+  caption = sprintf(
+    "Manual event recovery under transcript_filter=%s (%d/%d resolved to a current ID)",
+    tf, sum(!is.na(manual_events$current_id)), nrow(manual_events)
+  )
+)
 ```
 
-```{r}
-aggregated_dt <-
-  fread(file.path('processed_data', 'aggregated_dt_filtered.csv.gz'), stringsAsFactors = TRUE)
-load(file.path('processed_data', 'aggregating.rda'))
-event_dirs <- c('event_models_long', 
-                'event_models', 
-                'event_models_local')
-event_dirs <- file.path('processed_data', event_dirs)
-event_file_dt <- rbindlist(sapply(event_dirs, function(event_dir) {
-  rbindlist(sapply(as.character(c(manual_ids, c(4021, 4022, 459, 979, 309))), function(id) {
-      list(filename=list.files(event_dir, pattern = paste0('^', id, "[_.]"), full.names = TRUE))
-  }, simplify = FALSE), idcol = 'ID')
-}, simplify = FALSE), idcol = 'folder')
-event_file_dt[grepl("robust", filename, fixed = TRUE)]
-```
+The 4 rows with `current_id = NA` (BRCA1 old IDs 312/313, CD44 old IDs 459/463) are **not
+missing data** — root-caused: each event's defining isoform is an NMD-biotype transcript, which
+`biotype_filtered` excludes by design (confirmed via the GTF, not guessed). They cannot exist
+under this filter at all. See `revision/file-changes/09-1-ml-local.R.md` for the full trace.
 
+```{r, display-helpers}
+# feature_sets (long/short/local) live as a wflow_id PREFIX inside the per-
+# event CSVs now (e.g. "long_PSI_glmnet"), not as separate directories the way
+# the old 07/09-1 architecture wrote them -- `09zz-ml-event-glmnet-tidymodels.R`
+# writes one shared event_dir per filter (matches the Snakemake `event_models`
+# rule's `.done` sentinel path). There is also no single fitted `cvfit` R object
+# to `summary()` anymore -- the closest current equivalent to that old
+# inspection is the non-zero coefficient table + performance metrics, both
+# already written as separate per-event CSVs; that's what's shown below
+# (user-confirmed 2026-07-12, in place of trying to reconstruct a `cvfit`-shaped
+# object that no longer exists in the pipeline's output format).
+show_event_model <- function(current_id, label) {
+  cat(sprintf("\n### %s (current ID %s)\n\n", label, current_id))
+  if (is.na(current_id)) {
+    cat("_No current event under transcript_filter=", tf, " -- see note above._\n")
+    return(invisible(NULL))
+  }
+
+  coefs_file <- file.path(event_dir, sprintf("%d_nonzero_coefs.csv.gz", current_id))
+  metrics_file <- file.path(event_dir, sprintf("%d_fit_metrics.csv.gz", current_id))
+  if (!file.exists(coefs_file) || !file.exists(metrics_file)) {
+    cat("_Model not yet computed for this event (`event_models` rule hasn't run",
+        "for ID", current_id, "yet, or it fell outside `ids_to_build`'s",
+        "minimum-events/non-zero-variance filters)._\n")
+    return(invisible(NULL))
+  }
+
+  # response is always "PSI" (09-1's `response <- "PSI"`) -- exclude the
+  # rotation-control workflows (wflow_id "*_rotated_<n>_*") from this display,
+  # matching what the old cvfit-based view showed (the real fit only).
+  coefs <- fread(coefs_file)[grepl("_PSI_", wflow_id, fixed = TRUE)]
+  metrics <- fread(metrics_file)[grepl("_PSI_", wflow_id, fixed = TRUE)]
+
+  cat("**Non-zero coefficients** (by feature set):\n\n")
+  print(knitr::kable(coefs))
+  cat("\n**Fit metrics**:\n\n")
+  print(knitr::kable(metrics))
+
+  meta <- event_annotations_dt[ID == current_id]
+  cat("\n**Event annotation**:\n\n")
+  print(knitr::kable(meta[, .(event_id, gene_id, seqnames, `Event Type`, Variability)]))
+
+  chromhmm_ids <- to(chromhmm_hits[from(chromhmm_hits) == which(keep_rows_manual == current_id)])
+  if (length(chromhmm_ids)) {
+    cat("\n**Nearby ChromHMM states**:\n\n")
+    print(activeChromHMM[chromhmm_ids])
+  }
+  cat("\n**Event GRanges**:\n\n")
+  print(event_gr[current_id])
+  invisible(NULL)
+}
+```
 
 # CD45 / PTPRC
 
-```{r}
-# for each id in 4019:4022 for each event folder, list the .rds files starting with that id with lapply
-event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 1658, filename])
-summary(event_model$cvfit$`FALSE::OLS_GE`)
+```{r, results = "asis"}
+show_event_model(manual_events[old_id == 1658, current_id], "PTPRC/CD45")
 ```
 
-
-```{r}
-event_dt[ID == 1658, !sample_cols, with = FALSE]
-activeChromHMM[c(54093, 54111)]
-event_gr[1658]
-```
 ![CD45](images/CD451658.png)
 
 # FN1
 
-```{r}
-event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 4022, filename])
-summary(event_model$cvfit$`FALSE::OLS_GE`)
-```
-
-```{r}
-event_dt[ID == 4022, !sample_cols, with = FALSE]
-activeChromHMM[c(419854, 420041)]
-event_gr[4022]
+```{r, results = "asis"}
+for (oid in c(4019, 4020, 4021, 4022)) {
+  show_event_model(manual_events[old_id == oid, current_id], sprintf("FN1 (old ID %d)", oid))
+}
 ```
 
 ![FN1](images/FN4022.png)
 
 # CTNND1
 
-```{r}
-event_model <- readRDS(event_file_dt[grepl("robust", filename, fixed = TRUE)][ID == 13897, filename])
-summary(event_model$cvfit$`FALSE::OLS_GE`)
-print(event_model$nsamples)
+```{r, results = "asis"}
+for (oid in c(13896, 13897)) {
+  show_event_model(manual_events[old_id == oid, current_id], sprintf("CTNND1 (old ID %d)", oid))
+}
 ```
 
-```{r}
-event_dt[ID == 13897, !sample_cols, with = FALSE]
-# activeChromHMM[c(419854, 420041)]
-event_gr[13897]
-```
+# Other tracked events (BRCA1, CD44, + unlabelled)
 
+```{r, results = "asis"}
+other_ids <- manual_events[!gene_symbol %in% c("PTPRC/CD45", "FN1", "CTNND1") | is.na(gene_symbol), old_id]
+for (oid in other_ids) {
+  row <- manual_events[old_id == oid]
+  show_event_model(row$current_id, sprintf("%s (old ID %d)", ifelse(is.na(row$gene_symbol), "unlabelled", row$gene_symbol), oid))
+}
+```

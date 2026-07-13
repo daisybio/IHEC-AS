@@ -1,0 +1,34 @@
+# Snakemake SLURM profile — routes CPU rules to the exbio-interactive partition.
+#   mamba run -n ihec-as snakemake --profile profiles/slurm-interactive [targets]
+#
+# exbio-interactive = single node, 1-day time limit, ~1.5 TB RAM. Good for one
+# memory-heavy job (e.g. 02-3 rmats_event_filtering) or dev/interactive work,
+# but only ONE node exists, so jobs serialise — do not use for the full fan-out.
+#
+# The per-rule partition is chosen by _partition()/_ml_partition() in the
+# Snakefile from config["slurm_cpu_partition"] / config["slurm_gpu_partition"],
+# which OVERRIDE default-resources. So we redirect the CPU partition via the
+# `config:` override below; GPU rules stay on shared-gpu (the interactive node
+# has no a40, so gpu:a40 gres would not schedule there).
+
+executor: slurm
+slurm-logdir: logs/slurm
+
+jobs: 20 # 1 node -> jobs queue anyway; keep the submit rate sane
+latency-wait: 90
+max-jobs-per-second: 5
+slurm-array-jobs: "aggregate_chip_one"
+slurm-array-limit: 50
+restart-times: 0 # no automatic retry on failure — user reruns manually
+keep-incomplete: true
+rerun-incomplete: true
+
+# Redirect all CPU rules to exbio-interactive (GPU rules keep shared-gpu).
+config:
+  - slurm_cpu_partition=exbio-interactive
+
+default-resources:
+  - slurm_partition="exbio-interactive"
+  - slurm_extra="--mail-type=FAIL --mail-user=quirin.manz@tum.de"
+  - mem_mb=16000
+  - runtime=120

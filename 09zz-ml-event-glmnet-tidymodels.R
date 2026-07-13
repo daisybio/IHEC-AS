@@ -329,7 +329,8 @@ run_event_glmnet <- function(
 
   # For each (response, explanatory set) pair: promote predictors, impute,
   # drop zero-variance columns, dummy-encode nominals, and add
-  # protocol × gene_expression interaction terms.
+  # protocol × gene_expression_vst interaction terms. (§4.12b: 05 no longer
+  # emits a bare `gene_expression` column.)
   explanatory_recipe_list <- unlist(
     sapply(
       explanatory_vars,
@@ -343,7 +344,7 @@ run_event_glmnet <- function(
               step_impute_mean(all_numeric_predictors()) |>
               step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
               step_interact(
-                terms = ~ starts_with("protocol"):gene_expression
+                terms = ~ starts_with("protocol"):gene_expression_vst
               ) |>
               step_zv(all_predictors())
           },
@@ -403,13 +404,13 @@ run_event_glmnet <- function(
   # -- Feature extraction helpers ---------------------------------------------
 
   # Non-zero glmnet coefficients at the selected penalty, excluding the
-  # intercept and gene_expression (used as an interaction base term).
+  # intercept and gene_expression_vst (used as an interaction base term).
   .extract_glmnet_coefs <- function(best_params, final_fit) {
     penalty_val <- best_params$penalty[[1L]]
     engine <- workflows::extract_fit_engine(final_fit)
     coef_mat <- as.matrix(coef(engine, s = penalty_val))
     mask <- coef_mat[, 1L] != 0 &
-      !rownames(coef_mat) %in% c("(Intercept)", "gene_expression")
+      !rownames(coef_mat) %in% c("(Intercept)", "gene_expression_vst")
     coef_mat[mask, 1L, drop = FALSE]
   }
 
@@ -591,7 +592,7 @@ run_event_glmnet <- function(
 
 # ---------------------------------------------------------------------------
 # CLI entry point — invoked by 09-1-ml-local-array.sh as:
-#   Rscript 07-ml-event-glmnet-tidymodels.R <cfg_rds> <event_id>
+#   Rscript 09zz-ml-event-glmnet-tidymodels.R <cfg_rds> <event_id>
 # ---------------------------------------------------------------------------
 if (!interactive()) {
   args <- commandArgs(trailingOnly = TRUE)
@@ -641,6 +642,12 @@ if (!interactive()) {
             "transcript_filter",
             "project",
             "harmonized_sample_ontology_term_high_order_fig1",
+            # §4.12b: 05 emits BOTH gene_expression_getmm + gene_expression_vst;
+            # event-specific models use vst (single-gene, cross-sample —
+            # matches 06/09-1 routing), getmm is the pooled splicing_ml copy —
+            # exclude it here so it isn't also fit as a second expression
+            # predictor alongside vst.
+            "gene_expression_getmm",
             grouping_col,
             response
           )

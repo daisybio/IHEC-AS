@@ -11,14 +11,26 @@ slurm-logdir: logs/slurm
 jobs: 200
 latency-wait: 90
 max-jobs-per-second: 5
-slurm-array-jobs: "aggregate_chip_one"
-slurm-array-limit: 200
-restart-times: 1
-keep-incomplete: true
+# slurm-array-jobs / slurm-array-limit DISABLED 2026-07-08: grouping the ~2295
+# aggregate_chip_one jobs into a SLURM array stalled the scheduler — snakemake
+# submitted only the 2 non-array jobs (wgbs, pangolin) then froze while
+# assembling the array; maxentscan and the chip jobs never submitted (twice).
+# Fallback = individual submission: `jobs: 200` caps concurrency,
+# `max-jobs-per-second: 5` throttles the rate (~2295/5 ≈ 8 min to submit all).
+# Slower to submit but reliable. Re-enable only if the plugin's array path is
+# confirmed working on this cluster.
+# slurm-array-jobs: "aggregate_chip_one"
+# slurm-array-limit: 200
+restart-times: 0 # no automatic retry on job failure — user reruns manually
+# keep-incomplete: false (snakemake default) — DELETE a failed job's outputs so a
+# partial/empty file is never left at an output path (where it could be mistaken
+# for a valid result on rerun). Combined with `set -euo pipefail` in the rule
+# shells, failures leave no bogus outputs. (Was true; flipped 2026-07-08.)
+keep-incomplete: false
 rerun-incomplete: true
 
 default-resources:
   - slurm_partition="shared-cpu"
-  - slurm_extra="--mail-type=FAIL,END --mail-user=quirin.manz@tum.de"
+  - slurm_extra="--mail-type=FAIL --mail-user=quirin.manz@tum.de"
   - mem_mb=16000
   - runtime=120

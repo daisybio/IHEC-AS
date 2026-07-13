@@ -1,30 +1,64 @@
 ---
 title: "Post-aggregation analysis"
 output: html_document
-params:
-  transcript_filter: "biotype_filtered"
 ---
 
 ```{r, load-data}
 set.seed(getOption("EpiATLAS_AS_SEED", 42L))
 
-keep_rows_manual <- readRDS("processed_data/keep_rows_manual.rds")
+# Per-filter invocation (PLAN §4.12e per-filter incremental outputs): 05 builds
+# one transcript_filter per run from that filter's upstream outputs and writes
+# aggregated_dt_filtered_{tf}.csv.gz. Snakemake passes TRANSCRIPT_FILTER;
+# interactive runs fall back to the YAML param / primary filter.
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+tf <- this_transcript_filter
+
+keep_rows_manual <- readRDS(
+  sprintf("processed_data/keep_rows_manual_%s.rds", tf)
+)
 file_metadata <- fread("processed_data/file_table.csv.gz")
 metadata <- fread(sample_metadata_file)
-event_annotations_dt <- fread("processed_data/event_annotations_dt.csv.gz")
-psi_long_dt <- fread("processed_data/psi_long_dt.csv.gz")
-ijc_sjc_dt <- fread("processed_data/ijc_sjc_dt.csv.gz")
-# locate
+event_annotations_dt <- fread(
+  sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf)
+)
+psi_long_dt <- fread(sprintf("processed_data/psi_long_dt_%s.csv.gz", tf))
+ijc_sjc_dt <- fread(sprintf("processed_data/ijc_sjc_dt_%s.csv.gz", tf))
+# locate per-filter ChIP aggregation outputs (sample_dts/chip_agg_{tf}/)
+chip_agg_dir <- file.path(sample_dt_dir, sprintf("chip_agg_%s", tf))
 file_metadata[,
-  local_file := file.path(sample_dt_dir, paste0(basename(file_path), ".tab.gz"))
+  local_file := file.path(chip_agg_dir, paste0(basename(file_path), ".tab.gz"))
 ]
-stopifnot(file_metadata[assay_type == "ChIP-Seq", all(file.exists(local_file))])
+# Every ChIP metadata entry MUST have an aggregated tab. ALL ChIP source bigwigs
+# exist on disk — observed (…pval.signal.bigwig) AND ChromImpute imputed
+# (impute_*.pval.bw) — so a missing .tab.gz means the aggregation is INCOMPLETE
+# (a bug: e.g. the CHIP_BW glob once missed all 135 imputed tracks). Fail hard
+# with the count + an example — do NOT silently proceed on a subset (that masks
+# the bug + drops real data). Genuine no-data cohorts (AMED-CREST RNA) don't
+# apply here; every ChIP file_path resolves.
+.missing_chip <- file_metadata[
+  assay_type == "ChIP-Seq" & !file.exists(local_file)
+]
+if (nrow(.missing_chip) > 0L) {
+  stop(sprintf(
+    "ChIP aggregation INCOMPLETE: %d/%d tabs missing. First missing: %s (source exists: %s). Check the aggregate_chip_one/aggregate_chip_imp globs.",
+    nrow(.missing_chip),
+    file_metadata[assay_type == "ChIP-Seq", .N],
+    .missing_chip$local_file[1],
+    file.exists(file.path(
+      "/nfs/data3/IHEC/ChIP-Seq",
+      basename(.missing_chip$file_path[1])
+    ))
+  ))
+}
 
 # # we only need ChIP-Seq data, since WGBS has been aggregated via the matrices
 # file_table <- file_table[assay_type == "ChIP-Seq"]
 
-# load WGBS data
-wgbs_agg <- fread(file.path(sample_dt_dir, "WGBS_agg.csv.gz"))
+# load WGBS data (per-filter)
+wgbs_agg <- fread(file.path(sample_dt_dir, sprintf("WGBS_agg_%s.csv.gz", tf)))
 wgbs_agg <- wgbs_agg[!startsWith(name, "chromhmm")]
 wgbs_agg <- melt(
   wgbs_agg,
@@ -76,10 +110,16 @@ common_cols <- intersect(names(histone_dt), names(wgbs_agg))
 
 ```{r, build-aggregated-dt}
 # bind histone and WGBS data
+message("Building aggregated feature table from histone and WGBS inputs...")
 aggregated_dt <- rbindlist(list(
   histone_dt[ihec %in% common_ihec, ..common_cols],
   wgbs_agg[ihec %in% common_ihec, ..common_cols]
 ))
+# histone_dt (~30G, the ~1e9-row ChIP long table) and wgbs_agg are not used
+# after this rbind — free them before the tstrsplit + dcast, which otherwise
+# hold their working copies ON TOP of these (the chunk-4 OOM peak was 98G).
+rm(histone_dt, wgbs_agg)
+gc()
 
 # some data wrangling to prepare the data for putting into wide format
 aggregated_dt[, c("position", "ID") := tstrsplit(name, "_", fixed = TRUE)]
@@ -91,6 +131,7 @@ aggregated_dt[, experiment_type := droplevels(experiment_type)]
 aggregated_dt[, ihec := as.factor(ihec)]
 aggregated_dt[, ID := as.integer(ID)]
 # from long to wide
+message("Casting long-format measurements to wide format...")
 aggregated_dt <- dcast(
   aggregated_dt,
   ihec + ID ~ experiment_type + position,
@@ -111,7 +152,7 @@ setnames(aggregated_dt, old = "ihec", new = "IHEC")
 # auto-routed to the categorical/nominal branch of both downstream
 # pipelines without any code changes there: splicing_ml's
 # infer_feature_columns() buckets by dtype (non-numeric -> categorical_cols
-# -> OneHotEncoder, same as `protocol`); 07-ml-event-glmnet-tidymodels.R's
+# -> OneHotEncoder, same as `protocol`); 09zz-ml-event-glmnet-tidymodels.R's
 # tidymodels recipe uses all_nominal_predictors() -> step_dummy(). A numeric
 # 0/1 encoding would risk being misclassified as a continuous histone
 # signal by splicing_ml's `col.startswith("H3K")` clip-column rule if named
@@ -138,6 +179,7 @@ aggregated_dt[
 ]
 
 # write full table to disk
+message("Writing processed_data/aggregated_dt.csv.gz...")
 fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
 ```
 
@@ -239,6 +281,35 @@ aggregated_dt[
   on = .(ID),
   (cols_to_add) := mget(cols_to_add)
 ]
+
+# --- DROP events with uncomputable Variability (NA sd_psi) --------------------
+# NA Variability == NA sd_psi == <2 non-NA PSI samples after the 02-3 masking:
+# such events cannot be classified (median split) or used cross-sample, and are
+# unusable in 06 correlation + 09-1 (minimum_events guard) + any variability
+# stratification; contribution to the pooled splicing_ml is <=1 row each
+# (negligible, and biotype_filtered's `both` config is excluded anyway). Drop
+# here so aggregated_dt_filtered is clean for ALL consumers.
+# FIXED upstream 2026-07-13: 03's keep_rows_manual now includes
+# `!is.na(sd_psi)`, so a fresh 03 rerun will no longer emit these ~317 events
+# at all. This block is now defense-in-depth (kept in place so already-cached
+# 03/04 outputs from before that fix, or a stale keep_rows_manual_{tf}.rds, are
+# still handled correctly) rather than the primary filter. Until every
+# transcript_filter's 03 output has actually been regenerated,
+# keep_rows_manual_{tf}.rds may still be a SUPERSET of the modelled set —
+# direct readers (09-1/10) must intersect with aggregated_dt IDs.
+# NB Variability is CHARACTER and the NA-sd_psi events come through as EMPTY
+# STRING "", not NA: 03 fwrite writes NA-char as "" and fread reads it back as ""
+# (default na.strings = "NA", not ""). So test both is.na() AND == "".
+.na_var <- is.na(aggregated_dt$Variability) | aggregated_dt$Variability == ""
+n_na_variability_dropped <- aggregated_dt[.na_var, uniqueN(ID)]
+if (n_na_variability_dropped > 0L) {
+  warning(sprintf(
+    "05: dropping %d events with unset Variability (NA/'' == <2 valid PSI samples, sd_psi undefined) - now also filtered upstream in 03 keep_rows_manual as of 2026-07-13; this is a defense-in-depth catch for outputs from before that fix.",
+    n_na_variability_dropped
+  ))
+  aggregated_dt <- aggregated_dt[!(is.na(Variability) | Variability == "")]
+}
+
 # also add the protocol
 aggregated_dt[file_metadata, on = .(uuid), protocol := experiment_type]
 # add the ontology term and the project
@@ -262,15 +333,15 @@ aggregated_dt[
 ]
 
 
-# load transcript ids per filter
-filtered_transcript_ids <- readRDS(
-  "splicing_analysis/filtered_transcript_ids.rds"
-)
-# `transcript_filters` was previously an undefined variable here (only
-# worked by accident if a prior interactive session had it in the global
-# env, e.g. from running 03 first) — derive it from the actual upstream
-# artifact instead of hardcoding a second copy of the three filter names.
-transcript_filters <- names(filtered_transcript_ids)
+# # load transcript ids per filter
+# filtered_transcript_ids <- readRDS(
+#   "splicing_analysis/filtered_transcript_ids.rds"
+# )
+# # `transcript_filters` was previously an undefined variable here (only
+# # worked by accident if a prior interactive session had it in the global
+# # env, e.g. from running 03 first) — derive it from the actual upstream
+# # artifact instead of hardcoding a second copy of the three filter names.
+# transcript_filters <- names(filtered_transcript_ids)
 
 ### Old implementation recomputed TPM, now that we have §4.12b, we use the lengthScaledTPM + vst from 04-5-rnaseq-normalisation.Rmd
 # # load isoform quantifications
@@ -321,7 +392,9 @@ transcript_filters <- names(filtered_transcript_ids)
 #   by = .(transcript_filter, uuid, gene_id)
 # ]
 
-gene_quants_agg <- fread("processed_data/gene_expression_normalised.csv.gz")
+gene_quants_agg <- fread(
+  sprintf("processed_data/gene_expression_normalised_%s.csv.gz", tf)
+)
 
 # §4.12b — keep BOTH normalised representations under explicit names; there
 # is deliberately no ambiguous `gene_expression` column. Consumers pick by
@@ -346,219 +419,80 @@ aggregated_dt[
   )
 ]
 
-# §4.12e — decision check: do AS-event-hosting genes even need a
-# low-expression filter, or are they already pre-selected for expression by
-# rMATS (an event needs junction reads spanning it to be called at all)?
-# Compares the per-gene expression distribution of AS-event genes against
-# ALL annotation-passing genes (the same universe gene_quants_agg is built
-# from, genome-wide -- see 02-SUPPA2-analysis.Rmd filter-annotation chunk --
-# NOT restricted to AS events). Classic genome-wide expression is bimodal
-# (on/off: housekeeping/expressed vs silenced genes); if AS-event genes are
-# already unimodal and clear of the low mode, masking low-expression rows
-# below is redundant and can be dropped.
-#
-# Granularity: one point per (gene_id, transcript_filter), median expression
-# across samples -- the natural granularity for "is this gene on or off",
-# as opposed to the per-(gene,sample) granularity the old masking applied.
-# Checked on BOTH representations: gene_expression_getmm (CPM-like, >= 0,
-# what the old threshold was meant for) and gene_expression_vst (the actual
-# feature fed to models -- variance-stabilised, roughly log2-scale, can be
-# negative, so it gets no log1p and no comparable raw threshold line).
-min_gene_expression <- getOption("EpiATLAS_AS_MIN_GENE_EXPRESSION", 1)
-
-event_genes <- unique(event_annotations_dt[, .(transcript_filter, gene_id)])
-event_genes[, gene_id := gsub("\\.\\d+$", "", gene_id)]
-
-gene_median_expr <- gene_quants_agg[,
-  .(
-    median_getmm = median(gene_expression_getmm, na.rm = TRUE),
-    median_vst = median(gene_expression_vst, na.rm = TRUE)
-  ),
-  by = .(transcript_filter, gene_id)
-]
-gene_median_expr[, gene_id_stripped := gsub("\\.\\d+$", "", gene_id)]
-gene_median_expr[,
-  group := fifelse(
-    paste(transcript_filter, gene_id_stripped) %in%
-      event_genes[, paste(transcript_filter, gene_id)],
-    "AS-event gene",
-    "background (all genes)"
+# §3.4 / §4.12f — RBP + core-spliceosome expression features (from 04-6, all on
+# gene_expression_vst: single-gene columns, same routing as host expression).
+# rbp_score_* : per (ID, uuid), sum/mean/max expression of the RBPs with a
+# binding site near the event (binding-site-filtered). Events with no nearby RBP
+# get no row -> impute 0, NOT the column mean: 0 correctly encodes "no local RBP
+# signal"; the mean would fabricate a nonzero regulator score.
+rbp_score_dt <- fread(sprintf("processed_data/rbp_score_dt_%s.csv.gz", tf))
+aggregated_dt[
+  rbp_score_dt,
+  on = .(ID, uuid, transcript_filter),
+  c("rbp_score_sum", "rbp_score_mean", "rbp_score_max", "rbp_n") := .(
+    i.rbp_score_sum,
+    i.rbp_score_mean,
+    i.rbp_score_max,
+    i.rbp_n
   )
 ]
-
-dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
-
-# shared plot + Hartigan dip test (unimodality) logic for a given
-# representation column -- same dip test already used in
-# 03-prepare-aggregation.Rmd for variability measures. p > 0.05 -> can't
-# reject unimodal null; p < 0.05 -> bimodal signal.
-run_need_filter_check <- function(
-  value_col,
-  x_expr,
-  x_lab,
-  vline_val,
-  out_suffix
-) {
-  plot_dt <- copy(gene_median_expr)
-  plot_dt[, x_val := x_expr(get(value_col))]
-
-  p <- ggplot(plot_dt, aes(x = x_val, fill = group, color = group)) +
-    geom_density(alpha = 0.3) +
-    facet_wrap(~transcript_filter, ncol = 1, scales = "free_y") +
-    labs(
-      title = sprintf(
-        "per-gene median %s: AS-event genes vs all genes",
-        value_col
-      ),
-      x = x_lab
-    )
-  if (!is.null(vline_val)) {
-    p <- p +
-      geom_vline(xintercept = vline_val, linetype = "dashed", color = "black") +
-      labs(subtitle = "dashed line = former §4.12e masking threshold")
-  }
-  print(p)
-  ggsave(
-    sprintf("qc/distributions/gene_expression_need_filter_check_%s.pdf", out_suffix),
-    p,
-    width = 8,
-    height = 3 * length(transcript_filters)
-  )
-
-  if (requireNamespace("diptest", quietly = TRUE)) {
-    dip_results <- plot_dt[,
-      {
-        d <- diptest::dip.test(x_val)
-        list(dip_statistic = unname(d$statistic), p_value = d$p.value, n = .N)
-      },
-      by = .(transcript_filter, group)
-    ]
-    print(dip_results)
-    fwrite(
-      dip_results,
-      sprintf("qc/gene_expression_need_filter_dip_test_%s.csv", out_suffix)
-    )
-  } else {
-    warning("diptest package not available; skipping bimodality dip test")
-  }
+# rbp_n (# distinct expressed RBPs near the event) rides alongside so the model
+# can separate "how many RBPs" from "how much each" — rbp_score_sum conflates
+# them (see 04-6 Step 2a). Events with no nearby RBP get 0 (real value), not mean.
+for (col in c("rbp_score_sum", "rbp_score_mean", "rbp_score_max", "rbp_n")) {
+  set(aggregated_dt, which(is.na(aggregated_dt[[col]])), col, 0)
 }
 
-run_need_filter_check(
-  value_col = "median_getmm",
-  x_expr = log1p,
-  x_lab = "log1p(median gene_expression_getmm)",
-  vline_val = log1p(min_gene_expression),
-  out_suffix = "getmm"
+# spliceosome_* : core-machinery expression, per (uuid) genome-wide (not
+# site-filtered), joined on (uuid, transcript_filter). Present for every sample
+# -> no imputation needed. Own prefix keeps "general machinery" separable from
+# the local-regulator rbp_score_* in coefficient/importance output.
+splicing_factor_expression <- fread(sprintf(
+  "processed_data/splicing_factor_expression_%s.csv.gz",
+  tf
+))
+spliceosome_cols <- setdiff(
+  names(splicing_factor_expression),
+  c("uuid", "transcript_filter")
 )
-run_need_filter_check(
-  value_col = "median_vst",
-  x_expr = identity,
-  x_lab = "median gene_expression_vst",
-  vline_val = NULL,
-  out_suffix = "vst"
+aggregated_dt[
+  splicing_factor_expression,
+  on = .(uuid, transcript_filter),
+  (spliceosome_cols) := mget(paste0("i.", spliceosome_cols))
+]
+
+# §5.12f sanity — rbp_score_*/rbp_n are 0-imputed above (real value, not
+# missing), so must be non-NA for every row. spliceosome_* is joined
+# genome-wide/unfiltered (every uuid has core-machinery expression), so must
+# also be non-NA for ~100% of rows; any NA there means the (uuid,
+# transcript_filter) join key didn't match splicing_factor_expression.
+rbp_na_frac <- aggregated_dt[,
+  mean(is.na(rbp_score_sum) | is.na(rbp_score_mean) | is.na(rbp_score_max) | is.na(rbp_n))
+]
+append_sanity(
+  sprintf("rbp_score_non_na_%s", tf),
+  ifelse(rbp_na_frac == 0, "PASS", "FAIL"),
+  rbp_na_frac, 0,
+  "rbp_score_sum/mean/max/rbp_n should be 0-imputed, never NA, after the §5.12f join"
+)
+spliceosome_na_frac <- aggregated_dt[,
+  mean(rowSums(is.na(.SD)) > 0), .SDcols = spliceosome_cols
+]
+append_sanity(
+  sprintf("spliceosome_non_na_%s", tf),
+  ifelse(spliceosome_na_frac < 0.01, "PASS", "WARN"),
+  spliceosome_na_frac, 0.01,
+  "fraction of rows with >=1 NA spliceosome_* column (unfiltered genome-wide join, expect ~0)"
 )
 
-min_samples_per_event <- getOption("EpiATLAS_AS_MIN_SAMPLES_PER_EVENT", 10)
-
-# --- coverage-vs-expression overlap check --------------------------------
-# IJC/SJC (junction-read sample weighting, §4.8) already down-weights noisy
-# low-coverage rows in the loss. If gene_expression_getmm is highly
-# correlated with junction coverage, expression masking would be largely
-# redundant with that weighting; if the correlation is weak, the two catch
-# different noise sources (whole-gene expression vs event-specific junction
-# reads) and masking adds something coverage-weighting doesn't.
-coverage_expr_cor <- aggregated_dt[,
-  {
-    keep <- !is.na(gene_expression_getmm) & !is.na(IJC) & !is.na(SJC)
-    list(
-      spearman_r = cor(
-        log1p(gene_expression_getmm[keep]),
-        log1p(IJC[keep] + SJC[keep]),
-        method = "spearman"
-      ),
-      n = sum(keep)
-    )
-  },
-  by = transcript_filter
-]
-print(coverage_expr_cor)
-fwrite(coverage_expr_cor, "qc/gene_expression_vs_junction_coverage_cor.csv")
-
-# --- masking impact check (simulated, not applied) -----------------------
-# how many events (ID x transcript_filter) would drop below
-# min_samples_per_event if the §4.12e low-expression mask were applied --
-# quantifies data loss before committing to the mask.
-event_mask_impact <- aggregated_dt[,
-  .(
-    n_samples = .N,
-    n_after_mask = sum(gene_expression_getmm >= min_gene_expression, na.rm = TRUE)
-  ),
-  by = .(ID, transcript_filter, `Event Type`)
-]
-event_mask_impact[, would_drop := n_after_mask < min_samples_per_event]
-
-masking_impact_summary <- event_mask_impact[,
-  .(
-    n_events = .N,
-    n_events_would_drop = sum(would_drop),
-    frac_events_would_drop = mean(would_drop)
-  ),
-  by = .(transcript_filter, `Event Type`)
-]
-print(masking_impact_summary)
-fwrite(masking_impact_summary, "qc/gene_expression_masking_impact.csv")
-
-row_mask_frac <- aggregated_dt[,
-  .(frac_rows_would_mask = mean(gene_expression_getmm < min_gene_expression, na.rm = TRUE)),
-  by = transcript_filter
-]
-print(row_mask_frac)
-fwrite(row_mask_frac, "qc/gene_expression_masking_row_frac.csv")
-
-# Decision: KEEP masking. Evidence from the checks above:
-#  - dip test: AS-event genes are MORE bimodal than the genome-wide
-#    background (e.g. biotype_filtered getmm: dip=0.050 p<0.001 for event
-#    genes vs dip=0.0085 for background) -- a real low-expression
-#    subpopulation survives among event-hosting genes, contrary to the
-#    "already pre-selected for expression by rMATS" hypothesis.
-#  - coverage overlap: spearman r(gene_expression_getmm, IJC+SJC) ~ 0.70-0.72
-#    across filters -- correlated with junction-read sample weighting
-#    (§4.8) but far from redundant (30%+ unexplained variance), so masking
-#    catches noise the coverage weighting doesn't.
-#  - impact: cheap to apply -- only 8.5-12.8% of (event, sample) rows get
-#    masked, and only 0.3-1.9% of events are lost entirely to the
-#    min_samples_per_event floor below.
-# PSI in the masked (low-expression) rows is a noisy estimate (few
-# informative reads to derive inclusion/skip ratio from), so mask it to NA
-# rather than trusting it. Masking (not dropping the row outright) lets the
-# sample-count check below decide per-event whether enough non-masked
-# samples remain to keep modelling the event at all.
-#
-# Threshold is checked against gene_expression_getmm (CPM-like, >= 0, same
-# convention as the old TPM>=1 cutoff), NOT gene_expression (vst): vst is
-# variance-stabilised, roughly log2-scale, and can be negative, so
-# comparing it to a raw threshold of 1 doesn't correspond to "low
-# expression".
-aggregated_dt[gene_expression_getmm < min_gene_expression, PSI := NA]
-
-event_sample_counts <- aggregated_dt[
-  !is.na(PSI),
-  .N,
-  by = .(ID, transcript_filter)
-]
-low_sample_events <- event_sample_counts[
-  N < min_samples_per_event,
-  .(ID, transcript_filter)
-]
-if (nrow(low_sample_events) > 0) {
-  aggregated_dt <- aggregated_dt[
-    !low_sample_events,
-    on = .(ID, transcript_filter)
-  ]
-}
-# drop rows masked to NA above (and any events removed entirely by the
-# sample-count check, which have no remaining non-NA rows anyway)
-aggregated_dt <- aggregated_dt[!is.na(PSI)]
+# §4.12e — the low-expression event filter is now applied UPSTREAM in
+# 02-3-rmats-event-filtering.Rmd (per-(event,sample) expr_pass = VST host-gene
+# gate AND per-cell read-coverage floor IJC+SJC>=min_read_coverage) and the
+# minimum-sample floor was removed at data-construction. 05 therefore no longer
+# masks PSI or drops events on expression/sample-count grounds — it only checks
+# that the upstream gates held (see gene-expression-sanity + junction-coverage-
+# sanity chunks). Masked cells were written NA in the .psi and already dropped
+# above (aggregated_dt[!is.na(PSI)]).
 
 # make sure all of the gene_expression values are at least one: (deprecated because we don't have the suppa tpm filter anymore)
 # stopifnot(all(aggregated_dt[, gene_expression >= 1]))
@@ -590,20 +524,36 @@ aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
 # §4.13d — gene expression distribution sanity (post §4.12a fix)
 sanity_csv <- "qc/sanity_summary.csv"
 append_sanity <- function(check_name, status, value, threshold, notes = "") {
-  fwrite(
-    data.table(
-      check_name = check_name,
-      status = status,
-      value = value,
-      threshold = threshold,
-      notes = notes
-    ),
-    sanity_csv,
-    append = TRUE
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
   )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
 }
 
 dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+
+# record the NA-Variability drop (done above in expand-aggregated-dt); fixed
+# upstream in 03 keep_rows_manual as of 2026-07-13 — this stays PASS/0 once
+# every transcript_filter's 03 output has been regenerated.
+append_sanity(
+  sprintf("dropped_na_variability_events_%s", tf),
+  if (n_na_variability_dropped > 0L) "WARN" else "PASS",
+  n_na_variability_dropped, 0,
+  "events dropped in 05 for NA Variability (<2 valid PSI samples, sd_psi undefined); now also filtered upstream in 03 keep_rows_manual (defense-in-depth here)"
+)
 
 # 1. log1p(gene_expression_getmm) boxplot by protocol
 # getmm (CPM-like, >= 0) is the log1p-safe representation; vst can be
@@ -612,7 +562,8 @@ p_gene_expr <- ggplot(
   unique(aggregated_dt[, .(uuid, protocol, gene_expression_getmm)]),
   aes(x = protocol, y = log1p(gene_expression_getmm))
 ) +
-  geom_boxplot() +
+  geom_violin() +
+  geom_boxplot(width = 0.5) +
   labs(
     title = "log1p(gene_expression_getmm) by protocol",
     x = "protocol",
@@ -626,37 +577,12 @@ ggsave(
   height = 5
 )
 
-# 2. rank correlation across transcript_filter levels (getmm = expression
-# level; the §4.12a bug check)
-expr_by_filter <- unique(aggregated_dt[, .(
-  uuid,
-  gene_id,
-  transcript_filter,
-  gene_expression_getmm
-)])
-expr_wide <- dcast(
-  expr_by_filter,
-  uuid + gene_id ~ transcript_filter,
-  value.var = "gene_expression_getmm"
-)
-filter_cols <- setdiff(names(expr_wide), c("uuid", "gene_id"))
-if (length(filter_cols) >= 2) {
-  rank_cor <- cor(
-    expr_wide[[filter_cols[1]]],
-    expr_wide[[filter_cols[2]]],
-    method = "spearman",
-    use = "complete.obs"
-  )
-  append_sanity(
-    "gene_expression_rank_cor_across_filters",
-    ifelse(rank_cor > 0.95, "PASS", "WARN"),
-    rank_cor,
-    0.95,
-    "if < 0.5, §4.12a bug still active"
-  )
-}
+# (The old §4.12a cross-transcript_filter rank-correlation check was removed:
+# 05 is now per-filter, so a single filter is present and the check is
+# undefined. The §4.12a bug it guarded is moot anyway — gene_expression now
+# comes from 02-2's normalised output, not the last-write-wins transcript join.)
 
-# 3. % zero-expression events per sample (getmm: CPM-like, can be exactly 0;
+# 2. % zero-expression events per sample (getmm: CPM-like, can be exactly 0;
 # vst never is, so == 0 is only meaningful on getmm)
 zero_frac_by_sample <- aggregated_dt[,
   .(zero_frac = mean(gene_expression_getmm == 0, na.rm = TRUE)),
@@ -671,47 +597,93 @@ append_sanity(
   "fraction of samples with >=30% zero-expression events"
 )
 
-# 4. §4.12e post-mask verification -- confirms no row with
-# gene_expression_getmm below threshold survived masking (catches join/unit
-# mistakes like the previous vst-vs-getmm mismatch), and logs how many
-# events (ID x transcript_filter) were dropped entirely because
-# low-expression masking left them under min_samples_per_event. Compare
-# against the pre-mask simulated estimate in
-# qc/gene_expression_masking_impact.csv (should match).
-stopifnot(all(aggregated_dt$gene_expression_getmm >= min_gene_expression))
-append_sanity(
-  "gene_expression_getmm_below_threshold_postmask",
-  "PASS",
-  0,
-  min_gene_expression,
-  "rows remaining below masking threshold after §4.12e (should always be 0; assertion above enforces it)"
-)
+# §4.13d item 4 — housekeeping-gene cross-sample CV sanity. GAPDH/ACTB should
+# be stably expressed across all 405 epirrs; a high CV would flag a
+# normalisation problem. Sourced from `gene_quants_agg` (genome-wide,
+# per-transcript_filter, built above for the §4.12b join) rather than
+# `aggregated_dt`, because aggregated_dt is event-restricted — GAPDH/ACTB
+# would only appear there if one of them happens to host a modelled AS event.
+# getmm (CPM-like, >=0) is used, same convention as the other checks in this
+# chunk (vst can cross zero, making sd/mean CV ill-defined).
+housekeeping_ids <- c(GAPDH = "ENSG00000111640", ACTB = "ENSG00000075624")
+for (hk_symbol in names(housekeeping_ids)) {
+  hk_id <- housekeeping_ids[[hk_symbol]]
+  hk_vals <- gene_quants_agg[gene_id == hk_id, gene_expression_getmm]
+  if (length(hk_vals) == 0L) {
+    append_sanity(
+      sprintf("housekeeping_cv_%s", hk_symbol),
+      "WARN",
+      NA_real_,
+      0.3,
+      sprintf("%s (%s) not found in gene_expression_normalised_%s.csv.gz", hk_symbol, hk_id, tf)
+    )
+    next
+  }
+  hk_cv <- sd(hk_vals, na.rm = TRUE) / mean(hk_vals, na.rm = TRUE)
+  append_sanity(
+    sprintf("housekeeping_cv_%s", hk_symbol),
+    ifelse(hk_cv < 0.3, "PASS", "WARN"),
+    hk_cv,
+    0.3,
+    sprintf("cross-sample CV of gene_expression_getmm for %s (%s); expect < 0.3", hk_symbol, hk_id)
+  )
+}
 
-n_events_dropped_low_expr <- low_sample_events[, uniqueN(paste(
-  ID,
-  transcript_filter
-))]
-append_sanity(
-  "gene_expression_events_dropped_low_expression",
-  "INFO",
-  n_events_dropped_low_expr,
-  min_samples_per_event,
-  "events (ID x transcript_filter) dropped after low-expression masking left < min_samples_per_event non-NA samples"
-)
+# 4. §4.12e VST-gate CHECK (was a mask; masking now happens upstream in
+# 02-3-rmats-event-filtering.Rmd). Verify every surviving (event,sample) row
+# has host-gene VST at/above the cutoff 02-3 recorded — i.e. the upstream gate
+# held. Rows with NA VST are allowed under the 'keep' NA policy. This is a
+# check, not a mask: it must never mutate aggregated_dt.
+vst_cutoff_file <- sprintf("qc/vst_expression_cutoff_%s.csv", tf)
+if (file.exists(vst_cutoff_file)) {
+  vst_cutoff_dt <- fread(vst_cutoff_file)
+  vst_cutoff_val <- vst_cutoff_dt$cutoff[1]
+  na_policy <- getOption("EpiATLAS_AS_VST_NA_POLICY", "keep")
+  viol <- aggregated_dt[
+    !is.na(gene_expression_vst) & gene_expression_vst < vst_cutoff_val,
+    .N
+  ]
+  frac_viol <- viol / max(1L, nrow(aggregated_dt))
+  append_sanity(
+    "vst_gate_upstream_held",
+    if (frac_viol < 1e-6) "PASS" else "FAIL",
+    frac_viol,
+    vst_cutoff_val,
+    sprintf(
+      "fraction of surviving rows with vst < cutoff (should be 0; gate in 02-3; na_policy=%s)",
+      na_policy
+    )
+  )
+} else {
+  append_sanity(
+    "vst_gate_upstream_held",
+    "WARN",
+    NA_real_,
+    NA_real_,
+    sprintf("%s not found — cannot verify upstream VST gate", vst_cutoff_file)
+  )
+}
 ```
 
 
 ```{r, junction-coverage-sanity}
-# §4.13i — junction read coverage sanity. Complements §4.8: verifies the
-# IJC/SJC counts just joined in are high enough that PSI is a trustworthy
-# ratio rather than noise from a handful of reads.
-bf_dt <- aggregated_dt[transcript_filter == "biotype_filtered"]
+# §4.13i — junction read coverage. The per-(event,sample) read-coverage gate is
+# now APPLIED UPSTREAM in 02-3 (expr_pass: cells with IJC+SJC < min_read_coverage
+# are masked to NA PSI and dropped from the .jc file; NA-PSI rows are dropped here
+# at load). So every surviving cell already clears the floor — this is no longer a
+# DISCOVERY check but a VERIFICATION that the gate propagated 02-3 → 03 → 05
+# (a below-floor cell here would mean a .psi/.jc desync or a stale input).
 
-p_junction_cov <- ggplot(bf_dt, aes(x = log10(IJC + SJC + 1))) +
+# Distribution is still informative: it now shows the POST-gate coverage, with a
+# hard left edge at the cutoff.
+min_read_coverage <- getOption("EpiATLAS_AS_MIN_READ_COVERAGE", 10)
+p_junction_cov <- ggplot(aggregated_dt, aes(x = log10(IJC + SJC + 1))) +
   geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = log10(min_read_coverage + 1), linetype = "dashed", colour = "red") +
   facet_wrap(~`Event Type`, scales = "free_y") +
   labs(
-    title = "log10(IJC + SJC + 1), biotype_filtered",
+    title = sprintf("Post-gate junction coverage (floor = %d reads)", min_read_coverage),
+    subtitle = "dashed = applied per-cell gate (02-3 expr_pass)",
     x = "log10(IJC + SJC + 1)"
   )
 print(p_junction_cov)
@@ -722,53 +694,45 @@ ggsave(
   height = 5
 )
 
-# Conditional median (across expressing samples only, IJC+SJC > 0) per
-# event. Zeros excluded: IJC = SJC = 0 means rMATS reported PSI = NA for
-# that sample (unexpressed), not a low-coverage quantification — including
-# them would understate coverage for tissue-specific events that are
-# unexpressed in most samples but well-covered where they are expressed.
-event_coverage <- bf_dt[
-  IJC + SJC > 0,
-  .(median_coverage = median(as.double(IJC + SJC))),
-  by = ID
-]
-frac_below_10 <- event_coverage[, mean(median_coverage < 10)]
+# Gate-held verification: NO surviving cell may fall below the upstream floor.
+cov_cells <- aggregated_dt[!is.na(IJC) & !is.na(SJC)]
+min_cell_cov <- cov_cells[, min(IJC + SJC)]
+n_below <- cov_cells[IJC + SJC < min_read_coverage, .N]
 append_sanity(
-  "junction_coverage_median",
-  ifelse(frac_below_10 <= 0.10, "PASS", "WARN"),
-  frac_below_10,
-  0.10,
-  "fraction of biotype_filtered events with conditional median IJC+SJC < 10"
+  "junction_coverage_gate_held",
+  ifelse(n_below == 0L, "PASS", "FAIL"),
+  min_cell_cov,
+  min_read_coverage,
+  sprintf(
+    "min IJC+SJC over surviving cells = %g (upstream 02-3 gate = %d); %d cells below (want 0)",
+    min_cell_cov, min_read_coverage, n_below
+  )
 )
 ```
 
 
 ```{r, ri-protocol-sanity}
-# §4.13k — check that the known RI PSI~protocol bias (total-RNA-Seq
-# inflates RI PSI by ~0.05 vs mRNA-Seq) isn't concentrated in specific
-# ontologies. An ontology sampled almost entirely by one protocol would let
-# protocol bias masquerade as a genuine tissue effect downstream, since
+# §4.13k — 05 now builds ONE transcript_filter per run, so no cross-filter loop
+# (aggregated_dt holds a single filter `tf`). Check the known RI PSI~protocol
+# bias (total-RNA-Seq inflates RI PSI by ~0.05 vs mRNA-Seq) isn't concentrated in
+# specific ontologies. An ontology sampled almost entirely by one protocol would
+# let protocol bias masquerade as a genuine tissue effect downstream, since
 # protocol and ontology become statistically inseparable in that subgroup.
 #
 # Two things actually need showing here, and neither is "residuals from
-# lm(PSI~protocol)" (tried first, dropped): that shows leftover PSI
-# variance with the protocol effect removed, which is bounded/skewed and
-# not what a confound check needs to see.
+# lm(PSI~protocol)" (tried first, dropped): that shows leftover PSI variance with
+# the protocol effect removed, which is bounded/skewed and not what a confound
+# check needs to see.
 #  1. sample composition per ontology (the confound itself: is one protocol
-#     dominant?) - what protocol_balance below already computes, now
-#     visualized instead of hiding in a CSV row.
+#     dominant?).
 #  2. the protocol effect size per ontology (does the known ~0.05 bias hold
-#     everywhere, or blow up in specific tissues?) - a quantity the old
-#     residual plot never showed at all, since it subtracted the effect out
-#     before plotting.
-ri_dt_all <- rbindlist(lapply(transcript_filters, function(tf) {
-  aggregated_dt[transcript_filter == tf & `Event Type` == "RI"]
-}))
+#     everywhere, or blow up in specific tissues?).
+ri_dt <- aggregated_dt[`Event Type` == "RI"]
 
 # --- 1. protocol composition per ontology ---------------------------------
 protocol_composition <- unique(
-  ri_dt_all[, .(uuid, ontology, protocol, transcript_filter)]
-)[, .N, by = .(transcript_filter, ontology, protocol)]
+  ri_dt[, .(uuid, ontology, protocol)]
+)[, .N, by = .(ontology, protocol)]
 
 p_protocol_composition <- ggplot(
   protocol_composition,
@@ -776,29 +740,29 @@ p_protocol_composition <- ggplot(
 ) +
   geom_col(position = "fill") +
   geom_hline(yintercept = 0.5, linetype = "dashed") +
-  facet_wrap(~transcript_filter, ncol = 1) +
   labs(
-    title = "RNA-Seq protocol composition by ontology",
+    title = sprintf("RNA-Seq protocol composition by ontology (%s)", tf),
     x = "ontology",
     y = "fraction of samples"
   ) +
   theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
 print(p_protocol_composition)
 ggsave(
-  "qc/distributions/protocol_composition_by_ontology.pdf",
+  sprintf("qc/distributions/protocol_composition_by_ontology_%s.pdf", tf),
   p_protocol_composition,
   width = 9,
-  height = 5 * length(transcript_filters)
+  height = 5
 )
 
 # --- 2. protocol effect size (total-RNA-Seq - mRNA-Seq) per ontology ------
-# single-protocol ontologies (no contrast to estimate) get NA_real_ here and
-# are still caught by the composition plot/confounded_ontologies check
-# below - keep type consistent (NA_real_, not NA) so this doesn't hit the
-# same integer/double by-group mismatch as the median() fix above.
-protocol_effect <- ri_dt_all[,
+# single-protocol ontologies (no contrast) get NA_real_; type-consistent so the
+# by-group bind doesn't hit an int/double mismatch. PSI now carries VST-masked
+# NAs, so drop them before the effect estimate.
+protocol_effect <- ri_dt[,
   {
-    if (uniqueN(protocol) < 2) {
+    psi_total <- PSI[protocol == "total-RNA-Seq" & !is.na(PSI)]
+    psi_mrna <- PSI[protocol == "mRNA-Seq" & !is.na(PSI)]
+    if (length(psi_total) < 2L || length(psi_mrna) < 2L) {
       list(
         effect = NA_real_,
         ci_lo = NA_real_,
@@ -806,8 +770,6 @@ protocol_effect <- ri_dt_all[,
         n_samples = uniqueN(uuid)
       )
     } else {
-      psi_total <- PSI[protocol == "total-RNA-Seq"]
-      psi_mrna <- PSI[protocol == "mRNA-Seq"]
       effect <- mean(psi_total) - mean(psi_mrna)
       se <- sqrt(
         var(psi_total) / length(psi_total) + var(psi_mrna) / length(psi_mrna)
@@ -820,33 +782,29 @@ protocol_effect <- ri_dt_all[,
       )
     }
   },
-  by = .(transcript_filter, ontology)
+  by = .(ontology)
 ]
 
 p_protocol_effect <- ggplot(
   protocol_effect,
-  aes(
-    x = ontology,
-    y = effect,
-    ymin = ci_lo,
-    ymax = ci_hi,
-    color = transcript_filter
-  )
+  aes(x = ontology, y = effect, ymin = ci_lo, ymax = ci_hi)
 ) +
   geom_hline(yintercept = 0, linetype = "solid", color = "grey50") +
   geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
-  geom_pointrange(position = position_dodge(width = 0.6)) +
+  geom_pointrange() +
   labs(
-    title = "RI PSI protocol effect (total-RNA-Seq - mRNA-Seq) by ontology",
+    title = sprintf(
+      "RI PSI protocol effect (total-RNA-Seq - mRNA-Seq) by ontology (%s)",
+      tf
+    ),
     subtitle = "dashed red line = known global bias (~0.05)",
     x = "ontology",
-    y = "mean PSI difference",
-    color = "transcript_filter"
+    y = "mean PSI difference"
   ) +
   theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
 print(p_protocol_effect)
 ggsave(
-  "qc/distributions/ri_protocol_effect_by_ontology.pdf",
+  sprintf("qc/distributions/ri_protocol_effect_by_ontology_%s.pdf", tf),
   p_protocol_effect,
   width = 9,
   height = 5
@@ -855,27 +813,21 @@ ggsave(
 # flag ontologies where one protocol accounts for > 50% of samples (among
 # ontologies with > 50 samples total, per spec) — below that size a
 # single-protocol skew is expected sampling noise, not a real confound
-for (tf in transcript_filters) {
-  protocol_balance <- protocol_composition[
-    transcript_filter == tf,
-    .(max_frac = max(N) / sum(N), n_samples = sum(N)),
-    by = ontology
-  ]
-  confounded_ontologies <- protocol_balance[
-    max_frac > 0.5 & n_samples > 50,
-    ontology
-  ]
-  append_sanity(
-    sprintf("ri_protocol_ontology_confound_%s", tf),
-    ifelse(length(confounded_ontologies) == 0, "PASS", "WARN"),
-    length(confounded_ontologies),
-    0,
-    paste(
-      "confounded ontologies:",
-      paste(confounded_ontologies, collapse = ", ")
-    )
-  )
-}
+protocol_balance <- protocol_composition[,
+  .(max_frac = max(N) / sum(N), n_samples = sum(N)),
+  by = ontology
+]
+confounded_ontologies <- protocol_balance[
+  max_frac > 0.5 & n_samples > 50,
+  ontology
+]
+append_sanity(
+  sprintf("ri_protocol_ontology_confound_%s", tf),
+  ifelse(length(confounded_ontologies) == 0, "PASS", "WARN"),
+  length(confounded_ontologies),
+  0,
+  paste("confounded ontologies:", paste(confounded_ontologies, collapse = ", "))
+)
 ```
 
 
@@ -883,27 +835,41 @@ for (tf in transcript_filters) {
 # §4.13e — MaxEntScan splice-site scores (written by maxentscan_scores rule).
 # Score files are row-order-aligned with their source FASTA; IDs come from
 # the FASTA headers (">ID").
-scores3 <- fread("processed_data/3scores.txt", col.names = c("sequence", "3ss"))
+scores3 <- fread(
+  sprintf("processed_data/3scores_%s.txt", tf),
+  col.names = c("sequence", "3ss")
+)
 scores3down <- fread(
-  "processed_data/3down_scores.txt",
+  sprintf("processed_data/3down_scores_%s.txt", tf),
   col.names = c("sequence", "3ssdown")
 )
-scores5 <- fread("processed_data/5scores.txt", col.names = c("sequence", "5ss"))
+scores5 <- fread(
+  sprintf("processed_data/5scores_%s.txt", tf),
+  col.names = c("sequence", "5ss")
+)
 scores5up <- fread(
-  "processed_data/5up_scores.txt",
+  sprintf("processed_data/5up_scores_%s.txt", tf),
   col.names = c("sequence", "5ssup")
 )
 
 scores3[,
   ID := as.integer(substr(
-    grep("^>", readLines("processed_data/3ss.fasta"), value = TRUE),
+    grep(
+      "^>",
+      readLines(sprintf("processed_data/3ss_%s.fasta", tf)),
+      value = TRUE
+    ),
     2,
     .Machine$integer.max
   ))
 ]
 scores5[,
   ID := as.integer(substr(
-    grep("^>", readLines("processed_data/5ss.fasta"), value = TRUE),
+    grep(
+      "^>",
+      readLines(sprintf("processed_data/5ss_%s.fasta", tf)),
+      value = TRUE
+    ),
     2,
     .Machine$integer.max
   ))
@@ -936,9 +902,10 @@ ss_long <- melt(
   variable.name = "site",
   value.name = "score"
 )
+ss_long[, site := factor(site, levels = c('5ssup', '3ss', '5ss', '3ssdown'))]
 p_splice_scores <- ggplot(ss_long, aes(x = score)) +
   geom_histogram(bins = 50, fill = "steelblue", color = "white") +
-  facet_grid(transcript_filter + `Event Type` ~ site, scales = "free") +
+  facet_wrap(site ~ `Event Type`, scales = "free_y", ncol = 2) +
   labs(title = "MaxEntScan score distributions", x = "score")
 print(p_splice_scores)
 ggsave(
@@ -951,79 +918,249 @@ ss_na_frac <- aggregated_dt[, mean(
   is.na(`3ss`) | is.na(`3ssdown`) | is.na(`5ss`) | is.na(`5ssup`)
 )]
 stopifnot(ss_na_frac < 0.01)
+append_sanity(
+  sprintf("splice_site_na_frac__%s", tf),
+  if (ss_na_frac < 0.01) "PASS" else "FAIL",
+  ss_na_frac,
+  0.01,
+  "NA fraction across the 4 MaxEntScan score columns"
+)
+
+# §4.13e — score-distribution sanity (per-event, deduped). Expected ranges
+# (Yeo & Burge MaxEntScan): 5'ss ~[-20,12] median ~8; 3'ss ~[-30,16] median ~8.
+# Median well below these floors => coordinate/strand or frame bug.
+for (col in ss_cols) {
+  med <- ss_dedup[, median(get(col), na.rm = TRUE)]
+  lo <- if (startsWith(col, "5")) -20 else -30
+  hi <- if (startsWith(col, "5")) 12 else 16
+  in_range <- ss_dedup[, mean(get(col) >= lo & get(col) <= hi, na.rm = TRUE)]
+  append_sanity(
+    sprintf("splice_site_median_%s__%s", col, tf),
+    if (med > 0) "PASS" else "WARN",
+    med,
+    0,
+    sprintf(
+      "median %s score (Yeo-Burge expects ~8; range [%d,%d], %.1f%% in range)",
+      col,
+      lo,
+      hi,
+      100 * in_range
+    )
+  )
+}
+
+# §4.13e — RI splice sites should be WEAKER than SE (weak 5'/3' sites are a
+# primary driver of intron retention). Compare median 5ss+3ss by Event Type.
+if (uniqueN(ss_dedup$`Event Type`) > 1) {
+  ss_strength <- ss_dedup[,
+    .(
+      strength = median(`5ss` + `3ss`, na.rm = TRUE)
+    ),
+    by = `Event Type`
+  ]
+  ri_str <- ss_strength[`Event Type` == "RI", strength]
+  se_str <- ss_strength[`Event Type` == "SE", strength]
+  if (length(ri_str) && length(se_str)) {
+    append_sanity(
+      sprintf("splice_site_ri_weaker_than_se__%s", tf),
+      if (ri_str < se_str) "PASS" else "WARN",
+      ri_str - se_str,
+      0,
+      sprintf(
+        "median(5ss+3ss): RI=%.2f SE=%.2f (RI should be lower)",
+        ri_str,
+        se_str
+      )
+    )
+  }
+}
 ```
 
 
 ```{r, join-pangolin}
 # §4.13e-ext — Pangolin splice-site usage scores (written by pangolin_scores
 # rule). Guarded: rule may not have finished yet.
-if (file.exists("processed_data/pangolin_scores.csv")) {
-  pangolin_raw <- fread("processed_data/pangolin_scores.csv")
+pangolin_scores_file <- sprintf("processed_data/pangolin_scores_%s.csv", tf)
+if (file.exists(pangolin_scores_file)) {
+  pangolin_raw <- fread(pangolin_scores_file)
+  # Map each Pangolin site_type to the SAME four splice-site positions
+  # MaxEntScan uses (5ss / 5ssup / 3ss / 3ssdown) — NOT a 2-way donor/acceptor
+  # collapse. Averaging the two donors (or the two/three acceptors) together
+  # blurs distinct sites that 03 scores separately; the two tools must line up
+  # position-for-position. Coordinate correspondence (03 fasta export):
+  #   5ss     = alt/skipped-exon donor (E2)   = alt_donor  / (RI) donor
+  #   5ssup   = upstream-exon donor    (E1)   = upstream_donor
+  #   3ss     = alt/skipped-exon acceptor(E2) = alt_acceptor / (RI) acceptor
+  #   3ssdown = downstream-exon acceptor (E3) = downstream_acceptor
+  # RI has only donor+acceptor, so pangolin_5ssup/3ssdown are NA for RI events
+  # (Pangolin scores no separate upstream/downstream site there).
   pangolin_raw[,
-    site_class := fcase(
-      site_type %in% c("donor", "upstream_donor", "alt_donor")            , "donor"    ,
-      site_type %in% c("acceptor", "alt_acceptor", "downstream_acceptor") , "acceptor" ,
+    ss_pos := fcase(
+      site_type %in% c("alt_donor", "donor"),       "5ss",
+      site_type == "upstream_donor",                "5ssup",
+      site_type %in% c("alt_acceptor", "acceptor"), "3ss",
+      site_type == "downstream_acceptor",           "3ssdown",
       default = NA_character_
     )
   ]
-  pangolin_donor <- pangolin_raw[
-    site_class == "donor",
+  # 04-4 emits TWO quantities per tissue (schema 2026-07-09):
+  #   psite = P(splice site) — sequence-intrinsic site STRENGTH (MaxEntScan-analog)
+  #   usage = tissue-specific predicted splicing level ∈[0,1] — PSI-comparable
+  # Carry both (+ their across-tissue CV). Each (event_id, ss_pos) is one row here
+  # (each site_type maps to one position); mean() is a safe passthrough.
+  pangolin_agg <- pangolin_raw[
+    !is.na(ss_pos),
     .(
-      pangolin_donor_mean = mean(mean_usage, na.rm = TRUE),
-      pangolin_donor_tissue_cv = mean(tissue_cv, na.rm = TRUE)
+      psite_mean = mean(psite_mean, na.rm = TRUE),
+      psite_cv   = mean(psite_tissue_cv, na.rm = TRUE),
+      usage_mean = mean(usage_mean, na.rm = TRUE),
+      usage_cv   = mean(usage_tissue_cv, na.rm = TRUE)
     ),
-    by = event_id
+    by = .(event_id, ss_pos)
   ]
-  pangolin_acceptor <- pangolin_raw[
-    site_class == "acceptor",
-    .(
-      pangolin_acceptor_mean = mean(mean_usage, na.rm = TRUE),
-      pangolin_acceptor_tissue_cv = mean(tissue_cv, na.rm = TRUE)
-    ),
-    by = event_id
-  ]
+  # wide: one row per event; dcast names cols "<val>_<pos>" (e.g. psite_mean_5ss),
+  # rename to pangolin_<pos>_<val> (pangolin_5ss_psite_mean, pangolin_5ss_usage_mean, …)
+  pangolin_wide <- dcast(
+    pangolin_agg,
+    event_id ~ ss_pos,
+    value.var = c("psite_mean", "psite_cv", "usage_mean", "usage_cv")
+  )
+  old_names <- setdiff(names(pangolin_wide), "event_id")
+  setnames(
+    pangolin_wide,
+    old_names,
+    sub("^(psite_mean|psite_cv|usage_mean|usage_cv)_(.+)$", "pangolin_\\2_\\1", old_names)
+  )
 
   id_map <- unique(event_annotations_dt[, .(event_id, ID)])
-  pangolin_dt <- id_map[pangolin_donor, on = .(event_id)]
-  pangolin_dt[
-    pangolin_acceptor,
-    on = .(event_id),
-    c("pangolin_acceptor_mean", "pangolin_acceptor_tissue_cv") := .(
-      i.pangolin_acceptor_mean,
-      i.pangolin_acceptor_tissue_cv
-    )
-  ]
-
+  pangolin_dt <- id_map[pangolin_wide, on = .(event_id)]
+  pangolin_cols <- setdiff(names(pangolin_dt), c("event_id", "ID"))
   aggregated_dt[
     pangolin_dt,
     on = .(ID),
-    c(
-      "pangolin_donor_mean",
-      "pangolin_donor_tissue_cv",
-      "pangolin_acceptor_mean",
-      "pangolin_acceptor_tissue_cv"
-    ) := .(
-      i.pangolin_donor_mean,
-      i.pangolin_donor_tissue_cv,
-      i.pangolin_acceptor_mean,
-      i.pangolin_acceptor_tissue_cv
-    )
+    (pangolin_cols) := mget(paste0("i.", pangolin_cols))
   ]
 
-  cor_5ss_pangolin <- cor(
-    aggregated_dt[!duplicated(ID), `5ss`],
-    aggregated_dt[!duplicated(ID), pangolin_donor_mean],
-    method = "spearman",
-    use = "complete.obs"
+  # concordance PER EVENT TYPE: SE and RI have different site sets (RI has no
+  # upstream_donor/downstream_acceptor, so its 5ssup/3ssdown are NA) and are best
+  # checked separately. For each (event_type, site): MaxEntScan score vs Pangolin
+  # P(splice) at the SAME position — both score site STRENGTH, so Spearman r should
+  # be positive; low/negative => coord/join mismatch there. Uses psite (not usage):
+  # P(splice) is the sharp positional signal (~0.8 at a correct site, ~0.05 one base
+  # off), so it cleanly flags a coordinate error (this is how the donor-offset bug
+  # surfaced as −0.42). A site absent for a type (n<2 pairs) is INFO, not WARN.
+  # SE 5ss (alt-exon donor) is the primary coord-alignment gate (hard stopifnot).
+  ss_pangolin_map <- c(
+    `5ss`     = "pangolin_5ss_psite_mean",
+    `5ssup`   = "pangolin_5ssup_psite_mean",
+    `3ss`     = "pangolin_3ss_psite_mean",
+    `3ssdown` = "pangolin_3ssdown_psite_mean"
   )
-  cat(sprintf(
-    "Spearman r(5ss, pangolin_donor_mean) = %.3f (must be > 0.2)\n",
-    cor_5ss_pangolin
-  ))
+  dedup_ss <- aggregated_dt[!duplicated(ID)]
+  for (et in dedup_ss[, unique(`Event Type`)]) {
+    sub_et <- dedup_ss[`Event Type` == et]
+    for (mss in names(ss_pangolin_map)) {
+      pcol <- ss_pangolin_map[[mss]]
+      n_pair <- sub_et[!is.na(get(mss)) & !is.na(get(pcol)), .N]
+      r <- if (n_pair >= 2L) {
+        cor(sub_et[[mss]], sub_et[[pcol]], method = "spearman", use = "complete.obs")
+      } else {
+        NA_real_
+      }
+      cat(sprintf("[%s] Spearman r(%s, %s) = %.3f  (n=%d)\n", et, mss, pcol, r, n_pair))
+      append_sanity(
+        sprintf("pangolin_maxentscan_concordance_%s_%s__%s", et, mss, tf),
+        if (n_pair < 2L) "INFO" else if (r > 0.2) "PASS" else "WARN", r, 0.2,
+        sprintf("%s: Spearman r(MaxEntScan %s, %s), n=%d; same site, expect > 0.2", et, mss, pcol, n_pair)
+      )
+      append_sanity(
+        sprintf("pangolin_%s_%s_na_frac__%s", et, mss, tf),
+        "INFO", sub_et[, mean(is.na(get(pcol)))], NA_real_,
+        sprintf("%s: fraction with no Pangolin %s score (RI has none for 5ssup/3ssdown)", et, mss)
+      )
+    }
+  }
+  # primary coord-alignment gate: SE alt-exon donor must concord
+  se_ss <- dedup_ss[`Event Type` == "SE"]
+  cor_5ss_pangolin <- cor(
+    se_ss$`5ss`, se_ss$pangolin_5ss_psite_mean,
+    method = "spearman", use = "complete.obs"
+  )
   stopifnot(cor_5ss_pangolin > 0.2)
 } else {
-  warning(
-    "processed_data/pangolin_scores.csv not found — skipping Pangolin join (§4.13e-ext)"
+  warning(sprintf(
+    "%s not found — skipping Pangolin join (§4.13e-ext)",
+    pangolin_scores_file
+  ))
+  append_sanity(
+    sprintf("pangolin_join__%s", tf),
+    "WARN",
+    NA_real_,
+    NA_real_,
+    sprintf("%s absent — Pangolin columns not joined", pangolin_scores_file)
+  )
+}
+```
+
+
+```{r, dnam-tss-sanity}
+# §4.13c item 3 — DNAm β vs TSS proximity. Lives here (not 04-1): distance_TSS
+# is an event annotation that only exists after the 05 join. Biology: promoter/
+# TSS-proximal regions are hypomethylated, gene-body/intergenic hypermethylated,
+# so mean β should RISE with distance_TSS. Reported as INFO (Spearman r + a
+# per-bin boxplot) rather than a hard PASS/WARN: the sign depends on how
+# distance_TSS is defined (the §4.13c prose and this biology disagree on sign),
+# so we surface the value + plot and let it be read, not assert a direction.
+dnam_cols <- grep("^DNAm;", names(aggregated_dt), value = TRUE)
+if (length(dnam_cols) && "distance_TSS" %in% names(aggregated_dt)) {
+  ev_beta <- aggregated_dt[, c("ID", "distance_TSS", dnam_cols), with = FALSE]
+  ev_beta[, beta_row := rowMeans(.SD, na.rm = TRUE), .SDcols = dnam_cols]
+  ev_agg <- ev_beta[,
+    .(
+      beta = mean(beta_row, na.rm = TRUE),
+      distance_TSS = distance_TSS[1]
+    ),
+    by = ID
+  ]
+  ev_agg <- ev_agg[is.finite(beta) & is.finite(distance_TSS)]
+  r_tss <- ev_agg[, cor(
+    beta,
+    log10(distance_TSS + 1),
+    method = "spearman",
+    use = "complete.obs"
+  )]
+  cat(sprintf("Spearman(mean beta, log10(distance_TSS+1)) = %.3f\n", r_tss))
+  append_sanity(
+    sprintf("dnam_beta_vs_tss__%s", tf),
+    "INFO",
+    r_tss,
+    NA_real_,
+    "Spearman(mean beta, log10(distance_TSS+1)); expect TSS-proximal hypomethylated"
+  )
+  ev_agg[,
+    tss_bin := cut(
+      distance_TSS,
+      breaks = c(-Inf, 1e3, 5e3, 1e4, 5e4, Inf),
+      labels = c("0-1kb", "1-5kb", "5-10kb", "10-50kb", ">50kb")
+    )
+  ]
+  p_tss <- ggplot(ev_agg[!is.na(tss_bin)], aes(tss_bin, beta)) +
+    geom_boxplot(fill = "steelblue", outlier.size = 0.3) +
+    labs(
+      title = sprintf("DNAm vs TSS distance (%s)", tf),
+      subtitle = sprintf(
+        "per-event mean beta across samples x DNAm windows; Spearman r = %.3f",
+        r_tss
+      ),
+      x = "distance to TSS",
+      y = "mean beta (% methylation)"
+    )
+  print(p_tss)
+  ggsave(
+    sprintf("qc/distributions/dnam_beta_vs_tss_%s.pdf", tf),
+    p_tss,
+    width = 7,
+    height = 5
   )
 }
 ```
@@ -1036,6 +1173,104 @@ stopifnot(
   !any(is.infinite(aggregated_dt$PSI))
 )
 
-# write the filtered and augmented table to file
-fwrite(aggregated_dt, "processed_data/aggregated_dt_filtered.csv.gz")
+# write the filtered and augmented table to file (per transcript_filter)
+fwrite(
+  aggregated_dt,
+  sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf)
+)
+```
+
+```{r, gene-expression-by-event-type}
+# Relocated here from 02-2-rnaseq-normalisation.Rmd (which now runs before 03
+# and so cannot see event annotations). Genome-wide gene expression by hosted
+# event type: are SE/RI-hosting genes expressed differently from the
+# background of all genes? Uses the full per-filter normalisation table (all
+# genes, from gene_quants_agg) classified by which event type(s) each gene
+# hosts (from event_annotations_dt) — event-hosting genes vs a
+# "No annotated event" reference category.
+gene_event_types <- event_annotations_dt[,
+  .(
+    has_se = any(`Event Type` == "SE"),
+    has_ri = any(`Event Type` == "RI")
+  ),
+  by = .(gene_id)
+]
+gene_event_types[,
+  event_type_class := fcase(
+    has_se & has_ri , "Both"    ,
+    has_se          , "SE only" ,
+    has_ri          , "RI only"
+  )
+]
+gene_event_types[, gene_id_stripped := gsub("\\.\\d+$", "", gene_id)]
+
+gene_median_expr <- gene_quants_agg[,
+  .(
+    median_getmm = median(gene_expression_getmm, na.rm = TRUE),
+    median_vst = median(gene_expression_vst, na.rm = TRUE)
+  ),
+  by = .(gene_id)
+]
+gene_median_expr[, gene_id_stripped := gsub("\\.\\d+$", "", gene_id)]
+# update-join keeps ALL genes; event_type_class NA for non-event-hosting genes
+gene_median_expr[
+  gene_event_types,
+  on = .(gene_id_stripped),
+  event_type_class := i.event_type_class
+]
+gene_median_expr[
+  is.na(event_type_class),
+  event_type_class := "No annotated event"
+]
+gene_median_expr[,
+  event_type_class := factor(
+    event_type_class,
+    levels = c("No annotated event", "SE only", "RI only", "Both")
+  )
+]
+
+dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
+p_getmm_et <- ggplot(
+  gene_median_expr,
+  aes(x = event_type_class, y = log1p(median_getmm), fill = event_type_class)
+) +
+  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
+  scale_fill_viridis_d(option = "D", guide = "none") +
+  labs(
+    title = sprintf("Gene GeTMM-CPM by hosted event type (%s)", tf),
+    subtitle = "per-gene median across samples, log1p",
+    x = NULL,
+    y = "log1p(GeTMM-CPM)"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_getmm_et)
+ggsave(
+  sprintf("qc/distributions/gene_expression_getmm_by_event_type_%s.pdf", tf),
+  p_getmm_et,
+  width = 6,
+  height = 5
+)
+
+p_vst_et <- ggplot(
+  gene_median_expr,
+  aes(x = event_type_class, y = median_vst, fill = event_type_class)
+) +
+  geom_violin(trim = FALSE, alpha = 0.6, linewidth = 0.3) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9, linewidth = 0.3) +
+  scale_fill_viridis_d(option = "D", guide = "none") +
+  labs(
+    title = sprintf("Gene vst by hosted event type (%s)", tf),
+    subtitle = "per-gene median across samples (vst: no further transform)",
+    x = NULL,
+    y = "vst(expression)"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_vst_et)
+ggsave(
+  sprintf("qc/distributions/gene_expression_vst_by_event_type_%s.pdf", tf),
+  p_vst_et,
+  width = 6,
+  height = 5
+)
 ```

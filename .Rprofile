@@ -43,7 +43,13 @@ options(
   ), # used when method="percentile" or as final fallback
   EpiATLAS_AS_VST_NA_POLICY = .epiatlas_env_chr(
     "EpiATLAS_AS_VST_NA_POLICY", "keep"
-  ) # {"keep","drop"}: (event,sample) with no host-gene VST
+  ), # {"keep","drop"}: (event,sample) with no host-gene VST
+  EpiATLAS_AS_VST_FLOOR_EPS = .epiatlas_env_num(
+    "EpiATLAS_AS_VST_FLOOR_EPS", 0
+  ) # extra trim ABOVE the zero-inflation floor atom before the GMM fit. 0 (strict
+  # '>' min) removes only the exact structural-zero point mass -> antimode in the
+  # true valley (~7.15). >0 eats the real low-expression bump and inflates the
+  # cutoff (0.5->7.64, 1.0->8.31); raise only for a deliberately stricter call.
 )
 
 # vscode specific libraries
@@ -56,7 +62,16 @@ if (interactive()) {
 }
 
 # general libraries
-library(R.utils)
+# R.utils is loaded but NOT used anywhere in the pipeline (no R.utils:: call or
+# insert()/withTimeout()/etc.). On some compute nodes the module-R 4.2.1 renv
+# library is platform-incomplete and R.utils is absent — an unconditional
+# library(R.utils) then kills .Rprofile at startup, failing every R rule there.
+# Guard it so a missing (unused) R.utils only warns.
+if (requireNamespace("R.utils", quietly = TRUE)) {
+  library(R.utils)
+} else {
+  warning(".Rprofile: R.utils unavailable — skipping (unused by the pipeline)")
+}
 library(data.table)
 library(pbmcapply)
 library(rtracklayer)
@@ -91,12 +106,45 @@ ontology_column <- "harmonized_sample_ontology_term_high_order_fig1"
 slurm_cpus <- Sys.getenv("SLURM_CPUS_PER_TASK", unset = "")
 ncores <- if (nchar(slurm_cpus) > 0L) as.integer(slurm_cpus) else 40L
 data.table::setDTthreads(ncores)
+# Cap the multithreaded OpenBLAS to the allocation. Unset, openblas-pthread
+# grabs the whole node's core count (ignoring the SLURM cgroup) → thread
+# oversubscription/contention on the matrix-heavy steps (DESeq2 vst transform,
+# rowSds diagnostics, big data.table joins). Set at runtime via RhpcBLASctl:
+# OPENBLAS_NUM_THREADS is read when the BLAS is dlopen'd, before .Rprofile runs,
+# so Sys.setenv() here would be too late. (Snakefile shell.prefix also exports
+# it before R starts, for when RhpcBLASctl isn't installed.)
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  try(RhpcBLASctl::blas_set_num_threads(ncores), silent = TRUE)
+}
 message(sprintf("mc.cores: %d", options()$mc.cores))
 options(mc.cores = ncores)
 message(sprintf("set mc.cores to: %d", options()$mc.cores))
 
-if (!rmarkdown::pandoc_available()) {
-  Sys.setenv(RSTUDIO_PANDOC = "/usr/lib/rstudio-server/bin/quarto/bin/tools")
+# pandoc is needed by rmarkdown::render. It is NOT on every SLURM compute node
+# (only the login node has /usr/bin/pandoc), and the old single hardcoded
+# RStudio path fails there. Probe candidate dirs and point RSTUDIO_PANDOC at the
+# first that actually contains a pandoc binary of a sufficient version.
+if (!rmarkdown::pandoc_available("1.12.3")) {
+  .pandoc_candidates <- unique(c(
+    dirname(Sys.which("pandoc")), # pandoc already on PATH (any node)
+    file.path(Sys.getenv("CONDA_PREFIX"), "bin"), # conda/mamba env (all nodes)
+    "/usr/lib/rstudio-server/bin/quarto/bin/tools", # RStudio Server
+    "/usr/lib/rstudio/bin/quarto/bin/tools", # RStudio Desktop
+    "/usr/bin" # system
+  ))
+  for (.p in .pandoc_candidates) {
+    if (nzchar(.p) && file.exists(file.path(.p, "pandoc"))) {
+      Sys.setenv(RSTUDIO_PANDOC = .p)
+      if (rmarkdown::pandoc_available("1.12.3")) break
+    }
+  }
+  if (!rmarkdown::pandoc_available("1.12.3")) {
+    warning(
+      "pandoc >= 1.12.3 not found on this node. Install it into the env ",
+      "(`mamba install -n ihec-as pandoc`) so it is available on all SLURM ",
+      "nodes, or module-load it before rendering."
+    )
+  }
 }
 
 data_dir <- "/nfs/data/IHEC/RNAseq"
@@ -134,25 +182,44 @@ variability_colors <- c(
   "High" = "#D55E00"
 )
 
-ihec_ia_colors <- unlist(
-  jsonlite::read_json("data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json"),
-  recursive = FALSE
-)
-sample_hex_colors <- sapply(
-  unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE),
-  function(x) {
-    cols <- as.numeric(strsplit(x, ",")[[1]])
-    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
-  }
-)
-mark_hex_colors <- sapply(
-  unlist(ihec_ia_colors$experiment, recursive = FALSE),
-  function(x) {
-    cols <- as.numeric(strsplit(x, ",")[[1]])
-    rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
-  }
-)
-mark_hex_colors <- c(mark_hex_colors, DNAm = mark_hex_colors[["WGBS"]])
+# IHEC IA plot palette (cosmetic). .Rprofile is sourced at R startup — BEFORE
+# any Rmd chunk runs (incl. 01's download chunk that fetches this file) — so an
+# unconditional read here would crash every stage on a cold checkout. Guard it:
+# missing file → warn + NULL palettes (ggplot defaults), never a fatal halt.
+# Place data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json (01 downloads it) for the
+# real IHEC colors.
+.ia_colors_file <- "data/IHEC_EpiATLAS_IA_colors_Apl01_2024.json"
+if (file.exists(.ia_colors_file)) {
+  ihec_ia_colors <- unlist(
+    jsonlite::read_json(.ia_colors_file),
+    recursive = FALSE
+  )
+  sample_hex_colors <- sapply(
+    unlist(ihec_ia_colors$fig1_ontology_intermediate_merged, recursive = FALSE),
+    function(x) {
+      cols <- as.numeric(strsplit(x, ",")[[1]])
+      rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+    }
+  )
+  mark_hex_colors <- sapply(
+    unlist(ihec_ia_colors$experiment, recursive = FALSE),
+    function(x) {
+      cols <- as.numeric(strsplit(x, ",")[[1]])
+      rgb(cols[1], cols[2], cols[3], maxColorValue = 255)
+    }
+  )
+  mark_hex_colors <- c(mark_hex_colors, DNAm = mark_hex_colors[["WGBS"]])
+} else {
+  warning(
+    sprintf(
+      "%s not found — plot palettes fall back to ggplot defaults. Run 01's download chunk or place the file, then re-run for IHEC colors.",
+      .ia_colors_file
+    )
+  )
+  ihec_ia_colors <- NULL
+  sample_hex_colors <- NULL
+  mark_hex_colors <- NULL
+}
 
 plot_dir <- "images/Rplots"
 if (!dir.exists(plot_dir)) {

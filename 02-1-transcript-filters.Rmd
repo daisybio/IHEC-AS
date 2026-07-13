@@ -21,13 +21,19 @@ kept for cross-checking only.
 
 Make Splicing Analysis folder:
 
-```{bash, make-suppa-folder}
-mkdir -p splicing_analysis
+```{bash, make-splicing-folder}
+set -euo pipefail
+mkdir -p splicing_analysis/suppa
 cd splicing_analysis
-mkdir -p suppa
-# download gencode annotation
-wget -nc -q -O gencode.v29.annotation.gtf.gz ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz 
-gunzip -k gencode.v29.annotation.gtf.gz
+# Idempotent so force-reruns don't crash: plain `gunzip -k` exits status 2 when
+# the uncompressed .gtf already exists (refuses to overwrite), which halted the
+# render on reruns. Only fetch+decompress when the .gtf is missing; https (not
+# ftp) for reachability from SLURM compute nodes.
+if [ ! -f gencode.v29.annotation.gtf ]; then
+  wget -q -O gencode.v29.annotation.gtf.gz \
+    https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.annotation.gtf.gz
+  gunzip -kf gencode.v29.annotation.gtf.gz
+fi
 ```
 
 Load Isoform Quantifications:
@@ -35,11 +41,26 @@ Load Isoform Quantifications:
 ```{r, load-isoform-quants}
 # read the file table
 download_metadata <- fread("processed_data/file_table.csv.gz")
-# get the isoform quantification files
-isoform_files <- download_metadata[
-  assay_type == "RNA-Seq",
-  file.path(rna_data_dir, basename(file_path))
+
+# Restrict to the analysis cohort (samples with BOTH RNA-Seq and epigenomic
+# data) BEFORE reading isoform files. The full ~1555-sample RNA-Seq pool was
+# only used for the (unused) full isoform_quantifications.tsv.gz, an
+# exploratory all-sample TPM histogram, and the SUPPA reference expressions
+# (eval=FALSE) — none feed the active per-filter pipeline (02-2 reads the
+# subset). Reading only rna_to_use (~441) avoids the OOM (job 6280493) and is
+# ~3.5x faster. `.N >= 8` = epirrs with the full RNA+WGBS+ChIP panel.
+rna_to_use <- download_metadata[
+  assay_type == "RNA-Seq" &
+    epirr_id_without_version %in%
+      download_metadata[,
+        if (.N >= 8) .SD,
+        by = epirr_id_without_version
+      ][, epirr_id_without_version],
+  uuid
 ]
+rna_meta <- download_metadata[assay_type == "RNA-Seq" & uuid %in% rna_to_use]
+# get the isoform quantification files (cohort only)
+isoform_files <- rna_meta[, file.path(rna_data_dir, basename(file_path))]
 cols_to_keep <- c(
   "transcript_id",
   "gene_id",
@@ -56,11 +77,23 @@ iso_quants_list <- pbmcapply::pbmclapply(
   select = cols_to_keep
 )
 
-names(iso_quants_list) <- download_metadata[assay_type == "RNA-Seq", uuid]
+names(iso_quants_list) <- rna_meta[, uuid]
 
 # make one isoform quantification table
 isoform_quants <- data.table::rbindlist(iso_quants_list, idcol = "uuid")
 isoform_quants[, uuid := as.factor(uuid)]
+
+# Cohort-read sanity (new): non-empty guards a mis-scoped read; the warning
+# flags any rna_to_use RSEM files that failed to load (they'd silently drop
+# from gene_expression_normalised downstream).
+stopifnot(nrow(isoform_quants) > 0L)
+n_read <- uniqueN(isoform_quants$uuid)
+if (n_read < nrow(rna_meta)) {
+  warning(sprintf(
+    "02-1: %d/%d rna_to_use isoform files loaded (%d missing/failed to read)",
+    n_read, nrow(rna_meta), nrow(rna_meta) - n_read
+  ))
+}
 tpms <- isoform_quants[
   download_metadata[
     assay_type == "RNA-Seq",
@@ -75,24 +108,12 @@ tpms <- isoform_quants[
 ggplot(tpms, aes(x = tpm, fill = experiment_type)) +
   geom_histogram()
 
+# isoform_quants already holds ONLY the rna_to_use cohort (filtered before the
+# read above), so this IS the subset that 02-2 consumes. The old full-pool
+# isoform_quantifications.tsv.gz (all ~1555 RNA-Seq samples) was never read
+# downstream and is no longer written.
 fwrite(
   isoform_quants,
-  "splicing_analysis/isoform_quantifications.tsv.gz",
-  sep = "\t"
-)
-
-# also write subset of samples for which we have both RNA-Seq and epigenomic data
-rna_to_use <- download_metadata[
-  assay_type == "RNA-Seq" &
-    epirr_id_without_version %in%
-      download_metadata[,
-        if (.N >= 8) .SD,
-        by = epirr_id_without_version
-      ][, epirr_id_without_version],
-  uuid
-]
-fwrite(
-  isoform_quants[uuid %in% rna_to_use],
   "splicing_analysis/isoform_quantifications_subset.tsv.gz",
   sep = "\t"
 )

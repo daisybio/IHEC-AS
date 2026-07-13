@@ -32,7 +32,16 @@ build_feature_masks <- function(feature_names, histone_marks) {
 
   list(
     hist_cols = grepl(hist_pattern, feature_names),
-    log_cols = grepl("^width;|^distance_|^gene_expression$", feature_names)
+    # log_cols -> log1p (apply_log_transforms). §4.12b: `05` no longer emits a
+    # bare `gene_expression`; it writes `gene_expression_getmm` (GeTMM-CPM, >=0,
+    # log1p-SAFE) + `gene_expression_vst` (DESeq2 vst, ~log2-scale, CAN BE
+    # NEGATIVE). Only getmm may be log1p'd here — logging vst gives log1p(neg) =
+    # NaN. vst, if present as a feature, is already variance-stabilised and must
+    # stay unlogged. Hence match getmm ONLY (was the bare `^gene_expression$`,
+    # which now silently matches nothing).
+    log_cols = grepl(
+      "^width;|^distance_|^gene_expression_getmm$", feature_names
+    )
   )
 }
 

@@ -4,17 +4,32 @@ output: html_document
 ---
 
 ```{r, load-data}
-# load image and table
-load("processed_data/aggregating.rda")
+set.seed(getOption("EpiATLAS_AS_SEED", 42L))
+
+# Per-filter (PLAN §4.12e): 06 runs ONE transcript_filter per invocation.
+# `load("processed_data/aggregating.rda")` is GONE — that workspace is no longer
+# produced by the per-filter refactor. The two objects it supplied that aren't
+# .Rprofile globals are read explicitly here:
+#   metadata      <- sample metadata sheet (annotation join)
+#   file_metadata <- file_table (uuid -> protocol)
+# (to_analyze/histone_marks/cor_methods/minimum_events/variability_colors/
+#  mark_hex_colors/plot_dir/sample_metadata_file all come from .Rprofile.)
+this_transcript_filter <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+# single filter per run -> facet-level vector is just this one
+transcript_filters <- this_transcript_filter
+metadata <- fread(sample_metadata_file)
+file_metadata <- fread("processed_data/file_table.csv.gz")
 aggregated_dt <- fread(
-  "processed_data/aggregated_dt_filtered.csv.gz",
+  sprintf(
+    "processed_data/aggregated_dt_filtered_%s.csv.gz",
+    this_transcript_filter
+  ),
   stringsAsFactors = TRUE
 )
 source("05zz-feature-preprocessing.R")
-# remove manual_ids, i.e., filter IDs in keep_rows
-# aggregated_dt <- aggregated_dt[ID %in% keep_rows]
-# check if there are still manual_ids in the dt
-# stopifnot(!any(manual_ids %in% aggregated_dt$ID))
 aggregated_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 
 # set some global_variables
@@ -31,28 +46,63 @@ meta_exclude_cols <- c(
   "seqnames",
   "ontology",
   "project",
-  "protocol"
+  "protocol",
+  # §4.12b: keep gene_expression_vst as the conditioning feature (below);
+  # exclude the pooled-model getmm copy so it isn't double-counted.
+  "gene_expression_getmm"
 )
 sdcols <- names(aggregated_dt)[!names(aggregated_dt) %in% meta_exclude_cols]
+# Drop columns that must NOT enter the numeric PSI correlation:
+#   *_source  -> §4.13l categorical strings ("observed"/"imputed") -> cor() NA/err
+#   ^rbp_ / ^spliceosome_ -> new RBP/spliceosome feature families (05 §4.12f);
+#     06's scope is epigenetic marks + intrinsic features, so keep it stable —
+#     RBP/spliceosome correlation is a separate analysis, not folded in here.
+sdcols <- sdcols[
+  !grepl(
+    "_source$", #|^rbp_|^spliceosome_",
+    sdcols
+  )
+]
 aggregation_columns <- c(
   "Event Type",
   "transcript_filter",
   "uuid",
   "Variability"
 )
+# Intrinsic (cis / non-epigenetic) covariates the partial correlation conditions
+# on. Rationale (the correlation runs ACROSS EVENTS within a sample -> a cross-
+# gene axis): condition on per-event properties that could spuriously drive a
+# mark<->PSI correlation, WITHOUT over-conditioning on a PSI proxy.
+#   - gene_expression_vst : host-gene expression. vst is length-normalised (run
+#     on lengthScaledTPM in 02-2, NOT raw counts) AND variance-stabilised ->
+#     well-behaved cross-gene covariate for the lm residualisation. (getmm would
+#     need log1p and gains nothing here.) Used raw via lm().
+#   - distances : transcript-relative TSS/TES kept; the near-collinear gene-
+#     relative distance_gene_start/_end DROPPED (redundant, transcript-relative
+#     is the splicing-relevant frame).
+#   - widths : exon/intron length drives inclusion and mark footprint.
+#   - splice-site STRENGTH : MaxEntScan (local 9/23-mer) AND Pangolin psite
+#     (P(splice site), 10 kb context) — complementary cis predictors (r~0.3-0.5),
+#     so conditioning on both = strict "chromatin beyond sequence". Pangolin
+#     *usage* is deliberately EXCLUDED — it's a direct PSI proxy, conditioning on
+#     it would erase the signal, not a confound. (Residualisation is robust to
+#     collinearity among conditioners; RI's NA-for-that-type sites 5ssup/3ssdown
+#     are dropped per-group in partial_cor.)
 non_epigenetic_features <- c(
-  "gene_expression",
+  "gene_expression_vst",
   "distance_TSS",
-  "distance_gene_start",
   "distance_TES",
-  "distance_gene_end",
   "width;upstream_other_region",
   "width;event_name",
   "width;downstream_other_region",
   "3ss",
   "3ssdown",
   "5ss",
-  "5ssup"
+  "5ssup",
+  "pangolin_5ss_psite_mean",
+  "pangolin_5ssup_psite_mean",
+  "pangolin_3ss_psite_mean",
+  "pangolin_3ssdown_psite_mean"
 )
 main_cor <- "spearman"
 main_variability <- "All"
@@ -66,8 +116,14 @@ preprocessing_colors <- c(
 ```
 
 ```{r, generate-cor-dt}
-corr_file_raw <- "processed_data/correlation_intrinsic.csv.gz"
-corr_file_preproc <- "processed_data/correlation_intrinsic_preproc.csv.gz"
+corr_file_raw <- sprintf(
+  "processed_data/correlation_intrinsic_%s.csv.gz",
+  this_transcript_filter
+)
+corr_file_preproc <- sprintf(
+  "processed_data/correlation_intrinsic_preproc_%s.csv.gz",
+  this_transcript_filter
+)
 
 full_cor <- function(y, PSI, cor_method, this_minimum_events = minimum_events) {
   rmv <- is.na(y) | is.na(PSI)
@@ -94,12 +150,26 @@ partial_cor <- function(
   if (y_name %in% names(this_rest_dt)) {
     this_rest_dt <- this_rest_dt[, !..y_name]
   }
+  this_rest_dt[, test_column := y]
 
-  this_rest_dt <- na.omit(this_rest_dt[, test_column := y])
+  # Conditioners present in this group, MINUS any that are entirely NA within it
+  # (e.g. 5ssup/3ssdown — MaxEntScan AND Pangolin — for RI, which has no
+  # upstream/downstream exon). Without this, na.omit() below would drop EVERY row
+  # of the group -> NA partial correlation for that whole event type. Restrict to
+  # the usable columns first, so only genuinely-incomplete rows are removed.
   this_non_epigenetic_features <- intersect(
     non_epigenetic_features,
     names(this_rest_dt)
   )
+  this_non_epigenetic_features <- this_non_epigenetic_features[
+    vapply(
+      this_non_epigenetic_features,
+      function(col) !all(is.na(this_rest_dt[[col]])),
+      logical(1)
+    )
+  ]
+  keep_cols <- c("PSI", "test_column", this_non_epigenetic_features)
+  this_rest_dt <- na.omit(this_rest_dt[, ..keep_cols])
   corr <- NA_real_
 
   if (
@@ -157,6 +227,12 @@ append_protocol_levels <- function(input_cor_dt) {
 }
 
 compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
+  # add verbosity
+  message(sprintf(
+    "Computing correlations (apply_preprocessing = %s) for %d rows",
+    apply_preprocessing,
+    nrow(input_dt)
+  ))
   prepared_dt <- prepare_with_all_variability(input_dt)
 
   bind_group_results <- function(results, stage_label) {
@@ -196,18 +272,31 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
     )$dt
   }
 
+  # add verbosity
+  message(sprintf(
+    "Compute full correlations"
+  ))
   cor_dt <- rbindlist(
     lapply(setNames(cor_methods, cor_methods), function(cor_method) {
       groups_list <- split(prepared_dt, by = aggregation_columns)
 
-      group_results <- pbmclapply(groups_list, function(group_dt) {
-        proc_group_dt <- transform_group(group_dt)
-        proc_group_dt[,
-          lapply(.SD, full_cor, PSI, cor_method),
-          by = aggregation_columns,
-          .SDcols = sdcols
-        ]
-      })
+      group_results <- pbmclapply(
+        groups_list,
+        function(group_dt) {
+          # single-thread each fork (see full-correlation worker above): the
+          # lm()/cor.test() here hit BLAS, so without this each of the 10 forks
+          # spawns ncores BLAS threads -> ncores×10 oversubscription.
+          data.table::setDTthreads(1L)
+          try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+          proc_group_dt <- transform_group(group_dt)
+          proc_group_dt[,
+            lapply(.SD, full_cor, PSI, cor_method),
+            by = aggregation_columns,
+            .SDcols = sdcols
+          ]
+        },
+        mc.cores = min(getOption("EpiATLAS_AS_CORES", 10), 10)
+      )
       bind_group_results(
         group_results,
         sprintf("full correlation (%s)", cor_method)
@@ -218,32 +307,45 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
   cor_dt[, `Correlation Coefficient` := as.factor(`Correlation Coefficient`)]
   cor_dt[, `Partial Correlation` := FALSE]
 
+  # add verbosity
+  message(sprintf(
+    "Compute partial correlations"
+  ))
   pcor_dt <- rbindlist(
     lapply(setNames(cor_methods, cor_methods), function(cor_method) {
       groups_list <- split(prepared_dt, by = aggregation_columns)
 
-      group_results <- pbmclapply(groups_list, function(group_dt) {
-        proc_group_dt <- transform_group(group_dt)
-        rest_cols <- intersect(
-          c("PSI", non_epigenetic_features),
-          names(proc_group_dt)
-        )
-        rest_dt <- proc_group_dt[, ..rest_cols]
-        proc_group_dt[,
-          mapply(
-            y_name = sdcols,
-            y = .SD,
-            FUN = partial_cor,
-            MoreArgs = list(
-              rest_dt = rest_dt,
-              cor_method = cor_method
+      group_results <- pbmclapply(
+        groups_list,
+        function(group_dt) {
+          # single-thread each fork (see full-correlation worker above): the
+          # lm()/cor.test() here hit BLAS, so without this each of the 10 forks
+          # spawns ncores BLAS threads -> ncores×10 oversubscription.
+          data.table::setDTthreads(1L)
+          try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+          proc_group_dt <- transform_group(group_dt)
+          rest_cols <- intersect(
+            c("PSI", non_epigenetic_features),
+            names(proc_group_dt)
+          )
+          rest_dt <- proc_group_dt[, ..rest_cols]
+          proc_group_dt[,
+            mapply(
+              y_name = sdcols,
+              y = .SD,
+              FUN = partial_cor,
+              MoreArgs = list(
+                rest_dt = rest_dt,
+                cor_method = cor_method
+              ),
+              SIMPLIFY = FALSE
             ),
-            SIMPLIFY = FALSE
-          ),
-          by = aggregation_columns,
-          .SDcols = sdcols
-        ]
-      })
+            by = aggregation_columns,
+            .SDcols = sdcols
+          ]
+        },
+        mc.cores = min(getOption("EpiATLAS_AS_CORES", 10), 10)
+      )
       bind_group_results(
         group_results,
         sprintf("partial correlation (%s)", cor_method)
@@ -274,13 +376,25 @@ if (file.exists(corr_file_preproc)) {
   all_cor_preproc <- compute_all_cor(aggregated_dt, apply_preprocessing = TRUE)
   fwrite(all_cor_preproc, corr_file_preproc)
 }
-
+# RESOLVED 2026-07-12: this used to be a real open question -- answered by `05`'s
+# NA-Variability fix (events with < 2 non-NA PSI samples get Variability unset,
+# per 02-3's read-coverage/VST masking). `05` now drops those rows before writing
+# aggregated_dt_filtered_{tf}.csv.gz (see 05-create-aggregated-dt.Rmd.md's
+# NA-Variability note), so `aggregated_dt` here should never contain one --
+# confirmed on the current on-disk output (0 NA/blank Variability values). The
+# stopifnot below is accordingly a defense-in-depth check against a regression
+# upstream, not an open investigation.
 all_cor_raw[, Preprocessing := "Raw"]
 all_cor_preproc[, Preprocessing := "Preprocessed"]
 all_cor <- rbind(all_cor_raw, all_cor_preproc, use.names = TRUE, fill = TRUE)
 all_cor[,
   Preprocessing := factor(Preprocessing, levels = c("Raw", "Preprocessed"))
 ]
+all_cor[, stopifnot(
+  "Some entries in the correlation data have NA for Variability. These will be removed. This should not happen" = all(
+    !is.na(Variability)
+  )
+)]
 ```
 
 ```{r, nicer-names}
@@ -300,6 +414,9 @@ melt_cor_dt <- melt(
   variable.name = "feature",
   value.name = "Correlation w/ PSI"
 )
+# §4.12b: normalise the vst feature name back to the generic label so the
+# existing relabel chain below ("gene expression" -> "Gene\nExpression") works.
+melt_cor_dt[, feature := sub("gene_expression_vst", "gene_expression", feature)]
 melt_cor_dt[, `Event Type` := factor(`Event Type`, levels = c("SE", "RI"))]
 melt_cor_dt[
   `Event Type` == "SE",
@@ -381,7 +498,7 @@ library(tidytext)
 top_n <- 10 # melt_cor_dt[, uniqueN(feature)]
 # get the top n correlations with PSI from the feature vector
 tmp_cor_dt <- melt_cor_dt[
-  `Variability` == main_variability &
+  Variability == main_variability &
     `Correlation Coefficient` == main_cor &
     `Partial Correlation` == main_partial &
     protocol == main_protocol &
@@ -488,14 +605,14 @@ for (color_by in c(
   if (color_by == "Partial Correlation") {
     not_color_by <- melt_cor_dt[,
       `Correlation Coefficient` == main_cor &
-        `Variability` == main_variability &
+        Variability == main_variability &
         protocol == main_protocol &
         Preprocessing == main_preprocessing
     ]
   } else if (color_by == "Correlation Coefficient") {
     not_color_by <- melt_cor_dt[,
       `Partial Correlation` == main_partial &
-        `Variability` == main_variability &
+        Variability == main_variability &
         protocol == main_protocol &
         Preprocessing == main_preprocessing
     ]
@@ -510,14 +627,14 @@ for (color_by in c(
     not_color_by <- melt_cor_dt[,
       `Partial Correlation` == main_partial &
         `Correlation Coefficient` == main_cor &
-        `Variability` == main_variability &
+        Variability == main_variability &
         Preprocessing == main_preprocessing
     ]
   } else if (color_by == "Preprocessing") {
     not_color_by <- melt_cor_dt[,
       `Partial Correlation` == main_partial &
         `Correlation Coefficient` == main_cor &
-        `Variability` == main_variability &
+        Variability == main_variability &
         protocol == main_protocol
     ]
   }
@@ -533,9 +650,9 @@ for (color_by in c(
     median_dt <- dcast(
       tmp_cor_dt[,
         .(median_cor = unique(median_cor)),
-        by = .(`Event Type`, transcript_filter, feature, `Variability`)
+        by = .(`Event Type`, transcript_filter, feature, Variability)
       ],
-      `Event Type` + transcript_filter + feature ~ `Variability`,
+      `Event Type` + transcript_filter + feature ~ Variability,
       value.var = "median_cor"
     )
     median_dt[, diff_col := abs(`Low` - `High`)]
@@ -678,7 +795,7 @@ for (color_by in c(
 ```{r, top10-preprocessing-comparison, fig.width=21, fig.height=8}
 # explicit preprocessing vs no-preprocessing comparison on top features
 preproc_cmp_dt <- melt_cor_dt[
-  `Variability` == main_variability &
+  Variability == main_variability &
     `Correlation Coefficient` == main_cor &
     `Partial Correlation` == main_partial &
     protocol == main_protocol
@@ -750,7 +867,7 @@ print(p_preproc)
 heatmap_dt <- unique(melt_cor_dt[
   `Partial Correlation` == main_partial &
     `Correlation Coefficient` == main_cor &
-    `Variability` == main_variability &
+    Variability == main_variability &
     protocol == main_protocol &
     Preprocessing == main_preprocessing &
     grepl(paste(c(histone_marks, "DNAm"), collapse = "|"), x = feature),
@@ -836,7 +953,7 @@ ggsave(
 heatmap_preproc_dt <- unique(melt_cor_dt[
   `Partial Correlation` == main_partial &
     `Correlation Coefficient` == main_cor &
-    `Variability` == main_variability &
+    Variability == main_variability &
     protocol == main_protocol &
     grepl(paste(c(histone_marks, "DNAm"), collapse = "|"), x = feature),
   .(
