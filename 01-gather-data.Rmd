@@ -214,6 +214,28 @@ rmats_uuids <- if (file.exists(rmats_psi_file)) {
 rna_qc[, included := "all RNA-Seq"]
 rna_qc[uuid %in% rmats_uuids, included := "with rMATS data"]
 
+# Separate from `included` above (which drives this notebook's own rMATS-based
+# QC plots, faceted by "all RNA-Seq"/"with rMATS data"): chip_qc/wgbs_qc both
+# use a "this_project" vs "EpiATLAS" flag to restrict merged_qc to this
+# project's cohort. rna_qc never had an equivalent column -- the downstream
+# merge silently filtered `rna_qc[included == "this_project", ...]`, which
+# always returned ZERO ROWS (that value never occurs in `included`), so `uuid`
+# (which only ever comes from rna_qc's side of merged_qc) was NA for every one
+# of the 405 output rows. Found 2026-07-14 via qc_flag_covariates.csv's uuid
+# column being entirely blank.
+#
+# NOT `download_metadata[assay_type == "RNA-Seq", uuid]` (chip/wgbs's own
+# pattern) -- checked directly: for RNA-Seq that expression equals ALL 1555
+# rows of `download_metadata`/`rna_qc` (the whole EpiATLAS RNA-Seq pool, not
+# scoped to this project at all -- unlike ChIP-Seq, where the same pattern
+# correctly narrows 2430 rows down to this project's cohort). `rmats_uuids`
+# (already computed just above: RNA-Seq UUIDs with a full epigenetic panel,
+# intersected with the samples rMATS actually processed) is this project's
+# real 441-UUID cohort and is what `qc_flag_covariates.csv` needs to match
+# `aggregated_dt`'s own uuid population.
+rna_qc[, this_project := "EpiATLAS"]
+rna_qc[uuid %in% rmats_uuids, this_project := "this_project"]
+
 # RNA-Seq QC thresholds (used in both plots and flag computation)
 rna_thr <- list(
   total = 50e6, # IHEC standard
@@ -601,7 +623,7 @@ merged_qc <-
   merge(
     merge(
       chip_qc_wide[included == "this_project", -"included"],
-      rna_qc[included == "this_project", ..rna_qc_stats],
+      rna_qc[this_project == "this_project", ..rna_qc_stats],
       by = "epirr_id_without_version",
       all = TRUE
     ),
@@ -637,7 +659,7 @@ dir.create("qc", showWarnings = FALSE)
 lines <- c()
 
 # Flag count distribution
-lines <- c(lines, "=== QC Flag Count Distribution (all 405 samples) ===", "")
+lines <- c(lines, "=== QC Flag Count Distribution (441 RNA-Seq uuids / 405 epirrs) ===", "")
 flag_dist <- merged_qc[, .N, by = qc_flag_count][order(qc_flag_count)]
 lines <- c(lines, "Flag count distribution:")
 for (i in 1:nrow(flag_dist)) {

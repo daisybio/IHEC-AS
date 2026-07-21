@@ -224,7 +224,13 @@ analyze_tree <- function(irfinder_tree) {
 
   raw_results <- Filter(
     Negate(is.null),
-    pbmclapply(uuid_dirs, read_one_sample, mc.cores = min(8L, getOption("mc.cores", 4L)))
+    # mc.cores fallback lowered 4L->2L (2026-07-15): forked workers each carry a
+    # copy of the parent's memory, and this job OOM-killed at mem_mb=8000 with
+    # 4-way forking on real biotype_filtered data. Nothing in this pipeline ever
+    # sets options(mc.cores=), so this fallback is the actual value used
+    # regardless of Snakemake's `threads:` allocation -- that resource field was
+    # previously just documentation drift, not a real cap.
+    pbmclapply(uuid_dirs, read_one_sample, mc.cores = min(8L, getOption("mc.cores", 2L)))
   )
   irfinder_all <- rbindlist(lapply(raw_results, `[[`, "matched"))
   irfinder_all[ri_key_dt, on = "match_key", suppa_id := i.suppa_id]

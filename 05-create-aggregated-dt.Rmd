@@ -16,6 +16,31 @@ this_transcript_filter <- Sys.getenv(
 )
 tf <- this_transcript_filter
 
+# append_sanity() must be defined before first use below (expand-aggregated-dt
+# calls it) -- moved up from the gene-expression-sanity chunk where it
+# previously lived after its first callers, causing "could not find function
+# append_sanity" (found 2026-07-15 on a real Snakemake run).
+sanity_csv <- "qc/sanity_summary.csv"
+append_sanity <- function(check_name, status, value, threshold, notes = "") {
+  new_row <- data.table(
+    check_name = check_name,
+    status = status,
+    value = value,
+    threshold = threshold,
+    notes = notes
+  )
+  if (file.exists(sanity_csv)) {
+    # upsert by check_name: drop any prior row for this check before writing
+    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
+    # rows across reruns (append=TRUE never truncated -> the file only grew).
+    existing <- fread(sanity_csv)
+    existing <- existing[check_name != new_row$check_name]
+    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
+  } else {
+    fwrite(new_row, sanity_csv)
+  }
+}
+
 keep_rows_manual <- readRDS(
   sprintf("processed_data/keep_rows_manual_%s.rds", tf)
 )
@@ -522,26 +547,8 @@ aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
 
 ```{r, gene-expression-sanity}
 # §4.13d — gene expression distribution sanity (post §4.12a fix)
-sanity_csv <- "qc/sanity_summary.csv"
-append_sanity <- function(check_name, status, value, threshold, notes = "") {
-  new_row <- data.table(
-    check_name = check_name,
-    status = status,
-    value = value,
-    threshold = threshold,
-    notes = notes
-  )
-  if (file.exists(sanity_csv)) {
-    # upsert by check_name: drop any prior row for this check before writing
-    # the new one, so sanity_summary.csv doesn't accumulate stale/duplicate
-    # rows across reruns (append=TRUE never truncated -> the file only grew).
-    existing <- fread(sanity_csv)
-    existing <- existing[check_name != new_row$check_name]
-    fwrite(rbind(existing, new_row, fill = TRUE), sanity_csv)
-  } else {
-    fwrite(new_row, sanity_csv)
-  }
-}
+# sanity_csv / append_sanity() now defined in load-data (must precede
+# expand-aggregated-dt's calls) -- see note there.
 
 dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
 
@@ -1163,6 +1170,27 @@ if (length(dnam_cols) && "distance_TSS" %in% names(aggregated_dt)) {
     height = 5
   )
 }
+```
+
+```{r, dnam-mvalue-transform}
+# §3.1b — convert DNAm columns from raw % methylation (beta*100) to M-values
+# before the final write. M-values have far better statistical properties for
+# PCA/correlation/regression than beta values: variance is roughly constant
+# across the methylation range on the M-value (logit) scale, whereas beta's
+# variance is maximal near 0.5 and collapses near 0/1 -- distorting
+# Euclidean-distance-based methods (PCA) and Pearson correlation. Must run
+# AFTER dnam-tss-sanity above (which needs the real 0-100 beta scale for its
+# "mean beta (% methylation)" plot) and BEFORE the write below, since
+# 05b-feature-pca-sanity, 06-correlation, and splicing_ml all read the file
+# written below and share whatever scale these columns are in.
+dnam_cols <- grep("^DNAm;", names(aggregated_dt), value = TRUE)
+aggregated_dt[,
+  (dnam_cols) := lapply(.SD, function(x) {
+    beta <- x / 100
+    log2((beta + 0.001) / (1 - beta + 0.001))
+  }),
+  .SDcols = dnam_cols
+]
 ```
 
 

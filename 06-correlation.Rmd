@@ -295,7 +295,7 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
             .SDcols = sdcols
           ]
         },
-        mc.cores = min(getOption("EpiATLAS_AS_CORES", 10), 10)
+        mc.cores = min(getOption("EpiATLAS_AS_CORES", 4), 4)
       )
       bind_group_results(
         group_results,
@@ -344,7 +344,7 @@ compute_all_cor <- function(input_dt, apply_preprocessing = FALSE) {
             .SDcols = sdcols
           ]
         },
-        mc.cores = min(getOption("EpiATLAS_AS_CORES", 10), 10)
+        mc.cores = min(getOption("EpiATLAS_AS_CORES", 4), 4)
       )
       bind_group_results(
         group_results,
@@ -495,7 +495,7 @@ melt_cor_dt[,
 ```{r, top10-overall, fig.width=21, fig.height=8}
 library(ggh4x)
 library(tidytext)
-top_n <- 10 # melt_cor_dt[, uniqueN(feature)]
+top_n <- 25 # melt_cor_dt[, uniqueN(feature)]
 # get the top n correlations with PSI from the feature vector
 tmp_cor_dt <- melt_cor_dt[
   Variability == main_variability &
