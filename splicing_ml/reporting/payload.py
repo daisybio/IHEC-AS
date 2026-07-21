@@ -29,6 +29,7 @@ MAX_GLOBAL_POINTS = 8000
 MAX_PER_MODEL_POINTS = 2000
 MAX_PSI_SAMPLE_POINTS = 30000
 MAX_CURVE_POINTS = 3000
+MAX_FEATURE_DIST_POINTS = 3000
 
 
 def _downsample_pair(
@@ -97,6 +98,28 @@ def important_params_table_rows(task_result: dict[str, Any]) -> list[dict[str, s
 # Heatmap builder (promoted from nested function — called 3× in payload)
 # ---------------------------------------------------------------------------
 
+_LOWER_IS_BETTER_METRICS = {"rmse", "mad"}
+
+
+def _is_lower_is_better(metric: str) -> bool:
+    """True if a smaller value is better for *metric* (e.g. RMSE, MAD).
+
+    Handles the ``original_``/``logit_`` scale prefixes used for regression
+    metrics; everything else (r2_rss, ccc, and all classification metrics)
+    is higher-is-better.
+    """
+    base = metric
+    for prefix in ("original_", "logit_"):
+        if base.startswith(prefix):
+            base = base[len(prefix) :]
+            break
+    return base in _LOWER_IS_BETTER_METRICS
+
+
+def _direction_sort_key(metric: str) -> tuple[int, str]:
+    """Sort key grouping lower-is-better metrics before higher-is-better ones."""
+    return (0 if _is_lower_is_better(metric) else 1, metric)
+
 
 def _build_metric_heatmap(
     fold_rows: list[dict[str, Any]],
@@ -146,6 +169,7 @@ def _build_metric_heatmap(
         "z": metric_z,
         "sd": metric_sd,
         "text": metric_text,
+        "directions": [_is_lower_is_better(m) for m in metric_names],
     }
 
 
@@ -155,7 +179,49 @@ _EMPTY_HEATMAP: dict[str, Any] = {
     "z": [],
     "sd": [],
     "text": [],
+    "directions": [],
 }
+
+
+def _build_metric_fold_data(
+    fold_rows: list[dict[str, Any]],
+    model_order: list[str],
+    metric_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Build per-metric fold-level box-plot points and fold-connecting lines.
+
+    Mirrors the primary-metric-only ``model_fold_points``/``fold_lines``
+    computation, but repeated for every metric so the HTML report can render
+    one box plot per metric instead of only the primary one.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for metric in metric_names:
+        points: list[dict[str, Any]] = []
+        for r in fold_rows:
+            score = float(r.get("scores", {}).get(metric, float("nan")))
+            if not np.isnan(score):
+                points.append(
+                    {
+                        "model_name": str(r.get("model_name", "unknown")),
+                        "outer_fold": int(r.get("outer_fold", 0)),
+                        "score": score,
+                    }
+                )
+        fold_to_scores: dict[int, dict[str, float]] = {}
+        for p in points:
+            fold_to_scores.setdefault(p["outer_fold"], {})[p["model_name"]] = p[
+                "score"
+            ]
+        lines = [
+            {
+                "outer_fold": fold_id,
+                "x": [m for m in model_order if m in model_to_score],
+                "y": [model_to_score[m] for m in model_order if m in model_to_score],
+            }
+            for fold_id, model_to_score in sorted(fold_to_scores.items())
+        ]
+        out[metric] = {"points": points, "lines": lines}
+    return out
 
 
 def _safe_empty_payload(
@@ -174,6 +240,7 @@ def _safe_empty_payload(
         "warnings": warnings,
         "model_order": [],
         "metric_heatmap": _EMPTY_HEATMAP.copy(),
+        "metric_fold_data": {},
         "model_fold_points": model_fold_points or [],
         "fold_lines": [],
         "y_true": [],
@@ -189,6 +256,7 @@ def _safe_empty_payload(
         "pr_by_model": {},
         "pr_prevalence": None,
         "response_distribution": _ensure_thresholds(task_result),
+        "transformed_feature_distributions": {},
         "important_params": important_params_table_rows(task_result),
     }
 
@@ -510,6 +578,35 @@ def _build_classification_threshold_payload(
     return confusion_by_model, threshold_summary, best_threshold
 
 
+def _build_transformed_feature_distributions(
+    fold_rows: list[dict[str, Any]],
+) -> dict[str, list[float]]:
+    """Pool transformed-feature samples across every fold/model into one
+    per-feature list, for a post-preprocessing distribution histogram.
+
+    The preprocessor is refit per fold/model, but on the same fold's
+    training data with the same transform steps -- pooling across models is
+    harmless (near-duplicate samples of the same underlying population) and
+    gives a bigger, smoother sample than picking just one model.
+    """
+    pooled: dict[str, list[float]] = {}
+    for r in fold_rows:
+        tf = r.get("transformed_features")
+        if not tf:
+            continue
+        names = tf.get("feature_names") or []
+        values = tf.get("values") or []
+        if not names or not values:
+            continue
+        arr = np.asarray(values, dtype=float)
+        for i, name in enumerate(names):
+            pooled.setdefault(name, []).extend(arr[:, i].tolist())
+    return {
+        name: _downsample_list(vals, MAX_FEATURE_DIST_POINTS)
+        for name, vals in pooled.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -582,22 +679,29 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         {str(k) for r in fold_rows for k in r.get("scores", {}).keys() if k is not None}
     )
 
-    # Build metric heatmaps.
+    # Build metric heatmaps. Metrics are grouped lower-is-better-first so the
+    # heatmap/box-plot grid visually separates error metrics from fit-quality
+    # ones instead of interleaving directions the row-color scale can't both
+    # satisfy at once.
+    metric_names_all = sorted(metric_names_all, key=_direction_sort_key)
     metric_heatmap = _build_metric_heatmap(fold_rows, model_order, metric_names_all)
     metric_heatmap_original = _EMPTY_HEATMAP.copy()
     metric_heatmap_logit = _EMPTY_HEATMAP.copy()
 
     if task == "regression":
         original_metric_names = sorted(
-            [m for m in metric_names_all if m.startswith("original_")]
+            [m for m in metric_names_all if m.startswith("original_")],
+            key=_direction_sort_key,
         )
         logit_metric_names = sorted(
-            [m for m in metric_names_all if m.startswith("logit_")]
+            [m for m in metric_names_all if m.startswith("logit_")],
+            key=_direction_sort_key,
         )
         # Backward-compatible fallback when prefixed metrics are absent.
         if not original_metric_names:
             original_metric_names = sorted(
-                [m for m in metric_names_all if m in {"rmse", "mad", "r2_rss", "ccc"}]
+                [m for m in metric_names_all if m in {"rmse", "mad", "r2_rss", "ccc"}],
+                key=_direction_sort_key,
             )
         # Backfill logit metrics for older artifacts that only have original-scale scores.
         if not logit_metric_names:
@@ -624,7 +728,8 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
                 }
             )
             logit_metric_names = sorted(
-                [m for m in metric_names_all if m.startswith("logit_")]
+                [m for m in metric_names_all if m.startswith("logit_")],
+                key=_direction_sort_key,
             )
 
         metric_heatmap_original = _build_metric_heatmap(
@@ -635,6 +740,13 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         )
         # Suppress the mixed heatmap for regression (use scale-specific ones).
         metric_heatmap = _EMPTY_HEATMAP.copy()
+        metric_fold_data = _build_metric_fold_data(
+            fold_rows, model_order, original_metric_names + logit_metric_names
+        )
+    else:
+        metric_fold_data = _build_metric_fold_data(
+            fold_rows, model_order, metric_names_all
+        )
 
     # Fold-connecting line segments.
     fold_line_rows: dict[int, dict[str, float]] = {}
@@ -685,6 +797,7 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "metric_heatmap": metric_heatmap,
         "metric_heatmap_original": metric_heatmap_original,
         "metric_heatmap_logit": metric_heatmap_logit,
+        "metric_fold_data": metric_fold_data,
         "model_fold_points": model_fold_points,
         "fold_lines": fold_lines,
         "y_true": y_true,
@@ -700,5 +813,8 @@ def build_task_plot_payload(task_result: dict[str, Any]) -> dict[str, Any]:
         "pr_by_model": pr_by_model,
         "pr_prevalence": pr_prevalence,
         "response_distribution": _ensure_thresholds(task_result),
+        "transformed_feature_distributions": _build_transformed_feature_distributions(
+            fold_rows
+        ),
         "important_params": important_params_table_rows(task_result),
     }

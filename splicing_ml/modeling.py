@@ -40,6 +40,10 @@ from .models.xgb_utils import (
     _unwrap_model_step,
     xgb_gpu_available,
 )
+from .models.lgbm_utils import (
+    _set_lgbm_cpu_predictor_for_inference,
+    lgbm_gpu_available,
+)
 
 # metric_key and scorer_name are also re-exported for backward compat.
 from .models.search import metric_key, scorer_name
@@ -68,6 +72,8 @@ __all__ = [
     "_set_xgb_cpu_predictor_for_inference",
     "_unwrap_model_step",
     "xgb_gpu_available",
+    "_set_lgbm_cpu_predictor_for_inference",
+    "lgbm_gpu_available",
     # Grid helpers
     "_axis_count_from_budget",
     "_lhs_unit",

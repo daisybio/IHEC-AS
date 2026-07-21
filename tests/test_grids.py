@@ -170,12 +170,41 @@ def test_grid_rf_and_xgb(task: str) -> None:
     )
 
 
-@pytest.mark.parametrize("model_name", ["rf", "xgb", "svm", "mlp"])
+@pytest.mark.parametrize("task", ["regression", "classification"])
+def test_grid_lgbm(task: str) -> None:
+    """Test grid lgbm."""
+    pytest.importorskip("lightgbm")
+
+    lgbm = g.choose_param_grid(
+        model_name="lgbm",
+        task=task,
+        n_samples=5000,
+        n_features=120,
+        grid_size=7,
+        lgbm_use_gpu=False,
+    )
+    assert len(lgbm) == 7
+    _assert_nonempty_list_dict(
+        lgbm,
+        [
+            "model",
+            "model__n_estimators",
+            "model__num_leaves",
+            "model__learning_rate",
+            "model__bagging_fraction",
+            "model__feature_fraction",
+        ],
+    )
+
+
+@pytest.mark.parametrize("model_name", ["rf", "xgb", "lgbm", "svm", "mlp"])
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_lhs_candidates_shape(model_name: str, task: str) -> None:
     """Test lhs candidates shape."""
     if model_name in {"rf", "xgb"}:
         pytest.importorskip("xgboost")
+    if model_name == "lgbm":
+        pytest.importorskip("lightgbm")
 
     out = g.choose_param_lhs_candidates(
         model_name=model_name,
@@ -185,6 +214,7 @@ def test_lhs_candidates_shape(model_name: str, task: str) -> None:
         budget=6,
         xgb_use_gpu=False,
         cuml_use_gpu=False,
+        lgbm_use_gpu=False,
         scale_mode="auto",
     )
     assert len(out) == 6
@@ -208,6 +238,48 @@ def test_lhs_linear_is_singleton(task: str) -> None:
     )
     _assert_nonempty_list_dict(out, ["model"])
     assert len(out) == 1
+
+
+def test_lhs_unit_is_seed_deterministic() -> None:
+    """Same seed -> identical LHS design; different seed -> different design.
+
+    Regression test for the 2026-07-17 fix where every _lhs_unit call site
+    hardcoded seed=RNG_SEED instead of threading a caller-supplied seed —
+    --seed silently had no effect on which hyperparameter candidates got
+    tried. Guards against that hardcoding creeping back in.
+    """
+    unit_a = g._lhs_unit(n_points=8, n_dims=3, seed=123)
+    unit_b = g._lhs_unit(n_points=8, n_dims=3, seed=123)
+    unit_c = g._lhs_unit(n_points=8, n_dims=3, seed=456)
+
+    assert (unit_a == unit_b).all()
+    assert not (unit_a == unit_c).all()
+
+
+def test_choose_param_lhs_candidates_seed_changes_svm_candidates() -> None:
+    """choose_param_lhs_candidates(seed=...) actually varies the sampled C/gamma.
+
+    svm chosen because it needs no optional xgboost/lightgbm dependency and
+    its candidates directly encode the LHS row (model__C, model__gamma).
+    """
+
+    def _cg(seed: int) -> list[tuple[float, float]]:
+        out = g.choose_param_lhs_candidates(
+            model_name="svm",
+            task="classification",
+            n_samples=6000,
+            n_features=150,
+            budget=6,
+            cuml_use_gpu=False,
+            seed=seed,
+        )
+        return [(c["model__C"][0], c["model__gamma"][0]) for c in out]
+
+    same_a, same_b = _cg(123), _cg(123)
+    different = _cg(456)
+
+    assert same_a == same_b
+    assert same_a != different
 
 
 @pytest.mark.parametrize("task", ["regression", "classification"])
@@ -283,6 +355,37 @@ def test_optuna_distributions_rf_xgb(task: str) -> None:
         "model__min_child_weight",
     }
     assert isinstance(d_xgb["model__learning_rate"], dist.FloatDistribution)
+
+
+@pytest.mark.parametrize("task", ["regression", "classification"])
+def test_optuna_distributions_lgbm(task: str) -> None:
+    """Test optuna distributions lgbm."""
+    optuna = pytest.importorskip("optuna")
+    dist = optuna.distributions
+    pytest.importorskip("lightgbm")
+
+    base_lgbm, d_lgbm = g.build_optuna_distributions(
+        model_name="lgbm",
+        task=task,
+        n_samples=5000,
+        n_features=120,
+        lgbm_use_gpu=False,
+    )
+    assert hasattr(base_lgbm, "fit")
+    assert set(d_lgbm.keys()) == {
+        "model__n_estimators",
+        "model__num_leaves",
+        "model__learning_rate",
+        "model__bagging_fraction",
+        "model__feature_fraction",
+        "model__min_child_samples",
+        "model__reg_alpha",
+        "model__reg_lambda",
+    }
+    assert isinstance(d_lgbm["model__n_estimators"], dist.IntDistribution)
+    assert isinstance(d_lgbm["model__num_leaves"], dist.IntDistribution)
+    assert isinstance(d_lgbm["model__learning_rate"], dist.FloatDistribution)
+    assert isinstance(d_lgbm["model__reg_alpha"], dist.FloatDistribution)
 
 
 def test_unsupported_model_raises() -> None:

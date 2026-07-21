@@ -60,6 +60,7 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
     "elasticnet",
     "rf",
     "xgb",
+    "lgbm",
     "beta",
     "svm",
     "nysvm",
@@ -70,15 +71,28 @@ ALL_MODEL_TYPES: tuple[str, ...] = (
 # - svm (O(n²), unusable at SE scale)
 # - nysvm (OOM-killed on SE; worst-performing model at all scales)
 # - elasticnet (slower than linear, competitive only with linear/beta; not justified by performance gain)
+# - rf (redundant with xgb; xgb consistently outperforms it)
+# - tabicl (removed from defaults 2026-07-21, user direction) -- SE-scale runs regularly cost
+#   hours-to-a-day per fold beyond xgb/lgbm/linear: its own tf_col/tf_row/tf_icl context rebuild
+#   is expensive on its own, `tune_threshold_balanced_accuracy` has no tabicl exemption so it
+#   refits that context 4 more times per fold for threshold tuning, and it OOM'd outright in
+#   4 of 14 real logs scanned (evaluator.py's _chunked_model_call retry helps the OOMs but not
+#   the underlying wall-clock cost). Still selectable explicitly via --models/include_models;
+#   revisit re-adding to defaults if/once its cost profile is fixed (chunking is not the fix,
+#   see the retry-loop analysis in CLAUDE.md's Known Pitfalls).
+# - lgbm (added to defaults 2026-07-15, removed 2026-07-21) -- real logs across all 7
+#   available classification logs confirmed xgb consistently faster (2-4x at RI scale,
+#   ~13-40% at SE scale); lgbm does genuinely win on AUROC sometimes (5/5 folds outright in
+#   two separate configs), so this is a real accuracy-vs-speed tradeoff, not a "never helps"
+#   call -- user decided the win is too marginal to justify the added wall-clock. Still
+#   selectable via --models/include_models.
 # MLP was optimized with batch-size scaling, mixed precision, and early
 # stopping and is now fast enough for routine production runs.
 DEFAULT_MODEL_TYPES: tuple[str, ...] = tuple(
     {
         "linear",
         "xgb",
-        "tabicl",
     }
-    # m for m in ALL_MODEL_TYPES if m not in {"svm", "nysvm", "elasticnet", "mlp", "rf", "xgb"}
 )
 # Smoke mode covers all available model types including MLP.
 SMOKE_MODEL_TYPES: tuple[str, ...] = ALL_MODEL_TYPES
@@ -207,6 +221,9 @@ def validate_run_config(cfg: RunConfig) -> list[str]:
     if cfg.param_grid_size < 1:
         raise ValueError(f"param_grid_size must be >= 1, got {cfg.param_grid_size}")
 
+    # shap_max_samples: no lower bound to check -- <=0 is a valid sentinel
+    # meaning "disable subsampling, use every test row" (publication runs).
+
     # Smoke mode validation.
     if cfg.smoke_mode and cfg.smoke_max_rows < 100:
         raise ValueError(f"smoke_max_rows must be >= 100, got {cfg.smoke_max_rows}")
@@ -257,11 +274,17 @@ class RunConfig:
     optuna_sampler: str = "tpe"
     optuna_n_startup_trials: int = 5
     optuna_multivariate: bool = True
-    optuna_wandb_callback: bool = False
+    optuna_wandb_callback: bool = True
     xgb_use_gpu: bool | None = None
     cuml_use_gpu: bool | None = None
+    lgbm_use_gpu: bool | None = None
     verbose: bool = False
     include_models: tuple[str, ...] = ALL_MODEL_TYPES
+    # Ablation studies: restrict model features to specific FEATURE_GROUPS
+    # (see preprocessing.py), e.g. ("sequence",) for a sequence-only baseline
+    # or ("histone","dnam") for epigenetics-only. None = no restriction (all
+    # features, current default production behaviour).
+    feature_groups: tuple[str, ...] | None = None
     run_regression: bool = True
     run_classification: bool = True
     psi_low_threshold: float = PSI_LOW_BOUNDARY
@@ -275,8 +298,21 @@ class RunConfig:
     calibrate_classifiers: bool = True
     tune_threshold: bool = True
     output_level: str = "diagnostics"
+    # SHAP TreeExplainer cost scales linearly with n_test_samples (no internal
+    # subsampling); on SE-scale folds (millions of rows) computing it on the
+    # full outer-test fold took ~2h+ with zero progress output (found
+    # 2026-07-16 via real log audit). Subsampling to a fixed size gives
+    # stable mean-|SHAP| feature importance at a small, bounded cost instead.
+    # <=0 disables subsampling (every test row) -- use for the final
+    # publication run, where exact per-sample values matter more than
+    # wall-clock. Bumped default 5000 -> 50000 (2026-07-21): real log timing
+    # showed TreeExplainer at 5000 samples cost 0.4-144s even at SE scale
+    # (millions of test rows) vs. xgb/lgbm's own 60-200+ *minute* searches --
+    # huge unused headroom, so a bigger default gives materially more robust
+    # per-feature importance for routine runs too, not just publication ones.
+    shap_max_samples: int = 50000
     log_level: str = "info"
-    use_wandb: bool = False
+    use_wandb: bool = True
     wandb_project: str = "splicing-ml"
     wandb_entity: str | None = None
     wandb_require_auth: bool = True

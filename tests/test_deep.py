@@ -42,7 +42,7 @@ def test_mlp_regressor_handles_sparse_validation_context() -> None:
         _es_pp_val_context.y_val = None
 
 
-@pytest.mark.parametrize("model_name", ["mlp", "xgb"])
+@pytest.mark.parametrize("model_name", ["mlp", "xgb", "lgbm"])
 def test_es_pipeline_handles_validation_routing(model_name: str) -> None:
     """Regression test for sklearn metadata routing in the early-stopping pipeline."""
     torch = pytest.importorskip("torch")
@@ -62,6 +62,16 @@ def test_es_pipeline_handles_validation_routing(model_name: str) -> None:
             batch_size=2,
             max_epochs=1,
             early_stopping_patience=1,
+            random_state=0,
+        )
+    elif model_name == "lgbm":
+        lightgbm = pytest.importorskip("lightgbm")
+        model = lightgbm.LGBMRegressor(
+            n_estimators=2,
+            num_leaves=4,
+            learning_rate=0.1,
+            device_type="cpu",
+            verbose=-1,
             random_state=0,
         )
     else:

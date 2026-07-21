@@ -53,6 +53,92 @@ def slugify_config_key(key: tuple[str, str, str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Model card
+# ---------------------------------------------------------------------------
+
+# Caveat predicates: each takes (group_col, model_names) and, if it applies,
+# contributes one <li> to the model card. Kept in sync with CLAUDE.md's
+# "Known Pitfalls" section by hand -- there is no single source of truth to
+# derive this from automatically, so if a pitfall there changes, update here.
+_MODEL_CARD_CAVEATS: list[Any] = [
+    (
+        lambda group_col, models: group_col == "ontology",
+        'group_col="ontology" outer CV leaks event identity for high-capacity '
+        "models (xgb/lgbm/tabicl AUROC 0.97–1.0 on both Low and High "
+        "variability) — rows from the same event scatter across ontology "
+        "labels, so the model can fingerprint the event instead of "
+        "generalizing to a genuinely unseen cell type. Hierarchical ontology "
+        "supergrouping is applied but confirmed insufficient. Do not cite "
+        "tree/tabicl AUROC from this report as real generalization "
+        "performance; linear's numbers are unaffected.",
+    ),
+    (
+        lambda group_col, models: {"xgb", "lgbm"} <= models,
+        "lgbm vs xgb SHAP: the two agree strongly on feature <em>ranking</em> "
+        "(Spearman ρ≈0.885) but lgbm's absolute SHAP magnitude runs "
+        "~1.6–35× larger — compare rankings across these two "
+        "model families, never raw SHAP magnitudes.",
+    ),
+    (
+        lambda group_col, models: "tabicl" in models,
+        "tabicl has no SHAP/feature-attribution support (pretrained, no inner "
+        "CV, never routed through the tree-model SHAP path) — expect no "
+        "per-feature explanation for it in this report.",
+    ),
+    (
+        lambda group_col, models: "rf" in models,
+        '"rf" is XGBoost’s XGBRFClassifier/XGBRFRegressor, not sklearn’s '
+        "RandomForest — shares xgb's GPU setup but gets none of the "
+        "early-stopping machinery.",
+    ),
+]
+
+
+def _build_model_card_html(
+    config: tuple[str, str, str, str],
+    payload: list[dict[str, Any]],
+    run_datetime_display: str,
+) -> str:
+    """Return the "Model Card" HTML block shown at the top of the report.
+
+    Summarises the subset config and flags known caveats (CV leakage,
+    cross-model SHAP comparability, etc.) that apply to the specific
+    combination of group_col/models present in this report -- so a reader
+    doesn't need CLAUDE.md open to know a number shouldn't be trusted at
+    face value.
+    """
+    event_type, transcript_filter, variability, group_col = config
+    model_names: set[str] = set()
+    for p in payload:
+        model_names.update(p.get("model_order") or [])
+    models_display = ", ".join(sorted(model_names)) if model_names else "N/A"
+
+    caveats = [msg for predicate, msg in _MODEL_CARD_CAVEATS if predicate(group_col, model_names)]
+    if caveats:
+        caveats_html = "<ul style='margin:6px 0 0;padding-left:20px;'>" + "".join(
+            f"<li>{c}</li>" for c in caveats
+        ) + "</ul>"
+    else:
+        caveats_html = "<p style='color:#666;margin:6px 0 0;'>No known caveats apply to this subset/model combination.</p>"
+
+    return f"""
+  <div class="card" style="background:#fffbea;border-color:#e8d9a0;">
+    <h2 style="margin-top:0;">Model Card</h2>
+    <table style="width:auto;">
+      <tr><th>Event type</th><td>{html.escape(event_type)}</td></tr>
+      <tr><th>Transcript filter</th><td>{html.escape(transcript_filter)}</td></tr>
+      <tr><th>Variability</th><td>{html.escape(variability)}</td></tr>
+      <tr><th>Group column (outer CV)</th><td>{html.escape(group_col)}</td></tr>
+      <tr><th>Models</th><td>{html.escape(models_display)}</td></tr>
+      <tr><th>Results generated</th><td>{run_datetime_display}</td></tr>
+    </table>
+    <h3 style="margin-bottom:4px;">Known caveats for this configuration</h3>
+    {caveats_html}
+  </div>
+"""
+
+
+# ---------------------------------------------------------------------------
 # JavaScript helper functions (plain string — {} in JS needs no escaping here)
 # ---------------------------------------------------------------------------
 
@@ -65,23 +151,80 @@ _PLOTLY_JS_HELPERS = """
             el.innerHTML = '<p>No heatmap data available.</p>';
             return;
         }
+        const nModels = hm.models.length;
+        const nMetrics = hm.metrics.length;
+        // hm.z/sd/text arrive as model-rows x metric-cols; transpose so metrics
+        // become rows (y-axis) and models become columns (x-axis).
+        const zT = [], sdT = [], textT = [];
+        for (let mi = 0; mi < nMetrics; mi++) {
+            const zRow = [], sdRow = [], textRow = [];
+            for (let ri = 0; ri < nModels; ri++) {
+                zRow.push(hm.z[ri][mi]);
+                sdRow.push(hm.sd[ri][mi]);
+                textRow.push(hm.text[ri][mi]);
+            }
+            zT.push(zRow); sdT.push(sdRow); textT.push(textRow);
+        }
+        // Metrics live on unrelated scales (e.g. RMSE vs AUROC), so color each
+        // row (metric) independently via min-max scaling; the actual mean/sd
+        // stay available as displayed text and in hover via customdata.
+        // Some metrics are lower-is-better (RMSE, MAD) and some are
+        // higher-is-better (R2, CCC, AUROC, ...) -- without accounting for
+        // that, "best" would map to opposite color ends on different rows.
+        // hm.directions[i] (true = lower-is-better) flips the per-row scale
+        // so yellow always means "best" and purple "worst". Rows also arrive
+        // pre-grouped by direction (server-side sort), so a single divider
+        // line cleanly separates the two groups.
+        const directions = hm.directions || hm.metrics.map(() => false);
+        const yLabels = hm.metrics.map((m, i) => m + (directions[i] ? ' ↓ lower better' : ' ↑ higher better'));
+        const zColor = zT.map((row, ri) => {
+            const finite = row.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+            if (!finite.length) return row.map(() => null);
+            const lo = Math.min(...finite), hi = Math.max(...finite);
+            const lowerIsBetter = !!directions[ri];
+            if (hi === lo) return row.map((v) => (v === null || v === undefined ? null : 0.5));
+            return row.map((v) => {
+                if (v === null || v === undefined) return null;
+                const frac = (v - lo) / (hi - lo);
+                return lowerIsBetter ? 1 - frac : frac;
+            });
+        });
+        const customdata = zT.map((row, ri) => row.map((v, ci) => [v, sdT[ri][ci]]));
+
+        const nLowerIsBetter = directions.filter(Boolean).length;
+        const groupShapes = [];
+        if (nLowerIsBetter > 0 && nLowerIsBetter < nMetrics) {
+            // Lower-is-better rows are grouped first (bottom of the
+            // categorical y-axis), so the boundary sits right above them.
+            groupShapes.push({
+                type: 'line', xref: 'paper', x0: 0, x1: 1,
+                yref: 'y', y0: nLowerIsBetter - 0.5, y1: nLowerIsBetter - 0.5,
+                line: { color: '#888', width: 1, dash: 'dot' }
+            });
+        }
+
         Plotly.newPlot(
             divId,
             [{
                 type: 'heatmap',
-                x: hm.metrics,
-                y: hm.models,
-                z: hm.z,
-                customdata: hm.sd,
-                text: hm.text,
+                x: hm.models,
+                y: yLabels,
+                z: zColor,
+                zmin: 0,
+                zmax: 1,
+                customdata: customdata,
+                text: textT,
                 colorscale: 'Viridis',
                 texttemplate: '%{text}',
-                hovertemplate: 'Model=%{y}<br>Metric=%{x}<br>Mean=%{z:.4f}<br>SD=%{customdata:.4f}<extra></extra>'
+                showscale: true,
+                colorbar: { title: 'Row-scaled:<br>1=best, 0=worst' },
+                hovertemplate: 'Model=%{x}<br>Metric=%{y}<br>Mean=%{customdata[0]:.4f}<br>SD=%{customdata[1]:.4f}<extra></extra>'
             }],
             {
                 title: title,
-                xaxis: { title: 'Metric' },
-                yaxis: { title: 'Model', automargin: true }
+                xaxis: { title: 'Model', automargin: true },
+                yaxis: { title: 'Metric', automargin: true },
+                shapes: groupShapes
             },
             { responsive: true }
         );
@@ -125,6 +268,21 @@ _PLOTLY_JS_HELPERS = """
                 xaxis: { title: 'PSI' },
                 yaxis: { title: 'Count' },
                 shapes: shapes || []
+            },
+            { responsive: true }
+        );
+    }
+
+    // ── Transformed (post-preprocessing) feature distribution ───────────────
+    function plotFeatureHistogram(divId, values, featureName) {
+        Plotly.newPlot(
+            divId,
+            [{ x: values, type: 'histogram', nbinsx: 40 }],
+            {
+                title: { text: featureName, font: { size: 12 } },
+                margin: { l: 45, r: 15, t: 35, b: 35 },
+                xaxis: { title: 'Transformed value' },
+                yaxis: { title: 'Count' }
             },
             { responsive: true }
         );
@@ -231,20 +389,57 @@ _PLOTLY_JS_HELPERS = """
     }
 
     // ── Confusion matrix heatmap ─────────────────────────────────────────────
-    function plotConfusionMatrix(divId, cm, modelName) {
+    function plotConfusionMatrix(divId, cm, modelName, showColorbar) {
+        // Row-normalize by true class (cm rows are [True 0, True 1]) so each
+        // row sums to 1 -- classes are imbalanced enough that raw counts make
+        // the minority true-class row unreadable (both in the printed number
+        // and in the color scale, which raw counts would otherwise let the
+        // majority row dominate). Absolute counts are kept in parentheses.
+        const norm = cm.map((row) => {
+            const rowSum = row[0] + row[1];
+            return rowSum > 0 ? row.map((v) => v / rowSum) : row.map(() => 0);
+        });
+        const text = cm.map((row, i) =>
+            row.map((v, j) => norm[i][j].toFixed(2) + ' (' + v + ')')
+        );
         Plotly.newPlot(
             divId,
             [{
-                z: cm,
+                z: norm,
+                zmin: 0,
+                zmax: 1,
                 x: ['Pred 0', 'Pred 1'],
                 y: ['True 0', 'True 1'],
                 type: 'heatmap',
-                colorscale: 'Blues',
-                showscale: true,
-                text: cm,
+                // Explicit light-to-dark stops instead of the named 'Blues'
+                // preset -- Plotly's built-in direction was rendering low
+                // fractions dark and high fractions light, the opposite of
+                // what a reader expects from a confusion-matrix heatmap.
+                colorscale: [
+                    [0, '#f7fbff'],
+                    [0.25, '#c6dbef'],
+                    [0.5, '#6baed6'],
+                    [0.75, '#2171b5'],
+                    [1, '#08306b']
+                ],
+                // Every panel shares the same fixed 0-1 scale, so only the
+                // first panel in a grid needs to show the colorbar -- one
+                // shared legend instead of one redundant copy per model.
+                showscale: !!showColorbar,
+                colorbar: { title: 'Fraction of true class', tickformat: '.0%' },
+                text: text,
                 texttemplate: '%{text}'
             }],
-            { title: 'Confusion matrix - model=' + modelName },
+            {
+                // Short title only -- the full "row-normalized by true
+                // class" explanation lives once in the section header, not
+                // repeated (and clipped) on every narrow grid panel.
+                title: { text: modelName, font: { size: 13 } },
+                margin: { l: 55, r: 15, t: 35, b: 40 },
+                // Put True 0 on top so the diagonal (TN, TP) runs top-left
+                // to bottom-right, matching standard confusion-matrix layout.
+                yaxis: { autorange: 'reversed' }
+            },
             { responsive: true }
         );
     }
@@ -277,9 +472,11 @@ def write_subset_html_report(
     run_datetime_display = html.escape(run_datetime) if run_datetime else "N/A"
     html_generated_display = html.escape(html_generated_at)
     payload = [build_task_plot_payload(tr) for tr in task_results]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     payload_path = output_path.with_suffix(".json")
     payload_path.write_text(json.dumps(safe_json(payload)), encoding="utf-8")
     payload_file = payload_path.name
+    model_card_html = _build_model_card_html(config, payload, run_datetime_display)
 
     html_text = f"""<!doctype html>
 <html lang="en">
@@ -318,6 +515,7 @@ def write_subset_html_report(
     Results generated: <strong>{run_datetime_display}</strong> &nbsp;|&nbsp;
     Report rendered: <strong>{html_generated_display}</strong>
   </p>
+{model_card_html}
   <div id="spinner"><div class="spin"></div><span>Loading report…</span></div>
   <div id="reports"></div>
   <script>
@@ -342,6 +540,9 @@ def write_subset_html_report(
     }}
 
     function renderReports(reportData) {{
+      // Collected across every task card and rendered as one section at the
+      // bottom of the report, instead of interleaved per-task-card.
+      const allConfusionMatrices = [];
       for (const tr of reportData) {{
         const card = document.createElement('div');
         card.className = 'card';
@@ -376,36 +577,70 @@ def write_subset_html_report(
           plotMetricHeatmap(p0.id, heatmap, 'All metrics heatmap (mean +/- sd over folds)');
         }}
 
-        // ── Model-wise fold distribution ─────────────────────────────────────
-        const boxTraces = [];
-        for (const modelName of tr.model_order) {{
-          const yVals = tr.model_fold_points
-            .filter(p => p.model_name === modelName)
-            .map(p => p.primary_score);
-          boxTraces.push({{
-            type: 'box', name: modelName, y: yVals,
-            boxpoints: 'all', jitter: 0.35, pointpos: 0,
-            marker: {{ size: 6, opacity: 0.75 }}, line: {{ width: 1 }}
-          }});
+        // ── Model-wise fold distribution, repeated for every metric ──────────
+        p1.innerHTML = '';
+        p1.style.height = 'auto';
+        const metricFoldData = tr.metric_fold_data || {{}};
+        const metricKeys = Object.keys(metricFoldData);
+        if (!metricKeys.length) {{
+          p1.innerHTML = '<p>No fold-level metric data available.</p>';
+        }} else {{
+          const boxHeader = document.createElement('h3');
+          boxHeader.textContent = 'Model-wise distribution per metric';
+          p1.appendChild(boxHeader);
+          const boxGrid = document.createElement('div');
+          boxGrid.style.display = 'grid';
+          boxGrid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(340px, 1fr))';
+          boxGrid.style.gap = '12px';
+          p1.appendChild(boxGrid);
+          // Create every container div up front so the CSS grid has already
+          // settled on final column widths before any Plotly.newPlot call
+          // measures its container -- rendering into a div mid-layout can
+          // otherwise clip/mis-size the title on the first couple of plots.
+          const boxDivByMetric = {{}};
+          for (const metricName of metricKeys) {{
+            const boxDiv = document.createElement('div');
+            const safeMetricName = String(metricName).replace(/[^a-zA-Z0-9_]/g, '_');
+            boxDiv.id = `box_${{tr.task}}_${{safeMetricName}}`;
+            boxDiv.style.height = '320px';
+            boxGrid.appendChild(boxDiv);
+            boxDivByMetric[metricName] = boxDiv;
+          }}
+          for (const metricName of metricKeys) {{
+            const md = metricFoldData[metricName] || {{ points: [], lines: [] }};
+            const boxTraces = [];
+            for (const modelName of tr.model_order) {{
+              const yVals = (md.points || [])
+                .filter(p => p.model_name === modelName)
+                .map(p => p.score);
+              boxTraces.push({{
+                type: 'box', name: modelName, y: yVals,
+                boxpoints: 'all', jitter: 0.35, pointpos: 0,
+                marker: {{ size: 6, opacity: 0.75 }}, line: {{ width: 1 }}
+              }});
+            }}
+            const foldLineTraces = (md.lines || [])
+              .filter(fl => fl.x.length >= 2)
+              .map(fl => ({{
+                x: fl.x, y: fl.y, mode: 'lines+markers', type: 'scatter',
+                name: `Fold ${{fl.outer_fold}}`, showlegend: false,
+                marker: {{ size: 5, opacity: 0.65 }},
+                line: {{ width: 1, color: '#666' }},
+                hovertemplate: 'Fold ' + fl.outer_fold + '<br>%{{x}}: %{{y}}<extra></extra>'
+              }}));
+            const boxDiv = boxDivByMetric[metricName];
+            Plotly.newPlot(
+              boxDiv.id, [...boxTraces, ...foldLineTraces],
+              {{
+                title: {{ text: `Distribution of ${{metricName}}`, font: {{ size: 13 }} }},
+                margin: {{ l: 55, r: 15, t: 45, b: 45 }},
+                xaxis: {{ title: 'Model type' }},
+                yaxis: {{ title: metricName }}
+              }},
+              {{ responsive: true }}
+            );
+          }}
         }}
-        const foldLineTraces = tr.fold_lines
-          .filter(fl => fl.x.length >= 2)
-          .map(fl => ({{
-            x: fl.x, y: fl.y, mode: 'lines+markers', type: 'scatter',
-            name: `Fold ${{fl.outer_fold}}`, showlegend: false,
-            marker: {{ size: 5, opacity: 0.65 }},
-            line: {{ width: 1, color: '#666' }},
-            hovertemplate: 'Fold ' + fl.outer_fold + '<br>%{{x}}: %{{y}}<extra></extra>'
-          }}));
-        Plotly.newPlot(
-          p1.id, [...boxTraces, ...foldLineTraces],
-          {{
-            title: `Model-wise distribution of ${{tr.primary_metric}}`,
-            xaxis: {{ title: 'Model type' }},
-            yaxis: {{ title: tr.primary_metric }}
-          }},
-          {{ responsive: true }}
-        );
 
         // ── Predictions / distributions ──────────────────────────────────────
         if (tr.task === 'regression') {{
@@ -569,16 +804,12 @@ def write_subset_html_report(
             {{ responsive: true }}
           );
 
-          // Per-model confusion matrices.
-          const cmHeader = document.createElement('h3');
-          cmHeader.textContent = 'Confusion matrices by model'; card.appendChild(cmHeader);
-          const confWrap = document.createElement('div'); card.appendChild(confWrap);
+          // Per-model confusion matrices are collected here and rendered
+          // together in one section at the bottom of the report (see
+          // allConfusionMatrices below the main render loop).
           const confByModel = tr.confusion_by_model || {{}};
           for (const modelName of Object.keys(confByModel)) {{
-            const cmDiv = document.createElement('div');
-            cmDiv.id = `cm_${{tr.task}}_${{modelName}}`; cmDiv.style.height = '300px';
-            confWrap.appendChild(cmDiv);
-            plotConfusionMatrix(cmDiv.id, confByModel[modelName], modelName);
+            allConfusionMatrices.push({{ task: tr.task, modelName, cm: confByModel[modelName] }});
           }}
 
           // ROC + PR curves with shared legend in one combined panel.
@@ -597,6 +828,71 @@ def write_subset_html_report(
           ] : [];
           plotPsiHistogram(p4.id, psiVals, 'Response (PSI) distribution (shaded = excluded mid-range)', shapes);
         }}
+
+        // ── Transformed (post-preprocessing) feature distributions ─────────
+        const featureDist = tr.transformed_feature_distributions || {{}};
+        const featureNames = Object.keys(featureDist);
+        if (featureNames.length) {{
+          const fdHeader = document.createElement('h3');
+          fdHeader.textContent = 'Transformed feature distributions (after preprocessing)';
+          card.appendChild(fdHeader);
+          const fdNote = document.createElement('p');
+          fdNote.style.color = '#666'; fdNote.style.fontSize = '0.85rem';
+          fdNote.textContent = 'Sampled from the fitted preprocessor output (median-impute / log1p / percentile-clip as applicable, then StandardScaler); one-hot categorical columns omitted.';
+          card.appendChild(fdNote);
+          const fdGrid = document.createElement('div');
+          fdGrid.style.display = 'grid';
+          fdGrid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(260px, 1fr))';
+          fdGrid.style.gap = '10px';
+          card.appendChild(fdGrid);
+          // Two-pass render: create every container div before any
+          // Plotly.newPlot call (same CSS-grid/Plotly timing fix used for
+          // the per-metric box-plot grid above).
+          const fdDivs = featureNames.map((name) => {{
+            const safeName = String(name).replace(/[^a-zA-Z0-9_]/g, '_');
+            const fdDiv = document.createElement('div');
+            fdDiv.id = `fd_${{tr.task}}_${{safeName}}`;
+            fdDiv.style.height = '220px';
+            fdGrid.appendChild(fdDiv);
+            return fdDiv;
+          }});
+          featureNames.forEach((name, i) => {{
+            plotFeatureHistogram(fdDivs[i].id, featureDist[name], name);
+          }});
+        }}
+      }}
+
+      // ── Confusion matrices, gathered in one section at the report bottom ──
+      if (allConfusionMatrices.length) {{
+        const cmSection = document.createElement('div');
+        cmSection.className = 'card';
+        const cmSectionHeader = document.createElement('h2');
+        cmSectionHeader.textContent = 'Confusion matrices (all models)';
+        cmSection.appendChild(cmSectionHeader);
+        const cmSectionNote = document.createElement('p');
+        cmSectionNote.style.color = '#666';
+        cmSectionNote.style.fontSize = '0.85rem';
+        cmSectionNote.textContent = 'Row-normalized by true class -- each cell shows fraction of that row (absolute count in parentheses).';
+        cmSection.appendChild(cmSectionNote);
+        const cmGrid = document.createElement('div');
+        cmGrid.style.display = 'grid';
+        cmGrid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(340px, 1fr))';
+        cmGrid.style.gap = '12px';
+        cmSection.appendChild(cmGrid);
+        container.appendChild(cmSection);
+        // Two-pass render: create every container div before any
+        // Plotly.newPlot call (same CSS-grid/Plotly timing fix used for the
+        // per-metric box-plot grid above).
+        const cmDivs = allConfusionMatrices.map((entry) => {{
+          const cmDiv = document.createElement('div');
+          cmDiv.id = `cm_${{entry.task}}_${{entry.modelName}}`;
+          cmDiv.style.height = '300px';
+          cmGrid.appendChild(cmDiv);
+          return cmDiv;
+        }});
+        allConfusionMatrices.forEach((entry, i) => {{
+          plotConfusionMatrix(cmDivs[i].id, entry.cm, entry.modelName, i === 0);
+        }});
       }}
     }}
 

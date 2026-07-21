@@ -25,6 +25,7 @@ from sklearn.pipeline import Pipeline
 from .config import (
     ALL_MODEL_TYPES,
     DEFAULT_MODEL_TYPES,
+    METADATA_COLUMNS,
     RNG_SEED,
     RunConfig,
     SMOKE_MODEL_TYPES,
@@ -51,11 +52,17 @@ from .modeling import (
     cuml_gpu_available,
     evaluate_outer_fold,
     fit_best_estimator,
+    lgbm_gpu_available,
     metric_key,
     xgb_gpu_available,
 )
 from .ontology_hierarchy import map_ontology_to_supergroups
-from .preprocessing import add_protocol_expression_interactions, build_preprocessor
+from .preprocessing import (
+    FEATURE_GROUPS,
+    add_protocol_expression_interactions,
+    build_preprocessor,
+    select_feature_group_columns,
+)
 from .reporting import generate_html_reports
 from .tracking import NullTracker, make_tracker
 from .utils import progress_iter, set_log_level, vlog
@@ -227,11 +234,41 @@ def run_single_configuration(
     )
 
     groups_outer = sdf[grouping_col]
-    feature_drop_columns = ["PSI"]
+    # IJC/SJC are the raw junction counts rMATS computes PSI from
+    # (corr(PSI, IJC/(IJC+SJC))=0.99) -- leaving them in X lets any model
+    # reconstruct the target almost exactly (observed: AUROC=1.0 on real data).
+    feature_drop_columns = ["PSI", "IJC", "SJC"]
     if grouping_col not in {"seqnames", "ontology"} and grouping_col in sdf.columns:
         # Keep derived grouping helpers out of model features.
         feature_drop_columns.append(grouping_col)
     x = sdf.drop(columns=feature_drop_columns)
+
+    # Columns that are entirely NaN for this subset (e.g. pangolin's SE-only
+    # flanking-site columns when Event Type == RI) would otherwise trigger a
+    # SimpleImputer "Skipping features without any observed values" warning
+    # on every fold x candidate x model -- drop them once, up front, instead.
+    all_nan_cols = [c for c in x.columns if x[c].isna().all()]
+    if all_nan_cols:
+        vlog(
+            run_cfg.verbose,
+            f"Dropping {len(all_nan_cols)} all-NaN feature column(s) for this "
+            f"subset: {all_nan_cols}",
+            level="info",
+        )
+        x = x.drop(columns=all_nan_cols)
+
+    # Ablation studies: restrict to specific FEATURE_GROUPS (e.g. "sequence"
+    # only, or "all" minus "histone"). METADATA_COLUMNS (ID/uuid/etc.) are
+    # never real model features and must pass through untouched -- only the
+    # actual feature columns go through the group filter.
+    if run_cfg.feature_groups is not None:
+        candidate_cols = [c for c in x.columns if c not in METADATA_COLUMNS]
+        keep_feature_cols = select_feature_group_columns(
+            candidate_cols, run_cfg.feature_groups, verbose=run_cfg.verbose
+        )
+        drop_feature_cols = [c for c in candidate_cols if c not in keep_feature_cols]
+        if drop_feature_cols:
+            x = x.drop(columns=drop_feature_cols)
 
     preprocessor, prep_details = build_preprocessor(
         x,
@@ -450,6 +487,7 @@ def run_single_configuration(
                     lhs_scale_mode=run_cfg.lhs_scale_mode,
                     xgb_use_gpu=run_cfg.xgb_use_gpu,
                     cuml_use_gpu=run_cfg.cuml_use_gpu,
+                    lgbm_use_gpu=run_cfg.lgbm_use_gpu,
                     verbose=run_cfg.verbose,
                     debug_grid_progress=run_cfg.log_level == "debug",
                     optuna_backend=run_cfg.optuna_backend,
@@ -458,6 +496,7 @@ def run_single_configuration(
                     optuna_multivariate=run_cfg.optuna_multivariate,
                     optuna_wandb_callback=run_cfg.optuna_wandb_callback,
                     calibrate=run_cfg.calibrate_classifiers,
+                    random_seed=run_cfg.random_seed,
                 )
 
                 ev = evaluate_outer_fold(
@@ -475,6 +514,7 @@ def run_single_configuration(
                     verbose=run_cfg.verbose,
                     psi_low=run_cfg.psi_low_threshold,
                     psi_high=run_cfg.psi_high_threshold,
+                    shap_max_samples=run_cfg.shap_max_samples,
                 )
 
                 # Speed optimization: skip baseline in compact mode (3-5% faster)
@@ -516,10 +556,23 @@ def run_single_configuration(
                         for _k, _v in _scores_logit.items():
                             baseline_scores[f"logit_{_k}"] = float(_v)
 
-                # Compute training scores to detect overfitting.
+                # Compute training scores to detect overfitting. Skipped for
+                # tabicl: it's an in-context-learning model with no separate
+                # fitted parameters -- predict(x_train) attends over x_train
+                # as its own context, so every training row is trivially
+                # "recalled" rather than genuinely predicted. The resulting
+                # train_auroc/train_r2 is uninformative (always ~perfect) and
+                # not worth the cost: an entire extra ~90-100GB disk-offloaded
+                # predict() pass on top of the one already needed for the
+                # actual test-set evaluation (found 2026-07-16 alongside the
+                # GPU-leak/OOM-cascade fix above).
                 fitted_estimator = ev.get("estimator")
                 train_scores: dict[str, float] = {}
-                if fitted_estimator is not None and run_cfg.output_level == "diagnostics":
+                if (
+                    fitted_estimator is not None
+                    and run_cfg.output_level == "diagnostics"
+                    and model_name != "tabicl"
+                ):
                     try:
                         if task == "classification":
                             if hasattr(fitted_estimator, "predict_proba"):
@@ -595,6 +648,33 @@ def run_single_configuration(
                         fold_result["baseline_y_pred"] = baseline_prob.tolist()
                     else:
                         fold_result["baseline_y_pred"] = baseline_pred.tolist()
+                    # SHAP (xgb/lgbm only; None for other models) -- computed
+                    # in evaluate_outer_fold but never persisted until now
+                    # (found 2026-07-16 via log audit: real compute, thrown
+                    # away every time). Gated behind diagnostics like
+                    # y_true/y_pred above since it's a similarly heavy,
+                    # optional artifact -- listified for consistency with how
+                    # those fields are stored (same representation in both
+                    # the pickle.gz and json.gz outputs).
+                    shap_result = ev.get("shap")
+                    if shap_result is not None:
+                        fold_result["shap"] = {
+                            "shap_values": shap_result["shap_values"].tolist(),
+                            "feature_names": shap_result["feature_names"],
+                            "sampled_test_indices": shap_result[
+                                "sampled_test_indices"
+                            ].tolist(),
+                        }
+                    # Transformed-feature sample (any model; see
+                    # _compute_transformed_feature_sample) -- same
+                    # diagnostics gate and listified representation as SHAP
+                    # above, for HTML report distribution plots.
+                    transformed_result = ev.get("transformed_features")
+                    if transformed_result is not None:
+                        fold_result["transformed_features"] = {
+                            "feature_names": transformed_result["feature_names"],
+                            "values": transformed_result["values"].tolist(),
+                        }
                 fold_result["_estimator"] = ev.get("estimator")
 
                 # Release TabICL's training-data cache and GPU/CPU tensors
@@ -610,6 +690,18 @@ def run_single_configuration(
 
                 return fold_result
             except Exception as exc:
+                # Mirror the success-path cleanup below: a failed fit (e.g.
+                # TabICL CUDA OOM) can leave GPU tensors allocated with no
+                # local reference to del, so the next fold's fit inherits the
+                # leaked memory and is very likely to OOM again too. Always
+                # attempt empty_cache() here, not just for tabicl -- cheap and
+                # harmless if there's nothing to free.
+                try:
+                    import torch as _t
+                    if _t.cuda.is_available():
+                        _t.cuda.empty_cache()
+                except Exception:
+                    pass
                 return {"error": str(exc), "model_name": model_name, "fold_id": fold_id}
 
         model_results = [_fit_model_fold(m) for m in model_names]
@@ -673,6 +765,25 @@ def run_single_configuration(
         }
 
     ci_low, ci_high = bootstrap_ci(np.asarray(primary_scores), seed=run_cfg.random_seed)
+
+    # Per-model breakdown of the primary metric. `primary_metric_mean/std` above
+    # blend ALL models' folds together into one number -- fine as a rough
+    # config-task health check, but meaningless for comparing model
+    # architectures (e.g. mixes xgb's ~0.89 with tabicl's ~0.86 into one ~0.88
+    # blur). `fold_results` and `primary_scores` are appended together in the
+    # same loop iteration above, so they stay index-aligned.
+    model_scores: dict[str, list[float]] = {}
+    for fr, pscore in zip(fold_results, primary_scores):
+        model_scores.setdefault(str(fr["model_name"]), []).append(pscore)
+    primary_metric_by_model = {
+        m: {
+            "mean": float(np.mean(v)),
+            "std": float(np.std(v, ddof=0)),
+            "n_folds": len(v),
+        }
+        for m, v in model_scores.items()
+    }
+
     out = {
         "status": "ok",
         "config": asdict(cfg),
@@ -704,6 +815,10 @@ def run_single_configuration(
         "primary_metric_mean": float(np.mean(primary_scores)),
         "primary_metric_std": float(np.std(primary_scores, ddof=0)),
         "primary_metric_bootstrap_ci": [ci_low, ci_high],
+        "primary_metric_by_model": primary_metric_by_model,
+        "feature_groups": (
+            list(run_cfg.feature_groups) if run_cfg.feature_groups else ["all"]
+        ),
         "fold_results": fold_results,
         "warnings": warnings,
         "reproducibility": {
@@ -897,9 +1012,31 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_MODEL_TYPES),
         choices=list(ALL_MODEL_TYPES),
     )
+    p.add_argument(
+        "--feature-groups",
+        nargs="+",
+        default=None,
+        choices=list(FEATURE_GROUPS) + ["all"],
+        help=(
+            "Restrict model features to specific groups for ablation studies "
+            "(e.g. --feature-groups sequence, or --feature-groups histone dnam "
+            "for epigenetics-only). Omit for no restriction (all features)."
+        ),
+    )
     p.add_argument("--seed", type=int, default=RNG_SEED)
     p.add_argument("--max-cores", type=int, default=default_max_cores())
     p.add_argument("--param-grid-size", type=int, default=16)
+    p.add_argument(
+        "--shap-max-samples",
+        type=int,
+        default=50000,
+        help=(
+            "Max outer-test rows used for SHAP TreeExplainer per fold (xgb/lgbm "
+            "only) -- cost scales linearly with this, so large SE folds "
+            "(millions of rows) would otherwise take hours. <=0 disables "
+            "subsampling (every test row) -- use for the final publication run."
+        ),
+    )
     p.add_argument(
         "--search-strategy",
         type=str,
@@ -933,8 +1070,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--optuna-wandb-callback",
-        action="store_true",
-        help="Log per-trial Optuna metrics to the active W&B run (requires --wandb)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Log per-trial Optuna metrics to the active W&B run (requires --wandb; "
+            "default: on). Use --no-optuna-wandb-callback to disable."
+        ),
     )
     # Reduced from 10 → 5: inner_splits = outer_splits - 1, so 10 outer folds
     # gives 9 inner folds → 63 LogisticRegressionCV tasks vs 28 at 5 outer folds.
@@ -981,7 +1122,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Apply logit transform to regression targets (model on log-odds scale instead of raw PSI)",
     )
-    p.add_argument("--wandb", action="store_true")
+    p.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Track this run to W&B (default: on). Use --no-wandb to disable.",
+    )
     p.add_argument("--wandb-project", default="splicing-ml")
     p.add_argument("--wandb-entity", default=None)
     p.add_argument(
@@ -1037,6 +1183,15 @@ def _run_gpu_check() -> None:
     except Exception as e:
         print(f"cuML SVM: error ({e})")
 
+    # LightGBM
+    try:
+        from splicing_ml.models.lgbm_utils import lgbm_gpu_available
+
+        lgbm_ok = lgbm_gpu_available()
+        print(f"LightGBM: {'cuda' if lgbm_ok else 'cpu (no GPU)'}")
+    except Exception as e:
+        print(f"LightGBM: error ({e})")
+
     # PyTorch / MLP
     try:
         import torch as _torch
@@ -1069,7 +1224,10 @@ def main() -> None:
         return
 
     if args.smoke:
-        args.data_path = "processed_data/aggregated_dt_filtered.validation300k.csv.gz"
+        # Downsampling to --smoke-max-rows (pipeline.py ~L179) already shrinks
+        # whatever --data-path was given, per subset -- no need to swap in a
+        # separate fixture file (that file also predates the per-filter
+        # migration; it now lives under old_processed_data/, not processed_data/).
         # Keep smoke runs lightweight regardless of user default grid size.
         args.param_grid_size = min(args.param_grid_size, 4)
         # Always exercise the Optuna path in smoke so both search backends are covered.
@@ -1084,6 +1242,7 @@ def main() -> None:
         f"search_strategy={args.search_strategy}, "
         f"lhs_scale_mode={args.lhs_scale_mode}, "
         f"xgb_device={'auto' if 'xgb' in requested_models else 'n/a'}, "
+        f"lgbm_device={'auto' if 'lgbm' in requested_models else 'n/a'}, "
         f"data_reader_backend={args.data_reader_backend}, "
         f"data_path={args.data_path}, "
         f"group_filter={args.only_group}, "
@@ -1203,6 +1362,15 @@ def main() -> None:
             level="info",
         )
 
+    lgbm_use_gpu = None
+    if "lgbm" in models:
+        lgbm_use_gpu = lgbm_gpu_available()
+        vlog(
+            args.verbose,
+            f"LightGBM runtime device check: {'cuda' if lgbm_use_gpu else 'cpu'}",
+            level="info",
+        )
+
     if "mlp" in models or "tabicl" in models:
         try:
             import torch as _torch
@@ -1245,6 +1413,7 @@ def main() -> None:
         random_seed=args.seed,
         max_cores=max(1, args.max_cores),
         param_grid_size=max(1, args.param_grid_size),
+        shap_max_samples=args.shap_max_samples,
         search_strategy=args.search_strategy,
         lhs_scale_mode=args.lhs_scale_mode,
         optuna_backend=args.optuna,
@@ -1253,8 +1422,12 @@ def main() -> None:
         optuna_wandb_callback=args.optuna_wandb_callback,
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
+        lgbm_use_gpu=lgbm_use_gpu,
         verbose=args.verbose,
         include_models=models,
+        feature_groups=(
+            tuple(args.feature_groups) if args.feature_groups is not None else None
+        ),
         run_regression=not args.skip_regression,
         run_classification=not args.skip_classification,
         use_logit_regression=args.logit_regression,
@@ -1289,6 +1462,7 @@ def main() -> None:
         f"search_strategy={run_cfg.search_strategy}, "
         f"lhs_scale_mode={run_cfg.lhs_scale_mode}, "
         f"xgb_device={'cuda' if run_cfg.xgb_use_gpu else 'cpu'}, "
+        f"lgbm_device={'cuda' if run_cfg.lgbm_use_gpu else 'cpu'}, "
         f"data_reader_backend={run_cfg.data_reader_backend}, "
         f"data_path={run_cfg.data_path}, "
         f"group_filter={run_cfg.only_group_col}, "
@@ -1317,10 +1491,6 @@ def main() -> None:
         )
 
     # Thread limits are enforced by SLURM cgroups (-c N); no explicit guardrails needed.
-    # UNUSED: Legacy explicit thread guardrail wiring kept as reference.
-    # TODO: remove this dead block if cgroup-only scheduling remains the project default.
-    # thread_env = _configure_parallelism_guardrails(run_cfg.max_cores)
-    # vlog(args.verbose, f"Parallelism guardrails: {thread_env}", level="info")
 
     bundle = run_all_configurations(run_cfg)
     vlog(

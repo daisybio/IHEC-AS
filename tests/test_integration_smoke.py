@@ -16,10 +16,10 @@ class TestIntegrationSmoke:
         """Run a minimal pipeline on subset of data."""
         with tempfile.TemporaryDirectory() as tmpdir:
             run_cfg = RunConfig(
-                data_path="processed_data/aggregated_dt_filtered.validation300k.csv.gz",
+                data_path="processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz",
                 output_dir=tmpdir,
                 only_event_type="SE",
-                only_transcript_filter="transcripts",
+                only_transcript_filter="biotype_filtered",
                 only_variability="High",
                 outer_splits=2,
                 inner_splits=2,
@@ -28,6 +28,9 @@ class TestIntegrationSmoke:
                 run_classification=True,
                 smoke_mode=True,
                 smoke_max_rows=5000,
+                # RunConfig.use_wandb now defaults True (2026-07-16) -- tests
+                # must never implicitly depend on external W&B credentials.
+                use_wandb=False,
                 verbose=False,
             )
 
@@ -55,10 +58,10 @@ class TestIntegrationSmoke:
         """Verify compact output mode reduces payload size."""
         with tempfile.TemporaryDirectory() as tmpdir:
             run_cfg = RunConfig(
-                data_path="processed_data/aggregated_dt_filtered.validation300k.csv.gz",
+                data_path="processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz",
                 output_dir=tmpdir,
                 only_event_type="SE",
-                only_transcript_filter="transcripts",
+                only_transcript_filter="biotype_filtered",
                 only_variability="High",
                 outer_splits=2,
                 inner_splits=2,
@@ -67,6 +70,9 @@ class TestIntegrationSmoke:
                 run_classification=False,
                 smoke_mode=True,
                 smoke_max_rows=5000,
+                # RunConfig.use_wandb now defaults True (2026-07-16) -- tests
+                # must never implicitly depend on external W&B credentials.
+                use_wandb=False,
                 output_level="compact",
                 verbose=False,
             )
@@ -91,10 +97,10 @@ class TestIntegrationSmoke:
         """Verify --no-calibration flag is respected."""
         with tempfile.TemporaryDirectory() as tmpdir:
             run_cfg = RunConfig(
-                data_path="processed_data/aggregated_dt_filtered.validation300k.csv.gz",
+                data_path="processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz",
                 output_dir=tmpdir,
                 only_event_type="SE",
-                only_transcript_filter="transcripts",
+                only_transcript_filter="biotype_filtered",
                 only_variability="High",
                 outer_splits=2,
                 inner_splits=2,
@@ -103,6 +109,9 @@ class TestIntegrationSmoke:
                 run_classification=True,
                 smoke_mode=True,
                 smoke_max_rows=5000,
+                # RunConfig.use_wandb now defaults True (2026-07-16) -- tests
+                # must never implicitly depend on external W&B credentials.
+                use_wandb=False,
                 calibrate_classifiers=False,
                 verbose=False,
             )
@@ -122,10 +131,10 @@ class TestIntegrationSmoke:
         """Verify inner_splits config is respected (not derived from outer_k)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             run_cfg = RunConfig(
-                data_path="processed_data/aggregated_dt_filtered.validation300k.csv.gz",
+                data_path="processed_data/aggregated_dt_filtered_biotype_filtered.csv.gz",
                 output_dir=tmpdir,
                 only_event_type="SE",
-                only_transcript_filter="transcripts",
+                only_transcript_filter="biotype_filtered",
                 only_variability="High",
                 outer_splits=4,
                 inner_splits=4,  # Explicitly set to 4, not derived from outer_splits.
@@ -134,6 +143,9 @@ class TestIntegrationSmoke:
                 run_classification=False,
                 smoke_mode=True,
                 smoke_max_rows=5000,
+                # RunConfig.use_wandb now defaults True (2026-07-16) -- tests
+                # must never implicitly depend on external W&B credentials.
+                use_wandb=False,
                 verbose=True,  # Enable verbose to see inner split count in logs.
             )
 

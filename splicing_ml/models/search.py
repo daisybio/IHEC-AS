@@ -44,6 +44,7 @@ from .grids import (
     MLP_ES_PATIENCE,
 )
 from .xgb_utils import _set_xgb_cpu_predictor_for_inference, xgb_gpu_available
+from .lgbm_utils import _set_lgbm_cpu_predictor_for_inference, lgbm_gpu_available
 
 __all__ = ["fit_best_estimator"]
 
@@ -117,20 +118,6 @@ def metric_key(task: str) -> str:
     """Return the primary metric name for a task."""
     # This key is used for internal result dictionaries/logging, not sklearn scorer names.
     return "auroc" if task == "classification" else "rmse"
-
-
-def _elasticnet_budget_axes(
-    total_budget: int,
-    n_primary: int,
-    n_l1: int,
-) -> tuple[int, int]:
-    """Split a total candidate budget across primary regularization and l1_ratio axes."""
-    budget = max(1, int(total_budget))
-    l1_count = max(1, min(int(n_l1), int(round(budget**0.5))))
-    primary_count = max(
-        1, min(int(n_primary), int(math.ceil(budget / float(l1_count))))
-    )
-    return primary_count, l1_count
 
 
 def _adaptive_c_grid(n_samples: int) -> tuple[list[float], list[float]]:
@@ -1054,13 +1041,13 @@ class _ContextAwareCV:
         self._inner_cv = inner_cv
         self._model_name = model_name
         self._es_splits: list[tuple[np.ndarray, np.ndarray]] | None = None
-        if model_name in {"mlp", "xgb"} and len(inner_cv) >= 2:
+        if model_name in {"mlp", "xgb", "lgbm"} and len(inner_cv) >= 2:
             self._es_splits = _compute_es_splits(inner_cv)
 
     def split(self, X: Any, y: Any = None, groups: Any = None):  # type: ignore[override]
         """Yield (es_train_idx, scoring_val_idx) for each fold."""
         for i, (train_idx, val_idx) in enumerate(self._inner_cv):
-            if self._model_name in {"mlp", "xgb"} and self._es_splits is not None:
+            if self._model_name in {"mlp", "xgb", "lgbm"} and self._es_splits is not None:
                 es_train_idx, es_val_idx = self._es_splits[i]
                 _es_raw_val_context.X_val = (
                     X.iloc[es_val_idx] if hasattr(X, "iloc") else X[es_val_idx]
@@ -1083,16 +1070,37 @@ _TREE_ES_ROUNDS = (
 )
 _XGB_ES_N_MAX = 2000  # max n_estimators for XGB post-search probe
 _XGB_ES_N_MIN = 50  # floor on XGB optimal n_estimators (degenerate below this)
+_LGBM_ES_N_MAX = 2000  # max n_estimators for LightGBM post-search probe (mirrors XGB's; leaf-wise vs depth-wise tree counts aren't strictly comparable, may need retuning)
+_LGBM_ES_N_MIN = 50  # floor on LightGBM optimal n_estimators (degenerate below this)
 _MLP_ES_N_MAX = 500  # max epochs for MLP post-search probe (hard ceiling)
 # MLP_ES_PATIENCE imported from grids (defined alongside _mlp_base_model so one source of truth)
 
 
+def _lgbm_classification_sample_weight(y: np.ndarray) -> np.ndarray:
+    """Per-sample class-imbalance weight for LightGBM classification fits.
+
+    LightGBM's CUDA backend has a broken internal class-reweighting code path
+    -- both `scale_pos_weight=` and `is_unbalance=True` corrupt gradients on
+    `device_type="cuda"`, collapsing training to a root-only tree (confirmed
+    2026-07-14, see CLAUDE.md). Passing the equivalent weight as per-sample
+    `sample_weight=` at fit time sidesteps it (computed in Python, outside
+    CUDA's broken reweighting path).
+    """
+    n_pos = int(np.sum(y == 1))
+    n_neg = int(len(y) - n_pos)
+    ratio = float(n_neg) / max(1, n_pos)
+    return np.where(y == 1, ratio, 1.0).astype(np.float64)
+
+
 class _ESPipeline(Pipeline):
-    """Pipeline subclass that enables per-fold early stopping for XGB/MLP.
+    """Pipeline subclass that enables per-fold early stopping for XGB/LightGBM/MLP.
 
     When _es_raw_val_context holds raw val data (set by _ContextAwareCV),
     _ESPipeline preprocesses it with the just-fitted preprocessor and:
     - For XGB: passes eval_set + early_stopping_rounds to model.fit()
+    - For LightGBM: passes eval_set + a lightgbm.early_stopping callback to
+      model.fit() (LightGBM 4.x removed the early_stopping_rounds/verbose fit
+      kwargs in favor of callbacks=[...])
     - For MLP: stores preprocessed val in _es_pp_val_context for the model to read
 
     Falls back to standard Pipeline.fit() when no val data is available
@@ -1154,6 +1162,31 @@ class _ESPipeline(Pipeline):
                     level="debug",
                 )
                 model.fit(Xt, y, **fit_params)
+        elif X_val_pp is not None and y_val is not None and self.model_name == "lgbm":
+            lgbm_fit_params = dict(fit_params)
+            if model.__class__.__name__ == "LGBMClassifier":
+                lgbm_fit_params["sample_weight"] = _lgbm_classification_sample_weight(y)
+            try:
+                import lightgbm
+
+                model.fit(
+                    Xt,
+                    y,
+                    eval_set=[(X_val_pp, y_val)],
+                    callbacks=[
+                        lightgbm.early_stopping(
+                            stopping_rounds=_TREE_ES_ROUNDS, verbose=False
+                        )
+                    ],
+                    **lgbm_fit_params,
+                )
+            except Exception as exc:
+                vlog(
+                    True,
+                    f"LightGBM early stopping failed, falling back to standard fit: {exc}",
+                    level="debug",
+                )
+                model.fit(Xt, y, **lgbm_fit_params)
         elif X_val_pp is not None and y_val is not None and self.model_name == "mlp":
             _es_pp_val_context.X_val_pp = X_val_pp
             _es_pp_val_context.y_val = y_val
@@ -1162,6 +1195,12 @@ class _ESPipeline(Pipeline):
             finally:
                 _es_pp_val_context.X_val_pp = None
                 _es_pp_val_context.y_val = None
+        elif self.model_name == "lgbm" and model.__class__.__name__ == "LGBMClassifier":
+            model.fit(
+                Xt, y,
+                sample_weight=_lgbm_classification_sample_weight(y),
+                **fit_params,
+            )
         else:
             model.fit(Xt, y, **fit_params)
 
@@ -1184,10 +1223,18 @@ def _build_grid_search(
     verbose: bool,
     model_n_jobs: int = 1,
     debug_grid_progress: bool = False,
+    lgbm_use_gpu: bool | None = None,
+    random_seed: int = RNG_SEED,
 ) -> GridSearchCV:
     """Construct a GridSearchCV object with the appropriate candidate list."""
+    # NOTE: for lgbm, scale_pos_weight is computed here for backward-compatible
+    # threading through build_param_candidates, but _build_lgbm_base_model no
+    # longer forwards it to the constructor (unsafe on device_type="cuda" --
+    # see _lgbm_classification_sample_weight). Imbalance is applied via
+    # sample_weight at fit time instead. Still used normally for "rf" (XGBRF,
+    # unaffected).
     scale_pos_weight = None
-    if model_name == "rf" and task == "classification":
+    if model_name in {"rf", "lgbm"} and task == "classification":
         n_pos = int(np.sum(y_train == 1))
         n_neg = int(np.sum(y_train == 0))
         scale_pos_weight = float(n_neg) / max(1, n_pos)
@@ -1202,9 +1249,11 @@ def _build_grid_search(
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
+        lgbm_use_gpu=lgbm_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
         scale_pos_weight=scale_pos_weight,
+        seed=random_seed,
     )
 
     # For XGB with early stopping, n_estimators is determined by ES — not by the
@@ -1222,13 +1271,26 @@ def _build_grid_search(
             level="debug",
         )
 
+    # Same treatment for LightGBM: n_estimators comes from post-search ES.
+    if model_name == "lgbm":
+        for c in candidates:
+            c.pop("model__n_estimators", None)
+            for m in c.get("model", []):
+                m.set_params(n_estimators=_LGBM_ES_N_MAX)
+        vlog(
+            verbose,
+            f"LGBM grid search: fixed n_estimators={_LGBM_ES_N_MAX} (determined by ES); "
+            f"removed from search grid",
+            level="debug",
+        )
+
     # Wrap the pipeline with _ESPipeline for models that need early stopping.
-    if model_name in {"xgb", "mlp"}:
+    if model_name in {"xgb", "mlp", "lgbm"}:
         pipe = _ESPipeline(pipe.steps, model_name=model_name)
 
     # Activate _ContextAwareCV for models that need inner-fold validation data.
     cv_splitter = inner_cv
-    if model_name in {"xgb", "mlp"}:
+    if model_name in {"xgb", "mlp", "lgbm"}:
         cv_splitter = _ContextAwareCV(inner_cv, model_name)
 
     return _ProgressGridSearchCV(
@@ -1245,95 +1307,6 @@ def _build_grid_search(
     )
 
 
-def _fit_mlp_search(
-    task: str,
-    x_train: pd.DataFrame,
-    y_train: np.ndarray,
-    pipe: Pipeline,
-    inner_cv: list[tuple[np.ndarray, np.ndarray]],
-    param_grid_size: int,
-    search_strategy: str,
-    lhs_scale_mode: str,
-    verbose: bool,
-) -> tuple[Pipeline, dict[str, Any]]:
-    """Fit MLP with validation indices from inner CV to prevent data leakage.
-
-    Uses GridSearchCV for the inner CV loop (which already respects fold structure),
-    then manually refits the best model on all training data with explicit validation
-    indices from the first inner fold.
-    """
-    from sklearn.base import clone as sk_clone
-    from .grids import build_param_candidates
-
-    # Build GridSearchCV normally to evaluate all candidates.
-    search = _build_grid_search(
-        pipe=pipe,
-        model_name="mlp",
-        task=task,
-        x_train=x_train,
-        y_train=y_train,
-        inner_cv=inner_cv,
-        search_n_jobs=1,  # Single job for GPU memory safety.
-        param_grid_size=param_grid_size,
-        search_strategy=search_strategy,
-        lhs_scale_mode=lhs_scale_mode,
-        xgb_use_gpu=None,
-        cuml_use_gpu=None,
-        verbose=verbose,
-        model_n_jobs=1,
-        debug_grid_progress=verbose,
-    )
-
-    # Fit normally (inner CV respects fold structure).
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Setting penalty=None will ignore the C and l1_ratio parameters",
-            category=UserWarning,
-        )
-        search.fit(x_train, y_train)
-
-    # Extract best params and refit on all data with validation indices.
-    best_params = search.best_params_
-    best_pipe = sk_clone(pipe)
-
-    # Set best hyperparameters.
-    best_pipe.set_params(**best_params)
-
-    # Get validation indices from first inner fold.
-    _, val_idx_inner = inner_cv[0]
-    val_indices = (
-        x_train.index[val_idx_inner].to_numpy()
-        if hasattr(x_train, "index")
-        else val_idx_inner
-    )
-
-    # Manually fit the MLP step with validation indices.
-    # First, fit the preprocessor.
-    if "prep" in best_pipe.named_steps:
-        best_pipe.named_steps["prep"].fit(x_train, y_train)
-        X_prep = best_pipe.named_steps["prep"].transform(x_train)
-    else:
-        X_prep = x_train.values if hasattr(x_train, "values") else x_train
-
-    # Fit MLP with val_indices.
-    best_pipe.named_steps["model"].fit(X_prep, y_train, val_indices=val_indices)
-
-    vlog(
-        verbose,
-        f"Search complete model=mlp, task={task}, "
-        f"strategy={'lhs' if _use_lhs_strategy(search_strategy, 'mlp') else 'grid'}, "
-        f"candidates={len(search.cv_results_['params'])}, best_score={search.best_score_:.6f}",
-    )
-
-    tuning_info: dict[str, Any] = {
-        "best_params": {k: v for k, v in best_params.items()},
-        "best_score": float(search.best_score_),
-    }
-
-    return best_pipe, tuning_info
-
-
 def _fit_tree_early_stopping(
     model_name: str,
     task: str,
@@ -1344,7 +1317,7 @@ def _fit_tree_early_stopping(
     verbose: bool,
     reserve_calibration_holdout: bool = False,
 ) -> tuple[Pipeline, bool, int | None, tuple[pd.DataFrame, np.ndarray] | None]:
-    """Post-search refit with early stopping on final model (XGB and MLP only).
+    """Post-search refit with early stopping on final model (XGB, LightGBM, MLP only).
 
     Uses the globally smallest inner-fold val as the ES hold-out, then trains
     the probe model on ALL outer training data except that hold-out:
@@ -1354,23 +1327,25 @@ def _fit_tree_early_stopping(
     while keeping the ES signal on a partition that was never the scoring val
     for the same fold it was trained on.
 
-    Only applies early stopping to XGBoost and MLP (boosted models). RandomForest
-    (non-boosted) doesn't support early stopping with eval_set, so it just uses
-    standard fit with the n_estimators from the search.
+    Only applies early stopping to XGBoost, LightGBM, and MLP (boosted/iterative
+    models). RandomForest (non-boosted) doesn't support early stopping with
+    eval_set, so it just uses standard fit with the n_estimators from the search.
 
     For XGB: Uses eval_set with early_stopping_rounds.
+    For LightGBM: Uses eval_set with a lightgbm.early_stopping callback (4.x
+    removed the early_stopping_rounds/verbose fit kwargs).
     For MLP: Stores validation data in _es_pp_val_context for the model to read.
     For RF: Standard fit (no early stopping available for random forests).
 
-    reserve_calibration_holdout (XGB only): instead of refitting the final
-    model on ALL outer-train data, keep the ES-val partition held out and
-    return it (raw, pre-preprocessing) as the 4th tuple element so the caller
-    can fit ``CalibratedClassifierCV(..., cv="prefit")`` on a slice that was
-    never seen by the fitted model — unlike calibrating via ``cv=inner_splits``,
-    which reuses the exact folds that already selected the hyperparameters.
-    Costs the final model that one held-out slice of training data; ignored
-    for model_name != "xgb" (no other model routes through this reservation
-    path today).
+    reserve_calibration_holdout (XGB and LightGBM only): instead of refitting
+    the final model on ALL outer-train data, keep the ES-val partition held
+    out and return it (raw, pre-preprocessing) as the 4th tuple element so the
+    caller can fit ``CalibratedClassifierCV(..., estimator=FrozenEstimator(...))``
+    on a slice that was never seen by the fitted model — unlike calibrating via
+    ``cv=inner_splits``, which reuses the exact folds that already selected the
+    hyperparameters. Costs the final model that one held-out slice of training
+    data; ignored for model_name not in {"xgb", "lgbm"} (no other model routes
+    through this reservation path today).
 
     Returns (pipe, applied, optimal_n, calibration_holdout).
     """
@@ -1395,6 +1370,11 @@ def _fit_tree_early_stopping(
 
         model_final = clone(best_model)
         optimal_n = None
+        # Populated in the lgbm branch below (from y_final_train); reused by the
+        # calibration-holdout refit further down, which fits on the same
+        # y_final_train. The normal (non-calibration) final refit uses the full
+        # y_train instead and gets its own freshly-computed weight array there.
+        lgbm_sw: np.ndarray | None = None
 
         if model_name == "xgb":
             # XGBoost (boosted): try early stopping, fall back to standard fit if unsupported
@@ -1426,6 +1406,53 @@ def _fit_tree_early_stopping(
             else:
                 model_final.fit(X_final_train_t, y_final_train)
                 optimal_n = _XGB_ES_N_MAX
+        elif model_name == "lgbm":
+            # LightGBM (boosted): try early stopping, fall back to standard fit if unsupported
+            model_final.set_params(n_estimators=_LGBM_ES_N_MAX)
+            # scale_pos_weight/is_unbalance are unsafe on device_type="cuda" (see
+            # _lgbm_classification_sample_weight's docstring) -- classification
+            # imbalance is applied via sample_weight at every fit call below instead.
+            lgbm_sw = (
+                _lgbm_classification_sample_weight(y_final_train)
+                if task == "classification"
+                else None
+            )
+            if y_final_val is not None:
+                vlog(
+                    verbose,
+                    f"LGBM post-search ES: probe_train_n={len(X_final_train_t)}, es_val_n={len(X_final_val_t)}",
+                    level="debug",
+                )
+                try:
+                    import lightgbm
+
+                    model_final.fit(
+                        X_final_train_t,
+                        y_final_train,
+                        eval_set=[(X_final_val_t, y_final_val)],
+                        callbacks=[
+                            lightgbm.early_stopping(
+                                stopping_rounds=_TREE_ES_ROUNDS, verbose=False
+                            )
+                        ],
+                        sample_weight=lgbm_sw,
+                    )
+                    # LightGBM's sklearn wrapper exposes best_iteration_ (trailing
+                    # underscore) -- unlike XGBoost's best_iteration (no underscore).
+                    optimal_n = max(
+                        _LGBM_ES_N_MIN, int(model_final.best_iteration_) + 1
+                    )
+                except Exception as exc:
+                    vlog(
+                        verbose,
+                        f"LGBM post-search early stopping failed, falling back: {exc}",
+                        level="debug",
+                    )
+                    model_final.fit(X_final_train_t, y_final_train, sample_weight=lgbm_sw)
+                    optimal_n = _LGBM_ES_N_MAX
+            else:
+                model_final.fit(X_final_train_t, y_final_train, sample_weight=lgbm_sw)
+                optimal_n = _LGBM_ES_N_MAX
         elif model_name == "mlp":
             # MLP: inject val context so early stopping uses a proper group partition,
             # not the sequential val_fraction fallback (which is typically OOD).
@@ -1463,18 +1490,31 @@ def _fit_tree_early_stopping(
         #   all-data training (es_val is a subset of x_train, so it would be in-sample).
         if optimal_n is not None and model_name == "xgb":
             model_final.set_params(n_estimators=optimal_n, early_stopping_rounds=None)
+        elif optimal_n is not None and model_name == "lgbm":
+            # No early_stopping_rounds constructor param to clear (unlike XGB) --
+            # LightGBM's ES was applied purely via a fit-time callback.
+            model_final.set_params(n_estimators=optimal_n)
         elif optimal_n is not None and model_name == "mlp":
             model_final.set_params(max_epochs=optimal_n, restore_best_weights=False)
 
         calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
-        if reserve_calibration_holdout and model_name == "xgb":
+        if reserve_calibration_holdout and model_name in {"xgb", "lgbm"}:
             # Keep the ES-val slice held out instead of folding it back in, so
             # it can serve as a leakage-free cv="prefit" calibration set below.
-            model_final.fit(X_final_train_t, y_final_train)
+            if model_name == "lgbm" and task == "classification":
+                model_final.fit(X_final_train_t, y_final_train, sample_weight=lgbm_sw)
+            else:
+                model_final.fit(X_final_train_t, y_final_train)
             calibration_holdout = (x_train.iloc[es_val_idx], y_final_val)
         else:
             X_all_train_t = prep_fitted.transform(x_train)
-            model_final.fit(X_all_train_t, y_train)
+            if model_name == "lgbm" and task == "classification":
+                model_final.fit(
+                    X_all_train_t, y_train,
+                    sample_weight=_lgbm_classification_sample_weight(y_train),
+                )
+            else:
+                model_final.fit(X_all_train_t, y_train)
 
         pipe_final = Pipeline([("prep", prep_fitted), ("model", model_final)])
 
@@ -1510,7 +1550,7 @@ def _log_early_stopping_fold_sizes(
       scoring_val_n – held-out samples used for CV scoring (untouched by ES)
       es_val_n     – borrowed hold-out used only for early stopping
     """
-    if model_name not in {"xgb", "mlp"} or not inner_cv:
+    if model_name not in {"xgb", "mlp", "lgbm"} or not inner_cv:
         return
 
     es_splits = _compute_es_splits(inner_cv)
@@ -1541,16 +1581,19 @@ def _fit_grid_search(
     verbose: bool,
     debug_grid_progress: bool,
     calibrate: bool = False,
+    lgbm_use_gpu: bool | None = None,
+    random_seed: int = RNG_SEED,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit all non-ElasticNet, non-Beta models via GridSearchCV.
 
     Handles:
-    - Parallelism: limits XGBoost/cuML GPU jobs to 1 to avoid VRAM contention.
+    - Parallelism: limits XGBoost/LightGBM/cuML GPU jobs to 1 to avoid VRAM contention.
     - GPU retry: on CUDA failure, automatically falls back to CPU.
-    - XGBoost post-search refit: after tuning with a reduced n_estimators
-      budget, the final estimator is re-trained with a larger tree budget.
-    - calibrate=True (XGB only): reserves the ES-val slice as a dedicated
-      calibration holdout instead of folding it into the final refit.
+    - XGBoost/LightGBM post-search refit: after tuning with a reduced
+      n_estimators budget, the final estimator is re-trained with a larger
+      tree budget.
+    - calibrate=True (XGB and LightGBM only): reserves the ES-val slice as a
+      dedicated calibration holdout instead of folding it into the final refit.
     """
     # Limit concurrent GPU jobs to avoid VRAM contention.
     # For RF, split cores between search-level and tree-level parallelism:
@@ -1578,14 +1621,17 @@ def _fit_grid_search(
         # across parallel GridSearchCV workers.
         search_n_jobs = 1 if _mlp_has_gpu else max_cores
         model_n_jobs = 1
-    elif (model_name in {"xgb", "rf"} and bool(xgb_use_gpu)) or (
-        model_name == "svm" and bool(cuml_use_gpu)
+    elif (
+        (model_name in {"xgb", "rf"} and bool(xgb_use_gpu))
+        or (model_name == "svm" and bool(cuml_use_gpu))
+        or (model_name == "lgbm" and bool(lgbm_use_gpu))
     ):
         search_n_jobs = 1
         model_n_jobs = 1
-    elif model_name in {"rf", "xgb"} and max_cores > 1:
+    elif model_name in {"rf", "xgb", "lgbm"} and max_cores > 1:
         # Split budget between search-level and model-level parallelism.
-        # RF uses joblib tree-building threads; XGB CPU uses its own thread pool.
+        # RF/LightGBM use joblib/native tree-building threads; XGB CPU uses
+        # its own thread pool.
         model_n_jobs = max(1, int(max_cores**0.5))
         search_n_jobs = max(1, max_cores // model_n_jobs)
     else:
@@ -1605,27 +1651,21 @@ def _fit_grid_search(
         lhs_scale_mode=lhs_scale_mode,
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
+        lgbm_use_gpu=lgbm_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
         debug_grid_progress=debug_grid_progress,
+        random_seed=random_seed,
     )
 
     def _fit_search(search_obj: GridSearchCV) -> None:
-        # sklearn 1.8 internally converts C=np.inf → penalty=None and then
-        # warns about it, even though C=np.inf is their own recommended API.
         """Internal helper for fit search."""
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Setting penalty=None will ignore the C and l1_ratio parameters",
-                category=UserWarning,
-            )
-            if search_n_jobs > 1:
-                # Thread backend avoids occasional loky worker-stop warnings.
-                with parallel_backend("threading", n_jobs=search_n_jobs):
-                    search_obj.fit(x_train, y_train)
-                return
-            search_obj.fit(x_train, y_train)
+        if search_n_jobs > 1:
+            # Thread backend avoids occasional loky worker-stop warnings.
+            with parallel_backend("threading", n_jobs=search_n_jobs):
+                search_obj.fit(x_train, y_train)
+            return
+        search_obj.fit(x_train, y_train)
 
     _log_early_stopping_fold_sizes(model_name, inner_cv, verbose=verbose)
     try:
@@ -1655,8 +1695,10 @@ def _fit_grid_search(
                 lhs_scale_mode=lhs_scale_mode,
                 xgb_use_gpu=False,  # force CPU
                 cuml_use_gpu=cuml_use_gpu,
+                lgbm_use_gpu=lgbm_use_gpu,
                 verbose=verbose,
                 debug_grid_progress=debug_grid_progress,
+                random_seed=random_seed,
             )
             _fit_search(search)
         elif (
@@ -1680,18 +1722,47 @@ def _fit_grid_search(
                 lhs_scale_mode=lhs_scale_mode,
                 xgb_use_gpu=xgb_use_gpu,
                 cuml_use_gpu=False,  # force sklearn CPU path
+                lgbm_use_gpu=lgbm_use_gpu,
                 verbose=verbose,
                 debug_grid_progress=debug_grid_progress,
+                random_seed=random_seed,
+            )
+            _fit_search(search)
+        elif (
+            model_name == "lgbm" and bool(lgbm_use_gpu) and _looks_like_gpu_failure(exc)
+        ):
+            vlog(
+                verbose,
+                f"LGBM GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            search = _build_grid_search(
+                pipe=pipe,
+                model_name=model_name,
+                task=task,
+                x_train=x_train,
+                y_train=y_train,
+                inner_cv=inner_cv,
+                search_n_jobs=max_cores,
+                param_grid_size=param_grid_size,
+                search_strategy=search_strategy,
+                lhs_scale_mode=lhs_scale_mode,
+                xgb_use_gpu=xgb_use_gpu,
+                cuml_use_gpu=cuml_use_gpu,
+                lgbm_use_gpu=False,  # force CPU
+                verbose=verbose,
+                debug_grid_progress=debug_grid_progress,
+                random_seed=random_seed,
             )
             _fit_search(search)
         else:
             raise
 
-    # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
+    # XGB/LightGBM/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
     calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
-    if model_name in {"xgb", "mlp"}:
+    if model_name in {"xgb", "mlp", "lgbm"}:
         pipe_es, tree_es_applied, tree_es_n_estimators, calibration_holdout = (
             _fit_tree_early_stopping(
                 model_name=model_name,
@@ -1701,7 +1772,7 @@ def _fit_grid_search(
                 y_train=y_train,
                 inner_cv=inner_cv,
                 verbose=verbose,
-                reserve_calibration_holdout=calibrate and model_name == "xgb",
+                reserve_calibration_holdout=calibrate and model_name in {"xgb", "lgbm"},
             )
         )
         search.best_estimator_ = pipe_es
@@ -1726,12 +1797,13 @@ def _fit_grid_search(
 
     # Switch best estimator to CPU to avoid device-mismatch warnings downstream.
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
+    _set_lgbm_cpu_predictor_for_inference(search.best_estimator_)
 
     tuning_info: dict[str, Any] = {
         "best_params": sanitize_best_params(search.best_params_),
         "best_score": float(search.best_score_),
     }
-    if model_name in {"xgb", "mlp", "rf"}:
+    if model_name in {"xgb", "mlp", "rf", "lgbm"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
     if calibration_holdout is not None:
@@ -1787,13 +1859,15 @@ def _fit_optuna_search(
     verbose: bool,
     optuna_wandb_callback: bool = False,
     calibrate: bool = False,
+    lgbm_use_gpu: bool | None = None,
+    random_seed: int = RNG_SEED,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Fit a model via Optuna Bayesian optimisation (TPE or CMA-ES).
 
     Uses ``OptunaSearchCV`` as a drop-in for GridSearchCV.  GPU retry logic
-    and XGBoost post-search refit are preserved from ``_fit_grid_search``.
-    calibrate=True (XGB only): reserves the ES-val slice as a dedicated
-    calibration holdout instead of folding it into the final refit.
+    and XGBoost/LightGBM post-search refit are preserved from ``_fit_grid_search``.
+    calibrate=True (XGB and LightGBM only): reserves the ES-val slice as a
+    dedicated calibration holdout instead of folding it into the final refit.
     """
     try:
         import optuna
@@ -1827,21 +1901,26 @@ def _fit_optuna_search(
             vlog(verbose, "torch not installed; MLP will run on CPU", level="debug")
         search_n_jobs = 1 if _mlp_has_gpu else max_cores
         model_n_jobs = 1
-    elif (model_name in {"xgb", "rf"} and bool(xgb_use_gpu)) or (
-        model_name == "svm" and bool(cuml_use_gpu)
+    elif (
+        (model_name in {"xgb", "rf"} and bool(xgb_use_gpu))
+        or (model_name == "svm" and bool(cuml_use_gpu))
+        or (model_name == "lgbm" and bool(lgbm_use_gpu))
     ):
         search_n_jobs = 1
         model_n_jobs = 1
-    elif model_name in {"rf", "xgb"} and max_cores > 1:
+    elif model_name in {"rf", "xgb", "lgbm"} and max_cores > 1:
         model_n_jobs = max(1, int(max_cores**0.5))
         search_n_jobs = max(1, max_cores // model_n_jobs)
     else:
         search_n_jobs = max_cores
         model_n_jobs = 1
 
-    # ---- Imbalance weight for XGB classification --------------------------
+    # ---- Imbalance weight for XGB/RF classification (lgbm computed here too
+    # for backward-compatible threading, but ignored by _build_lgbm_base_model
+    # -- unsafe on device_type="cuda", applied via sample_weight at fit time
+    # instead; see _lgbm_classification_sample_weight) -------------------------
     scale_pos_weight: float | None = None
-    if task == "classification" and model_name in {"xgb", "rf"}:
+    if task == "classification" and model_name in {"xgb", "rf", "lgbm"}:
         pos = int(np.sum(y_train == 1))
         neg = int(np.sum(y_train == 0))
         if pos > 0 and neg > 0:
@@ -1852,6 +1931,7 @@ def _fit_optuna_search(
         xgb_gpu: bool | None,
         cuml_gpu: bool | None,
         n_jobs: int,
+        lgbm_gpu: bool | None = lgbm_use_gpu,
     ) -> OptunaSearchCV:
         """Internal helper for make search."""
         base_model, distributions = build_optuna_distributions(
@@ -1861,6 +1941,7 @@ def _fit_optuna_search(
             n_features=x_train.shape[1],
             xgb_use_gpu=xgb_gpu,
             cuml_use_gpu=cuml_gpu,
+            lgbm_use_gpu=lgbm_gpu,
             verbose=verbose,
             model_n_jobs=model_n_jobs,
             scale_pos_weight=scale_pos_weight,
@@ -1879,16 +1960,27 @@ def _fit_optuna_search(
                 level="debug",
             )
 
+        # Same treatment for LightGBM.
+        if model_name == "lgbm":
+            base_model.set_params(n_estimators=_LGBM_ES_N_MAX)
+            distributions.pop("model__n_estimators", None)
+            vlog(
+                verbose,
+                f"LGBM Optuna search: fixed n_estimators={_LGBM_ES_N_MAX} (determined by ES); "
+                f"removed from distributions",
+                level="debug",
+            )
+
         pipe_copy = clone(pipe)
         pipe_copy.set_params(model=base_model)
 
         # Wrap pipeline with _ESPipeline for models that need early stopping
-        if model_name in {"xgb", "mlp"}:
+        if model_name in {"xgb", "mlp", "lgbm"}:
             pipe_copy = _ESPipeline(pipe_copy.steps, model_name=model_name)
 
         # Activate _ContextAwareCV for models that need inner-fold validation data
         cv_splitter = inner_cv
-        if model_name in {"xgb", "mlp"}:
+        if model_name in {"xgb", "mlp", "lgbm"}:
             cv_splitter = _ContextAwareCV(inner_cv, model_name)
 
         warnings.filterwarnings(
@@ -1896,13 +1988,13 @@ def _fit_optuna_search(
         )
         if optuna_sampler == "cmaes":
             sampler = optuna.samplers.CmaEsSampler(
-                seed=RNG_SEED,
+                seed=random_seed,
                 n_startup_trials=optuna_n_startup_trials,
                 restart_strategy="ipop",
             )
         else:
             sampler = optuna.samplers.TPESampler(
-                seed=RNG_SEED,
+                seed=random_seed,
                 n_startup_trials=optuna_n_startup_trials,
                 multivariate=optuna_multivariate,
                 constant_liar=True,
@@ -1948,16 +2040,11 @@ def _fit_optuna_search(
                 verbose=0,
             )
 
-    search = _make_search(xgb_use_gpu, cuml_use_gpu, search_n_jobs)
+    search = _make_search(xgb_use_gpu, cuml_use_gpu, search_n_jobs, lgbm_use_gpu)
 
     def _fit_search(search_obj: OptunaSearchCV) -> None:
         """Internal helper for fit search."""
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Setting penalty=None will ignore the C and l1_ratio parameters",
-                category=UserWarning,
-            )
             warnings.filterwarnings(
                 "ignore", category=optuna.exceptions.ExperimentalWarning
             )
@@ -1976,6 +2063,7 @@ def _fit_optuna_search(
         )
         fallback_xgb_use_gpu = False if model_name in {"xgb", "rf"} else xgb_use_gpu
         fallback_cuml_use_gpu = False if model_name == "svm" else cuml_use_gpu
+        fallback_lgbm_use_gpu = False if model_name == "lgbm" else lgbm_use_gpu
         return _fit_grid_search(
             task=task,
             model_name=model_name,
@@ -1989,6 +2077,7 @@ def _fit_optuna_search(
             lhs_scale_mode="auto",
             xgb_use_gpu=fallback_xgb_use_gpu,
             cuml_use_gpu=fallback_cuml_use_gpu,
+            lgbm_use_gpu=fallback_lgbm_use_gpu,
             verbose=verbose,
             debug_grid_progress=False,
         )
@@ -2022,6 +2111,16 @@ def _fit_optuna_search(
             )
             search = _make_search(xgb_use_gpu, False, max_cores)
             _fit_search(search)
+        elif (
+            model_name == "lgbm" and bool(lgbm_use_gpu) and _looks_like_gpu_failure(exc)
+        ):
+            vlog(
+                verbose,
+                f"LGBM GPU training failed; retrying on CPU ({exc})",
+                level="info",
+            )
+            search = _make_search(xgb_use_gpu, cuml_use_gpu, max_cores, False)
+            _fit_search(search)
         else:
             message = str(exc)
             if (
@@ -2044,11 +2143,11 @@ def _fit_optuna_search(
     if optuna_failure_reason is not None:
         return _fallback_to_grid(optuna_failure_reason)
 
-    # XGB/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
+    # XGB/LightGBM/MLP: post-search refit with early stopping to find optimal n_estimators/epochs.
     tree_es_applied = False
     tree_es_n_estimators: int | None = None
     calibration_holdout: tuple[pd.DataFrame, np.ndarray] | None = None
-    if model_name in {"xgb", "mlp"}:
+    if model_name in {"xgb", "mlp", "lgbm"}:
         pipe_es, tree_es_applied, tree_es_n_estimators, calibration_holdout = (
             _fit_tree_early_stopping(
                 model_name=model_name,
@@ -2058,7 +2157,7 @@ def _fit_optuna_search(
                 y_train=y_train,
                 inner_cv=inner_cv,
                 verbose=verbose,
-                reserve_calibration_holdout=calibrate and model_name == "xgb",
+                reserve_calibration_holdout=calibrate and model_name in {"xgb", "lgbm"},
             )
         )
         search.best_estimator_ = pipe_es
@@ -2071,6 +2170,7 @@ def _fit_optuna_search(
     )
 
     _set_xgb_cpu_predictor_for_inference(search.best_estimator_)
+    _set_lgbm_cpu_predictor_for_inference(search.best_estimator_)
 
     tuning_info: dict[str, Any] = {
         "best_params": sanitize_best_params(search.best_params_),
@@ -2078,7 +2178,7 @@ def _fit_optuna_search(
         "optuna_n_trials": int(param_grid_size),
         "optuna_sampler": optuna_sampler,
     }
-    if model_name in {"xgb", "mlp", "rf"}:
+    if model_name in {"xgb", "mlp", "rf", "lgbm"}:
         tuning_info["tree_es_applied"] = tree_es_applied
         tuning_info["tree_es_n_estimators"] = tree_es_n_estimators
     if calibration_holdout is not None:
@@ -2145,6 +2245,8 @@ def fit_best_estimator(
     optuna_multivariate: bool = True,
     optuna_wandb_callback: bool = False,
     calibrate: bool = False,
+    lgbm_use_gpu: bool | None = None,
+    random_seed: int = RNG_SEED,
 ) -> tuple[Pipeline, dict[str, Any]]:
     """Tune hyperparameters via grouped inner CV and return the best estimator.
 
@@ -2153,8 +2255,8 @@ def fit_best_estimator(
     - "beta": no hyperparameters; cross_validate + refit.
     - All others: GridSearchCV with grid or LHS candidates.
 
-    calibrate (XGB only, via GridSearchCV/Optuna paths): reserves the ES-val
-    slice as a dedicated leakage-free calibration holdout — see
+    calibrate (XGB and LightGBM only, via GridSearchCV/Optuna paths): reserves
+    the ES-val slice as a dedicated leakage-free calibration holdout — see
     ``_fit_tree_early_stopping``'s ``reserve_calibration_holdout``.
 
     Returns
@@ -2238,6 +2340,8 @@ def fit_best_estimator(
             verbose=verbose,
             optuna_wandb_callback=optuna_wandb_callback,
             calibrate=calibrate,
+            lgbm_use_gpu=lgbm_use_gpu,
+            random_seed=random_seed,
         )
 
     return _fit_grid_search(
@@ -2256,4 +2360,6 @@ def fit_best_estimator(
         verbose=verbose,
         debug_grid_progress=debug_grid_progress,
         calibrate=calibrate,
+        lgbm_use_gpu=lgbm_use_gpu,
+        random_seed=random_seed,
     )

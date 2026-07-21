@@ -6,7 +6,7 @@ Public entry point: ``build_param_candidates`` — a single function that
 dispatches to grid or Latin Hypercube sampling based on the requested
 search strategy and model type.
 
-Only "linear", "rf", "xgb", "svm", and "mlp" models are handled here.
+Only "linear", "rf", "xgb", "lgbm", "svm", and "mlp" models are handled here.
 "elasticnet" and "beta" bypass GridSearchCV entirely in
 ``search.fit_best_estimator`` and are never dispatched to these builders.
 """
@@ -49,12 +49,6 @@ __all__ = [
 _ALPHA_GRID: np.ndarray = np.logspace(-6, 2, num=50)
 _C_GRID: np.ndarray = 1.0 / _ALPHA_GRID
 _L1_RATIO_GRID: list[float] = [0.1, 0.5, 0.9, 0.95, 1.0]
-# UNUSED: Denser legacy grid retained as a reference for historical tuning behavior.
-# TODO: remove this block if benchmark history is captured elsewhere.
-# Original (denser) grids — ~2× slower per fold, marginally better coverage:
-# _ALPHA_GRID: np.ndarray = np.logspace(-6, 2, num=100)
-# _C_GRID: np.ndarray = 1.0 / _ALPHA_GRID
-# _L1_RATIO_GRID: list[float] = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +136,11 @@ def build_param_candidates(
     lhs_scale_mode: str = "auto",
     xgb_use_gpu: bool | None = None,
     cuml_use_gpu: bool | None = None,
+    lgbm_use_gpu: bool | None = None,
     verbose: bool = False,
     model_n_jobs: int = 1,
     scale_pos_weight: float | None = None,
+    seed: int = RNG_SEED,
 ) -> list[dict[str, Any]]:
     """Return a GridSearchCV-compatible candidate list for the given model.
 
@@ -155,7 +151,7 @@ def build_param_candidates(
     Parameters
     ----------
     model_name : str
-        One of: "linear", "rf", "xgb", "svm", "mlp".
+        One of: "linear", "rf", "xgb", "lgbm", "svm", "mlp".
     task : str
         "regression" or "classification".
     n_samples, n_features : int
@@ -163,15 +159,20 @@ def build_param_candidates(
     budget : int
         Target number of hyperparameter candidates.
     strategy : {"grid", "random", "hybrid"}
-        "random" and "hybrid" (for rf/xgb/svm/mlp) use LHS; "grid" uses fixed pools.
+        "random" and "hybrid" (for rf/xgb/lgbm/svm/mlp) use LHS; "grid" uses fixed pools.
     lhs_scale_mode : {"auto", "log", "linear"}
         Scale mapping for LHS candidates (passed through to LHS builder).
     xgb_use_gpu : bool or None
         GPU flag forwarded to XGBoost candidate builders.
     cuml_use_gpu : bool or None
         GPU flag forwarded to cuML SVM candidate builders.
+    lgbm_use_gpu : bool or None
+        GPU flag forwarded to LightGBM candidate builders.
     verbose : bool
         Enable debug logging.
+    seed : int
+        Seed for LHS space-filling designs (used by both the LHS-strategy path
+        and the fixed-grid path's own internal LHS sampling for xgb/lgbm).
     """
     use_lhs = _use_lhs_strategy(strategy, model_name)
     if use_lhs:
@@ -183,10 +184,12 @@ def build_param_candidates(
             budget=budget,
             xgb_use_gpu=xgb_use_gpu,
             cuml_use_gpu=cuml_use_gpu,
+            lgbm_use_gpu=lgbm_use_gpu,
             scale_mode=lhs_scale_mode,
             verbose=verbose,
             model_n_jobs=model_n_jobs,
             scale_pos_weight=scale_pos_weight,
+            seed=seed,
         )
     return choose_param_grid(
         model_name=model_name,
@@ -196,9 +199,11 @@ def build_param_candidates(
         grid_size=budget,
         xgb_use_gpu=xgb_use_gpu,
         cuml_use_gpu=cuml_use_gpu,
+        lgbm_use_gpu=lgbm_use_gpu,
         verbose=verbose,
         model_n_jobs=model_n_jobs,
         scale_pos_weight=scale_pos_weight,
+        seed=seed,
     )
 
 
@@ -209,7 +214,7 @@ def _use_lhs_strategy(search_strategy: str, model_name: str) -> bool:
     if search_strategy == "grid":
         return False
     # Hybrid: use LHS for high-dimensional tree/kernel/neural-network spaces.
-    return model_name in {"rf", "xgb", "svm", "nysvm", "mlp"}
+    return model_name in {"rf", "xgb", "lgbm", "svm", "nysvm", "mlp"}
 
 
 def _resolve_gpu_flag(requested: bool | None, detect_fn: Any) -> bool:
@@ -218,6 +223,38 @@ def _resolve_gpu_flag(requested: bool | None, detect_fn: Any) -> bool:
     If ``requested`` is not None, respect it; otherwise call ``detect_fn``.
     """
     return bool(requested) if requested is not None else bool(detect_fn())
+
+
+_LGBM_GPU_ROW_THRESHOLD = 1_000_000
+# Below this row count, lgbm always uses CPU regardless of GPU availability.
+#
+# Confirmed via real wall-clock benchmarking (.claude/scratch/lgbm_cpu_vs_gpu_wallclock.py,
+# 2026-07-14): LightGBM's CUDA backend's untuned GPU never beats single-threaded CPU below
+# ~1M rows (fixed per-round host<->device transfer overhead dominates at this project's
+# feature count/tree depth); tuned GPU (max_bin=63, gpu_use_dp=False -- LightGBM's own
+# recommended GPU settings) roughly ties CPU around 200k rows and wins by 1M rows. This
+# project's real event types span both regimes: RI tops out at ~205k rows/fold (below
+# threshold -> CPU), SE runs 2-4M rows/fold (above -> tuned GPU). No universally published
+# threshold exists for this (LightGBM's own docs/benchmarks start at 400k+ rows and give only
+# qualitative "large and dense" guidance) -- this value is this project's own measured
+# crossover point on its own hardware/hyperparameter-shape, not lifted from external docs.
+
+
+def _resolve_lgbm_gpu_flag(
+    requested: bool | None, n_samples: int, detect_fn: Any
+) -> bool:
+    """Resolve lgbm's GPU flag: explicit override, else scale-adaptive auto-detect.
+
+    Below _LGBM_GPU_ROW_THRESHOLD rows, GPU is never used regardless of availability --
+    LightGBM's CUDA backend doesn't pay off at that scale for this project (see
+    _LGBM_GPU_ROW_THRESHOLD's comment). Above it, falls back to the normal availability probe.
+    An explicit ``requested`` value (True/False) always wins over both checks.
+    """
+    if requested is not None:
+        return bool(requested)
+    if n_samples < _LGBM_GPU_ROW_THRESHOLD:
+        return False
+    return bool(detect_fn())
 
 
 def _linear_candidates(
@@ -235,8 +272,15 @@ def _linear_candidates(
         return [
             {
                 "model": [
+                    # penalty=None (not C=np.inf): both mean "unregularized",
+                    # but C=np.inf makes sklearn 1.8 internally convert to
+                    # penalty=None anyway and warn about it on every .fit()
+                    # call (real UserWarning source found 2026-07-16 via log
+                    # audit -- previously worked around by suppressing the
+                    # warning at 3+ call sites; requesting the same thing
+                    # directly avoids triggering it at all).
                     LogisticRegression(
-                        C=np.inf,
+                        penalty=None,
                         solver="lbfgs",
                         max_iter=5000,
                         class_weight="balanced",
@@ -366,6 +410,102 @@ def _xgb_ranges(n_samples: int) -> dict[str, float]:
         "subsample_high": 0.95,
         "colsample_low": 0.5,
         "colsample_high": 0.9,
+    }
+
+
+def _lgbm_common_kwargs(use_gpu: bool, model_n_jobs: int) -> dict[str, Any]:
+    """Common kwargs shared by LightGBM estimators.
+
+    LightGBM is a separate library from XGBoost with its own GPU mechanism
+    (`device_type`, not `device`) -- cannot reuse `_xgb_common_kwargs`.
+    `bagging_freq=1` is required for `bagging_fraction` to have any effect
+    (LightGBM ignores bagging_fraction when bagging_freq=0, its default).
+    `verbose=-1` suppresses per-iteration stdout spam during grid/Optuna search.
+
+    When GPU is used, also applies LightGBM's own recommended GPU tuning
+    (`max_bin=63`, `gpu_use_dp=False` --
+    https://lightgbm.readthedocs.io/en/latest/GPU-Performance.html) -- confirmed via real
+    wall-clock benchmarking (2026-07-14) to meaningfully narrow the GPU-vs-CPU gap at scale
+    (see _LGBM_GPU_ROW_THRESHOLD).
+    """
+    common = {
+        "random_state": RNG_SEED,
+        "n_jobs": 1 if use_gpu else model_n_jobs,
+        "device_type": "cuda" if use_gpu else "cpu",
+        "bagging_freq": 1,
+        "verbose": -1,
+    }
+    if use_gpu:
+        common["max_bin"] = 63
+        common["gpu_use_dp"] = False
+    return common
+
+
+def _build_lgbm_base_model(
+    task: str,
+    common: dict[str, Any],
+    scale_pos_weight: float | None,
+) -> Any:
+    """Construct LightGBM classifier/regressor base estimator.
+
+    Unlike XGBoost/RF, ``scale_pos_weight`` is deliberately NOT forwarded to
+    ``LGBMClassifier`` here -- LightGBM's CUDA backend has a broken internal
+    class-reweighting code path (confirmed 2026-07-14: both `scale_pos_weight`
+    and `is_unbalance=True` corrupt gradients on `device_type="cuda"`, causing
+    instant root-only-tree collapse to exact-chance AUROC). Class imbalance is
+    instead applied via per-sample `sample_weight=` at every `.fit()` call
+    site in search.py, which happens in Python outside CUDA's broken
+    reweighting path. See CLAUDE.md's LightGBM API section.
+    """
+    try:
+        from lightgbm import LGBMClassifier, LGBMRegressor
+    except Exception as exc:
+        raise RuntimeError("lightgbm requested but not installed") from exc
+
+    if task == "classification":
+        return LGBMClassifier(
+            objective="binary",
+            metric="binary_logloss",
+            **common,
+        )
+    return LGBMRegressor(objective="regression", metric="rmse", **common)
+
+
+def _lgbm_ranges(n_samples: int) -> dict[str, float]:
+    """LightGBM heuristic ranges from dataset size.
+
+    Reuses `_xgb_ranges`'s sample-count-scaled heuristics for learning_rate,
+    n_estimators, bagging_fraction (=subsample), feature_fraction (=colsample)
+    and min_child_samples (=min_child_weight) -- those axes mean the same
+    thing across both libraries and are already scaled sensibly. `num_leaves`
+    (LightGBM's primary complexity control, leaf-wise growth vs XGB's
+    depth-wise) is derived from the same depth heuristic via 2**depth - 1,
+    clamped to LightGBM's own sane range. `reg_alpha`/`reg_lambda` are new
+    axes with no XGB precedent in this codebase (XGB's grids don't tune L1/L2
+    here either) -- a reasonable default log-scale range, not a reuse.
+    """
+    x = _xgb_ranges(n_samples)
+    depth_low = int(x["depth_low"])
+    depth_high = int(x["depth_high"])
+    leaves_low = max(7, 2**depth_low - 1)
+    leaves_high = min(255, max(leaves_low + 8, 2 ** (depth_high + 1) - 1))
+    return {
+        "num_leaves_low": float(leaves_low),
+        "num_leaves_high": float(leaves_high),
+        "lr_low": x["lr_low"],
+        "lr_high": x["lr_high"],
+        "n_est_low": x["n_est_low"],
+        "n_est_high": x["n_est_high"],
+        "bagging_low": x["subsample_low"],
+        "bagging_high": x["subsample_high"],
+        "feature_low": x["colsample_low"],
+        "feature_high": x["colsample_high"],
+        "min_child_low": x["min_child_low"],
+        "min_child_high": x["min_child_high"],
+        "reg_alpha_low": 1e-3,
+        "reg_alpha_high": 5.0,
+        "reg_lambda_low": 1e-3,
+        "reg_lambda_high": 5.0,
     }
 
 
@@ -618,6 +758,130 @@ def _xgb_candidate_from_row(
     return out
 
 
+def _lgbm_candidate_from_row(
+    base_model: Any,
+    row: np.ndarray,
+    *,
+    n_est_low: int,
+    n_est_high: int,
+    leaves_low: int,
+    leaves_high: int,
+    lr_low: float,
+    lr_high: float,
+    bagging_low: float,
+    bagging_high: float,
+    feature_low: float,
+    feature_high: float,
+    scale_mode: str,
+    min_child_low: float | None = None,
+    min_child_high: float | None = None,
+    reg_alpha_low: float | None = None,
+    reg_alpha_high: float | None = None,
+    reg_lambda_low: float | None = None,
+    reg_lambda_high: float | None = None,
+) -> dict[str, list[Any]]:
+    """Build one LightGBM candidate dict from a sampled row.
+
+    Uses the first 5 dims for base LightGBM params (mirrors
+    _xgb_candidate_from_row's shape, translated to LightGBM's param names).
+    If min-child bounds are provided, dim 5 is used for
+    ``model__min_child_samples``; if reg_alpha/reg_lambda bounds are also
+    provided, dims 6/7 are used for those (only ever requested together by
+    the LHS/Optuna callers, never independently).
+    """
+    out: dict[str, list[Any]] = {
+        "model": [base_model],
+        "model__n_estimators": [
+            int(
+                round(
+                    _map_with_scale(
+                        float(row[0]),
+                        n_est_low,
+                        n_est_high,
+                        scale_mode,
+                        default_scale="linear",
+                    )
+                )
+            )
+        ],
+        "model__num_leaves": [
+            int(
+                round(
+                    _map_with_scale(
+                        float(row[1]),
+                        leaves_low,
+                        leaves_high,
+                        scale_mode,
+                        default_scale="linear",
+                    )
+                )
+            )
+        ],
+        "model__learning_rate": [
+            _map_with_scale(
+                float(row[2]),
+                lr_low,
+                lr_high,
+                scale_mode,
+                default_scale="log",
+            )
+        ],
+        "model__bagging_fraction": [
+            _map_with_scale(
+                float(row[3]),
+                bagging_low,
+                bagging_high,
+                scale_mode,
+                default_scale="linear",
+            )
+        ],
+        "model__feature_fraction": [
+            _map_with_scale(
+                float(row[4]),
+                feature_low,
+                feature_high,
+                scale_mode,
+                default_scale="linear",
+            )
+        ],
+    }
+    if min_child_low is not None and min_child_high is not None:
+        out["model__min_child_samples"] = [
+            int(
+                round(
+                    _map_with_scale(
+                        float(row[5]),
+                        min_child_low,
+                        min_child_high,
+                        scale_mode,
+                        default_scale="log",
+                    )
+                )
+            )
+        ]
+    if reg_alpha_low is not None and reg_alpha_high is not None:
+        out["model__reg_alpha"] = [
+            _map_with_scale(
+                float(row[6]),
+                reg_alpha_low,
+                reg_alpha_high,
+                scale_mode,
+                default_scale="log",
+            )
+        ]
+    if reg_lambda_low is not None and reg_lambda_high is not None:
+        out["model__reg_lambda"] = [
+            _map_with_scale(
+                float(row[7]),
+                reg_lambda_low,
+                reg_lambda_high,
+                scale_mode,
+                default_scale="log",
+            )
+        ]
+    return out
+
+
 def _mlp_candidate_from_row(
     base_model: Any,
     row: np.ndarray,
@@ -798,9 +1062,11 @@ def choose_param_grid(
     grid_size: int,
     xgb_use_gpu: bool | None = None,
     cuml_use_gpu: bool | None = None,
+    lgbm_use_gpu: bool | None = None,
     verbose: bool = False,
     model_n_jobs: int = 1,
     scale_pos_weight: float | None = None,
+    seed: int = RNG_SEED,
 ) -> list[dict[str, Any]]:
     """Build heuristic fixed-grid parameter candidates for GridSearchCV.
 
@@ -808,6 +1074,7 @@ def choose_param_grid(
     values. The "model" key holds the estimator instance(s) to try.
     """
     from .xgb_utils import xgb_gpu_available
+    from .lgbm_utils import lgbm_gpu_available
 
     vlog(
         verbose,
@@ -866,7 +1133,7 @@ def choose_param_grid(
         subsample_high = ranges["subsample_high"]
         colsample_low = ranges["colsample_low"]
         colsample_high = ranges["colsample_high"]
-        unit = _lhs_unit(n_points=n_points, n_dims=5, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=5, seed=seed)
         base_model = _build_xgb_base_model(task, common)
         return [
             _xgb_candidate_from_row(
@@ -882,6 +1149,32 @@ def choose_param_grid(
                 subsample_high=subsample_high,
                 colsample_low=colsample_low,
                 colsample_high=colsample_high,
+                scale_mode="linear",
+            )
+            for row in unit
+        ]
+
+    if model_name == "lgbm":
+        use_gpu = _resolve_lgbm_gpu_flag(lgbm_use_gpu, n_samples, lgbm_gpu_available)
+        common = _lgbm_common_kwargs(use_gpu, model_n_jobs)
+        n_points = max(1, int(grid_size))
+        ranges = _lgbm_ranges(n_samples)
+        base_model = _build_lgbm_base_model(task, common, scale_pos_weight)
+        unit = _lhs_unit(n_points=n_points, n_dims=5, seed=seed)
+        return [
+            _lgbm_candidate_from_row(
+                base_model,
+                row,
+                n_est_low=int(ranges["n_est_low"]),
+                n_est_high=int(ranges["n_est_high"]),
+                leaves_low=int(ranges["num_leaves_low"]),
+                leaves_high=int(ranges["num_leaves_high"]),
+                lr_low=ranges["lr_low"],
+                lr_high=ranges["lr_high"],
+                bagging_low=ranges["bagging_low"],
+                bagging_high=ranges["bagging_high"],
+                feature_low=ranges["feature_low"],
+                feature_high=ranges["feature_high"],
                 scale_mode="linear",
             )
             for row in unit
@@ -965,10 +1258,12 @@ def choose_param_lhs_candidates(
     budget: int,
     xgb_use_gpu: bool | None = None,
     cuml_use_gpu: bool | None = None,
+    lgbm_use_gpu: bool | None = None,
     scale_mode: str = "auto",
     verbose: bool = False,
     model_n_jobs: int = 1,
     scale_pos_weight: float | None = None,
+    seed: int = RNG_SEED,
 ) -> list[dict[str, list[Any]]]:
     """Build a space-filling LHS candidate set for GridSearchCV.
 
@@ -976,6 +1271,7 @@ def choose_param_lhs_candidates(
     ``GridSearchCV(param_grid=<result>)``.
     """
     from .xgb_utils import xgb_gpu_available
+    from .lgbm_utils import lgbm_gpu_available
 
     n_points = max(1, int(budget))
     vlog(
@@ -1000,7 +1296,7 @@ def choose_param_lhs_candidates(
         min_child_low = ranges["min_child_low"]
         min_child_high = ranges["min_child_high"]
         base_model = _build_xgbrf_base_model(task, common, scale_pos_weight)
-        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=seed)
         return [
             _rf_candidate_from_row(
                 base_model,
@@ -1033,7 +1329,7 @@ def choose_param_lhs_candidates(
         subsample_high = ranges["subsample_high"]
         colsample_low = ranges["colsample_low"]
         colsample_high = ranges["colsample_high"]
-        unit = _lhs_unit(n_points=n_points, n_dims=6, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=6, seed=seed)
         return [
             _xgb_candidate_from_row(
                 base_model,
@@ -1055,11 +1351,42 @@ def choose_param_lhs_candidates(
             for row in unit
         ]
 
+    if model_name == "lgbm":
+        use_gpu = _resolve_lgbm_gpu_flag(lgbm_use_gpu, n_samples, lgbm_gpu_available)
+        common = _lgbm_common_kwargs(use_gpu, model_n_jobs)
+        base_model = _build_lgbm_base_model(task, common, scale_pos_weight)
+        ranges = _lgbm_ranges(n_samples)
+        unit = _lhs_unit(n_points=n_points, n_dims=8, seed=seed)
+        return [
+            _lgbm_candidate_from_row(
+                base_model,
+                row,
+                n_est_low=int(ranges["n_est_low"]),
+                n_est_high=int(ranges["n_est_high"]),
+                leaves_low=int(ranges["num_leaves_low"]),
+                leaves_high=int(ranges["num_leaves_high"]),
+                lr_low=ranges["lr_low"],
+                lr_high=ranges["lr_high"],
+                bagging_low=ranges["bagging_low"],
+                bagging_high=ranges["bagging_high"],
+                feature_low=ranges["feature_low"],
+                feature_high=ranges["feature_high"],
+                scale_mode=scale_mode,
+                min_child_low=ranges["min_child_low"],
+                min_child_high=ranges["min_child_high"],
+                reg_alpha_low=ranges["reg_alpha_low"],
+                reg_alpha_high=ranges["reg_alpha_high"],
+                reg_lambda_low=ranges["reg_lambda_low"],
+                reg_lambda_high=ranges["reg_lambda_high"],
+            )
+            for row in unit
+        ]
+
     if model_name == "svm":
         base_model = _svm_base_model(task, cuml_use_gpu)
         # 2 LHS dims: C and gamma on log scale
         c_low, c_high, gamma_low, gamma_high = _svm_ranges(n_samples)
-        unit = _lhs_unit(n_points=n_points, n_dims=2, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=2, seed=seed)
         return [
             {
                 "model": [base_model],
@@ -1090,7 +1417,7 @@ def choose_param_lhs_candidates(
         gamma_high = ranges["gamma_high"]
         base_model = _nysvm_base_model(task, (n_comp_low + n_comp_high) // 2)
         c_key = "model__svc__C" if task == "classification" else "model__svr__C"
-        unit = _lhs_unit(n_points=n_points, n_dims=3, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=3, seed=seed)
         return [
             _nysvm_candidate_from_row(
                 base_model,
@@ -1114,7 +1441,7 @@ def choose_param_lhs_candidates(
         base_model = _mlp_base_model(task)
         batch_sizes = _mlp_batch_sizes(n_samples)
         batch_size = batch_sizes[len(batch_sizes) // 2]  # mid-range value
-        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=RNG_SEED)
+        unit = _lhs_unit(n_points=n_points, n_dims=4, seed=seed)
         return [
             _mlp_candidate_from_row(base_model, row, scale_mode, batch_size=batch_size)
             for row in unit
@@ -1135,6 +1462,7 @@ def build_optuna_distributions(
     n_features: int,
     xgb_use_gpu: bool | None = None,
     cuml_use_gpu: bool | None = None,
+    lgbm_use_gpu: bool | None = None,
     verbose: bool = False,
     model_n_jobs: int = 1,
     scale_pos_weight: float | None = None,
@@ -1149,7 +1477,7 @@ def build_optuna_distributions(
     Parameters
     ----------
     model_name : str
-        One of: "rf", "xgb", "svm", "mlp".  "linear" is not supported
+        One of: "rf", "xgb", "lgbm", "svm", "mlp".  "linear" is not supported
         (no hyperparameters to tune).
     task : str
         "regression" or "classification".
@@ -1159,12 +1487,14 @@ def build_optuna_distributions(
         GPU flag forwarded to XGBoost/RF estimator constructors.
     cuml_use_gpu : bool or None
         GPU flag forwarded to cuML SVM estimator constructor.
+    lgbm_use_gpu : bool or None
+        GPU flag forwarded to LightGBM estimator constructor.
     verbose : bool
         Enable debug logging.
     model_n_jobs : int
         Thread budget for the base estimator itself (not the search).
     scale_pos_weight : float or None
-        Class imbalance weight forwarded to XGB classification estimators.
+        Class imbalance weight forwarded to XGB/LightGBM classification estimators.
 
     Returns
     -------
@@ -1193,6 +1523,7 @@ def build_optuna_distributions(
         ) from exc
 
     from .xgb_utils import xgb_gpu_available
+    from .lgbm_utils import lgbm_gpu_available
 
     vlog(
         verbose,
@@ -1251,6 +1582,39 @@ def build_optuna_distributions(
         }
         return base_model, distributions
 
+    if model_name == "lgbm":
+        use_gpu = _resolve_lgbm_gpu_flag(lgbm_use_gpu, n_samples, lgbm_gpu_available)
+        common = _lgbm_common_kwargs(use_gpu, model_n_jobs)
+        ranges = _lgbm_ranges(n_samples)
+        base_model = _build_lgbm_base_model(task, common, scale_pos_weight)
+        distributions = {
+            "model__n_estimators": IntDistribution(
+                int(ranges["n_est_low"]), int(ranges["n_est_high"])
+            ),
+            "model__num_leaves": IntDistribution(
+                int(ranges["num_leaves_low"]), int(ranges["num_leaves_high"])
+            ),
+            "model__learning_rate": FloatDistribution(
+                ranges["lr_low"], ranges["lr_high"], log=True
+            ),
+            "model__bagging_fraction": FloatDistribution(
+                ranges["bagging_low"], ranges["bagging_high"]
+            ),
+            "model__feature_fraction": FloatDistribution(
+                ranges["feature_low"], ranges["feature_high"]
+            ),
+            "model__min_child_samples": IntDistribution(
+                int(ranges["min_child_low"]), int(ranges["min_child_high"]), log=True
+            ),
+            "model__reg_alpha": FloatDistribution(
+                ranges["reg_alpha_low"], ranges["reg_alpha_high"], log=True
+            ),
+            "model__reg_lambda": FloatDistribution(
+                ranges["reg_lambda_low"], ranges["reg_lambda_high"], log=True
+            ),
+        }
+        return base_model, distributions
+
     if model_name == "svm":
         base_model = _svm_base_model(task, cuml_use_gpu)
         _, c_high, _, gamma_high = _svm_ranges(n_samples)
@@ -1297,5 +1661,5 @@ def build_optuna_distributions(
 
     raise ValueError(
         f"build_optuna_distributions: unsupported model '{model_name}'. "
-        f"Supported: rf, xgb, svm, nysvm, mlp."
+        f"Supported: rf, xgb, lgbm, svm, nysvm, mlp."
     )
