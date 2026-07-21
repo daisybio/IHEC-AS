@@ -24,11 +24,12 @@ Steps (everything from 02-2 on is per-transcript_filter, suffix _{tf}):
     04-2 aggregate-ChIP           →  sample_dts/chip_agg_{tf}/… , chip_agg_{tf}.done
     04-3 maxentscan               →  processed_data/{3,3down,5,5up}scores_{tf}.txt
     04-4 pangolin                 →  processed_data/pangolin_scores_{tf}.csv
-    04-5 rbp-binding-sites        →  processed_data/rbp_per_event.rds  (standalone; not in rule all)
+    04-5 rbp-binding-sites        →  processed_data/rbp_per_event.rds  (dependency of create_aggregated_dt)
     05   create-aggregated-dt     →  processed_data/aggregated_dt_filtered_{tf}.csv.gz
-    05b  feature-pca-sanity       →  reports/05b-feature-pca-sanity_{primary}.html  (standalone; not in rule all)
+    05b  feature-pca-sanity       →  reports/05b-feature-pca-sanity_{primary}.html
     06   correlation              →  processed_data/correlation_intrinsic_{tf}.csv.gz  (primary filter)
-    08   splicing_ml              →  splicing_ml/output/{et}_{tf}_{var}_{gc}/
+    08   splicing_ml_{classification,regression}          →  splicing_ml/output/{et}_{tf}_{var}_{gc}/ (parallel per task)
+    08b  splicing_ml_ablation_{classification,regression} →  splicing_ml/output_ablation/{fg}/{et}_{primary}_{var}_seqnames/ (battery, primary filter, parallel per task)
     09-1 event-models             →  processed_data/event_models/{tf}/.done
     09-2 ml-analysis              →  reports/09-2-ml-local-new_{primary}.html
     10   experimental-events      →  reports/10-experimental-events_{tf}.html
@@ -103,6 +104,33 @@ PANGOLIN_ENV = config.get(
 # batch: 4096 on the 48G a40; 1024 on the 12G titan or on CPU (host-RAM fit).
 PANGOLIN_BATCH = 4096 if (_pangolin_gpu and not _pangolin_titan) else 1024
 
+# W&B tracking toggle (no file edit): `--config wandb_enabled=true`. Off by
+# default -- matches run_splicing_ml.py's own CLI default (--wandb not passed
+# unless asked). Old scripts/slurm_ml_one_config.sh always ran `wandb login`
+# and passed --wandb/--wandb-project when a project name was given; mirrored
+# here as a single flat toggle rather than scripts/'s 5th positional CLI arg.
+WANDB_ENABLED = str(config.get("wandb_enabled", False)).lower() in ("true", "1", "yes")
+WANDB_PROJECT = config.get("wandb_project", "splicing-ml")
+WANDB_NO_REQUIRE_AUTH = str(config.get("wandb_no_require_auth", False)).lower() in (
+    "true", "1", "yes",
+)
+
+
+def wandb_login_cmd():
+    # Loads stored credentials (e.g. ~/.netrc from a prior `wandb login`) into
+    # the job environment, same as the old script did unconditionally when a
+    # project name was passed.
+    return "wandb login >/dev/null 2>&1 && " if WANDB_ENABLED else ""
+
+
+def wandb_cli_args():
+    if not WANDB_ENABLED:
+        return ""
+    args = f"--wandb --wandb-project {WANDB_PROJECT}"
+    if WANDB_NO_REQUIRE_AUTH:
+        args += " --wandb-no-require-auth"
+    return args
+
 # ML configs: all combos minus excluded ones
 EXCLUDE_ML = {
     (e["transcript_filter"], e["variability"])
@@ -115,6 +143,18 @@ def _ml_configs():
             yield et, tf, var, gc
 
 ML_CONFIGS = list(_ml_configs())
+
+# Feature-group ablation battery (§4.15) folded into `rule all` -- PRIMARY
+# filter only, seqnames only (ontology excluded: leaks event identity on
+# low-variability subsets, see memory project_splicing_ml_ontology_cv_event_leak.md).
+# Sequence-only vs epigenetics-only across both event types x all 3 variability
+# strata = 12 targets, matching the battery the user requested 2026-07-14.
+ABLATION_FEATURE_GROUPS = ["sequence", "histone+dnam"]
+ABLATION_CONFIGS = [
+    (fg, et, var) for fg in ABLATION_FEATURE_GROUPS
+    for et in EVENT_TYPES
+    for var in VARIABILITIES
+]
 
 wildcard_constraints:
     transcript_filter = "|".join(ALL_TRANSCRIPT_FILTERS),
@@ -141,7 +181,7 @@ def _partition(rule_key):
             else config["slurm_cpu_partition"])
 
 def _extra(rule_key):
-    base = "--mail-type=END,FAIL --mail-user=quirin.manz@tum.de"
+    base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
     if config["resources"][rule_key]["gpu"]:
         return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
@@ -157,7 +197,7 @@ def _ml_partition(wc):
     return config["slurm_gpu_partition"] if gpu else config["slurm_cpu_partition"]
 
 def _ml_extra(wc):
-    base = "--mail-type=END,FAIL --mail-user=quirin.manz@tum.de"
+    base = "--mail-type=FAIL --mail-user=quirin.manz@tum.de"
     if ml_resource(wc.event_type, wc.variability, "gpu"):
         return f"--exclude={config['slurm_gpu_exclude']} {base}"
     return base
@@ -188,11 +228,20 @@ rule all:
         # build them; each is an independent, parallel DAG branch).
         f"processed_data/aggregated_dt_filtered_{PRIMARY}.csv.gz",
         f"processed_data/correlation_intrinsic_{PRIMARY}.csv.gz",
-        # ML global models (all configs)
-        [f"splicing_ml/output/{et}_{tf}_{var}_{gc}/splicing_ml_results_classification.pkl.gz"
-         for et, tf, var, gc in ML_CONFIGS],
+        # ML global models (all configs) -- classification/regression run as
+        # separate parallel jobs (see rule splicing_ml_classification/_regression)
+        [f"splicing_ml/output/{et}_{tf}_{var}_{gc}/splicing_ml_results_{task}.pkl.gz"
+         for et, tf, var, gc in ML_CONFIGS for task in ("classification", "regression")],
+        # Feature-group ablation battery (PRIMARY filter, seqnames only)
+        [f"splicing_ml/output_ablation/{fg}/{et}_{PRIMARY}_{var}_seqnames/splicing_ml_results_{task}.pkl.gz"
+         for fg, et, var in ABLATION_CONFIGS for task in ("classification", "regression")],
         # Event-specific models (primary filter only — extend if needed)
         f"processed_data/event_models/{PRIMARY}/.done",
+        # QC / diagnostic notebooks (previously standalone-only; now part of
+        # the default build per user direction 2026-07-14: "all should be all")
+        f"reports/04-2-chip-signal-sanity_{PRIMARY}.html",
+        f"qc/irfinder_tree_comparison_{PRIMARY}.csv.gz",
+        f"reports/05b-feature-pca-sanity_{PRIMARY}.html",
         # Final analysis reports
         f"reports/09-2-ml-local-new_{PRIMARY}.html",
         f"reports/10-experimental-events_{PRIMARY}.html",
@@ -536,11 +585,11 @@ rule aggregate_chip:
         done = touch("sample_dts/chip_agg_{transcript_filter}.done"),
     localrule: True
 
-# §4.13b ChIP signal sanity — STANDALONE QC (like rbp_binding_sites): NOT in
-# `rule all` and NOT an input to create_aggregated_dt, so it never gates the
-# data build. Needs the whole per-filter ChIP aggregation together (streams each
-# tab once), hence a real compute job downstream of the aggregate_chip sentinel —
-# not folded into that localrule. Request explicitly to run it.
+# §4.13b ChIP signal sanity — QC check, NOT an input to create_aggregated_dt,
+# so it never gates the data build (in `rule all` since 2026-07-14, but as a
+# leaf, not a dependency). Needs the whole per-filter ChIP aggregation together
+# (streams each tab once), hence a real compute job downstream of the
+# aggregate_chip sentinel — not folded into that localrule.
 rule chip_signal_sanity:
     input:
         rmd = "04-2-chip-signal-sanity.Rmd",
@@ -770,7 +819,12 @@ rule correlation:
     log: f"logs/06_correlation_{PRIMARY}.log"
     threads: R("correlation", "threads")
     resources:
-        mem_mb          = R("correlation", "mem_mb"),
+        # attempt-scaled (2026-07-15): OOM-killed at flat mem_mb=48000 (5
+        # oom_kill events, job 6329894) -- compute_all_cor's pbmclapply forks
+        # up to 10 workers over the full 9M-row aggregated_dt, each fork's
+        # copy-on-write footprint apparently exceeds the flat budget. Scale on
+        # retry like the ML rules instead of guessing a single higher number.
+        mem_mb          = lambda wc, attempt: R("correlation", "mem_mb") * attempt,
         runtime         = R("correlation", "runtime"),
         slurm_partition = _partition("correlation"),
         slurm_extra     = _extra("correlation"),
@@ -786,14 +840,21 @@ rule correlation:
 
 
 # ── Step 08: splicing_ml global models ────────────────────────────────────────
-rule splicing_ml:
+# Split into classification/regression rules (2026-07-14) so the two tasks run as
+# independent, parallelizable SLURM jobs instead of serially inside one job --
+# they use the same input data but train unrelated models, so there's no reason
+# to pay for both sequentially in the same allocation. The only duplicated cost
+# is the initial load_dataset() call (~seconds), shared inside a single
+# run_splicing_ml.py invocation but now paid twice across the two jobs --
+# negligible next to per-task training time (minutes to hours).
+rule splicing_ml_classification:
     input:
         src  = SPLICING_ML_SRC,
         data = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
     output:
         pkl  = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.pkl.gz",
         json = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.json.gz",
-    log: "logs/splicing_ml_{event_type}_{transcript_filter}_{variability}_{group_col}.log"
+    log: "logs/splicing_ml_classification_{event_type}_{transcript_filter}_{variability}_{group_col}.log"
     threads: lambda wc: ml_resource(wc.event_type, wc.variability, "threads")
     resources:
         mem_mb          = lambda wc, attempt: ml_resource(wc.event_type, wc.variability, "mem_mb") * attempt,
@@ -802,9 +863,12 @@ rule splicing_ml:
         slurm_extra     = _ml_extra,
         qos             = _ml_qos,
         gres            = _ml_gres,
+    params:
+        wandb_login = wandb_login_cmd(),
+        wandb_args  = wandb_cli_args(),
     shell:
         """
-        mamba run -n ihec-as python run_splicing_ml.py \
+        {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
             --debug \
             --optuna \
             --data-path {input.data} \
@@ -815,6 +879,147 @@ rule splicing_ml:
             --only-group {wildcards.group_col} \
             --skip-regression \
             --max-cores {threads} \
+            {params.wandb_args} \
+        > {log} 2>&1
+        """
+
+
+rule splicing_ml_regression:
+    input:
+        src  = SPLICING_ML_SRC,
+        data = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+    output:
+        pkl  = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_regression.pkl.gz",
+        json = "splicing_ml/output/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_regression.json.gz",
+    log: "logs/splicing_ml_regression_{event_type}_{transcript_filter}_{variability}_{group_col}.log"
+    threads: lambda wc: ml_resource(wc.event_type, wc.variability, "threads")
+    resources:
+        mem_mb          = lambda wc, attempt: ml_resource(wc.event_type, wc.variability, "mem_mb") * attempt,
+        runtime         = lambda wc: ml_resource(wc.event_type, wc.variability, "runtime"),
+        slurm_partition = _ml_partition,
+        slurm_extra     = _ml_extra,
+        qos             = _ml_qos,
+        gres            = _ml_gres,
+    params:
+        wandb_login = wandb_login_cmd(),
+        wandb_args  = wandb_cli_args(),
+    shell:
+        """
+        {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
+            --debug \
+            --optuna \
+            --data-path {input.data} \
+            --output-dir splicing_ml/output/{wildcards.event_type}_{wildcards.transcript_filter}_{wildcards.variability}_{wildcards.group_col} \
+            --only-event-type {wildcards.event_type} \
+            --only-transcript-filter {wildcards.transcript_filter} \
+            --only-variability {wildcards.variability} \
+            --only-group {wildcards.group_col} \
+            --skip-classification \
+            --max-cores {threads} \
+            {params.wandb_args} \
+        > {log} 2>&1
+        """
+
+
+# ── Step 08b: splicing_ml feature-group ablations (§4.15) ─────────────────────
+# In `rule all` since 2026-07-14 (ABLATION_CONFIGS: sequence + histone+dnam x
+# both event types x all 3 variability strata, PRIMARY filter, seqnames only
+# -- 12 targets, "all should be all" per user direction). The full 8-group
+# FEATURE_GROUPS space (per-group-only: rbp/spliceosome/gene_expression/dnam/
+# histone alone) is NOT in ABLATION_CONFIGS -- only the two combos actually
+# requested so far. Extend ABLATION_FEATURE_GROUPS above to add more, or
+# request other combos directly, e.g.:
+#   snakemake --profile profiles/slurm \
+#     splicing_ml/output_ablation/histone/RI_biotype_filtered_Low_seqnames/splicing_ml_results_classification.pkl.gz
+# {feature_groups} is a "+"-joined FEATURE_GROUPS combo (matches
+# wandb_tracker.py's own run-name convention for the same concept, e.g.
+# "sequence" or "histone+dnam") -- translated back to `--feature-groups a b`
+# (space-separated) for the CLI.
+# group_col restricted to seqnames ONLY (see wildcard_constraints below):
+# ontology-grouped CV leaks event identity on low-variability subsets (99.7%
+# of RI/Low events span multiple ontologies -- ontology-grouping doesn't
+# isolate whole events the way seqnames-grouping does, see memory
+# project_splicing_ml_ontology_cv_event_leak.md) -- ablation conclusions on
+# ontology-split numbers would be unreliable for exactly the subsets battery
+# A cares most about. User-directed 2026-07-14: ablations run on seqnames only.
+rule splicing_ml_ablation_classification:
+    wildcard_constraints:
+        group_col = "seqnames",
+    input:
+        src  = SPLICING_ML_SRC,
+        data = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+    output:
+        pkl  = "splicing_ml/output_ablation/{feature_groups}/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.pkl.gz",
+        json = "splicing_ml/output_ablation/{feature_groups}/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_classification.json.gz",
+    log: "logs/splicing_ml_ablation_classification_{feature_groups}_{event_type}_{transcript_filter}_{variability}_{group_col}.log"
+    threads: lambda wc: ml_resource(wc.event_type, wc.variability, "threads")
+    resources:
+        mem_mb          = lambda wc, attempt: ml_resource(wc.event_type, wc.variability, "mem_mb") * attempt,
+        runtime         = lambda wc: ml_resource(wc.event_type, wc.variability, "runtime"),
+        slurm_partition = _ml_partition,
+        slurm_extra     = _ml_extra,
+        qos             = _ml_qos,
+        gres            = _ml_gres,
+    params:
+        wandb_login  = wandb_login_cmd(),
+        wandb_args   = wandb_cli_args(),
+        feature_args = lambda wc: wc.feature_groups.replace("+", " "),
+    shell:
+        """
+        {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
+            --debug \
+            --optuna \
+            --data-path {input.data} \
+            --output-dir splicing_ml/output_ablation/{wildcards.feature_groups}/{wildcards.event_type}_{wildcards.transcript_filter}_{wildcards.variability}_{wildcards.group_col} \
+            --only-event-type {wildcards.event_type} \
+            --only-transcript-filter {wildcards.transcript_filter} \
+            --only-variability {wildcards.variability} \
+            --only-group {wildcards.group_col} \
+            --feature-groups {params.feature_args} \
+            --skip-regression \
+            --max-cores {threads} \
+            {params.wandb_args} \
+        > {log} 2>&1
+        """
+
+
+rule splicing_ml_ablation_regression:
+    wildcard_constraints:
+        group_col = "seqnames",
+    input:
+        src  = SPLICING_ML_SRC,
+        data = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+    output:
+        pkl  = "splicing_ml/output_ablation/{feature_groups}/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_regression.pkl.gz",
+        json = "splicing_ml/output_ablation/{feature_groups}/{event_type}_{transcript_filter}_{variability}_{group_col}/splicing_ml_results_regression.json.gz",
+    log: "logs/splicing_ml_ablation_regression_{feature_groups}_{event_type}_{transcript_filter}_{variability}_{group_col}.log"
+    threads: lambda wc: ml_resource(wc.event_type, wc.variability, "threads")
+    resources:
+        mem_mb          = lambda wc, attempt: ml_resource(wc.event_type, wc.variability, "mem_mb") * attempt,
+        runtime         = lambda wc: ml_resource(wc.event_type, wc.variability, "runtime"),
+        slurm_partition = _ml_partition,
+        slurm_extra     = _ml_extra,
+        qos             = _ml_qos,
+        gres            = _ml_gres,
+    params:
+        wandb_login  = wandb_login_cmd(),
+        wandb_args   = wandb_cli_args(),
+        feature_args = lambda wc: wc.feature_groups.replace("+", " "),
+    shell:
+        """
+        {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
+            --debug \
+            --optuna \
+            --data-path {input.data} \
+            --output-dir splicing_ml/output_ablation/{wildcards.feature_groups}/{wildcards.event_type}_{wildcards.transcript_filter}_{wildcards.variability}_{wildcards.group_col} \
+            --only-event-type {wildcards.event_type} \
+            --only-transcript-filter {wildcards.transcript_filter} \
+            --only-variability {wildcards.variability} \
+            --only-group {wildcards.group_col} \
+            --feature-groups {params.feature_args} \
+            --skip-classification \
+            --max-cores {threads} \
+            {params.wandb_args} \
         > {log} 2>&1
         """
 
@@ -834,6 +1039,10 @@ rule event_models:
         chromhmm_hits    = "processed_data/chromhmm_hits_{transcript_filter}.rds",
         wgbs             = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
         file_table       = "processed_data/file_table.csv.gz",
+        # RBP Step 4 (§3.4): wide per-RBP expression + nearby-RBP map, joined
+        # per event into the feature tables (09-1 Phase 1).
+        rbp_wide         = "processed_data/rbp_wide_expression_{transcript_filter}.csv.gz",
+        rbp_per_event    = "processed_data/rbp_per_event_{transcript_filter}.rds",
     output:
         session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
         done    = touch("processed_data/event_models/{transcript_filter}/.done"),

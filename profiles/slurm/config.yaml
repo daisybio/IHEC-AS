@@ -8,14 +8,14 @@
 executor: slurm
 slurm-logdir: logs/slurm
 
-jobs: 200
+jobs: 50
 latency-wait: 90
 max-jobs-per-second: 5
 # slurm-array-jobs / slurm-array-limit DISABLED 2026-07-08: grouping the ~2295
 # aggregate_chip_one jobs into a SLURM array stalled the scheduler — snakemake
 # submitted only the 2 non-array jobs (wgbs, pangolin) then froze while
 # assembling the array; maxentscan and the chip jobs never submitted (twice).
-# Fallback = individual submission: `jobs: 200` caps concurrency,
+# Fallback = individual submission: `jobs: 50` caps concurrency,
 # `max-jobs-per-second: 5` throttles the rate (~2295/5 ≈ 8 min to submit all).
 # Slower to submit but reliable. Re-enable only if the plugin's array path is
 # confirmed working on this cluster.

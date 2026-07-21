@@ -34,6 +34,20 @@ pangolin_use_gpu: true
 # pangolin_gpu_gres: "gpu:titan:1"
 # pangolin_env: "pangolin-titan"
 
+# W&B tracking for splicing_ml/splicing_ml_ablation rules. Default flipped
+# ON 2026-07-16 after a design review confirmed the tracker's design/plots
+# are sound (found + fixed 2 real issues first: a delete-vs-still-running
+# race in _delete_existing_run, and the ranking/by_* charts blending RI+SE
+# into one misleading mean -- both fixed in wandb_tracker.py before this
+# flip). Requires `wandb login` to have been run once already on this node
+# (stored credentials, e.g. ~/.netrc) -- the rule itself also runs
+# `wandb login` to load them into the job env, same as the old
+# scripts/slurm_ml_one_config.sh did. Disable per-invocation without editing
+# this file: `snakemake --config wandb_enabled=false ...`.
+wandb_enabled: true
+wandb_project: "splicing-ml"
+wandb_no_require_auth: false
+
 event_types:
   - SE
   - RI
@@ -47,10 +61,11 @@ group_cols:
   - seqnames
   - ontology
 
-# biotype_filtered + both is excluded (see original SLURM config exclusion)
-exclude_ml_configs:
-  - transcript_filter: biotype_filtered
-    variability: both
+# biotype_filtered + both was previously excluded here (see original SLURM
+# config exclusion) -- re-enabled 2026-07-17 per user request. This makes the
+# splicing_ml_L resource tier (SE + both) reachable for the first time; RI +
+# both now also runs, routed to splicing_ml_M (see resources below).
+exclude_ml_configs: []
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # (Removed rmats_filtered_dir / gencode_gtf_dir / wgbs_bed_dir 2026-07-06: all
@@ -124,7 +139,12 @@ resources:
     mem_mb:
       10000 # bigWigAverageOverBed loads the whole pval bigwig; OOM-Killed
       # at 500M. The old standalone 04-2-aggregate-ChIP.sh used 10G.
-    runtime: 15
+    runtime:
+      60 # bumped from 15 (2026-07-15): 3 jobs on 1.6-2GB bigwigs hit the 15min
+      # wall — 2 TIMEOUT-killed, 1 finished at 14:51/15:01 (no margin). NFS I/O
+      # bound, not compute — sacct showed runtime, not OOM. Matches the old
+      # standalone 04-2-aggregate-ChIP.sh array job's `-t 0-1:00:00` (same tool,
+      # same 10G mem) — that reference value is 60min, not 15 or 30.
     threads: 1
     gpu: 0
   aggregate_chip:
@@ -166,9 +186,18 @@ resources:
     threads: 1
     gpu: 0
   irfinder_concordance:
-    mem_mb: 8000 # ~1GB RSS observed on a real biotype_filtered run (415 samples, 250k introns/sample fread+filtered before rbind - peak stays small since only matched rows are kept per sample).
+    mem_mb: 24000 # bumped 8000->24000 2026-07-15: real run OOM-killed at 8000 (7 oom_kill events,
+      # SLURM jobid 6325961) despite the R log showing a clean completion -- the kill landed on a
+      # forked pbmclapply worker after the main process's visible work finished. Old 8000 estimate
+      # ("~1GB RSS") predates whatever grew event_RI.psi/event_RI.jc.csv.gz since, and didn't
+      # account for fork-multiplied memory across parallel workers. 24000 = 3x headroom given the
+      # remaining 2-way forking (see threads note below); not independently re-measured yet.
     runtime: 60 # runs BOTH annotation + TSL12 trees (415 files read twice) - real run ~ a few minutes locally, doubled + buffer for slower cluster I/O.
-    threads: 8 # matches the min(8L, mc.cores) cap in the Rmd's pbmclapply over IRFinder sample files.
+    threads: 2 # lowered 8->2 2026-07-15: the "matches min(8L, mc.cores)" claim was already wrong --
+      # nothing in this pipeline sets options(mc.cores=), so the Rmd's pbmclapply always used its
+      # getOption() fallback (4L) regardless of this value. Lowered the Rmd's fallback to 2L (see
+      # 02-4-irfinder-concordance.Rmd) to actually cut fork-multiplied memory, and lowered this to
+      # match reality instead of over-reserving unused cores.
     gpu: 0
   create_aggregated_dt:
     mem_mb:
@@ -182,9 +211,23 @@ resources:
     threads: 4
     gpu: 0
   correlation:
-    mem_mb: 48000
+    mem_mb:
+      180000 # bumped 48000->96000->180000 (2026-07-15): OOM-killed TWICE --
+      # first at 48000 (job 6329894, 5 oom_kill events), then again at 96000
+      # (job 6329989, MaxRSS 93.68G, right at the cap). compute_all_cor's
+      # pbmclapply forks (10) multiply memory via R's fork-COW-breaking GC,
+      # roughly linear in fork count over a large base object -- 96000
+      # clearly wasn't real headroom, not just an off-by-a-little. Primary
+      # fix is cutting forks 10->4 (06-correlation.Rmd mc.cores, chosen for
+      # memory safety, not to match a thread count); mem_mb kept generous as
+      # a hedge since the linear-scaling model is inferred, not measured.
+      # profile's restart-times:0 means the Snakefile's attempt-scaling
+      # multiplier never fires on a manual rerun, so the base value itself
+      # must be high enough for attempt=1.
     runtime: 180
-    threads: 8
+    threads: 4 # matches mc.cores=4 in 06-correlation.Rmd (was 8, oversized
+      # once the fork count itself was cut for memory safety -- no reason to
+      # reserve SLURM CPUs the script won't fork into).
     gpu: 0
   feature_pca_sanity:
     mem_mb: 48000 # reads the full aggregated_dt_filtered_{tf}.csv.gz (~2.2G/9M rows)
@@ -201,13 +244,37 @@ resources:
     threads: 8
     gpu: 1
   splicing_ml_M: # SE + High/Low | RI + both
-    mem_mb: 64000
-    runtime: 720
+    mem_mb:
+      128000 # bumped from 64000 (2026-07-17): job SE_biotype_filtered_Low_seqnames
+      # was silently SIGKILLed (host-RAM cgroup OOM, no traceback) right as it moved
+      # from TabICL to fitting `linear` -- real log shows TabICL's tf_col array at
+      # this fold's scale (seq_len=4010018) needed an "Output size: 174.00GB",
+      # disk-offloaded because both GPU and CPU were already "tight"; the leftover
+      # host-RAM footprint plus the 4M-row dataframe pushed past 64GB. `exclude_ml_configs`
+      # currently excludes ALL "both"-variability configs (only `biotype_filtered`
+      # transcript_filter is active, and that's the one excluded pair) -- so "RI + both"
+      # never runs either, and this tier in practice only ever serves "SE + High/Low",
+      # which the splicing_ml_L comment below already admits is comparable in row-scale
+      # ("2.5-4M/fold") to "SE + both" -- matching its 128000 mem_mb directly rather than
+      # guessing a smaller number.
+    runtime:
+      5760 # bumped from 720 (2026-07-16): job 6329948 (SE/Low/ontology) TIMED
+      # OUT at 12h -- real log shows outer_splits=5, models=['lgbm','tabicl',
+      # 'xgb','linear'] (4 now that lgbm's a default), fold 1 alone
+      # (train_n=2.5M) took 9h44m, fold 2 (train_n=4M) was still 2h11m in when
+      # killed. 5 folds at that pace is 50-60h+, nowhere near 12h -- went
+      # straight to the shared-gpu partition's real ceiling (4 days = 5760min,
+      # confirmed via `sinfo`) rather than another incremental guess.
     threads: 8
     gpu: 1
   splicing_ml_L: # SE + both
     mem_mb: 128000
-    runtime: 1440
+    runtime:
+      5760 # bumped from 1440 (2026-07-16), same reasoning as splicing_ml_M --
+      # SE + both has even more rows than SE/Low's 2.5-4M/fold, so 1440 (24h)
+      # was likely already insufficient even before lgbm's addition. Not
+      # measured directly (no L-tier full run has finished with 4 models
+      # yet) -- set to the partition ceiling rather than guess a number.
     threads: 12
     gpu: 1
   event_models:
