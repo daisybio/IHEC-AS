@@ -227,7 +227,12 @@ event_summary_table[
   mean_cv_rsq := mean_cv_rsq
 ]
 
-# "Rotated Hit": did this event's real PSI appear as a rotation in another event?
+# "Rotated Hit": did this event's FEATURES get borrowed as a background control
+# for another event? (Rotation is now FEATURE-rotation — 09zz fits this event's
+# PSI against other matched events' real feature matrices — so the rotated
+# `response` token is the control event whose FEATURES were used, not whose PSI.
+# Semantics flipped from PSI-borrowing to feature-borrowing; the ID set is
+# computed the same way.)
 rotation_ids <- event_summary_table[
   response_type == "rotated",
   unique(as.integer(response))

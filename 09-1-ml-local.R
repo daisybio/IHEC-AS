@@ -35,6 +35,12 @@ sample_cols <- readRDS(sprintf("processed_data/sample_cols_%s.rds", tf))
 event_gr <- readRDS(sprintf("processed_data/event_gr_%s.rds", tf))
 activeChromHMM <- readRDS(sprintf("processed_data/activeChromHMM_%s.rds", tf))
 chromhmm_hits <- readRDS(sprintf("processed_data/chromhmm_hits_%s.rds", tf))
+# RBP Step 4 (§3.4): wide per-RBP expression (one rbp_<name> col per POSTAR3 RBP)
+# + the per-event nearby-RBP map. Used to attach each event's binding-site-local
+# RBP columns to its feature table (Phase 1 below). (The 3-col rbp_score_* / rbp_n
+# aggregate already rides in via aggregated_dt from 05 §4.12f.)
+rbp_wide <- fread(sprintf("processed_data/rbp_wide_expression_%s.csv.gz", tf))
+rbp_per_event <- readRDS(sprintf("processed_data/rbp_per_event_%s.rds", tf))
 
 response <- "PSI"
 grouping_col <- "ontology" # CV fold grouping column
@@ -99,7 +105,10 @@ file_table[,
 setkey(file_table, "local_file")
 
 # WGBS chromHMM coverage — cached as .fst for fast re-read (per-filter)
-wgbs_chromhmm_file <- file.path(sample_dt_dir, sprintf("WGBS_chromhmm_%s.fst", tf))
+wgbs_chromhmm_file <- file.path(
+  sample_dt_dir,
+  sprintf("WGBS_chromhmm_%s.fst", tf)
+)
 if (file.exists(wgbs_chromhmm_file)) {
   wgbs_chromhmm <- fst::read_fst(wgbs_chromhmm_file, as.data.table = TRUE)
 } else {
@@ -165,7 +174,10 @@ ids_to_build <- ids_to_build[
 # NB: no "first only make biotype_filtered ids" subset needed anymore —
 # aggregated_dt is already scoped to exactly `tf` (per-filter architecture),
 # unlike the old combined-filters event_dt this line used to subset from.
-event_annotations_dt[ID %in% ids_to_build, table(transcript_filter, `Event Type`)]
+event_annotations_dt[
+  ID %in% ids_to_build,
+  table(transcript_filter, `Event Type`)
+]
 
 
 # PSI matrix (events × samples) used inside each SLURM job to select
@@ -311,6 +323,21 @@ pbmcapply::pbmclapply(ids_to_build, function(id) {
     on = .(IHEC),
     (cols_to_add) := mget(cols_to_add)
   ]
+
+  # RBP Step 4 (§3.4): attach the wide per-RBP expression columns for the RBPs
+  # with a binding site near THIS event (rbp_per_event). Folded in with the other
+  # predictors (long/short/local); events with no nearby RBP add nothing.
+  nearby <- rbp_per_event[ID == id, rbp]
+  nearby_rbps <- if (length(nearby) == 1L) unlist(nearby[[1]]) else character(0)
+  rbp_cols <- intersect(paste0("rbp_", nearby_rbps), names(rbp_wide))
+  if (length(rbp_cols) > 0L) {
+    feature_data[
+      rbp_wide[, c("uuid", "transcript_filter", rbp_cols), with = FALSE],
+      on = .(uuid, transcript_filter),
+      (rbp_cols) := mget(paste0("i.", rbp_cols))
+    ]
+  }
+
   fwrite(feature_data, feature_table_file)
   invisible(NULL)
 })
@@ -355,7 +382,10 @@ saveRDS(
   response = response,
   grouping_col = grouping_col,
   nfolds = nfolds,
-  nrotations = nrotations
+  nrotations = nrotations,
+  # §4.9: thread the global seed to the array workers (09zz uses seed_base +
+  # this_id per event; falls back to the option if this field is absent).
+  seed = getOption("EpiATLAS_AS_SEED", 42L)
 )
 
 dir.create(event_dir, showWarnings = FALSE)

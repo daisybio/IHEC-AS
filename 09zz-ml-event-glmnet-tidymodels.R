@@ -621,6 +621,93 @@ if (!interactive()) {
   grouping_col <- cfg$grouping_col
   nfolds <- cfg$nfolds
   nrotations <- cfg$nrotations
+  # §4.9: base seed threaded from .slurm_cfg (fallback to the global option for
+  # old cfgs). Per-event offset (this_id) added at use sites.
+  seed_base <- if (!is.null(cfg$seed)) cfg$seed else getOption(
+    "EpiATLAS_AS_SEED", 42L
+  )
+
+  # Build the three explanatory-variable sets (long/short/local) from a feature
+  # table's columns. Factored out (was inline) so the FEATURE-rotation controls
+  # can build their own sets from their own feature tables. `ev_id` selects the
+  # per-event vicinity-narrowed chromHMM subset (for the "short" set); `resp` is
+  # the outcome column to exclude.
+  #   long  = all explanatory; short = drop vicinity-far chromHMM; local = drop
+  #           all chromHMM.
+  # Blocklist excludes id/meta/grouping/outcome, the pooled `gene_expression_getmm`
+  # (event models use vst), AND `IJC`/`SJC`/`PSI` — the latter are ILLEGAL
+  # features: PSI = IJC/(IJC+SJC), so using the junction counts as predictors is
+  # trivial target leakage (same rule as splicing_ml's IJC/SJC/PSI drop).
+  build_explanatory_vars <- function(feat_dt, ev_id, resp) {
+    explanatory <- names(feat_dt)[
+      !names(feat_dt) %in%
+        c(
+          "IHEC",
+          "ID",
+          "Event Type",
+          "Variability",
+          "seqnames",
+          "gene_id",
+          "uuid",
+          "transcript_filter",
+          "project",
+          "harmonized_sample_ontology_term_high_order_fig1",
+          "gene_expression_getmm",
+          "IJC",
+          "SJC",
+          "PSI",
+          grouping_col,
+          resp
+        )
+    ]
+    chromhmm_explanatory <- explanatory[grepl(
+      "chromhmm",
+      explanatory,
+      fixed = TRUE
+    )]
+    smaller_chromhmm_ids <- chromhmm_hits_smaller[
+      chromhmm_hits_smaller[, "queryHits"] ==
+        which(keep_rows_manual == ev_id),
+      "subjectHits"
+    ]
+    # init = all-TRUE so an empty smaller-id set (possible for a control event)
+    # doesn't error in Reduce and correctly marks every chromHMM col as "far".
+    old_chromhmm_explanatory <- chromhmm_explanatory[Reduce(
+      `&`,
+      lapply(sprintf("chromhmm_%d", smaller_chromhmm_ids), function(suff) {
+        !endsWith(chromhmm_explanatory, suff)
+      }),
+      rep(TRUE, length(chromhmm_explanatory))
+    )]
+    setNames(
+      list(
+        explanatory,
+        explanatory[!explanatory %in% old_chromhmm_explanatory],
+        explanatory[!explanatory %in% chromhmm_explanatory]
+      ),
+      feature_sets
+    )
+  }
+
+  # FEATURE-rotation control loader: read a control event's feature table, align
+  # its rows to THIS event's samples, drop the control's own PSI, and attach THIS
+  # event's PSI as the outcome column named after the control id (so 09-2's
+  # wflow_id token2 stays a distinct per-control label). `this_psi` must already
+  # be ordered to `this_uuids`.
+  load_control_features <- function(cid, this_uuids, this_psi) {
+    cdt <- data.table::fread(file.path(
+      feature_table_dir,
+      paste0("feature_table_", cid, ".csv.gz")
+    ))
+    cdt <- cdt[uuid %in% this_uuids]
+    cdt <- cdt[match(this_uuids, uuid)] # order to this event's samples
+    stopifnot(!anyNA(cdt$uuid), all(cdt$uuid == this_uuids))
+    if ("PSI" %in% names(cdt)) {
+      cdt[, PSI := NULL]
+    }
+    cdt[, (as.character(cid)) := this_psi]
+    cdt
+  }
 
   tryCatch(
     {
@@ -629,54 +716,8 @@ if (!interactive()) {
         paste0("feature_table_", this_id, ".csv.gz")
       ))
 
-      explanatory <- names(feature_data)[
-        !names(feature_data) %in%
-          c(
-            "IHEC",
-            "ID",
-            "Event Type",
-            "Variability",
-            "seqnames",
-            "gene_id",
-            "uuid",
-            "transcript_filter",
-            "project",
-            "harmonized_sample_ontology_term_high_order_fig1",
-            # §4.12b: 05 emits BOTH gene_expression_getmm + gene_expression_vst;
-            # event-specific models use vst (single-gene, cross-sample —
-            # matches 06/09-1 routing), getmm is the pooled splicing_ml copy —
-            # exclude it here so it isn't also fit as a second expression
-            # predictor alongside vst.
-            "gene_expression_getmm",
-            grouping_col,
-            response
-          )
-      ]
-      chromhmm_explanatory <- explanatory[grepl(
-        "chromhmm",
-        explanatory,
-        fixed = TRUE
-      )]
-
-      smaller_chromhmm_ids <- chromhmm_hits_smaller[
-        chromhmm_hits_smaller[, "queryHits"] ==
-          which(keep_rows_manual == this_id),
-        "subjectHits"
-      ]
-      old_chromhmm_explanatory <- chromhmm_explanatory[Reduce(
-        `&`,
-        lapply(sprintf("chromhmm_%d", smaller_chromhmm_ids), function(suff) {
-          !endsWith(chromhmm_explanatory, suff)
-        })
-      )]
-
-      explanatory_vars <- setNames(
-        list(
-          explanatory,
-          explanatory[!explanatory %in% old_chromhmm_explanatory],
-          explanatory[!explanatory %in% chromhmm_explanatory]
-        ),
-        feature_sets
+      explanatory_vars <- build_explanatory_vars(
+        feature_data, this_id, response
       )
 
       subset_psi_matrix <- psi_table[feature_data[, uuid], , drop = FALSE]
@@ -705,42 +746,75 @@ if (!interactive()) {
       stopifnot(
         rownames(subset_psi_matrix) == feature_data[, as.character(uuid)]
       )
-      set.seed(this_id)
+      set.seed(seed_base + this_id)
       print(glue::glue(
-        "Running event {this_id} with {this_rotations} rotations (out of {nrotations})..."
+        "Running event {this_id} with {this_rotations} FEATURE rotations (out of {nrotations})..."
       ))
-      rotated_psis <- subset_psi_matrix[, as.character(sample(
-        other_ids,
-        this_rotations
-      ))]
+      sampled_controls <- sample(other_ids, this_rotations)
 
-      rm(
-        psi_table,
-        subset_psi_matrix,
-        event_dt,
-        chromhmm_hits_smaller,
-        keep_rows_manual
-      )
+      this_uuids <- feature_data[, uuid]
+      this_psi <- feature_data[[response]] # aligned to this_uuids
+
+      rm(psi_table, subset_psi_matrix, event_dt)
       gc()
 
       parallel <- if (length(args) >= 3L) as.integer(args[3L]) else 1L
 
-      wrs <- run_event_glmnet(
-        this_feature_data = cbind(feature_data, rotated_psis),
-        explanatory_vars,
-        response,
-        rotated_psis,
-        grouping_col,
-        nfolds,
-        seed = this_id,
-        parallel = parallel,
-        cv_folds_path = file.path(
-          event_dir,
-          paste0(this_id, "_cv_folds.csv.gz")
-        )
+      # FEATURE rotation: fit THIS event's PSI against (real) its own feature
+      # matrix and (background) each matched control's REAL feature matrix on the
+      # same samples. Each is its own run_event_glmnet call (rotated_psis = NULL,
+      # single response); controls run as the OUTER pbmclapply to keep
+      # ~this_rotations-way parallelism (each call internally serial). Emitted
+      # wflow ids: "{fs}_PSI_glmnet" (real) + "{fs}_{control_id}_glmnet"
+      # (background), so 09-2's real-vs-rotated shape (1 real + N distinct-token
+      # rotated per feature_set) is preserved — only the null axis changed.
+      rotation_specs <- c(
+        list(list(cid = "PSI", is_real = TRUE)),
+        lapply(sampled_controls, function(cid) list(cid = cid, is_real = FALSE))
       )
-      rm(feature_data, rotated_psis, explanatory_vars)
+
+      wrs_list <- pbmcapply::pbmclapply(
+        rotation_specs,
+        function(spec) {
+          if (isTRUE(spec$is_real)) {
+            run_event_glmnet(
+              this_feature_data = feature_data,
+              explanatory_vars = explanatory_vars,
+              response = response,
+              rotated_psis = NULL,
+              grouping_col = grouping_col,
+              nfolds = nfolds,
+              seed = seed_base + this_id,
+              parallel = 1L,
+              cv_folds_path = file.path(
+                event_dir,
+                paste0(this_id, "_cv_folds.csv.gz")
+              )
+            )
+          } else {
+            cdt <- load_control_features(spec$cid, this_uuids, this_psi)
+            resp <- as.character(spec$cid)
+            run_event_glmnet(
+              this_feature_data = cdt,
+              explanatory_vars = build_explanatory_vars(cdt, spec$cid, resp),
+              response = resp,
+              rotated_psis = NULL,
+              grouping_col = grouping_col,
+              nfolds = nfolds,
+              seed = seed_base + this_id,
+              parallel = 1L,
+              cv_folds_path = NULL
+            )
+          }
+        },
+        mc.cores = parallel
+      )
+      rm(feature_data, explanatory_vars, chromhmm_hits_smaller, keep_rows_manual)
       gc()
+
+      # flatten the per-rotation result lists into one flat named workflow list
+      # (real -> 3 "{fs}_PSI_glmnet"; each control -> 3 "{fs}_{cid}_glmnet").
+      wrs <- unlist(wrs_list, recursive = FALSE)
 
       # Log any pbmclapply worker errors before writing CSVs.
       worker_errors <- Filter(
