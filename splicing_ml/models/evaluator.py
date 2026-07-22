@@ -120,6 +120,90 @@ def _compute_xgb_shap(
         return None
 
 
+def _compute_linear_shap(
+    best_estimator: Pipeline,
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    verbose: bool,
+    max_samples: int = 5000,
+) -> dict[str, Any] | None:
+    """Return per-test-sample SHAP values for a linear outer-fold model.
+
+    Detects any fitted sklearn linear model via `coef_`/`intercept_` (the
+    sklearn linear-model convention -- covers LogisticRegression, the
+    project's default classification model, and LinearRegression/ElasticNet
+    for regression) -- other model types return None. Uses `best_estimator`
+    (the tuned pre-calibration Pipeline), matching `_compute_xgb_shap`'s
+    convention.
+
+    Unlike TreeExplainer, `shap.LinearExplainer` needs a background sample to
+    account for feature correlation when attributing linear coefficients to
+    SHAP values -- drawn here from `x_train` (same "prep" transform), capped
+    small (200 rows) since background size drives this explainer's own cost,
+    unlike the test-side `max_samples` subsampling which mirrors
+    `_compute_xgb_shap`'s.
+    """
+    if not isinstance(best_estimator, Pipeline) or "model" not in best_estimator.named_steps:
+        return None
+    model = best_estimator.named_steps["model"]
+    if not (hasattr(model, "coef_") and hasattr(model, "intercept_")):
+        return None
+
+    try:
+        import time
+
+        import shap
+
+        n_test = len(x_test)
+        if max_samples > 0 and n_test > max_samples:
+            rng = np.random.default_rng(RNG_SEED)
+            sample_pos = np.sort(rng.choice(n_test, size=max_samples, replace=False))
+            x_shap = x_test.iloc[sample_pos]
+        else:
+            sample_pos = np.arange(n_test)
+            x_shap = x_test
+
+        prep = best_estimator.named_steps["prep"]
+        x_test_t = prep.transform(x_shap)
+        feature_names = (
+            list(prep.get_feature_names_out())
+            if hasattr(prep, "get_feature_names_out")
+            else None
+        )
+
+        n_train = len(x_train)
+        bg_size = min(n_train, 200)
+        bg_rng = np.random.default_rng(RNG_SEED)
+        bg_pos = bg_rng.choice(n_train, size=bg_size, replace=False)
+        x_background_t = prep.transform(x_train.iloc[bg_pos])
+
+        vlog(
+            verbose,
+            f"SHAP LinearExplainer starting: n_test={n_test}, n_sampled={len(x_test_t)}, "
+            f"background_n={bg_size}",
+            level="info",
+        )
+        t0 = time.monotonic()
+        explainer = shap.LinearExplainer(model, x_background_t)
+        shap_values = np.asarray(explainer.shap_values(x_test_t))
+        vlog(
+            verbose,
+            f"SHAP LinearExplainer done in {time.monotonic() - t0:.1f}s (n_sampled={len(x_test_t)})",
+            level="info",
+        )
+        return {
+            "shap_values": shap_values,
+            "feature_names": feature_names,
+            "sampled_test_indices": sample_pos,
+        }
+    except Exception as exc:
+        compact = (
+            str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+        )
+        vlog(verbose, f"Linear SHAP computation failed, skipping: {compact}", level="info")
+        return None
+
+
 def _compute_transformed_feature_sample(
     best_estimator: Pipeline,
     x_test: pd.DataFrame,
@@ -390,7 +474,8 @@ def _eval_classification(
         "y_true": y_test,
         "y_pred": y_prob,
         "estimator": final_estimator,
-        "shap": _compute_xgb_shap(best_estimator, x_test, verbose, shap_max_samples),
+        "shap": _compute_xgb_shap(best_estimator, x_test, verbose, shap_max_samples)
+        or _compute_linear_shap(best_estimator, x_train, x_test, verbose, shap_max_samples),
         "transformed_features": _compute_transformed_feature_sample(
             best_estimator, x_test, verbose, shap_max_samples
         ),
@@ -471,7 +556,8 @@ def _eval_regression(
         "y_pred_logit": y_pred_logit,
         "estimator": best_estimator,
         "psi_bin_metrics": psi_bin_metrics,
-        "shap": _compute_xgb_shap(best_estimator, x_test, verbose, shap_max_samples),
+        "shap": _compute_xgb_shap(best_estimator, x_test, verbose, shap_max_samples)
+        or _compute_linear_shap(best_estimator, x_train, x_test, verbose, shap_max_samples),
         "transformed_features": _compute_transformed_feature_sample(
             best_estimator, x_test, verbose, shap_max_samples
         ),

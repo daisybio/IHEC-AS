@@ -49,6 +49,7 @@ nrotations <- 10L # negative-control rotations per event
 feature_sets <- c("long", "short", "local") # explanatory-set names and dir suffixes
 
 source("09zz-ml-event-glmnet-tidymodels.R")
+tidymodels::tidymodels_prefer()
 
 # =============================================================================
 # Output directory
@@ -155,7 +156,7 @@ setkey(wgbs_chromhmm, name, IHEC)
 # note). A dropped event can have exactly 1 non-NA sample (sd undefined, not
 # all-NA), so the old all-NA stopifnot no longer holds — relaxed to <2 here,
 # checked against psi_long_dt (same 02-3 masking as aggregated_dt's source).
-.dropped_ids <- setdiff(keep_rows_manual, aggregated_dt[, unique(ID)])
+.dropped_ids <- base::setdiff(keep_rows_manual, aggregated_dt[, unique(ID)])
 .n_non_na <- psi_long_dt[ID %in% .dropped_ids & !is.na(psi), .N, by = ID]
 stopifnot(all(.n_non_na$N < 2L))
 
@@ -191,7 +192,7 @@ psi_table <- as.matrix(
   rownames = "uuid"
 )
 
-ids_to_build <- setdiff(ids_to_build, already_computed_ids)
+ids_to_build <- base::setdiff(ids_to_build, already_computed_ids)
 
 # =============================================================================
 # Build chip_matrix — rows = chromHMM regions, cols = ChIP-Seq files (cached)
@@ -329,7 +330,9 @@ pbmcapply::pbmclapply(ids_to_build, function(id) {
   # predictors (long/short/local); events with no nearby RBP add nothing.
   nearby <- rbp_per_event[ID == id, rbp]
   nearby_rbps <- if (length(nearby) == 1L) unlist(nearby[[1]]) else character(0)
-  rbp_cols <- intersect(paste0("rbp_", nearby_rbps), names(rbp_wide))
+  # base::intersect — `conflicted` is active (09zz attaches dplyr + GenomicRanges,
+  # both export intersect); bare intersect() errors inside the worker.
+  rbp_cols <- base::intersect(paste0("rbp_", nearby_rbps), names(rbp_wide))
   if (length(rbp_cols) > 0L) {
     feature_data[
       rbp_wide[, c("uuid", "transcript_filter", rbp_cols), with = FALSE],
@@ -409,7 +412,7 @@ saveRDS(.slurm_cfg, cfg_file)
 #   n_outer_cores — how many events run in parallel
 #   n_inner_cores — workflows parallelised within each event
 #                   (passed as 3rd CLI arg; SLURM always uses 1)
-n_local_test <- 0L # set > 0 to bypass sbatch
+n_local_test <- 10L # set > 0 to bypass sbatch
 n_outer_cores <- 5L
 n_inner_cores <- 11L
 

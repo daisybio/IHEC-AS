@@ -26,3 +26,31 @@ event_glmnet_logs
 old_*
 logs
 .snakemake
+
+# editor/OS cruft
+.DS_Store
+._.DS_Store
+.vdoc.*.r
+
+# Rmd render artifacts
+*_files/
+*_cache/
+
+# pipeline run outputs (regenerated, not source)
+qc/
+splicing_ml.output.*/
+splicing_ml/output_ablation/
+splicing_ml/output_legacy_*.tar.gz
+tmp/
+
+# stray tool state
+.future/
+.posit/
+untitled:*
+
+# misc generated/downloaded artifacts
+Rplots.pdf
+*.tar.gz
+*.log
+rmat_reference.csv.gz
+rmats_suppa.psi

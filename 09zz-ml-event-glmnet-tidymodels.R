@@ -13,6 +13,9 @@ suppressPackageStartupMessages({
 
 tidymodels::tidymodels_prefer()
 conflicted::conflicts_prefer(base::setdiff)
+# base::intersect over dplyr::/GenomicRanges:: (09-1 RBP-col join + control matching
+# use plain vector intersect). Set here since 09-1 source()s this file before Phase 1.
+conflicted::conflicts_prefer(base::intersect)
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +166,42 @@ conflicted::conflicts_prefer(base::setdiff)
 
 
 # Maps a character vector of ontology labels to biology-guided supergroup names.
-# Uses hierarchical clustering (average linkage) on path distances to form
-# exactly n_groups groups.  Unknown labels are assigned to "other".
+# Uses hierarchical clustering (average linkage) on path distances to form up
+# to n_groups groups. Unknown labels are assigned to "other".
+#
+# Clusters only the labels PRESENT in `ontology_vec` (not the full fixed
+# vocabulary in .ontology_bio_paths) -- fixed 2026-07-22. Clustering the full
+# 34-label universe every time is data-independent: this dataset's ontology
+# labels are majority blood/immune, and at the configured distances all 13
+# blood/immune leaves sit close enough together (subdomain gaps of 0.5) that
+# any k in [2,33] merges them into ONE cluster before the 21 non-blood labels
+# (whose germ-layer gaps are wider, 0.75) finish splitting -- so a blood-only
+# event always collapsed to 1 supergroup regardless of n_groups, which then
+# crashed rsample::group_vfold_cv(v=1) ("v must be >= 2"). Clustering only the
+# present labels lets blood's own lymphoid/myeloid/hematopoietic subdomains
+# split against each other instead of being swamped by irrelevant somatic/
+# developmental leaves that this event's samples don't even contain.
 .map_ontology_to_supergroups <- function(ontology_vec, n_groups = 5L) {
-  labels <- sort(names(.ontology_bio_paths))
+  norm_ont <- tolower(trimws(as.character(ontology_vec)))
+  labels <- sort(unique(norm_ont[norm_ont %in% names(.ontology_bio_paths)]))
   n <- length(labels)
-  stopifnot(n_groups >= 3L, n_groups <= n)
+
+  if (n == 0L) {
+    return(rep("other", length(norm_ont)))
+  }
+
+  effective_groups <- max(1L, min(n_groups, n))
+
+  if (n == 1L || effective_groups == 1L) {
+    # Nothing to split: either only one known label is present, or n_groups
+    # collapsed to 1 -- every known label falls in a single named group.
+    id_to_name <- setNames(
+      .cluster_name_from_paths(.ontology_bio_paths[labels], cluster_id = 1L),
+      "1"
+    )
+    mapped <- ifelse(norm_ont %in% labels, "1", NA_character_)
+    return(ifelse(is.na(mapped), "other", id_to_name[mapped]))
+  }
 
   dist_mat <- matrix(0.0, n, n, dimnames = list(labels, labels))
   for (i in seq_len(n - 1L)) {
@@ -184,7 +217,7 @@ conflicted::conflicts_prefer(base::setdiff)
 
   cluster_ids <- cutree(
     hclust(as.dist(dist_mat), method = "average"),
-    k = n_groups
+    k = effective_groups
   )
 
   # Name each cluster by its longest common path prefix
@@ -204,7 +237,6 @@ conflicted::conflicts_prefer(base::setdiff)
     character(1L)
   )
 
-  norm_ont <- tolower(trimws(as.character(ontology_vec)))
   mapped <- cluster_ids[norm_ont]
   ifelse(is.na(mapped), "other", id_to_name[as.character(mapped)])
 }
