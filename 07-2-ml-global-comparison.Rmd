@@ -1,0 +1,190 @@
+---
+title: "ML Global Comparison (splicing_ml)"
+output: html_document
+---
+
+Recreates the comparison originally made in `08-2-ml-global.Rmd` (caret-based RF/LASSO/OLS on
+`processed_data/global_models/*.rds`, matching the preprint's Fig 2B), but reads results from the
+current `splicing_ml` Python pipeline instead. `08-2-ml-global.Rmd`'s own data dependency
+(`processed_data/global_models/`) no longer exists on disk -- that notebook is a frozen historical
+record of the pre-rewrite approach, not something this one edits or replaces in place.
+
+Numbered `07` in anticipation of `splicing_ml/` eventually being renamed `07_splicing_ml/` (07 is
+currently the one unused slot in the 01-10 sequence, sitting exactly where this belongs: after
+`06-correlation`'s genome-wide association work, before `08-2`'s frozen old-approach comparison and
+`09`'s event-local models). `-2` mirrors `08-1`/`08-2`'s fit/analyze split -- the "07-1" equivalent
+is the `splicing_ml` package + its Snakemake rules themselves, not a single script.
+
+Known differences from the original Fig 2B, all deliberate (see conversation this notebook was
+written in for the full reasoning):
+
+- No "Chr & Cell" (both held out at once) condition -- that CV mode doesn't exist in the current
+  pipeline. Only the two that do (`seqnames`="Chr", `ontology`="Cell") are shown.
+- The ablation battery (feature-set breakdown) only ever ran with `group_col="seqnames"` (see
+  `Snakefile`: `wildcard_constraints: group_col = "seqnames"` on `splicing_ml_ablation_classification`
+  -- deliberately excludes `ontology`, known to leak event identity, see `CLAUDE.md` Known
+  Pitfalls). So the "Cell" x-position only ever has an "All features" point; the Non-Epigenetic/
+  Epigenetic lines simply don't reach it.
+- Every "Cell" (`ontology`) point is ringed in red: `group_col="ontology"` is confirmed (`CLAUDE.md`
+  Known Pitfalls) to leak event identity for tree models like xgb -- near-ceiling AUROC there is
+  not real generalization. Included for completeness, not to be read as a trustworthy number.
+
+```{r, setup}
+splicing_ml_root <- "splicing_ml"
+model <- "xgb" # single model for the feature-set comparison, matching the preprint's tree-based
+# (random forest) comparison in spirit -- xgb is this project's current default tree model (rf
+# itself is excluded from defaults, see CLAUDE.md "Default Models": "redundant with XGB; XGB
+# consistently outperforms it").
+
+metrics <- c("balanced_accuracy", "auroc", "auprc", "mcc")
+metric_labels <- c(
+  balanced_accuracy = "Balanced\nAccuracy", auroc = "AUROC", auprc = "AUPRC", mcc = "MCC"
+)
+variabilities <- c("High", "both", "Low")
+variability_labels <- c(High = "High", both = "All", Low = "Low") # matches variability_colors names
+group_cols <- c("seqnames", "ontology")
+group_col_labels <- c(seqnames = "Chr", ontology = "Cell")
+feature_sets <- list(
+  list(key = "all", label = "All"),
+  list(key = "sequence", label = "Non Epigenetic"),
+  list(key = "histone+dnam", label = "Epigenetic")
+)
+# Distinct from variability_colors (Low/All/High) so the two color legends never clash when both
+# appear near each other -- picked from the remaining unused Okabe-Ito colors.
+feature_colors <- c(
+  "All" = "#0072B2", "Non Epigenetic" = "#009E73", "Epigenetic" = "#CC79A7"
+)
+```
+
+```{r, load-results}
+# Deliberately read the small `reports/subset_report_*.json` payload (already
+# written by splicing_ml's reporting/payload.py for the HTML report), NOT the
+# raw `splicing_ml_results_classification.json.gz` next to it. The raw file
+# carries full per-fold diagnostics arrays (y_true/y_pred/shap/
+# transformed_features) -- confirmed real sizes 186MB-824MB *compressed* (RI/
+# High/seqnames, SE/Low/seqnames respectively), several GB uncompressed.
+# `jsonlite::fromJSON()` on that (even piping through `jq` first) measured out
+# to 60GB+ RAM and 30+ minutes for a single file just to read `model_name`/
+# `scores` -- unusable across the 24 files this notebook reads. The report
+# payload already has exactly what's needed: a fold-averaged
+# `metric_heatmap.z[model][metric]`, max 5.7MB even at SE scale, since
+# payload.py never puts the raw per-fold arrays in it. This is why the rule is
+# resourced at only 8GB/30min in config/snakemake_config.yaml.
+result_path <- function(event_type, variability, group_col, feature_key) {
+  subset_name <- sprintf("%s_biotype_filtered_%s_%s", event_type, variability, group_col)
+  dir <- if (feature_key == "all") {
+    file.path(splicing_ml_root, "output", subset_name)
+  } else {
+    file.path(splicing_ml_root, "output_ablation", feature_key, subset_name)
+  }
+  file.path(dir, "reports", sprintf("subset_report_%s.json", subset_name))
+}
+
+read_metric <- function(path, model, metric) {
+  # simplifyVector=FALSE: jsonlite's default auto-simplification turns a
+  # uniform numeric matrix like `z` (3 models x 5 metrics here) into a real R
+  # matrix rather than nested lists, silently breaking `z[[mi]][[ti]]`-style
+  # indexing (double-bracket on a matrix flattens to vector indexing instead
+  # of row/col lookup) -- confirmed via a real crash ("subscript out of
+  # bounds") that only triggered for ti > 1.
+  d <- jsonlite::fromJSON(path, simplifyVector = FALSE)[[1]]
+  mh <- d$metric_heatmap
+  mi <- match(model, unlist(mh$models))
+  ti <- match(metric, unlist(mh$metrics))
+  if (is.na(mi) || is.na(ti)) NA_real_ else as.numeric(mh$z[[mi]][[ti]])
+}
+
+rows <- list()
+missing_configs <- character(0)
+for (event_type in to_analyze) {
+  for (variability in variabilities) {
+    for (group_col in group_cols) {
+      for (fs in feature_sets) {
+        path <- result_path(event_type, variability, group_col, fs$key)
+        if (!file.exists(path)) {
+          missing_configs <- c(missing_configs, path)
+          next
+        }
+        for (metric in metrics) {
+          v <- read_metric(path, model, metric)
+          if (!is.na(v)) {
+            rows[[length(rows) + 1]] <- data.table::data.table(
+              `Event Type` = event_type, Variability = variability, `Group Col` = group_col,
+              Features = fs$label, Metric = metric, Value = v
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+if (length(missing_configs) > 0) {
+  message(sprintf(
+    "%d config(s) not yet available (plotted with gaps): \n%s",
+    length(missing_configs), paste(missing_configs, collapse = "\n")
+  ))
+}
+stopifnot("No splicing_ml result files found -- has splicing_ml_classification been run yet?" = length(rows) > 0)
+
+comparison_dt <- data.table::rbindlist(rows)
+comparison_dt[, `Test on` := factor(group_col_labels[`Group Col`], levels = group_col_labels[group_cols])]
+comparison_dt[, Variability := factor(variability_labels[Variability], levels = variability_labels[variabilities])]
+comparison_dt[, Measure := factor(metric_labels[Metric], levels = metric_labels[metrics])]
+comparison_dt[, Features := factor(Features, levels = vapply(feature_sets, function(f) f$label, character(1)))]
+comparison_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+```
+
+```{r, plot-comparison, fig.width=14, fig.height=9}
+# Ontology ("Cell") points: known event-identity CV leak for tree models -- ring in red so the
+# plot itself carries the caveat, not just this notebook's prose.
+leak_points <- comparison_dt[`Test on` == "Cell"]
+
+p <- ggplot(comparison_dt, aes(x = `Test on`, y = Value, color = Features, group = Features)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2) +
+  geom_point(
+    data = leak_points, aes(x = `Test on`, y = Value),
+    shape = 21, color = "red", fill = NA, size = 4.5, stroke = 1.1, inherit.aes = FALSE
+  ) +
+  ggh4x::facet_grid2(
+    Measure ~ `Event Type` + Variability,
+    scales = "free_y", strip = ggh4x::strip_nested()
+  ) +
+  scale_color_manual(values = feature_colors) +
+  labs(
+    x = "Test on Unseen Chromosome (Chr) or Cell Type (Cell)",
+    y = "Value",
+    title = sprintf("model=%s performance by held-out condition and feature set", model),
+    subtitle = paste0(
+      "Red-ringed points = group_col=\"ontology\" (\"Cell\") -- confirmed to leak event identity ",
+      "for tree models\n(CLAUDE.md Known Pitfalls); do not read as real generalization."
+    )
+  ) +
+  theme(legend.position = "bottom", plot.subtitle = element_text(size = 8, color = "gray30"))
+print(p)
+ggsave(filename = file.path(plot_dir, "07-2_ml_global_comparison.pdf"), plot = p, width = 14, height = 9)
+
+data.table::fwrite(comparison_dt, file.path(plot_dir, "07-2_ml_global_comparison_data.csv"))
+```
+
+```{r, upload-wandb}
+# No native R wandb client in this project -- shell out to a small standalone Python script
+# instead of adding a splicing_ml/*.py dependency here (that would sit inside SPLICING_ML_SRC and
+# retrigger every splicing_ml_classification/ablation Snakemake rule on next invocation).
+# Pushes the tidy comparison data as a native wandb Table + bar charts (built by wandb itself,
+# interactive/filterable in the UI) rather than uploading a static PNG -- avoids the PIL
+# dependency wandb.Image() needs (not installed in this project's env) and gives a richer result.
+wandb_upload_script <- "scripts/upload_comparison_to_wandb.py"
+csv_path <- file.path(plot_dir, "07-2_ml_global_comparison_data.csv")
+
+if (file.exists(wandb_upload_script)) {
+  status <- system2(
+    "mamba", c("run", "-n", "ihec-as", "python", wandb_upload_script, csv_path),
+    stdout = TRUE, stderr = TRUE
+  )
+  message(paste(status, collapse = "\n"))
+} else {
+  warning(sprintf("%s not found -- skipping W&B upload.", wandb_upload_script))
+}
+```
