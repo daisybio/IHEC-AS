@@ -238,6 +238,13 @@ resources:
     threads: 8 # UMAP itself hardcodes n_threads=2L; extra threads help the
     # CSV read + rsvd/data.table ops, not UMAP directly.
     gpu: 0
+  ml_global_comparison:
+    mem_mb: 8000 # only reads small per-fold JSON summaries (fold_results, no
+    # aggregated_dt), builds one ggplot -- an order of magnitude lighter than
+    # feature_pca_sanity/correlation above.
+    runtime: 30
+    threads: 1
+    gpu: 0
   splicing_ml_S: # RI + High/Low
     mem_mb: 32000
     runtime: 360

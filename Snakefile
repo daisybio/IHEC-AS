@@ -235,7 +235,11 @@ rule all:
         # Feature-group ablation battery (PRIMARY filter, seqnames only)
         [f"splicing_ml/output_ablation/{fg}/{et}_{PRIMARY}_{var}_seqnames/splicing_ml_results_{task}.pkl.gz"
          for fg, et, var in ABLATION_CONFIGS for task in ("classification", "regression")],
-        # Event-specific models (primary filter only — extend if needed)
+        # Fig2B-style comparison plot over the two batteries above (rule ml_global_comparison)
+        f"reports/07-2-ml-global-comparison_{PRIMARY}.html",
+        # Event-specific models (primary filter only — extend if needed):
+        # Tier-1 ridge-screen results + Tier-2 elastic-net on hits.
+        f"processed_data/event_models/{PRIMARY}/screen_results.csv.gz",
         f"processed_data/event_models/{PRIMARY}/.done",
         # QC / diagnostic notebooks (previously standalone-only; now part of
         # the default build per user direction 2026-07-14: "all should be all")
@@ -839,6 +843,57 @@ rule correlation:
         """
 
 
+# ── Step 07: splicing_ml Fig2B-style global comparison plot ───────────────────
+# Reads splicing_ml_classification's + splicing_ml_ablation_classification's own
+# JSON outputs (no aggregated_dt/large-data re-read) and recreates a comparison
+# close to the preprint's Fig 2B: model=xgb balanced_accuracy/AUROC/AUPRC/MCC by
+# held-out condition (Chr=seqnames, Cell=ontology -- no "Chr & Cell", that mode
+# doesn't exist in this pipeline) x feature set (All/Non-Epigenetic/Epigenetic,
+# from the ablation battery, seqnames only -- see ABLATION_CONFIGS above).
+# Numbered 07 (the one unused slot between 06-correlation and 08-2's frozen old
+# comparison) in anticipation of `splicing_ml/` eventually being renamed
+# `07_splicing_ml/`. Explicit input lists (not a glob) so Snakemake's DAG
+# correctly requires exactly the same 12+12 targets `rule all` already commits
+# to for splicing_ml_classification/splicing_ml_ablation_classification --
+# nothing extra is forced to build just for this plot.
+_ML_GLOBAL_COMPARISON_MAIN_JSONS = [
+    f"splicing_ml/output/{et}_{PRIMARY}_{var}_{gc}/splicing_ml_results_classification.json.gz"
+    for et in EVENT_TYPES for var in VARIABILITIES for gc in GROUP_COLS
+]
+_ML_GLOBAL_COMPARISON_ABLATION_JSONS = [
+    f"splicing_ml/output_ablation/{fg}/{et}_{PRIMARY}_{var}_seqnames/splicing_ml_results_classification.json.gz"
+    for fg, et, var in ABLATION_CONFIGS
+]
+
+rule ml_global_comparison:
+    input:
+        rmd      = "07-2-ml-global-comparison.Rmd",
+        wandb_py = "scripts/upload_comparison_to_wandb.py",
+        main_jsons     = _ML_GLOBAL_COMPARISON_MAIN_JSONS,
+        ablation_jsons = _ML_GLOBAL_COMPARISON_ABLATION_JSONS,
+    output:
+        html = f"reports/07-2-ml-global-comparison_{PRIMARY}.html",
+        pdf  = "images/Rplots/07-2_ml_global_comparison.pdf",
+        csv  = "images/Rplots/07-2_ml_global_comparison_data.csv",
+    log: f"logs/07_2_ml_global_comparison_{PRIMARY}.log"
+    threads: R("ml_global_comparison", "threads")
+    resources:
+        mem_mb          = R("ml_global_comparison", "mem_mb"),
+        runtime         = R("ml_global_comparison", "runtime"),
+        slurm_partition = _partition("ml_global_comparison"),
+        slurm_extra     = _extra("ml_global_comparison"),
+        qos             = _qos("ml_global_comparison"),
+        gres            = _gres("ml_global_comparison"),
+    params:
+        wandb_login = wandb_login_cmd(),
+    shell:
+        f"""
+        {{params.wandb_login}}Rscript -e "rmarkdown::render('07-2-ml-global-comparison.Rmd',
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
+        """
+
+
 # ── Step 08: splicing_ml global models ────────────────────────────────────────
 # Split into classification/regression rules (2026-07-14) so the two tasks run as
 # independent, parallelizable SLURM jobs instead of serially inside one job --
@@ -1024,11 +1079,24 @@ rule splicing_ml_ablation_regression:
         """
 
 
-# ── Step 09-1: event-specific glmnet models ───────────────────────────────────
-rule event_models:
+# ── Event-specific models: build → Tier-1 ridge screen → aggregate → Tier-2 EN ─
+# Two-tier redesign (2026-07-22). Tier-1 (09s-*) is a fit-free closed-form ridge
+# screen that decides significance for ALL events cheaply (feature-rotation null
+# → qvalue FDR). Tier-2 (09-1 → 09zz elastic-net) runs ONLY on screen hits, real
+# PSI, for feature interpretation. DAG:
+#   build_feature_tables → event_screen → screen_aggregate → event_models
+# NOTE on async SLURM arrays (same fire-and-forget convention as the rest of this
+# pipeline): `event_screen` and `event_models` SUBMIT arrays and return; the
+# per-event work runs afterwards. Run `screen_aggregate` only after the screen
+# array has finished (it warns if per-event files are incomplete), and re-run
+# `ml_analysis` only after the elastic-net array has finished.
+
+# ── Step 09-1a: build per-event feature tables (Phase 1, build-only) ───────────
+rule build_feature_tables:
     input:
         script           = "09-1-ml-local.R",
         local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
+        shared           = "09-ml-shared.R",
         aggregated_dt    = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
         keep_rows_manual = "processed_data/keep_rows_manual_{transcript_filter}.rds",
         sample_cols      = "processed_data/sample_cols_{transcript_filter}.rds",
@@ -1039,12 +1107,101 @@ rule event_models:
         chromhmm_hits    = "processed_data/chromhmm_hits_{transcript_filter}.rds",
         wgbs             = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
         file_table       = "processed_data/file_table.csv.gz",
-        # RBP Step 4 (§3.4): wide per-RBP expression + nearby-RBP map, joined
-        # per event into the feature tables (09-1 Phase 1).
         rbp_wide         = "processed_data/rbp_wide_expression_{transcript_filter}.csv.gz",
         rbp_per_event    = "processed_data/rbp_per_event_{transcript_filter}.rds",
     output:
         session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+        all_ids = "processed_data/event_glmnet_all_ids_{transcript_filter}.txt",
+        cfg     = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+    log: "logs/09_1a_build_feature_tables_{transcript_filter}.log"
+    threads: R("event_models", "threads")
+    resources:
+        mem_mb          = R("event_models", "mem_mb"),
+        runtime         = R("event_models", "runtime"),
+        slurm_partition = _partition("event_models"),
+        slurm_extra     = _extra("event_models"),
+        qos             = _qos("event_models"),
+        gres            = _gres("event_models"),
+    shell:
+        """
+        EPIATLAS_AS_ML_PHASE=build \
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript 09-1-ml-local.R > {log} 2>&1
+        """
+
+# ── Step 09s: Tier-1 fit-free ridge screen (fires SLURM array over all events) ─
+rule event_screen:
+    input:
+        dispatch = "09s-dispatch.R",
+        screen   = "09s-ridge-screen.R",
+        shared   = "09-ml-shared.R",
+        array_sh = "09s-ridge-screen-array.sh",
+        cfg      = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        all_ids  = "processed_data/event_glmnet_all_ids_{transcript_filter}.txt",
+        session  = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+    output:
+        dispatched = touch("processed_data/event_models/{transcript_filter}/.screen_dispatched"),
+    log: "logs/09s_event_screen_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        Rscript 09s-dispatch.R {input.cfg} > {log} 2>&1
+        """
+
+# ── Step 09s: aggregate the screen → qvalues + Tier-1 hit list ────────────────
+# Run only after the event_screen SLURM array has FINISHED (guarded: warns on
+# incomplete per-event files). Produces the hit list the elastic-net runs on.
+rule screen_aggregate:
+    input:
+        aggregate  = "09s-aggregate.R",
+        cfg        = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        dispatched = "processed_data/event_models/{transcript_filter}/.screen_dispatched",
+    output:
+        results = "processed_data/event_models/{transcript_filter}/screen_results.csv.gz",
+        hits    = "processed_data/event_models/{transcript_filter}/tier1_hits_{transcript_filter}.txt",
+    log: "logs/09s_screen_aggregate_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        Rscript 09s-aggregate.R {input.cfg} > {log} 2>&1
+        """
+
+# ── Step 09-1: Tier-2 elastic-net on screen hits (fires SLURM array) ──────────
+rule event_models:
+    input:
+        script           = "09-1-ml-local.R",
+        local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
+        shared           = "09-ml-shared.R",
+        hits             = "processed_data/event_models/{transcript_filter}/tier1_hits_{transcript_filter}.txt",
+        session          = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+        cfg              = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        aggregated_dt    = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        keep_rows_manual = "processed_data/keep_rows_manual_{transcript_filter}.rds",
+        sample_cols      = "processed_data/sample_cols_{transcript_filter}.rds",
+        event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        psi_long_dt      = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
+        event_gr         = "processed_data/event_gr_{transcript_filter}.rds",
+        active_chromhmm  = "processed_data/activeChromHMM_{transcript_filter}.rds",
+        chromhmm_hits    = "processed_data/chromhmm_hits_{transcript_filter}.rds",
+        wgbs             = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
+        file_table       = "processed_data/file_table.csv.gz",
+        rbp_wide         = "processed_data/rbp_wide_expression_{transcript_filter}.csv.gz",
+        rbp_per_event    = "processed_data/rbp_per_event_{transcript_filter}.rds",
+    output:
         done    = touch("processed_data/event_models/{transcript_filter}/.done"),
     log: "logs/09_1_event_models_{transcript_filter}.log"
     threads: R("event_models", "threads")
@@ -1069,6 +1226,7 @@ rule ml_analysis:
         session         = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
         active_chromhmm = f"processed_data/activeChromHMM_{PRIMARY}.rds",
         event_models    = f"processed_data/event_models/{PRIMARY}/.done",
+        screen_results  = f"processed_data/event_models/{PRIMARY}/screen_results.csv.gz",
         rmd             = "09-2-ml-local-new.Rmd",
         # global model results (all configs for primary filter)
         splicing_ml = [
@@ -1135,6 +1293,9 @@ rule clean:
         rm -f processed_data/correlation_intrinsic_preproc_*.csv.gz
         rm -rf processed_data/event_models/*/
         rm -rf processed_data/session_09_1_ml_local_*.rds
+        rm -f processed_data/event_glmnet_all_ids_*.txt
+        rm -f processed_data/event_glmnet_cfg_*.rds
+        rm -f processed_data/event_glmnet_ids_*.txt
         rm -rf reports/
         echo "Cleaned outputs. Upstream steps (01-04) preserved."
         """
