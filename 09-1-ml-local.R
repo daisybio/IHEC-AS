@@ -45,7 +45,11 @@ rbp_per_event <- readRDS(sprintf("processed_data/rbp_per_event_%s.rds", tf))
 response <- "PSI"
 grouping_col <- "ontology" # CV fold grouping column
 nfolds <- 5L # number of CV folds = ontology supergroups
-nrotations <- 10L # negative-control rotations per event
+# Tier-2 elastic-net no longer runs its own rotation null — significance is now
+# owned by the Tier-1 fit-free ridge screen (09s-ridge-screen.R). 09zz fits the
+# real PSI only, so nrotations = 0 here (belt-and-suspenders alongside 09zz's
+# stripped rotation loop). Screen rotation count is separate (cfg$screen_rotations).
+nrotations <- 0L
 feature_sets <- c("long", "short", "local") # explanatory-set names and dir suffixes
 
 source("09zz-ml-event-glmnet-tidymodels.R")
@@ -191,6 +195,11 @@ psi_table <- as.matrix(
   ),
   rownames = "uuid"
 )
+
+# Full modelable id set (min-samples + non-constant-PSI filtered) — the Tier-1
+# ridge screen runs on ALL of these; written to disk below for 09s-dispatch.R.
+# (Kept before the already-computed setdiff so the screen covers every event.)
+all_modelable_ids <- ids_to_build
 
 ids_to_build <- base::setdiff(ids_to_build, already_computed_ids)
 
@@ -386,6 +395,10 @@ saveRDS(
   grouping_col = grouping_col,
   nfolds = nfolds,
   nrotations = nrotations,
+  # Tier-1 ridge-screen rotation count (feature-rotation controls per event);
+  # cheap → a few hundred gives an empirical-p floor ≈ 1/(R+1). Consumed by
+  # 09s-ridge-screen.R, not by the elastic-net.
+  screen_rotations = getOption("EpiATLAS_AS_SCREEN_ROTATIONS", 200L),
   # §4.9: thread the global seed to the array workers (09zz uses seed_base +
   # this_id per event; falls back to the option if this field is absent).
   seed = getOption("EpiATLAS_AS_SEED", 42L)
@@ -398,26 +411,71 @@ ids_file <- normalizePath(
   file.path("processed_data", sprintf("event_glmnet_ids_%s.txt", tf)),
   mustWork = FALSE
 )
+all_ids_file <- normalizePath(
+  file.path("processed_data", sprintf("event_glmnet_all_ids_%s.txt", tf)),
+  mustWork = FALSE
+)
 cfg_file <- normalizePath(
   file.path("processed_data", sprintf("event_glmnet_cfg_%s.rds", tf)),
   mustWork = FALSE
 )
-writeLines(as.character(ids_to_build), ids_file)
+# All modelable events → the Tier-1 ridge screen (09s-dispatch.R fires an array
+# over these; the screen has its own per-event idempotency).
+writeLines(as.character(all_modelable_ids), all_ids_file)
 saveRDS(.slurm_cfg, cfg_file)
 
+# Snakemake `build_feature_tables` runs this with EPIATLAS_AS_ML_PHASE=build to
+# stop here (feature tables + session + cfg + all-events id list produced), so
+# the build stays a distinct DAG step ahead of the screen. `event_models` runs
+# it with no phase set → falls through to the hits-gated elastic-net dispatch.
+if (identical(Sys.getenv("EPIATLAS_AS_ML_PHASE"), "build")) {
+  message(
+    "Build-only phase — feature tables + session + cfg + all_ids written; ",
+    "skipping elastic-net dispatch."
+  )
+  quit(save = "no", status = 0L)
+}
+
 # =============================================================================
-# Phase 2 dispatch: local test OR SLURM array
+# Phase 2 dispatch — Tier-2 elastic-net, HITS ONLY
 # =============================================================================
+# The EN interpreter runs only on events the Tier-1 ridge screen flagged
+# (q < threshold, effect > 0), listed in tier1_hits_<tf>.txt by 09s-aggregate.R.
+# Until that file exists (screen not run yet) this invocation is BUILD-ONLY:
+# feature tables + session + cfg + all-events id list are produced and no EN is
+# dispatched — so `rule build_feature_tables` and `rule event_models` can both
+# just run this script (build is idempotent; EN fires once hits exist).
+hits_file <- file.path(event_dir, sprintf("tier1_hits_%s.txt", tf))
+if (!file.exists(hits_file)) {
+  message(
+    "Build complete. No Tier-1 hits file yet (", hits_file, ") — run the ridge ",
+    "screen + aggregate (09s-dispatch.R) first, then re-run this to dispatch ",
+    "the elastic-net on hits."
+  )
+  quit(save = "no", status = 0L)
+}
+hit_ids <- as.integer(readLines(hits_file))
+ids_for_en <- base::intersect(ids_to_build, hit_ids)
+writeLines(as.character(ids_for_en), ids_file)
+message(sprintf(
+  "Tier-1 hits: %d total; %d not-yet-computed → dispatching EN on %d events",
+  length(hit_ids), length(ids_for_en), length(ids_for_en)
+))
+if (length(ids_for_en) == 0L) {
+  message("Nothing to dispatch (all hits already computed).")
+  quit(save = "no", status = 0L)
+}
+
 # Set n_local_test > 0 to run a small subset locally instead of sbatch.
 #   n_outer_cores — how many events run in parallel
 #   n_inner_cores — workflows parallelised within each event
 #                   (passed as 3rd CLI arg; SLURM always uses 1)
-n_local_test <- 10L # set > 0 to bypass sbatch
+n_local_test <- 0L # set > 0 to bypass sbatch
 n_outer_cores <- 5L
 n_inner_cores <- 11L
 
 if (n_local_test > 0L) {
-  test_ids <- head(ids_to_build, n_local_test)
+  test_ids <- head(ids_for_en, n_local_test)
   message(sprintf(
     "Local test: %d events, %d outer x %d inner cores",
     length(test_ids),
@@ -445,10 +503,10 @@ if (n_local_test > 0L) {
   )
   message("Local test runs complete.")
 } else {
-  n <- length(ids_to_build)
+  n <- length(ids_for_en)
   system(sprintf(
     'sbatch --array=0-%d%%20 "%s" "%s" "%s" "%s"',
-    1000, #n - 1L,
+    n - 1L,
     normalizePath("09-1-ml-local-array.sh"),
     ids_file,
     cfg_file,

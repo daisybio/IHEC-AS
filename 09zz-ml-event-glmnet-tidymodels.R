@@ -341,6 +341,66 @@ run_event_glmnet <- function(
     data.table::fwrite(cv_folds_dt, cv_folds_path)
   }
 
+  # -- Nominal-predictor level fixing -----------------------------------------
+  # Cast every nominal (character) predictor to a factor whose levels come from
+  # the FULL event data, ONCE, before any CV split. R factor subsetting keeps the
+  # parent's full `levels`, so a per-fold training split that happens to contain
+  # only one observed value (e.g. all `observed` for a mark's `H3K*_source` flag,
+  # or a single `protocol`) still carries every level. Without this, `step_dummy()`
+  # aborts at bake with "Only one factor level in <col>" on that fold — which,
+  # under the outer pbmclapply's silent try(), sank every workflow for such an
+  # event with no error in the logs (found via the 2026-07-22 event_models smoke).
+  # Mirrors splicing_ml's "OHE categories from the full dataset, not per-fold"
+  # rule. NA stays NA (→ all-zero dummy, unchanged behaviour). Restricted to
+  # actual predictors so id/meta character cols (uuid, gene_id, …) — which are
+  # role="misc" and step_rm'd before step_dummy anyway — aren't needlessly cast.
+  predictor_cols <- base::intersect(
+    unique(unlist(explanatory_vars, use.names = FALSE)),
+    names(this_feature_data)
+  )
+  nominal_predictors <- predictor_cols[vapply(
+    predictor_cols,
+    function(cc) is.character(this_feature_data[[cc]]),
+    logical(1)
+  )]
+  if (length(nominal_predictors) > 0L) {
+    this_feature_data[,
+      (nominal_predictors) := lapply(.SD, factor),
+      .SDcols = nominal_predictors
+    ]
+  }
+
+  # Drop GLOBALLY-constant nominal predictors (single level across the whole
+  # event) — the cast above only rescues per-fold-single-but-globally-multi
+  # columns; a column that is constant across every sample (e.g. an event whose
+  # `H3K4me3_source` is `observed` for all samples) has just one level, still
+  # trips `step_dummy`, and carries zero information anyway. Remove it from the
+  # explanatory sets so it is never promoted to predictor (role stays "misc" →
+  # step_rm'd before step_dummy). Note whether `protocol` survives: if protocol
+  # is itself constant it gets dropped here, and its interaction term below must
+  # be omitted (a constant-protocol × gene_expression_vst interaction is just a
+  # rescaled gene_expression_vst, which is already a main-effect predictor —
+  # no information lost).
+  constant_nominals <- nominal_predictors[vapply(
+    nominal_predictors,
+    function(cc) nlevels(this_feature_data[[cc]]) < 2L,
+    logical(1)
+  )]
+  if (length(constant_nominals) > 0L) {
+    message(sprintf(
+      "Event %s: dropping %d globally-constant nominal predictor(s): %s",
+      this_feature_data[["ID"]][[1L]],
+      length(constant_nominals),
+      paste(constant_nominals, collapse = ", ")
+    ))
+    explanatory_vars <- lapply(
+      explanatory_vars,
+      function(v) base::setdiff(v, constant_nominals)
+    )
+  }
+  protocol_varies <- "protocol" %in%
+    unique(unlist(explanatory_vars, use.names = FALSE))
+
   # -- Recipes ----------------------------------------------------------------
   # One base recipe per response (primary PSI + rotated PSI columns), then one
   # variant per explanatory set.
@@ -360,9 +420,10 @@ run_event_glmnet <- function(
   )
 
   # For each (response, explanatory set) pair: promote predictors, impute,
-  # drop zero-variance columns, dummy-encode nominals, and add
-  # protocol × gene_expression_vst interaction terms. (§4.12b: 05 no longer
-  # emits a bare `gene_expression` column.)
+  # dummy-encode nominals, add the protocol × gene_expression_vst interaction
+  # (only when protocol actually varies — see protocol_varies above), and drop
+  # zero-variance columns. (§4.12b: 05 no longer emits a bare `gene_expression`
+  # column.)
   explanatory_recipe_list <- unlist(
     sapply(
       explanatory_vars,
@@ -370,15 +431,22 @@ run_event_glmnet <- function(
         sapply(
           base_recipes,
           function(base_recipe) {
-            base_recipe |>
+            rec <- base_recipe |>
               update_role(all_of(var), new_role = "predictor") |>
               step_rm(has_role("misc")) |>
               step_impute_mean(all_numeric_predictors()) |>
-              step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
-              step_interact(
-                terms = ~ starts_with("protocol"):gene_expression_vst
-              ) |>
-              step_zv(all_predictors())
+              step_dummy(all_nominal_predictors(), one_hot = TRUE)
+            # Skip the interaction entirely for constant-protocol events — the
+            # protocol column was dropped above, so starts_with("protocol")
+            # would select nothing, and the interaction would be redundant with
+            # the gene_expression_vst main effect regardless.
+            if (protocol_varies) {
+              rec <- rec |>
+                step_interact(
+                  terms = ~ starts_with("protocol"):gene_expression_vst
+                )
+            }
+            rec |> step_zv(all_predictors())
           },
           simplify = FALSE
         )
@@ -639,8 +707,8 @@ if (!interactive()) {
   setwd(cfg$project_dir)
 
   sess <- readRDS(cfg$session_rds)
-  psi_table <- sess$psi_table
-  event_dt <- sess$event_dt
+  # psi_table / event_dt were only used for rotation-control matching, now owned
+  # by the Tier-1 screen — Tier-2 needs only the chromHMM-vicinity objects.
   chromhmm_hits_smaller <- sess$chromhmm_hits_smaller
   keep_rows_manual <- sess$keep_rows_manual
   rm(sess)
@@ -721,26 +789,6 @@ if (!interactive()) {
     )
   }
 
-  # FEATURE-rotation control loader: read a control event's feature table, align
-  # its rows to THIS event's samples, drop the control's own PSI, and attach THIS
-  # event's PSI as the outcome column named after the control id (so 09-2's
-  # wflow_id token2 stays a distinct per-control label). `this_psi` must already
-  # be ordered to `this_uuids`.
-  load_control_features <- function(cid, this_uuids, this_psi) {
-    cdt <- data.table::fread(file.path(
-      feature_table_dir,
-      paste0("feature_table_", cid, ".csv.gz")
-    ))
-    cdt <- cdt[uuid %in% this_uuids]
-    cdt <- cdt[match(this_uuids, uuid)] # order to this event's samples
-    stopifnot(!anyNA(cdt$uuid), all(cdt$uuid == this_uuids))
-    if ("PSI" %in% names(cdt)) {
-      cdt[, PSI := NULL]
-    }
-    cdt[, (as.character(cid)) := this_psi]
-    cdt
-  }
-
   tryCatch(
     {
       feature_data <- data.table::fread(file.path(
@@ -752,101 +800,73 @@ if (!interactive()) {
         feature_data, this_id, response
       )
 
-      subset_psi_matrix <- psi_table[feature_data[, uuid], , drop = FALSE]
-      other_ids <- as.integer(colnames(subset_psi_matrix)[
-        colSums(is.na(subset_psi_matrix)) == 0 &
-          apply(subset_psi_matrix, 2, sd, na.rm = TRUE) > 0
-      ])
-      this_event <- event_dt[ID == this_id]
-      other_ids <- other_ids[
-        other_ids != this_id &
-          other_ids %in% event_dt[`Event Type` == this_event$`Event Type`, ID] &
-          other_ids %in% event_dt[seqnames != this_event$seqnames, ID] &
-          other_ids %in% event_dt[Variability == this_event$Variability, ID] &
-          other_ids %in%
-            event_dt[transcript_filter == this_event$transcript_filter, ID]
-      ]
-
-      this_rotations <- min(nrotations, length(other_ids))
-      if (this_rotations < nrotations) {
-        warning(sprintf(
-          "Not enough rotation controls for %d, using %d",
-          this_id,
-          this_rotations
-        ))
-      }
-      stopifnot(
-        rownames(subset_psi_matrix) == feature_data[, as.character(uuid)]
+      # Event-level skip: require the full `nfolds` distinct ontology supergroups
+      # (2026-07-22). An event whose present ontology labels cluster into fewer
+      # than nfolds biology supergroups cannot support an nfolds-way grouped CV.
+      # Rather than silently reduce the fold count and fit an underpowered model
+      # — or crash on the degenerate columns such low-diversity events tend to
+      # carry (globally-constant `H3K*_source`, all-NA-in-fold numeric marks) —
+      # skip the whole event with a logged reason. Ontology is a per-sample
+      # property, so this one check is authoritative for the event. A stub
+      # `_all_metrics` is still written so 09-1's already_computed glob does not
+      # re-dispatch it, plus a `_skipped` marker recording why.
+      event_supergroups <- .map_ontology_to_supergroups(
+        feature_data[[grouping_col]],
+        n_groups = nfolds
       )
-      set.seed(seed_base + this_id)
-      print(glue::glue(
-        "Running event {this_id} with {this_rotations} FEATURE rotations (out of {nrotations})..."
-      ))
-      sampled_controls <- sample(other_ids, this_rotations)
-
-      this_uuids <- feature_data[, uuid]
-      this_psi <- feature_data[[response]] # aligned to this_uuids
-
-      rm(psi_table, subset_psi_matrix, event_dt)
-      gc()
+      n_surviving_groups <- length(unique(event_supergroups))
+      if (n_surviving_groups < nfolds) {
+        message(sprintf(
+          paste0(
+            "SKIP event %d: only %d ontology supergroup(s) survive (need %d) ",
+            "-- too few for %d-fold biology-grouped CV"
+          ),
+          this_id, n_surviving_groups, nfolds, nfolds
+        ))
+        data.table::fwrite(
+          data.table::data.table(
+            ID = this_id,
+            skipped = TRUE,
+            reason = "insufficient_ontology_supergroups",
+            n_supergroups = n_surviving_groups,
+            required = nfolds
+          ),
+          file.path(event_dir, paste0(this_id, "_skipped.csv.gz"))
+        )
+        # sentinel: keeps 09-1 from re-dispatching (already_computed globs this)
+        data.table::fwrite(
+          data.table::data.table(ID = this_id),
+          file.path(event_dir, paste0(this_id, "_all_metrics.csv.gz"))
+        )
+        quit(save = "no", status = 0)
+      }
 
       parallel <- if (length(args) >= 3L) as.integer(args[3L]) else 1L
+      set.seed(seed_base + this_id)
+      print(glue::glue(
+        "Fitting event {this_id} (real PSI only; Tier-2 interpretation)..."
+      ))
 
-      # FEATURE rotation: fit THIS event's PSI against (real) its own feature
-      # matrix and (background) each matched control's REAL feature matrix on the
-      # same samples. Each is its own run_event_glmnet call (rotated_psis = NULL,
-      # single response); controls run as the OUTER pbmclapply to keep
-      # ~this_rotations-way parallelism (each call internally serial). Emitted
-      # wflow ids: "{fs}_PSI_glmnet" (real) + "{fs}_{control_id}_glmnet"
-      # (background), so 09-2's real-vs-rotated shape (1 real + N distinct-token
-      # rotated per feature_set) is preserved — only the null axis changed.
-      rotation_specs <- c(
-        list(list(cid = "PSI", is_real = TRUE)),
-        lapply(sampled_controls, function(cid) list(cid = cid, is_real = FALSE))
-      )
-
-      wrs_list <- pbmcapply::pbmclapply(
-        rotation_specs,
-        function(spec) {
-          if (isTRUE(spec$is_real)) {
-            run_event_glmnet(
-              this_feature_data = feature_data,
-              explanatory_vars = explanatory_vars,
-              response = response,
-              rotated_psis = NULL,
-              grouping_col = grouping_col,
-              nfolds = nfolds,
-              seed = seed_base + this_id,
-              parallel = 1L,
-              cv_folds_path = file.path(
-                event_dir,
-                paste0(this_id, "_cv_folds.csv.gz")
-              )
-            )
-          } else {
-            cdt <- load_control_features(spec$cid, this_uuids, this_psi)
-            resp <- as.character(spec$cid)
-            run_event_glmnet(
-              this_feature_data = cdt,
-              explanatory_vars = build_explanatory_vars(cdt, spec$cid, resp),
-              response = resp,
-              rotated_psis = NULL,
-              grouping_col = grouping_col,
-              nfolds = nfolds,
-              seed = seed_base + this_id,
-              parallel = 1L,
-              cv_folds_path = NULL
-            )
-          }
-        },
-        mc.cores = parallel
+      # Tier-2 interpretation: fit THIS event's real PSI on its own feature
+      # matrix, across the long/short/local sets. Significance ("is this event
+      # epigenetically predictable?") is decided upstream by the Tier-1 fit-free
+      # ridge screen (09s-ridge-screen.R) — 09zz only runs on screen HITS, so
+      # there is no rotation null here. Every wflow_id is "{fs}_PSI_glmnet"
+      # (response_type == "real"); the parallelism is now across the 3 feature
+      # sets inside run_event_glmnet (mc.cores = parallel).
+      wrs <- run_event_glmnet(
+        this_feature_data = feature_data,
+        explanatory_vars = explanatory_vars,
+        response = response,
+        rotated_psis = NULL,
+        grouping_col = grouping_col,
+        nfolds = nfolds,
+        seed = seed_base + this_id,
+        parallel = parallel,
+        cv_folds_path = file.path(event_dir, paste0(this_id, "_cv_folds.csv.gz"))
       )
       rm(feature_data, explanatory_vars, chromhmm_hits_smaller, keep_rows_manual)
       gc()
-
-      # flatten the per-rotation result lists into one flat named workflow list
-      # (real -> 3 "{fs}_PSI_glmnet"; each control -> 3 "{fs}_{cid}_glmnet").
-      wrs <- unlist(wrs_list, recursive = FALSE)
 
       # Log any pbmclapply worker errors before writing CSVs.
       worker_errors <- Filter(
