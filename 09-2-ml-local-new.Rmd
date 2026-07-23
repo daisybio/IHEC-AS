@@ -64,6 +64,17 @@ read_event_csvs <- function(pattern) {
   rbindlist(pbmclapply(files, fread), fill = TRUE)
 }
 
+# Tier-1 ridge-screen results — significance (is the event epigenetically
+# predictable beyond confounds?) is now decided HERE, not by the elastic-net
+# rotation test. One row per event: screen_R2/CCC, matched feature-rotation null
+# summary, empirical p, effect (= real − null mean), and FDR q. `sig := q < 0.1`
+# drives every downstream significance split. The 6 per-event elastic-net tables
+# below are HITS-ONLY (Tier-2) and all response_type == "real".
+screen_dt <- fread(file.path(event_dir, "screen_results.csv.gz"))
+screen_dt[, ID := as.integer(ID)]
+screen_q_threshold <- 0.1
+screen_dt[, sig := is.finite(q) & q < screen_q_threshold & is.finite(effect) & effect > 0]
+
 # Best hyperparameters per (event, workflow)
 best_params_table <- read_event_csvs("^\\d+_best_params\\.csv\\.gz$")
 best_params_table[, ID := as.integer(ID)]
@@ -577,13 +588,13 @@ ggplot(
 ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 10, height = 3)
 ```
 
-## 2. Rotation test: does epigenetic signal exceed chance?
+## 2. Tier-1 ridge screen: does epigenetic signal exceed chance?
 
-The core question: does a model trained on real PSI outperform 10 models trained on unrelated (rotated) PSI values? Three complementary tests are applied:
+Significance is decided by the **Tier-1 fit-free ridge screen** (`09s-ridge-screen.R` → `screen_results.csv.gz`), run on *every* event, not by the elastic-net. For each event it computes a closed-form group-leave-one-ontology-out ridge **partial-R²** (epigenetics beyond protocol/expression/TSS) and tests it against a **matched feature-rotation null** (hundreds of unrelated control loci, each a cheap closed-form re-fit) → empirical p → FDR **q**. An event is significant when **q < threshold AND effect > 0**, where `effect = real R² − mean(null R²)`.
 
-1. **Real R² (diagnostic)** — compares in-sample vs CV R²; the gap quantifies overfitting. All rotation testing uses CV R² only.
-2. **Empirical p-value** — fraction of rotated controls with R² ≥ real model R² (plus 1 pseudo-count). With 10 rotations, minimum achievable p = 1/11 ≈ 0.091; conventional p < 0.05 requires ≥ 19 rotations.
-3. **t-statistic** — standardised distance of real R² from the rotated distribution: t = (real − mean(rotated)) / (SD(rotated) / √n). Accounts for variation in how spread out the rotated null is per event.
+Key point (fingerprint unmasking): **high raw R² is not sufficient**. Cell-type-fingerprint events have high R² but `effect ≈ 0` — a *random* control locus's chromatin predicts their PSI just as well, because both track cell-type identity. Only `effect > 0 & q < threshold` events carry genuinely event-specific epigenetic signal. The elastic-net below (Tier 2) then runs **only on these hits**, real PSI only, for feature interpretation.
+
+Plot 1 (real in-sample vs CV R²) is retained as an overfitting diagnostic; Plots 2–3 show the screen's p-value distribution and the effect-vs-R² unmasking.
 
 ```{r paired-rotation-analysis}
 # Defensive re-assignment (already set in build chunks)
@@ -653,160 +664,174 @@ ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
 # Conventional p < 0.05 requires >= 19 rotations.
 # Computed for both in-sample and CV; see rationale below.
 # ------------------------------------------------------------------
-emp_p_both_dt <- wflow_fit[,
-  {
-    real_val <- .SD[response_type == "real", .estimate]
-    rot_vals <- .SD[response_type == "rotated", .estimate]
-    if (length(real_val) == 1L && length(rot_vals) > 0L) {
-      .(emp_p = (sum(rot_vals >= real_val) + 1L) / (length(rot_vals) + 1L))
-    } else {
-      .(emp_p = NA_real_)
-    }
-  },
-  by = .(ID, `Event Type`, feature_set, lambda_selection, metric_type)
-]
-emp_p_both_dt[, sig := emp_p <= (1 / 11)]
-
-# CV-only slice — downstream chunks (variability-significance, n-robust-significance,
-# lambda-switching) use emp_p_dt which is CV-only (unbiased generalization test).
-emp_p_dt <- emp_p_both_dt[metric_type == "CV"]
-
 # ------------------------------------------------------------------
-# Sanity check: rotated_hit should not affect emp_p distribution.
-# "Hit by Rotation" events had their real PSI borrowed as a null for another event.
-# If Hit events show systematically lower emp_p, it implies their PSI correlates
-# broadly with cell-type identity (fingerprint), inflating the null for those events.
-# Expected result: distributions overlap — rotation sampling is matched and unbiased.
-# ------------------------------------------------------------------
-rotated_hit_check_dt <- copy(emp_p_dt)
-rotated_hit_check_dt[
-  event_summary_table[
-    response_type == "real",
-    .(ID, feature_set, lambda_selection, rotated_hit)
-  ],
-  on = .(ID, feature_set, lambda_selection),
-  rotated_hit := rotated_hit
+# Significance now comes from the Tier-1 ridge SCREEN (screen_dt), not from
+# elastic-net rotations — Tier-2 (09zz) is hits-only, real PSI, so there are no
+# rotated rows here. screen_dt is per-EVENT: a closed-form group-leave-one-
+# ontology-out ridge partial-R² (epigenetics beyond protocol/expression/TSS)
+# tested against a matched FEATURE-rotation null (hundreds of control loci) →
+# empirical p → FDR q; `sig := q < threshold & effect > 0` (effect = real R² −
+# mean null R²). Broadcast the event-level significance across the EN
+# (feature_set × lambda_selection) rows so the downstream per-feature-set chunks
+# keep their join shape; the value is identical across an event's rows.
+#
+# NOTE (fingerprint unmasking): high raw screen_R2 is NOT sufficient — cell-type
+# fingerprint events have high R² but effect ≈ 0 (a random control locus predicts
+# their PSI just as well). Only effect > 0 & q < threshold events are genuinely
+# event-specific. See screen_effect_vs_r2.pdf below.
+fs_lambda_combos <- unique(
+  best_params_table[, .(ID, feature_set, lambda_selection)]
+)
+emp_p_dt <- merge(
+  fs_lambda_combos,
+  screen_dt[, .(
+    ID, emp_p = p_emp, q, effect, screen_R2, screen_CCC,
+    null_R2_mean, sig
+  )],
+  by = "ID", all.x = TRUE
+)
+emp_p_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
+emp_p_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+emp_p_dt[,
+  feature_set := factor(feature_set, levels = c("local", "short", "long"))
 ]
-ggplot(
-  rotated_hit_check_dt[!is.na(emp_p) & !is.na(rotated_hit)],
-  aes(x = emp_p, fill = rotated_hit)
-) +
-  geom_histogram(
-    breaks = seq(0, 1, by = 1 / 11),
-    position = "dodge",
-    alpha = .7
-  ) +
-  geom_vline(xintercept = 1 / 11, linetype = "dashed", color = "red") +
-  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
-  theme_bw() +
-  labs(
-    title = "Rotation sampling sanity check: emp p by Hit vs Not Hit events",
-    x = "Empirical p-value (CV)",
-    y = "Number of events",
-    fill = "Rotation status",
-    caption = paste(
-      "Hit by Rotation: this event's PSI was used as a null control for another event.",
-      "Systematically lower emp p for Hit events would indicate inflated null.",
-      "Expected: distributions overlap (matched sampling, no bias)."
-    )
-  )
-ggsave(file.path(plot_dir_ev, "rotated_hit_sanity.pdf"), width = 14, height = 4)
 
-print(emp_p_dt[,
+# Per-event significance summary (screen is event-level, so de-duplicate the
+# broadcast rows before counting).
+print(unique(emp_p_dt[, .(ID, `Event Type`, q, effect, sig)])[,
   .(
     n_sig = sum(sig, na.rm = TRUE),
-    n_total = sum(!is.na(emp_p)),
+    n_total = sum(!is.na(q)),
     pct_sig = round(100 * mean(sig, na.rm = TRUE), 1)
   ),
-  by = .(`Event Type`, feature_set, lambda_selection)
+  by = `Event Type`
 ])
 
-# Both in-sample and CV shown: the comparison is diagnostic.
-# In-sample > CV signal: genuine signal amplified by overfitting.
-# In-sample < CV signal: rotated models also overfit (fingerprint confound; supports
-#   paper's concern that sample-specific epigenomic fingerprints drive predictions).
-ggplot(emp_p_both_dt[!is.na(emp_p)], aes(x = emp_p, fill = feature_set)) +
-  geom_histogram(
-    breaks = seq(0, 1, by = 1 / 11),
-    position = "dodge",
-    alpha = .7
-  ) +
-  geom_vline(xintercept = 1 / 11, linetype = "dashed", color = "red") +
-  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
+screen_plot_dt <- unique(emp_p_dt[, .(
+  ID, `Event Type`, emp_p, q, effect, screen_R2, sig
+)])
+
+# Plot 2 (replaces the rotation-p histogram): screen empirical-p per event.
+ggplot(screen_plot_dt[is.finite(emp_p)], aes(x = emp_p, fill = `Event Type`)) +
+  geom_histogram(bins = 40, alpha = .7, position = "identity") +
+  geom_vline(xintercept = screen_q_threshold, linetype = "dashed", color = "red") +
+  facet_wrap(~`Event Type`, scales = "free_y") +
   theme_bw() +
   labs(
-    title = "Empirical p-value distribution: rotation test (in-sample vs CV R2)",
-    x = "Empirical p-value",
+    title = "Tier-1 ridge-screen empirical p-value (per event)",
+    x = "Empirical p (matched feature-rotation null)",
     y = "Number of events",
-    caption = paste(
-      "Red line: minimum achievable p with 10 rotations (1/11 approx 0.091).",
-      "Conventional p < 0.05 requires >= 19 rotations.",
-      "CV is primary (unbiased). In-sample > CV: overfitting amplifies genuine signal.",
-      "In-sample < CV: rotated models also overfit (fingerprint confound).",
-      "Positive result: excess events at p = 1/11 bin (left spike above uniform null)."
-    )
+    caption = "Significant = FDR q < threshold AND effect (real - mean null R2) > 0."
   )
-ggsave(file.path(plot_dir_ev, "empirical_pvalue.pdf"), width = 14, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_pvalue.pdf"), width = 10, height = 4)
 
-# ------------------------------------------------------------------
-# Plot 3: Within-event t-statistic (in-sample and CV)
-# t = (real R² - mean(rotated R²)) / (SD(rotated) / sqrt(n_rot))
-# With n=10 rotations: df=9, one-tailed critical value approx 1.833 (alpha=0.05).
-# Edge case: if all rotated R² are identical (SD=0), t is undefined -> NA.
-# ------------------------------------------------------------------
-t_both_dt <- wflow_fit[,
-  {
-    real_val <- .SD[response_type == "real", .estimate]
-    rot_vals <- .SD[response_type == "rotated", .estimate]
-    n_rot <- length(rot_vals)
-    if (length(real_val) == 1L && n_rot > 1L) {
-      sd_rot <- sd(rot_vals, na.rm = TRUE)
-      if (!is.na(sd_rot) && sd_rot > .Machine$double.eps) {
-        .(
-          t_stat = (real_val - mean(rot_vals, na.rm = TRUE)) /
-            (sd_rot / sqrt(n_rot)),
-          n_rot = n_rot
-        )
-      } else {
-        .(t_stat = NA_real_, n_rot = n_rot)
-      }
-    } else {
-      .(t_stat = NA_real_, n_rot = NA_integer_)
-    }
-  },
-  by = .(ID, `Event Type`, feature_set, lambda_selection, metric_type)
-]
-
-# CV-only t_dt (for reference; t_both_dt used in plot)
-t_dt <- t_both_dt[metric_type == "CV"]
-t_crit <- qt(0.95, df = 9) # critical value for most events (n_rot=10, df=9)
-
+# Plot 3 (replaces the rotation t-statistic): effect vs raw R² — the fingerprint
+# unmasking. High raw R² with effect ≈ 0 = cell-type fingerprint (a random locus
+# predicts as well); only effect > 0 & q < threshold events pass.
 ggplot(
-  t_both_dt[!is.na(t_stat)],
-  aes(x = feature_set, y = t_stat, color = feature_set)
+  screen_plot_dt[is.finite(effect) & is.finite(screen_R2)],
+  aes(x = screen_R2, y = effect, color = sig)
 ) +
-  geom_hline(yintercept = t_crit, linetype = "dashed", color = "red") +
   geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-  geom_violin(alpha = .5) +
-  geom_jitter(alpha = .2, width = 0.2, size = .5) +
-  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
+  geom_point(alpha = .4, size = .8) +
+  facet_wrap(~`Event Type`) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey60")) +
   theme_bw() +
   labs(
-    title = "Within-event t-statistic: real R2 vs rotated distribution (in-sample and CV)",
-    x = NULL,
-    y = "t-statistic ((real R2 - mean rotated) / (SD rotated / sqrt(n)))",
-    caption = sprintf(
-      paste(
-        "Red line: one-tailed t critical value alpha=0.05, df=9 (t=%.3f).",
-        "CV is primary. In-sample vs CV comparison is diagnostic:",
-        "in-sample > CV = genuine signal amplified by overfitting;",
-        "in-sample < CV = rotated models also overfit (fingerprint confound).",
-        "Positive result: distribution bulk above red line."
-      ),
-      t_crit
+    title = "Screen effect (real - null) vs raw R2: fingerprint unmasking",
+    x = "Raw group-LOO screen R2",
+    y = "Effect = real R2 - mean null R2",
+    color = "Significant\n(q < thresh, effect > 0)",
+    caption = paste(
+      "High raw R2 with effect near 0 = cell-type fingerprint (random control",
+      "loci predict as well). Only effect > 0 & q < threshold = event-specific."
     )
   )
-ggsave(file.path(plot_dir_ev, "tstat_rsq.pdf"), width = 14, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_effect_vs_r2.pdf"), width = 10, height = 4)
+```
+
+Plot 4 shows, per event, exactly *where* the real partial-R² sits inside its own matched feature-rotation null distribution — the raw material behind the empirical p. This reads the full null vectors persisted by `09s-ridge-screen.R` (`screen/<ID>_screen_null.csv.gz`, one row per control locus), which the summary `screen_results.csv.gz` collapses to mean/sd. Only a manageable subset of events is drawn (all hits, plus the top events by effect) — the full event set is far too many to facet.
+
+```{r screen-null-histograms}
+# Per-event null-distribution histograms: real screen_R2 (vertical line) over the
+# ~200 matched feature-rotation null R2 values. The nulls are the SAME quantity
+# the empirical p is computed from (p = (1 + #{null >= real}) / (1 + R_used)), so
+# a real line far in the right tail = small p = event-specific epigenetic signal;
+# a real line buried in the bulk = fingerprint / no signal.
+null_files <- list.files(
+  file.path(event_dir, "screen"),
+  pattern = "_screen_null\\.csv\\.gz$",
+  full.names = TRUE
+)
+
+if (length(null_files) == 0L) {
+  message("No screen_null sidecars found — skipping per-event null histograms. ",
+          "(Re-run 09s-ridge-screen.R after the null-vector write to populate them.)")
+} else {
+  null_long <- rbindlist(lapply(null_files, fread), fill = TRUE)
+  null_long[, ID := as.integer(ID)]
+  null_long <- null_long[is.finite(null_R2)]
+
+  # Choose which events to draw: every hit, plus the top events by effect (most
+  # interesting even if not significant). Capped so the full-run event set can't
+  # explode the facet grid.
+  max_facets <- 24L
+  hit_ids <- screen_dt[sig == TRUE, ID]
+  top_ids <- screen_dt[is.finite(effect)][order(-effect), ID]
+  plot_ids <- head(unique(c(hit_ids, top_ids)), max_facets)
+  n_omitted <- length(unique(null_long$ID)) - length(plot_ids)
+  if (n_omitted > 0L) {
+    message(sprintf(
+      "Null histograms: drawing %d event(s) (%d hit + top-by-effect); %d omitted.",
+      length(plot_ids), length(hit_ids), n_omitted
+    ))
+  }
+
+  nd <- null_long[ID %in% plot_ids]
+  # Per-event real value + significance + a compact facet label.
+  ev_lab <- screen_dt[
+    ID %in% plot_ids,
+    .(ID, screen_R2, p_emp, q, sig)
+  ]
+  ev_lab[event_dt, on = "ID", `Event Type` := `Event Type`]
+  ev_lab[, facet := sprintf(
+    "ID %d (%s)\nR2=%.3f p=%.2g q=%.2g%s",
+    ID, `Event Type`, screen_R2, p_emp, q,
+    fifelse(sig %in% TRUE, " *", "")
+  )]
+  nd[ev_lab, on = "ID", facet := facet]
+  vlines <- ev_lab[, .(ID, facet, screen_R2, sig)]
+
+  ggplot(nd, aes(x = null_R2)) +
+    geom_histogram(bins = 30, fill = "grey70", color = NA) +
+    geom_vline(
+      data = vlines,
+      aes(xintercept = screen_R2, color = sig %in% TRUE),
+      linewidth = 0.7
+    ) +
+    facet_wrap(~facet, scales = "free") +
+    scale_color_manual(
+      values = c(`TRUE` = "firebrick", `FALSE` = "steelblue"),
+      labels = c(`TRUE` = "significant", `FALSE` = "not sig"),
+      name = "real R2 (event)"
+    ) +
+    theme_bw(base_size = 10) +
+    labs(
+      title = "Tier-1: real partial-R2 vs its matched feature-rotation null (per event)",
+      x = "R2 (grey = null control loci; line = this event's real R2)",
+      y = "Number of null control loci",
+      caption = paste(
+        "Each grey histogram = the ~200 matched-control null R2 for one event;",
+        "the vertical line is that event's own real R2. Right-tail line = small",
+        "empirical p = event-specific signal. * = FDR-significant (q < threshold",
+        "& effect > 0)."
+      )
+    )
+  ggsave(
+    file.path(plot_dir_ev, "screen_null_histograms.pdf"),
+    width = 14, height = 10
+  )
+}
 ```
 
 ## 3. Biological context of significant events
