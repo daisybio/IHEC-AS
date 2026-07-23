@@ -19,7 +19,7 @@ Stage order (restructured 2026-07-06):
   → 03-prepare-aggregation
   → 04-*  (WGBS / ChIP / MaxEntScan / Pangolin)
   → 05-create-aggregated-dt
-  → 06 / 07 / 09  (+ splicing_ml)
+  → 06-correlation / 07-2-ml-global-comparison / 09  (+ splicing_ml)
 ```
 
 ### Per-transcript-filter architecture
