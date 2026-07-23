@@ -691,10 +691,19 @@ run_event_glmnet <- function(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point — invoked by 09-1-ml-local-array.sh as:
-#   Rscript 09zz-ml-event-glmnet-tidymodels.R <cfg_rds> <event_id>
+# CLI entry point — invoked (per event) as:
+#   Rscript 09zz-ml-event-glmnet-tidymodels.R <cfg_rds> <event_id> [cores]
 # ---------------------------------------------------------------------------
-if (!interactive()) {
+# Guard on THIS file being the script Rscript actually invoked — NOT merely
+# `!interactive()`. 09-1-ml-local.R source()s this file for run_event_glmnet(),
+# and source() also runs under Rscript (!interactive() == TRUE there too); a bare
+# !interactive() block would then execute with 09-1's own (cfg-less) args →
+# `readRDS(NA)` crash during the build phase. `--file=` names the invoked script.
+.is_09zz_script <- local({
+  f <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))
+  length(f) == 1L && basename(f) == "09zz-ml-event-glmnet-tidymodels.R"
+})
+if (!interactive() && .is_09zz_script) {
   args <- commandArgs(trailingOnly = TRUE)
   cfg_path <- args[1]
   this_id <- as.integer(args[2])

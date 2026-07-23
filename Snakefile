@@ -1082,17 +1082,25 @@ rule splicing_ml_ablation_regression:
 # ── Event-specific models: build → Tier-1 ridge screen → aggregate → Tier-2 EN ─
 # Two-tier redesign (2026-07-22). Tier-1 (09s-*) is a fit-free closed-form ridge
 # screen that decides significance for ALL events cheaply (feature-rotation null
-# → qvalue FDR). Tier-2 (09-1 → 09zz elastic-net) runs ONLY on screen hits, real
-# PSI, for feature interpretation. DAG:
-#   build_feature_tables → event_screen → screen_aggregate → event_models
-# NOTE on async SLURM arrays (same fire-and-forget convention as the rest of this
-# pipeline): `event_screen` and `event_models` SUBMIT arrays and return; the
-# per-event work runs afterwards. Run `screen_aggregate` only after the screen
-# array has finished (it warns if per-event files are incomplete), and re-run
-# `ml_analysis` only after the elastic-net array has finished.
+# → qvalue FDR). Tier-2 (09zz elastic-net) runs ONLY on screen hits, real PSI,
+# for feature interpretation. DAG:
+#   build_feature_tables → event_screen_one (× all events) → screen_aggregate
+#     → event_model_one (× hits) → event_models
+# Snakemake-native scatter/gather (mirrors aggregate_chip_one/aggregate_chip):
+# ONE job per event, submitted + tracked by Snakemake, throttled by the profile's
+# `jobs`/`max-jobs-per-second` (NOT a self-submitted SLURM array — 09s-dispatch.R
+# / 09s-ridge-screen-array.sh / 09-1's Phase-2 sbatch are now UNUSED by the
+# pipeline, kept only for standalone use). The event set is pipeline-generated, so
+# `build_feature_tables` and `screen_aggregate` are CHECKPOINTS: the gather input
+# functions (_event_screen_targets / _event_model_targets) read their output id
+# lists to expand the scatter. Result: honest deps, `snakemake … .done` runs the
+# whole chain in one invocation with no manual array-completion gating.
+wildcard_constraints:
+    id=r"\d+",
 
 # ── Step 09-1a: build per-event feature tables (Phase 1, build-only) ───────────
-rule build_feature_tables:
+# CHECKPOINT: writes the all-events id list the screen scatter fans out over.
+checkpoint build_feature_tables:
     input:
         script           = "09-1-ml-local.R",
         local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
@@ -1129,19 +1137,45 @@ rule build_feature_tables:
         Rscript 09-1-ml-local.R > {log} 2>&1
         """
 
-# ── Step 09s: Tier-1 fit-free ridge screen (fires SLURM array over all events) ─
-rule event_screen:
+# ── Gather input functions (read a checkpoint's generated id list) ────────────
+# Snakemake resolves the per-event scatter from the *contents* of the id files
+# the pipeline writes, not from anything known at parse time — hence checkpoints.
+def _event_screen_targets(wildcards):
+    tf = wildcards.transcript_filter
+    all_ids = checkpoints.build_feature_tables.get(
+        transcript_filter=tf
+    ).output.all_ids
+    with open(all_ids) as fh:
+        ids = [ln.strip() for ln in fh if ln.strip()]
+    return expand(
+        "processed_data/event_models/{tf}/screen/{id}_screen.csv.gz",
+        tf=tf, id=ids,
+    )
+
+def _event_model_targets(wildcards):
+    tf = wildcards.transcript_filter
+    hits = checkpoints.screen_aggregate.get(transcript_filter=tf).output.hits
+    with open(hits) as fh:
+        ids = [ln.strip() for ln in fh if ln.strip()]
+    return expand(
+        "processed_data/event_models/{tf}/{id}_all_metrics.csv.gz",
+        tf=tf, id=ids,
+    )
+
+# ── Step 09s: Tier-1 fit-free ridge screen — ONE job per event ────────────────
+# Reads feature_table_<id> at runtime (not a declared input — no rule produces
+# those individually; ordering after the build comes via cfg/session). Writes one
+# summary row; the null-vector sidecar (<id>_screen_null.csv.gz) is written only
+# when the event has controls, so it is deliberately NOT a declared output.
+rule event_screen_one:
     input:
-        dispatch = "09s-dispatch.R",
-        screen   = "09s-ridge-screen.R",
-        shared   = "09-ml-shared.R",
-        array_sh = "09s-ridge-screen-array.sh",
-        cfg      = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
-        all_ids  = "processed_data/event_glmnet_all_ids_{transcript_filter}.txt",
-        session  = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+        screen  = "09s-ridge-screen.R",
+        shared  = "09-ml-shared.R",
+        cfg     = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
     output:
-        dispatched = touch("processed_data/event_models/{transcript_filter}/.screen_dispatched"),
-    log: "logs/09s_event_screen_{transcript_filter}.log"
+        row = "processed_data/event_models/{transcript_filter}/screen/{id}_screen.csv.gz",
+    log: "logs/09s_screen/{transcript_filter}/{id}.log"
     threads: R("analysis", "threads")
     resources:
         mem_mb          = R("analysis", "mem_mb"),
@@ -1152,17 +1186,18 @@ rule event_screen:
         gres            = _gres("analysis"),
     shell:
         """
-        Rscript 09s-dispatch.R {input.cfg} > {log} 2>&1
+        Rscript 09s-ridge-screen.R {input.cfg} {wildcards.id} {threads} > {log} 2>&1
         """
 
 # ── Step 09s: aggregate the screen → qvalues + Tier-1 hit list ────────────────
-# Run only after the event_screen SLURM array has FINISHED (guarded: warns on
-# incomplete per-event files). Produces the hit list the elastic-net runs on.
-rule screen_aggregate:
+# CHECKPOINT: the gather (`_event_screen_targets`) forces every per-event screen
+# job to finish before this runs, so q-values are computed on the complete set;
+# its `hits` output then drives the Tier-2 scatter (`_event_model_targets`).
+checkpoint screen_aggregate:
     input:
-        aggregate  = "09s-aggregate.R",
-        cfg        = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
-        dispatched = "processed_data/event_models/{transcript_filter}/.screen_dispatched",
+        aggregate = "09s-aggregate.R",
+        cfg       = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        screens   = _event_screen_targets,
     output:
         results = "processed_data/event_models/{transcript_filter}/screen_results.csv.gz",
         hits    = "processed_data/event_models/{transcript_filter}/tier1_hits_{transcript_filter}.txt",
@@ -1180,30 +1215,20 @@ rule screen_aggregate:
         Rscript 09s-aggregate.R {input.cfg} > {log} 2>&1
         """
 
-# ── Step 09-1: Tier-2 elastic-net on screen hits (fires SLURM array) ──────────
-rule event_models:
+# ── Step 09zz: Tier-2 elastic-net — ONE job per screen HIT ────────────────────
+# 09zz writes several per-event CSVs; <id>_all_metrics.csv.gz is written LAST as
+# the completion sentinel (also written as a stub for events 09zz skips), so it
+# is the declared output. feature_table_<id>/aggregated_dt read at runtime.
+rule event_model_one:
     input:
-        script           = "09-1-ml-local.R",
-        local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
-        shared           = "09-ml-shared.R",
-        hits             = "processed_data/event_models/{transcript_filter}/tier1_hits_{transcript_filter}.txt",
-        session          = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
-        cfg              = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
-        aggregated_dt    = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
-        keep_rows_manual = "processed_data/keep_rows_manual_{transcript_filter}.rds",
-        sample_cols      = "processed_data/sample_cols_{transcript_filter}.rds",
-        event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
-        psi_long_dt      = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
-        event_gr         = "processed_data/event_gr_{transcript_filter}.rds",
-        active_chromhmm  = "processed_data/activeChromHMM_{transcript_filter}.rds",
-        chromhmm_hits    = "processed_data/chromhmm_hits_{transcript_filter}.rds",
-        wgbs             = "sample_dts/WGBS_agg_{transcript_filter}.csv.gz",
-        file_table       = "processed_data/file_table.csv.gz",
-        rbp_wide         = "processed_data/rbp_wide_expression_{transcript_filter}.csv.gz",
-        rbp_per_event    = "processed_data/rbp_per_event_{transcript_filter}.rds",
+        glmnet  = "09zz-ml-event-glmnet-tidymodels.R",
+        shared  = "09-ml-shared.R",
+        cfg     = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+        hits    = "processed_data/event_models/{transcript_filter}/tier1_hits_{transcript_filter}.txt",
     output:
-        done    = touch("processed_data/event_models/{transcript_filter}/.done"),
-    log: "logs/09_1_event_models_{transcript_filter}.log"
+        metrics = "processed_data/event_models/{transcript_filter}/{id}_all_metrics.csv.gz",
+    log: "logs/09zz_en/{transcript_filter}/{id}.log"
     threads: R("event_models", "threads")
     resources:
         mem_mb          = R("event_models", "mem_mb"),
@@ -1214,9 +1239,17 @@ rule event_models:
         gres            = _gres("event_models"),
     shell:
         """
-        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
-        Rscript 09-1-ml-local.R > {log} 2>&1
+        Rscript 09zz-ml-event-glmnet-tidymodels.R {input.cfg} {wildcards.id} {threads} > {log} 2>&1
         """
+
+# ── Step 09-1: Tier-2 gather — .done once every hit's EN has finished ─────────
+# Empty hit list → no inputs → .done just touches (valid: nothing to fit).
+rule event_models:
+    input:
+        _event_model_targets,
+    output:
+        done = touch("processed_data/event_models/{transcript_filter}/.done"),
+    localrule: True
 
 
 # ── Step 09-2: ML analysis report ─────────────────────────────────────────────
