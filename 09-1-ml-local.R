@@ -399,6 +399,18 @@ saveRDS(
   # cheap → a few hundred gives an empirical-p floor ≈ 1/(R+1). Consumed by
   # 09s-ridge-screen.R, not by the elastic-net.
   screen_rotations = getOption("EpiATLAS_AS_SCREEN_ROTATIONS", 200L),
+  # Feature sets the Tier-1 screen runs per event (long/short/local) — SEPARATE
+  # from `feature_sets` above (which 09zz/Tier-2 always needs all three of). The
+  # screen splits so a spatially-local signal isn't diluted by far chromHMM in
+  # one omnibus ridge; FDR is then computed per (tf, Event Type, feature_set).
+  # Default = all three, and it is ALSO the right setting for reusing a prior
+  # omnibus screen: 09s-ridge-screen.R resumes PER FEATURE SET, tagging an
+  # untagged legacy per-event file as `long` (identical quantity — one ridge over
+  # all epigenetic X) and recomputing only the missing sets. Narrow this only to
+  # deliberately skip a set entirely.
+  screen_feature_sets = getOption(
+    "EpiATLAS_AS_SCREEN_FEATURE_SETS", c("long", "short", "local")
+  ),
   # §4.9: thread the global seed to the array workers (09zz uses seed_base +
   # this_id per event; falls back to the option if this field is absent).
   seed = getOption("EpiATLAS_AS_SEED", 42L)

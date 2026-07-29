@@ -114,10 +114,13 @@ read_event_csvs <- function(pattern) {
 
 # Tier-1 ridge-screen results — significance (is the event epigenetically
 # predictable beyond confounds?) is now decided HERE, not by the elastic-net
-# rotation test. One row per event: screen_R2/CCC, matched feature-rotation null
-# summary, empirical p, effect (= real − null mean), and FDR q. `sig := q < 0.1`
-# drives every downstream significance split. The 6 per-event elastic-net tables
-# below are HITS-ONLY (Tier-2) and all response_type == "real".
+# rotation test. One row per event PER FEATURE SET (long/short/local): screen_R2/CCC,
+# matched feature-rotation null summary, empirical p, effect (= real − null mean),
+# and FDR q computed WITHIN each (transcript_filter, Event Type, feature_set) group
+# by 09s-aggregate.R. So screen_dt is keyed by (ID, feature_set), NOT by ID alone —
+# every join/facet below must carry feature_set or the 3 rows per event collide.
+# `sig` is per (event, feature_set); an event is a Tier-2 hit if sig in ANY set.
+# The 6 per-event elastic-net tables below are HITS-ONLY (Tier-2), all real PSI.
 # Robust load so 09-2 renders on PARTIAL results too (screen still running / not
 # yet aggregated). Prefer the aggregated screen_results.csv.gz (real Storey q from
 # 09s-aggregate.R over ALL events); if it is absent, assemble a provisional
@@ -138,7 +141,9 @@ if (file.exists(.screen_results_file)) {
       "will be empty. Run the ridge screen (09s) first."
     )
     screen_dt <- data.table(
-      ID = integer(), n_samples = integer(), R_used = integer(),
+      ID = integer(), feature_set = character(), `Event Type` = character(),
+      transcript_filter = character(),
+      n_samples = integer(), R_used = integer(),
       screen_R2 = numeric(), screen_CCC = numeric(), null_R2_mean = numeric(),
       null_R2_sd = numeric(), p_emp = numeric(), effect = numeric(),
       note = character()
@@ -150,13 +155,45 @@ if (file.exists(.screen_results_file)) {
     ), "per-event rows; q via BH proxy (PARTIAL, not the final Storey FDR).")
     screen_dt <- rbindlist(pbmclapply(.screen_rows, fread), fill = TRUE)
   }
+  # BH proxy mirrors the aggregator's GROUPED FDR (per tf × Event Type × feature_set),
+  # so a provisional render doesn't silently pool the feature sets into one test.
+  if (!"feature_set" %in% names(screen_dt)) screen_dt[, feature_set := "long"]
+  if (!"transcript_filter" %in% names(screen_dt)) screen_dt[, transcript_filter := tf]
   screen_dt[, q := NA_real_]
-  .ok <- is.finite(screen_dt$p_emp)
-  if (any(.ok)) screen_dt$q[.ok] <- p.adjust(screen_dt$p_emp[.ok], method = "BH")
+  if (nrow(screen_dt) > 0L) {
+    if (!"Event Type" %in% names(screen_dt)) {
+      screen_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
+    }
+    screen_dt[
+      is.finite(p_emp),
+      q := p.adjust(p_emp, method = "BH"),
+      by = .(transcript_filter, `Event Type`, feature_set)
+    ]
+  }
 }
 screen_dt[, ID := as.integer(ID)]
+# Pre-2026-07-29 aggregates are the single omnibus ridge over all epigenetic X —
+# that IS the `long` set, so tag rather than drop (keeps old results renderable).
+if (!"feature_set" %in% names(screen_dt)) screen_dt[, feature_set := "long"]
+# Ordered long → short → local (decreasing feature count) for stable facet order.
+screen_feature_sets <- intersect(
+  c("long", "short", "local"), unique(as.character(screen_dt$feature_set))
+)
+screen_dt[, feature_set := factor(
+  as.character(feature_set),
+  levels = c(screen_feature_sets,
+             setdiff(unique(as.character(feature_set)), screen_feature_sets))
+)]
+if (!"Event Type" %in% names(screen_dt) && nrow(screen_dt) > 0L) {
+  screen_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
+}
 screen_q_threshold <- 0.1
+# Per (event, feature_set) significance …
 screen_dt[, sig := is.finite(q) & q < screen_q_threshold & is.finite(effect) & effect > 0]
+# … and the per-EVENT roll-up (sig in ANY feature set) — this is what defines a
+# Tier-2 hit in 09s-aggregate.R, and what the biology sections downstream split on.
+screen_dt[, sig_any := any(sig %in% TRUE), by = ID]
+screen_sig_ids <- sort(unique(screen_dt[sig %in% TRUE, ID]))
 
 # en_available — is there USABLE Tier-2/EN data? Gates every EN-dependent chunk
 # (via `eval = en_available`) so the Tier-1 (screen) report always renders, even
@@ -706,9 +743,11 @@ ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 10, height = 3)
 
 Significance is decided by the **Tier-1 fit-free ridge screen** (`09s-ridge-screen.R` → `screen_results.csv.gz`), run on *every* event, not by the elastic-net. For each event it computes a closed-form group-leave-one-ontology-out ridge **partial-R²** (epigenetics beyond protocol/expression/TSS) and tests it against a **matched feature-rotation null** (hundreds of unrelated control loci, each a cheap closed-form re-fit) → empirical p → FDR **q**. An event is significant when **q < threshold AND effect > 0**, where `effect = real R² − mean(null R²)`.
 
-Key point (fingerprint unmasking): **high raw R² is not sufficient**. Cell-type-fingerprint events have high R² but `effect ≈ 0` — a *random* control locus's chromatin predicts their PSI just as well, because both track cell-type identity. Only `effect > 0 & q < threshold` events carry genuinely event-specific epigenetic signal. The elastic-net below (Tier 2) then runs **only on these hits**, real PSI only, for feature interpretation.
+The screen runs **per feature space**, the same three the elastic-net uses: `long` (all epigenetic features), `short` (drop the far-vicinity chromHMM windows), `local` (drop chromHMM entirely). Reason: a signal confined to the exon's immediate neighbourhood is *diluted* when hundreds of far chromHMM windows are bundled into one omnibus ridge, so testing the narrower spaces separately recovers power the single omnibus test loses. Consequently **FDR is computed within each (`transcript_filter`, `Event Type`, `feature_set`) group** — a local-only signal is compared against other local screens, not against a mixed family — and every table/plot below is keyed by `(ID, feature_set)`, not by event alone. The three spaces are *nested* (`local ⊂ short ⊂ long`), so their per-set hit counts are correlated and must not be summed; an event is a **Tier-2 hit if it is significant in any set**.
 
-Plot 1 (real in-sample vs CV R²) is retained as an overfitting diagnostic; Plots 2–3 show the screen's p-value distribution and the effect-vs-R² unmasking.
+Key point (fingerprint unmasking): **high raw R² is not sufficient**. Cell-type-fingerprint events have high R² but `effect ≈ 0` — a *random* control locus's chromatin predicts their PSI just as well, because both track cell-type identity. Only `effect > 0 & q < threshold` events carry genuinely event-specific epigenetic signal. This is also why raw R² cannot be compared across feature sets while `effect` can: dropping chromHMM lowers raw R², but it lowers the matched null by the same token.
+
+Plot 1 (real in-sample vs CV R²) is retained as an overfitting diagnostic; Plots 2–3 show the screen's p-value distribution and the effect-vs-R² unmasking, both split by feature set.
 
 ```{r paired-rotation-analysis, eval = en_available}
 if (en_available) {
@@ -789,9 +828,11 @@ ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
 # ontology-out ridge partial-R² (epigenetics beyond protocol/expression/TSS)
 # tested against a matched FEATURE-rotation null (hundreds of control loci) →
 # empirical p → FDR q; `sig := q < threshold & effect > 0` (effect = real R² −
-# mean null R²). Broadcast the event-level significance across the EN
-# (feature_set × lambda_selection) rows so the downstream per-feature-set chunks
-# keep their join shape; the value is identical across an event's rows.
+# mean null R²). The screen is run PER FEATURE SET (long/short/local — the same
+# three spaces the elastic-net uses), so this joins on (ID, feature_set), NOT on ID
+# alone: each EN workflow gets the significance of the feature space it was actually
+# fit in. Only lambda_selection is broadcast (the screen has no lambda analogue).
+# Joining on ID alone would both triplicate the rows and cross feature spaces.
 #
 # NOTE (fingerprint unmasking): high raw screen_R2 is NOT sufficient — cell-type
 # fingerprint events have high R² but effect ≈ 0 (a random control locus predicts
@@ -800,13 +841,14 @@ ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
 fs_lambda_combos <- unique(
   best_params_table[, .(ID, feature_set, lambda_selection)]
 )
+.screen_join <- screen_dt[, .(
+  ID, feature_set = as.character(feature_set), emp_p = p_emp, q, effect,
+  screen_R2, screen_CCC, null_R2_mean, sig, sig_any
+)]
 emp_p_dt <- merge(
-  fs_lambda_combos,
-  screen_dt[, .(
-    ID, emp_p = p_emp, q, effect, screen_R2, screen_CCC,
-    null_R2_mean, sig
-  )],
-  by = "ID", all.x = TRUE
+  fs_lambda_combos[, feature_set := as.character(feature_set)][],
+  .screen_join,
+  by = c("ID", "feature_set"), all.x = TRUE
 )
 emp_p_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
 emp_p_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
@@ -822,33 +864,53 @@ emp_p_dt[,
 # tables). Previously these were computed off emp_p_dt, which broadcasts screen
 # values across the EN (feature_set × lambda) rows and is therefore empty when
 # there are no hits.
-screen_plot_dt <- screen_dt[, .(ID, emp_p = p_emp, q, effect, screen_R2, sig)]
+screen_plot_dt <- screen_dt[, .(ID, feature_set, emp_p = p_emp, q, effect,
+                                screen_R2, sig)]
 screen_plot_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
 screen_plot_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+.n_fs <- max(1L, uniqueN(screen_plot_dt$feature_set))
 
-# Per-event significance summary by event type.
+# Significance summary per (Event Type × feature_set) — the exact grouping the FDR
+# was computed within, so these counts are the per-group hit counts.
 print(screen_plot_dt[,
   .(
     n_sig = sum(sig, na.rm = TRUE),
     n_total = sum(!is.na(q)),
     pct_sig = round(100 * mean(sig, na.rm = TRUE), 1)
   ),
-  by = `Event Type`
-])
+  by = .(`Event Type`, feature_set)
+][order(`Event Type`, feature_set)])
 
-# Plot 2: screen empirical-p per event, faceted by event type.
+# Roll-up: an event counts as a hit if significant in ANY feature set (Tier-2's
+# definition). Reported alongside the per-set counts because the sets are nested
+# (local ⊂ short ⊂ long), so per-set counts are not independent and don't add up.
+print(screen_plot_dt[,
+  .(n_sig_sets = sum(sig, na.rm = TRUE)),
+  by = .(`Event Type`, ID)
+][, .(
+  n_events         = uniqueN(ID),
+  n_sig_any_set    = uniqueN(ID[n_sig_sets > 0L]),
+  n_sig_all_sets   = uniqueN(ID[n_sig_sets == .n_fs])
+), by = `Event Type`][order(`Event Type`)])
+
+# Plot 2: screen empirical-p per event, event type × feature set.
 print(ggplot(screen_plot_dt[is.finite(emp_p)], aes(x = emp_p, fill = `Event Type`)) +
   geom_histogram(bins = 40, alpha = .7, position = "identity") +
   geom_vline(xintercept = screen_q_threshold, linetype = "dashed", color = "red") +
-  facet_wrap(~`Event Type`, scales = "free_y") +
+  facet_grid(feature_set ~ `Event Type`, scales = "free_y") +
   theme_bw() +
   labs(
-    title = "Tier-1 ridge-screen empirical p-value (per event)",
+    title = "Tier-1 ridge-screen empirical p-value (per event, per feature set)",
     x = "Empirical p (matched feature-rotation null)",
     y = "Number of events",
-    caption = "Significant = FDR q < threshold AND effect (real - mean null R2) > 0."
+    caption = paste(
+      "Rows = feature set (long = all epigenetic; short = drop far chromHMM;",
+      "local = drop all chromHMM). FDR is computed within each row × column cell.",
+      "Significant = q < threshold AND effect (real - mean null R2) > 0."
+    )
   ))
-ggsave(file.path(plot_dir_ev, "screen_pvalue.pdf"), width = 10, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_pvalue.pdf"),
+  width = 10, height = 2 + 2.2 * .n_fs, limitsize = FALSE)
 
 # Plot 3: effect vs raw R² — the fingerprint unmasking. High raw R² with effect
 # ≈ 0 = cell-type fingerprint (a random locus predicts as well); only effect > 0
@@ -859,7 +921,7 @@ print(ggplot(
 ) +
   geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
   geom_point(alpha = .4, size = .8) +
-  facet_wrap(~`Event Type`) +
+  facet_grid(feature_set ~ `Event Type`) +
   scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey60")) +
   theme_bw() +
   labs(
@@ -869,13 +931,59 @@ print(ggplot(
     color = "Significant\n(q < thresh, effect > 0)",
     caption = paste(
       "High raw R2 with effect near 0 = cell-type fingerprint (random control",
-      "loci predict as well). Only effect > 0 & q < threshold = event-specific."
+      "loci predict as well). Only effect > 0 & q < threshold = event-specific.",
+      "Rows = feature set: raw R2 drops as chromHMM windows are removed, but the",
+      "matched null drops with it, so effect is the comparable quantity across rows."
     )
   ))
-ggsave(file.path(plot_dir_ev, "screen_effect_vs_r2.pdf"), width = 10, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_effect_vs_r2.pdf"),
+  width = 10, height = 2 + 2.2 * .n_fs, limitsize = FALSE)
+
+# Does narrowing the feature space actually recover diluted local signal? Per event,
+# compare effect across sets — the motivation for splitting the screen at all. A
+# positive local-minus-long effect means the omnibus ridge was diluting that event.
+if (.n_fs > 1L) {
+  eff_wide <- dcast(
+    screen_plot_dt[is.finite(effect)], ID + `Event Type` ~ feature_set,
+    value.var = "effect"
+  )
+  .pairs <- intersect(c("short", "local"), names(eff_wide))
+  if ("long" %in% names(eff_wide) && length(.pairs) > 0L) {
+    eff_delta <- melt(
+      eff_wide, id.vars = c("ID", "Event Type", "long"),
+      measure.vars = .pairs, variable.name = "feature_set", value.name = "effect"
+    )[is.finite(effect) & is.finite(long)]
+    eff_delta[, delta := effect - long]
+    cat("Effect gain from narrowing the feature space (vs `long`):\n")
+    print(eff_delta[, .(
+      n              = .N,
+      median_delta   = round(median(delta), 4),
+      pct_improved   = round(100 * mean(delta > 0), 1)
+    ), by = .(`Event Type`, feature_set)][order(`Event Type`, feature_set)])
+
+    print(ggplot(eff_delta, aes(x = long, y = effect, color = `Event Type`)) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+      geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+      geom_vline(xintercept = 0, linetype = "dotted", color = "grey60") +
+      geom_point(alpha = .3, size = .7) +
+      facet_grid(feature_set ~ `Event Type`) +
+      theme_bw() +
+      labs(
+        title = "Does a narrower feature space recover diluted local signal?",
+        x = "Effect in `long` (all epigenetic features)",
+        y = "Effect in the narrower feature set",
+        caption = paste(
+          "Dashed = equality. Points above it = the narrower space beats the omnibus",
+          "ridge for that event (signal was being diluted by far chromHMM windows)."
+        )
+      ))
+    ggsave(file.path(plot_dir_ev, "screen_effect_by_feature_set.pdf"),
+      width = 10, height = 2 + 2.2 * length(.pairs), limitsize = FALSE)
+  }
+}
 ```
 
-Plot 4 shows, per event, exactly *where* the real partial-R² sits inside its own matched feature-rotation null distribution — the raw material behind the empirical p. This reads the full null vectors persisted by `09s-ridge-screen.R` (`screen/<ID>_screen_null.csv.gz`, one row per control locus), which the summary `screen_results.csv.gz` collapses to mean/sd. Only a manageable subset of events is drawn (all hits, plus the top events by effect) — the full event set is far too many to facet.
+Plot 4 shows, per event **and feature set**, exactly *where* the real partial-R² sits inside its own matched feature-rotation null distribution — the raw material behind the empirical p. This reads the full null vectors persisted by `09s-ridge-screen.R` (`screen/<ID>_screen_null.csv.gz`, one row per control locus per feature set), which the summary `screen_results.csv.gz` collapses to mean/sd. Only a manageable subset is drawn (all significant `(event, feature set)` pairs, plus the top pairs by effect) — the full set is far too many to facet, and only those events' sidecars are read.
 
 ```{r screen-null-histograms}
 # Per-event null-distribution histograms: real screen_R2 (vertical line) over the
@@ -883,49 +991,61 @@ Plot 4 shows, per event, exactly *where* the real partial-R² sits inside its ow
 # the empirical p is computed from (p = (1 + #{null >= real}) / (1 + R_used)), so
 # a real line far in the right tail = small p = event-specific epigenetic signal;
 # a real line buried in the bulk = fingerprint / no signal.
-null_files <- list.files(
-  file.path(event_dir, "screen"),
-  pattern = "_screen_null\\.csv\\.gz$",
-  full.names = TRUE
-)
+# Which panels to draw is decided from screen_dt ALONE, so the file selection happens
+# FIRST: the full sidecar set is ~34k files / hundreds of MB at genome scale, and
+# reading all of it to then plot <=24 panels dominated the render. Read only the
+# events actually drawn.
+#
+# A facet is an (event, feature_set) PAIR, not an event — the same event has a
+# different real R2 and a different null in each feature space, which is exactly the
+# comparison worth seeing. Draw every significant pair, then top-by-effect, capped so
+# the full-run set can't explode the grid.
+max_facets <- 24L
+.key <- c("ID", "feature_set")
+screen_pairs <- copy(screen_dt)[, feature_set := as.character(feature_set)]
+hit_pairs <- screen_pairs[sig %in% TRUE, .(ID, feature_set)]
+top_pairs <- screen_pairs[is.finite(effect)][order(-effect), .(ID, feature_set)]
+plot_pairs <- unique(rbindlist(list(hit_pairs, top_pairs)))
+plot_pairs <- plot_pairs[seq_len(min(max_facets, nrow(plot_pairs)))]
 
-if (length(null_files) == 0L) {
-  message("No screen_null sidecars found — skipping per-event null histograms. ",
-          "(Re-run 09s-ridge-screen.R after the null-vector write to populate them.)")
+null_files <- file.path(
+  event_dir, "screen", sprintf("%d_screen_null.csv.gz", unique(plot_pairs$ID))
+)
+null_files <- null_files[file.exists(null_files)]
+
+if (nrow(plot_pairs) == 0L || length(null_files) == 0L) {
+  message("No screen_null sidecars for the selected events — skipping per-event ",
+          "null histograms. (Re-run 09s-ridge-screen.R to populate them.)")
 } else {
   null_long <- rbindlist(lapply(null_files, fread), fill = TRUE)
   null_long[, ID := as.integer(ID)]
+  # Sidecars written before the per-feature-set screen hold the omnibus null = `long`.
+  if (!"feature_set" %in% names(null_long)) null_long[, feature_set := "long"]
+  null_long[, feature_set := as.character(feature_set)]
   null_long <- null_long[is.finite(null_R2)]
 
-  # Choose which events to draw: every hit, plus the top events by effect (most
-  # interesting even if not significant). Capped so the full-run event set can't
-  # explode the facet grid.
-  max_facets <- 24L
-  hit_ids <- screen_dt[sig == TRUE, ID]
-  top_ids <- screen_dt[is.finite(effect)][order(-effect), ID]
-  plot_ids <- head(unique(c(hit_ids, top_ids)), max_facets)
-  n_omitted <- length(unique(null_long$ID)) - length(plot_ids)
+  n_omitted <- nrow(unique(screen_pairs[is.finite(effect), .(ID, feature_set)])) -
+    nrow(plot_pairs)
   if (n_omitted > 0L) {
     message(sprintf(
-      "Null histograms: drawing %d event(s) (%d hit + top-by-effect); %d omitted.",
-      length(plot_ids), length(hit_ids), n_omitted
+      "Null histograms: drawing %d (event × feature set) panel(s) (%d significant + top-by-effect); %d omitted.",
+      nrow(plot_pairs), nrow(hit_pairs), n_omitted
     ))
   }
 
-  nd <- null_long[ID %in% plot_ids]
-  # Per-event real value + significance + a compact facet label.
-  ev_lab <- screen_dt[
-    ID %in% plot_ids,
-    .(ID, screen_R2, p_emp, q, sig)
-  ]
+  nd <- null_long[plot_pairs, on = .key, nomatch = NULL]
+  # Per-(event, feature_set) real value + significance + a compact facet label.
+  ev_lab <- screen_pairs[
+    plot_pairs, on = .key, nomatch = NULL
+  ][, .(ID, feature_set, screen_R2, p_emp, q, sig)]
   ev_lab[event_dt, on = "ID", `Event Type` := `Event Type`]
   ev_lab[, facet := sprintf(
-    "ID %d (%s)\nR2=%.3f p=%.2g q=%.2g%s",
-    ID, `Event Type`, screen_R2, p_emp, q,
+    "ID %d (%s) [%s]\nR2=%.3f p=%.2g q=%.2g%s",
+    ID, `Event Type`, feature_set, screen_R2, p_emp, q,
     fifelse(sig %in% TRUE, " *", "")
   )]
-  nd[ev_lab, on = "ID", facet := facet]
-  vlines <- ev_lab[, .(ID, facet, screen_R2, sig)]
+  nd[ev_lab, on = .key, facet := facet]
+  vlines <- ev_lab[, .(ID, feature_set, facet, screen_R2, sig)]
 
   ggplot(nd, aes(x = null_R2)) +
     geom_histogram(bins = 30, fill = "grey70", color = NA) +
@@ -942,14 +1062,15 @@ if (length(null_files) == 0L) {
     ) +
     theme_bw(base_size = 10) +
     labs(
-      title = "Tier-1: real partial-R2 vs its matched feature-rotation null (per event)",
+      title = "Tier-1: real partial-R2 vs its matched feature-rotation null (per event × feature set)",
       x = "R2 (grey = null control loci; line = this event's real R2)",
       y = "Number of null control loci",
       caption = paste(
-        "Each grey histogram = the ~200 matched-control null R2 for one event;",
-        "the vertical line is that event's own real R2. Right-tail line = small",
+        "One panel per (event, feature set): each grey histogram = the ~200",
+        "matched-control null R2 computed in THAT feature space, with the vertical",
+        "line that event's own real R2 in the same space. Right-tail line = small",
         "empirical p = event-specific signal. * = FDR-significant (q < threshold",
-        "& effect > 0)."
+        "& effect > 0; FDR within tf x Event Type x feature set)."
       )
     )
   ggsave(
@@ -964,40 +1085,47 @@ Finally, screen QC / calibration diagnostics: is the feature-rotation null hones
 ```{r screen-diagnostics}
 sd_fin <- screen_dt[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
 
-# Coverage: rotations actually used + degenerate-event notes (NA = fit fine).
-cat("Screen coverage:\n")
+# Coverage per feature set: rotations used, n_features (the point of the split),
+# and degenerate-event notes (NA = fit fine).
+cat("Screen coverage per feature set:\n")
 print(screen_dt[, .(
   n_events        = .N,
   finite_p        = sum(is.finite(p_emp)),
+  median_features = as.integer(median(n_features, na.rm = TRUE)),
   R_used_median   = median(R_used, na.rm = TRUE),
   R_used_below_max = sum(R_used < max(R_used, na.rm = TRUE), na.rm = TRUE)
-)])
+), by = feature_set][order(feature_set)])
 cat("Degenerate-event notes (NA = screened cleanly):\n")
-print(screen_dt[, .N, by = note][order(-N)])
+print(screen_dt[, .N, by = .(feature_set, note)][order(feature_set, -N)])
 
 # (1) NULL CALIBRATION — p_emp should be ~flat under the null. A broken/optimistic
 # null piles p toward 0 across all bins; genuine signal shows only as a modest
 # excess in the leftmost bin over the uniform (dashed) line.
+# Calibration must be checked PER feature set — each is its own family of tests with
+# its own FDR, so one set's null can be broken while another's is fine.
 n_bins <- 10L
+.unif_dt <- sd_fin[, .(y = .N / n_bins), by = feature_set]
 print(ggplot(sd_fin, aes(x = p_emp)) +
   geom_histogram(
     breaks = seq(0, 1, 1 / n_bins), fill = "grey70", color = "white"
   ) +
   geom_hline(
-    yintercept = nrow(sd_fin) / n_bins, linetype = "dashed", color = "firebrick"
+    data = .unif_dt, aes(yintercept = y), linetype = "dashed", color = "firebrick"
   ) +
+  facet_wrap(~feature_set, scales = "free_y") +
   theme_bw() +
   labs(
-    title = "Tier-1 null calibration: empirical p-value distribution",
+    title = "Tier-1 null calibration: empirical p-value distribution per feature set",
     x = "Empirical p (matched feature-rotation null)",
     y = "Number of events",
     caption = paste(
-      "Dashed = uniform expectation. Flat ≈ well-calibrated null; excess in the",
-      "leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
+      "Dashed = uniform expectation (per panel). Flat = well-calibrated null; excess",
+      "in the leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
       "indicate an optimistic (broken) null."
     )
   ))
-ggsave(file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"), width = 8, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"),
+  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
 
 # (2) FINGERPRINT — effect & p within raw-R2 strata. High raw R2 with effect ≈ 0
 # and non-small p = cell-type fingerprint, not event-specific signal (binned
@@ -1006,14 +1134,14 @@ sd_fin[, r2_stratum := cut(
   screen_R2, c(-Inf, 0, 0.1, 0.2, 0.5, Inf),
   labels = c("<=0", "(0,0.1]", "(0.1,0.2]", "(0.2,0.5]", ">0.5")
 )]
-cat("Fingerprint check — effect & p within raw-R2 strata:\n")
+cat("Fingerprint check — effect & p within raw-R2 strata, per feature set:\n")
 print(sd_fin[, .(
   n              = .N,
   median_R2      = round(median(screen_R2), 3),
   median_effect  = round(median(effect), 4),
   pct_effect_pos = round(100 * mean(effect > 0), 1),
   median_p       = round(median(p_emp), 3)
-), by = r2_stratum][order(r2_stratum)])
+), by = .(feature_set, r2_stratum)][order(feature_set, r2_stratum)])
 
 # (3) SMALL-n INSTABILITY — very-negative group-LOO R2 concentrates in small
 # events (expected), not a bug. y clipped at the 1st percentile for readability.
@@ -1027,13 +1155,19 @@ print(ggplot(sd_fin, aes(x = n_samples, y = screen_R2, color = sig)) +
   coord_cartesian(
     ylim = c(quantile(sd_fin$screen_R2, 0.01, na.rm = TRUE), 1)
   ) +
+  facet_wrap(~feature_set) +
   theme_bw() +
   labs(
     title = "Screen R2 vs sample size (very-negative R2 = small-n LOO instability)",
     x = "n samples (event)",
-    y = "Group-LOO screen R2"
+    y = "Group-LOO screen R2",
+    caption = paste(
+      "Per feature set: the p >> n regime eases as features are dropped, so the",
+      "negative-R2 tail should shrink from long -> short -> local."
+    )
   ))
-ggsave(file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"), width = 8, height = 4)
+ggsave(file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"),
+  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
 ```
 
 ## 3. Biological context of significant events
@@ -1122,9 +1256,15 @@ nrob_sig_dt[,
     levels = c("High", "Low")
   )
 ]
+# Label reflects the Tier-1 screen's criterion (FDR within tf × Event Type ×
+# feature_set), not the retired 10-rotation elastic-net p-floor of 1/11.
 nrob_sig_dt[
   !is.na(emp_p),
-  sig_label := fifelse(sig, "Significant (p <= 1/11)", "Not significant")
+  sig_label := fifelse(
+    sig,
+    sprintf("Significant (q < %g, effect > 0)", screen_q_threshold),
+    "Not significant"
+  )
 ]
 nrob_sig_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 

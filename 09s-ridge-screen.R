@@ -54,30 +54,106 @@ if (!interactive()) {
   screen_dir <- file.path(event_dir, "screen")
   dir.create(screen_dir, recursive = TRUE, showWarnings = FALSE)
   out_file <- file.path(screen_dir, paste0(this_id, "_screen.csv.gz"))
-  if (file.exists(out_file)) {
-    message("Already computed: ", this_id)
-    quit(save = "no", status = 0L)
+  null_file <- file.path(screen_dir, paste0(this_id, "_screen_null.csv.gz"))
+
+  # Screen is now run PER FEATURE SET (long/short/local) — the omnibus single
+  # ridge over all epigenetic features under-powers spatially-local signal in
+  # p>>n (a strong exon-local signal diluted by hundreds of far chromHMM windows).
+  # `long`=all epigenetic; `short`=drop far chromHMM; `local`=drop all chromHMM.
+  # Screen feature sets: prefer the screen-specific cfg field (lets the screen run
+  # short/local-only in long-reuse mode without touching Tier-2's feature_sets).
+  feature_sets <- if (!is.null(cfg$screen_feature_sets)) {
+    cfg$screen_feature_sets
+  } else if (!is.null(cfg$feature_sets)) {
+    cfg$feature_sets
+  } else {
+    c("long", "short", "local")
+  }
+
+  # Resume gate is PER FEATURE SET, not per file: a pre-existing output from the
+  # earlier omnibus run has no `feature_set` column at all — those rows ARE the
+  # `long` set, so they're retained (tagged) and only the missing sets recomputed.
+  # Same for the null sidecar, so 09-2's Plot 4 keeps its long facets.
+  read_existing <- function(path) {
+    if (!file.exists(path)) return(NULL)
+    dt <- tryCatch(data.table::fread(path), error = function(e) NULL)
+    if (is.null(dt) || !nrow(dt)) return(NULL)
+    if (!"feature_set" %in% names(dt)) dt[, feature_set := "long"]
+    dt[]
+  }
+  existing_rows <- read_existing(out_file)
+  existing_null <- read_existing(null_file)
+  if (!is.null(existing_rows)) {
+    feature_sets <- base::setdiff(
+      feature_sets, unique(as.character(existing_rows$feature_set))
+    )
+    if (length(feature_sets) == 0L) {
+      message("Already computed (all feature sets): ", this_id)
+      quit(save = "no", status = 0L)
+    }
+    message("Resuming ", this_id, " — missing sets: ",
+            paste(feature_sets, collapse = ","))
   }
 
   # --- session (event metadata + PSI matrix for control matching) --------
   sess <- readRDS(cfg$session_rds)
   psi_table <- sess$psi_table
   event_dt <- sess$event_dt
+  # chromHMM-vicinity objects — needed for the long/short/local partition
+  # (mirrors 09zz's build_explanatory_vars): `short` drops far-vicinity chromHMM,
+  # `local` drops all chromHMM.
+  chromhmm_hits_smaller <- sess$chromhmm_hits_smaller
+  keep_rows_manual <- sess$keep_rows_manual
   rm(sess)
   gc()
 
-  # NA-safe single-row writer (so every event appears in aggregation).
-  write_row <- function(row) {
-    data.table::fwrite(data.table::as.data.table(row), out_file)
+  this_et <- as.character(event_dt[ID == this_id, `Event Type`][1L])
+  this_tf <- as.character(event_dt[ID == this_id, transcript_filter][1L])
+
+  # Writer + NA filler emit ONE ROW PER FEATURE SET, carrying the
+  # feature_set / Event Type / transcript_filter keys the aggregator groups FDR by
+  # (`by = .(transcript_filter, Event Type, feature_set)`).
+  # Retained rows from an earlier (omnibus/partial) run are re-emitted alongside
+  # the newly computed sets. Legacy rows also predate the Event Type /
+  # transcript_filter keys the aggregator groups FDR by, so backfill them here.
+  # ATOMIC: in resume mode this OVERWRITES a file whose retained rows are the only
+  # copy of an already-completed screen. Write to a temp sibling + rename (atomic on
+  # the same filesystem) so a crash/kill mid-write can't truncate existing results.
+  # NOTE: the temp name MUST keep the .csv.gz extension and compress= must be
+  # explicit — fwrite picks its compression from the file extension, so a temp path
+  # ending in ".tmp<pid>" silently writes PLAIN CSV that then gets renamed to
+  # .csv.gz (fread tolerates it; zcat/gzfile do not).
+  write_atomic <- function(dt, path) {
+    tmp <- paste0(path, ".tmp", Sys.getpid(), ".csv.gz")
+    data.table::fwrite(dt, tmp, compress = "gzip")
+    if (!file.rename(tmp, path)) {
+      unlink(tmp)
+      stop("Failed to rename ", tmp, " -> ", path)
+    }
   }
-  na_row <- function(n_samples = NA_integer_, note = NA_character_) {
-    list(
-      ID = this_id, n_samples = n_samples, n_features = NA_integer_,
-      R_used = 0L, lambda = NA_real_, screen_df = NA_real_,
-      screen_R2 = NA_real_, screen_CCC = NA_real_,
-      null_R2_mean = NA_real_, null_R2_sd = NA_real_, null_CCC_mean = NA_real_,
-      p_emp = NA_real_, effect = NA_real_, note = note
-    )
+  write_rows <- function(dt) {
+    if (!is.null(existing_rows)) {
+      if (!"Event Type" %in% names(existing_rows)) {
+        existing_rows[, `Event Type` := this_et]
+      }
+      if (!"transcript_filter" %in% names(existing_rows)) {
+        existing_rows[, transcript_filter := this_tf]
+      }
+      dt <- data.table::rbindlist(list(existing_rows, dt), fill = TRUE)
+    }
+    write_atomic(dt, out_file)
+  }
+  na_rows <- function(n_samples = NA_integer_, note = NA_character_) {
+    data.table::rbindlist(lapply(feature_sets, function(fs) {
+      list(
+        ID = this_id, feature_set = fs, `Event Type` = this_et,
+        transcript_filter = this_tf,
+        n_samples = n_samples, n_features = NA_integer_, R_used = 0L,
+        lambda = NA_real_, screen_df = NA_real_, screen_R2 = NA_real_,
+        screen_CCC = NA_real_, null_R2_mean = NA_real_, null_R2_sd = NA_real_,
+        null_CCC_mean = NA_real_, p_emp = NA_real_, effect = NA_real_, note = note
+      )
+    }))
   }
 
   # --- load this event's feature table -----------------------------------
@@ -86,18 +162,18 @@ if (!interactive()) {
   )
   feature_data <- feature_data[!is.na(PSI)]
   if (nrow(feature_data) < 6L) {
-    write_row(na_row(nrow(feature_data), "too_few_samples"))
+    write_rows(na_rows(nrow(feature_data), "too_few_samples"))
     quit(save = "no", status = 0L)
   }
 
   # --- CV supergroups (leave-one-ontology-group-out) ---------------------
   groups <- resolve_supergroup_folds(feature_data[[grouping_col]], nfolds)
   if (is.null(groups)) {
-    write_row(na_row(nrow(feature_data), "collapsed_to_one_group"))
+    write_rows(na_rows(nrow(feature_data), "collapsed_to_one_group"))
     quit(save = "no", status = 0L)
   }
 
-  # --- partition columns: X (epigenetic) vs Z (confounds) ----------------
+  # --- confounds (Z), shared across all feature sets --------------------
   parts <- screen_partition_columns(names(feature_data), grouping_col)
   this_uuids <- feature_data[["uuid"]]
   confound_df <- as.data.frame(
@@ -105,12 +181,35 @@ if (!interactive()) {
   )
   prep <- prep_event(feature_data[["PSI"]], confound_df)
 
-  X_real <- as.matrix(feature_data[, parts$x_cols, with = FALSE])
-  real <- ridge_screen_stat(prep, X_real, groups)
-  if (!is.finite(real$R2)) {
-    write_row(na_row(nrow(feature_data), "real_stat_na"))
-    quit(save = "no", status = 0L)
+  # long/short/local column sets for a feature table, given its event id.
+  # Mirrors 09zz's build_explanatory_vars: long = all epigenetic X; short = drop
+  # the far-vicinity chromHMM windows (keep the near ones from chromhmm_hits_smaller);
+  # local = drop ALL chromHMM (exon-proximal marks / DNAm / splice-site / RBP only).
+  feature_set_columns <- function(x_cols, ev_id) {
+    chromhmm <- x_cols[grepl("chromhmm", x_cols, fixed = TRUE)]
+    smaller_ids <- chromhmm_hits_smaller[
+      chromhmm_hits_smaller[, "queryHits"] == which(keep_rows_manual == ev_id),
+      "subjectHits"
+    ]
+    far <- chromhmm[Reduce(
+      `&`,
+      lapply(sprintf("chromhmm_%d", smaller_ids), function(s) !endsWith(chromhmm, s)),
+      rep(TRUE, length(chromhmm))
+    )]
+    list(
+      long = x_cols,
+      short = base::setdiff(x_cols, far),
+      local = base::setdiff(x_cols, chromhmm)
+    )
   }
+  ridge_R2 <- function(cols, dt) {
+    if (length(cols) == 0L) {
+      return(list(R2 = NA_real_, CCC = NA_real_, lambda = NA_real_,
+                  df = NA_real_, n_features = 0L))
+    }
+    ridge_screen_stat(prep, as.matrix(dt[, cols, with = FALSE]), groups)
+  }
+  this_fs_cols <- feature_set_columns(parts$x_cols, this_id)
 
   # --- matched controls (same selection as 09zz's feature-rotation) ------
   subset_psi_matrix <- psi_table[this_uuids, , drop = FALSE]
@@ -129,86 +228,91 @@ if (!interactive()) {
   rm(subset_psi_matrix, psi_table)
   gc()
 
-  # --- feature-rotation null: swap in each control's epigenetic matrix,
-  #     keep THIS event's PSI + confounds (prep) + groups fixed --------------
-  load_control_X <- function(cid) {
+  # --- feature-rotation null, PER FEATURE SET. Each matched control contributes
+  #     one R² per feature set, computed from the CONTROL's OWN long/short/local
+  #     columns (same as 09zz), on THIS event's PSI/confounds/groups (prep fixed). --
+  control_fs_R2 <- function(cid) {
+    na <- setNames(rep(NA_real_, length(feature_sets)), feature_sets)
     cdt <- tryCatch(
       data.table::fread(
         file.path(feature_table_dir, paste0("feature_table_", cid, ".csv.gz"))
       ),
       error = function(e) NULL
     )
-    if (is.null(cdt)) return(NULL)
+    if (is.null(cdt)) return(na)
     cdt <- cdt[uuid %in% this_uuids]
     cdt <- cdt[match(this_uuids, uuid)]
-    if (anyNA(cdt$uuid) || !all(cdt$uuid == this_uuids)) return(NULL)
+    if (anyNA(cdt$uuid) || !all(cdt$uuid == this_uuids)) return(na)
     cparts <- screen_partition_columns(names(cdt), grouping_col)
-    as.matrix(cdt[, cparts$x_cols, with = FALSE])
+    cfs <- feature_set_columns(cparts$x_cols, cid)
+    vapply(feature_sets, function(fs) ridge_R2(cfs[[fs]], cdt)$R2, numeric(1))
   }
 
   n_use <- min(n_rotations, length(other_ids))
-  null_R2 <- numeric(0)
-  null_CCC <- numeric(0)
   if (n_use > 0L) {
     set.seed(seed_base + this_id)
     sampled <- sample(other_ids, n_use)
-    null_stats <- pbmcapply::pbmclapply(
-      sampled,
-      function(cid) {
-        Xc <- load_control_X(cid)
-        if (is.null(Xc)) return(c(NA_real_, NA_real_))
-        s <- ridge_screen_stat(prep, Xc, groups)
-        c(s$R2, s$CCC)
-      },
-      mc.cores = cores
-    )
-    null_mat <- do.call(rbind, null_stats)
-    null_R2 <- null_mat[is.finite(null_mat[, 1L]), 1L]
-    null_CCC <- null_mat[is.finite(null_mat[, 2L]), 2L]
-
-    # Persist the full per-control null vector (sidecar) for the 09-2 per-event
-    # null-distribution histograms. These values are already computed above —
-    # the main screen row only keeps their mean/sd — so this is a near-free
-    # write, not extra compute. One row per sampled control (order matches
-    # `sampled`); `control_id` records which locus was borrowed. NAs kept so the
-    # count reflects attempted rotations; 09-2 filters to finite for the p-value
-    # geometry. Filename is `_screen_null.csv.gz` (NOT `_screen.csv.gz`) so
-    # 09s-aggregate.R's `_screen\.csv\.gz$` glob does not pick it up.
-    data.table::fwrite(
-      data.table::data.table(
-        ID = this_id,
-        control_id = sampled,
-        null_R2 = null_mat[, 1L],
-        null_CCC = null_mat[, 2L]
-      ),
-      file.path(screen_dir, paste0(this_id, "_screen_null.csv.gz"))
-    )
-  }
-
-  R_used <- length(null_R2)
-  p_emp <- if (R_used > 0L) {
-    (1 + sum(null_R2 >= real$R2)) / (1 + R_used)
+    null_list <- pbmcapply::pbmclapply(sampled, control_fs_R2, mc.cores = cores)
+    null_mat <- do.call(rbind, null_list) # n_use × feature_sets (named cols)
   } else {
-    NA_real_
+    sampled <- integer(0)
+    null_mat <- matrix(
+      numeric(0), nrow = 0L, ncol = length(feature_sets),
+      dimnames = list(NULL, feature_sets)
+    )
   }
-  effect <- if (R_used > 0L) real$R2 - mean(null_R2) else NA_real_
 
-  write_row(list(
-    ID = this_id,
-    n_samples = nrow(feature_data),
-    n_features = real$n_features,
-    R_used = R_used,
-    lambda = real$lambda,
-    screen_df = real$df,
-    screen_R2 = real$R2,
-    screen_CCC = real$CCC,
-    null_R2_mean = if (R_used > 0L) mean(null_R2) else NA_real_,
-    null_R2_sd = if (R_used > 0L) sd(null_R2) else NA_real_,
-    null_CCC_mean = if (length(null_CCC) > 0L) mean(null_CCC) else NA_real_,
-    p_emp = p_emp,
-    effect = effect,
-    note = NA_character_
-  ))
-  message("Done screen: ", this_id, " R2=", round(real$R2, 4),
-          " p=", signif(p_emp, 3), " (R_used=", R_used, ")")
+  # --- per feature set: real stat + empirical p + effect ----------------
+  rows <- list()
+  null_side <- list()
+  for (fs in feature_sets) {
+    real <- ridge_R2(this_fs_cols[[fs]], feature_data)
+    nR2 <- null_mat[, fs]
+    nR2 <- nR2[is.finite(nR2)]
+    R_used <- length(nR2)
+    ok <- is.finite(real$R2) && R_used > 0L
+    rows[[fs]] <- list(
+      ID = this_id, feature_set = fs, `Event Type` = this_et,
+      transcript_filter = this_tf,
+      n_samples = nrow(feature_data), n_features = real$n_features,
+      R_used = R_used, lambda = real$lambda, screen_df = real$df,
+      screen_R2 = real$R2, screen_CCC = real$CCC,
+      null_R2_mean = if (R_used > 0L) mean(nR2) else NA_real_,
+      null_R2_sd = if (R_used > 0L) stats::sd(nR2) else NA_real_,
+      # Always NA in the per-feature-set screen: `control_fs_R2` returns only R2 per
+      # control (one numeric per feature set), so there is no null CCC to average.
+      # Deliberate — significance is defined on R2 (p_emp/effect), nothing reads this
+      # column, and computing a second per-control statistic would ~double the null
+      # cost for an unused number. Retained purely so the schema still matches the
+      # pre-2026-07-29 omnibus rows, which DO carry a real value here.
+      null_CCC_mean = NA_real_,
+      p_emp = if (ok) (1 + sum(nR2 >= real$R2)) / (1 + R_used) else NA_real_,
+      effect = if (ok) real$R2 - mean(nR2) else NA_real_,
+      note = NA_character_
+    )
+    # Per-event null sidecar (feature_set-tagged) for 09-2's null histograms.
+    if (nrow(null_mat) > 0L) {
+      null_side[[fs]] <- data.table::data.table(
+        ID = this_id, feature_set = fs, control_id = sampled,
+        null_R2 = null_mat[, fs]
+      )
+    }
+  }
+  write_rows(data.table::rbindlist(rows))
+  if (length(null_side) > 0L) {
+    null_out <- data.table::rbindlist(null_side)
+    if (!is.null(existing_null)) {
+      null_out <- data.table::rbindlist(
+        list(existing_null, null_out),
+        fill = TRUE
+      )
+    }
+    write_atomic(null_out, null_file)
+  }
+  message(
+    "Done screen: ", this_id, " (", this_et, ") — ",
+    paste(vapply(feature_sets, function(fs) sprintf(
+      "%s R2=%.3f p=%.3g", fs, rows[[fs]]$screen_R2, rows[[fs]]$p_emp
+    ), character(1)), collapse = " | ")
+  )
 }
