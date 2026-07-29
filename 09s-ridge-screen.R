@@ -32,6 +32,10 @@ if (!interactive()) {
   this_id <- as.integer(args[2])
   cores <- if (length(args) >= 3L) as.integer(args[3L]) else 1L
 
+  # cfg_path <- "processed_data/event_glmnet_cfg_biotype_filtered.rds"
+  # this_id <- 20541
+  # cores <- 10L
+
   cfg <- readRDS(cfg_path)
   setwd(cfg$project_dir)
   data.table::setDTthreads(cores)
@@ -43,7 +47,11 @@ if (!interactive()) {
   event_dir <- cfg$event_dir
   grouping_col <- cfg$grouping_col
   nfolds <- cfg$nfolds
-  seed_base <- if (!is.null(cfg$seed)) cfg$seed else getOption("EpiATLAS_AS_SEED", 42L)
+  seed_base <- if (!is.null(cfg$seed)) {
+    cfg$seed
+  } else {
+    getOption("EpiATLAS_AS_SEED", 42L)
+  }
   # Tier-1 rotation count: cheap, so default to a few hundred (p-floor ≈ 1/(R+1)).
   n_rotations <- if (!is.null(cfg$screen_rotations)) {
     cfg$screen_rotations
@@ -74,25 +82,65 @@ if (!interactive()) {
   # earlier omnibus run has no `feature_set` column at all — those rows ARE the
   # `long` set, so they're retained (tagged) and only the missing sets recomputed.
   # Same for the null sidecar, so 09-2's Plot 4 keeps its long facets.
+  # Rows are only reusable if they were produced by the CURRENT statistic. The
+  # stamp (SCREEN_STAT_VERSION, defined next to prep_event/ridge_screen_stat in
+  # 09-ml-shared.R) is compared here; anything stamped with an older version -- or
+  # unstamped, which means version 1, the pre-2026-07-29 leaky statistic -- is
+  # DISCARDED and recomputed. Without this check a correctness fix is invisible to
+  # the reuse logic: Snakemake re-runs every per-event job because the script
+  # changed, but each exits "Already computed" on file existence and keeps the
+  # stale numbers.
   read_existing <- function(path) {
-    if (!file.exists(path)) return(NULL)
+    if (!file.exists(path)) {
+      return(NULL)
+    }
     dt <- tryCatch(data.table::fread(path), error = function(e) NULL)
-    if (is.null(dt) || !nrow(dt)) return(NULL)
-    if (!"feature_set" %in% names(dt)) dt[, feature_set := "long"]
+    if (is.null(dt) || !nrow(dt)) {
+      return(NULL)
+    }
+    ver <- if ("stat_version" %in% names(dt)) {
+      suppressWarnings(as.integer(dt$stat_version))
+    } else {
+      rep(1L, nrow(dt))
+    }
+    stale <- is.na(ver) | ver != SCREEN_STAT_VERSION
+    if (all(stale)) {
+      message(
+        "Discarding ", basename(path), ": stat_version ",
+        paste(unique(ifelse(is.na(ver), "NA", ver)), collapse = "/"),
+        " != current ", SCREEN_STAT_VERSION, " -- recomputing"
+      )
+      return(NULL)
+    }
+    if (any(stale)) {
+      message(
+        "Dropping ", sum(stale), " stale row(s) from ", basename(path),
+        " (stat_version != ", SCREEN_STAT_VERSION, ")"
+      )
+      dt <- dt[!stale]
+    }
+    if (!"feature_set" %in% names(dt)) {
+      dt[, feature_set := "long"]
+    }
     dt[]
   }
   existing_rows <- read_existing(out_file)
   existing_null <- read_existing(null_file)
   if (!is.null(existing_rows)) {
     feature_sets <- base::setdiff(
-      feature_sets, unique(as.character(existing_rows$feature_set))
+      feature_sets,
+      unique(as.character(existing_rows$feature_set))
     )
     if (length(feature_sets) == 0L) {
       message("Already computed (all feature sets): ", this_id)
       quit(save = "no", status = 0L)
     }
-    message("Resuming ", this_id, " — missing sets: ",
-            paste(feature_sets, collapse = ","))
+    message(
+      "Resuming ",
+      this_id,
+      " — missing sets: ",
+      paste(feature_sets, collapse = ",")
+    )
   }
 
   # --- session (event metadata + PSI matrix for control matching) --------
@@ -146,12 +194,24 @@ if (!interactive()) {
   na_rows <- function(n_samples = NA_integer_, note = NA_character_) {
     data.table::rbindlist(lapply(feature_sets, function(fs) {
       list(
-        ID = this_id, feature_set = fs, `Event Type` = this_et,
+        ID = this_id,
+        feature_set = fs,
+        `Event Type` = this_et,
         transcript_filter = this_tf,
-        n_samples = n_samples, n_features = NA_integer_, R_used = 0L,
-        lambda = NA_real_, screen_df = NA_real_, screen_R2 = NA_real_,
-        screen_CCC = NA_real_, null_R2_mean = NA_real_, null_R2_sd = NA_real_,
-        null_CCC_mean = NA_real_, p_emp = NA_real_, effect = NA_real_, note = note
+        n_samples = n_samples,
+        n_features = NA_integer_,
+        R_used = 0L,
+        lambda = NA_real_,
+        screen_df = NA_real_,
+        screen_R2 = NA_real_,
+        screen_CCC = NA_real_,
+        null_R2_mean = NA_real_,
+        null_R2_sd = NA_real_,
+        null_CCC_mean = NA_real_,
+        p_emp = NA_real_,
+        effect = NA_real_,
+        note = note,
+        stat_version = SCREEN_STAT_VERSION
       )
     }))
   }
@@ -179,7 +239,7 @@ if (!interactive()) {
   confound_df <- as.data.frame(
     feature_data[, parts$confound_cols, with = FALSE]
   )
-  prep <- prep_event(feature_data[["PSI"]], confound_df)
+  prep <- prep_event(feature_data[["PSI"]], confound_df, groups)
 
   # long/short/local column sets for a feature table, given its event id.
   # Mirrors 09zz's build_explanatory_vars: long = all epigenetic X; short = drop
@@ -193,7 +253,9 @@ if (!interactive()) {
     ]
     far <- chromhmm[Reduce(
       `&`,
-      lapply(sprintf("chromhmm_%d", smaller_ids), function(s) !endsWith(chromhmm, s)),
+      lapply(sprintf("chromhmm_%d", smaller_ids), function(s) {
+        !endsWith(chromhmm, s)
+      }),
       rep(TRUE, length(chromhmm))
     )]
     list(
@@ -204,8 +266,13 @@ if (!interactive()) {
   }
   ridge_R2 <- function(cols, dt) {
     if (length(cols) == 0L) {
-      return(list(R2 = NA_real_, CCC = NA_real_, lambda = NA_real_,
-                  df = NA_real_, n_features = 0L))
+      return(list(
+        R2 = NA_real_,
+        CCC = NA_real_,
+        lambda = NA_real_,
+        df = NA_real_,
+        n_features = 0L
+      ))
     }
     ridge_screen_stat(prep, as.matrix(dt[, cols, with = FALSE]), groups)
   }
@@ -223,7 +290,8 @@ if (!interactive()) {
       other_ids %in% event_dt[`Event Type` == this_event$`Event Type`, ID] &
       other_ids %in% event_dt[seqnames != this_event$seqnames, ID] &
       other_ids %in% event_dt[Variability == this_event$Variability, ID] &
-      other_ids %in% event_dt[transcript_filter == this_event$transcript_filter, ID]
+      other_ids %in%
+        event_dt[transcript_filter == this_event$transcript_filter, ID]
   ]
   rm(subset_psi_matrix, psi_table)
   gc()
@@ -239,10 +307,14 @@ if (!interactive()) {
       ),
       error = function(e) NULL
     )
-    if (is.null(cdt)) return(na)
+    if (is.null(cdt)) {
+      return(na)
+    }
     cdt <- cdt[uuid %in% this_uuids]
     cdt <- cdt[match(this_uuids, uuid)]
-    if (anyNA(cdt$uuid) || !all(cdt$uuid == this_uuids)) return(na)
+    if (anyNA(cdt$uuid) || !all(cdt$uuid == this_uuids)) {
+      return(na)
+    }
     cparts <- screen_partition_columns(names(cdt), grouping_col)
     cfs <- feature_set_columns(cparts$x_cols, cid)
     vapply(feature_sets, function(fs) ridge_R2(cfs[[fs]], cdt)$R2, numeric(1))
@@ -257,7 +329,9 @@ if (!interactive()) {
   } else {
     sampled <- integer(0)
     null_mat <- matrix(
-      numeric(0), nrow = 0L, ncol = length(feature_sets),
+      numeric(0),
+      nrow = 0L,
+      ncol = length(feature_sets),
       dimnames = list(NULL, feature_sets)
     )
   }
@@ -272,11 +346,17 @@ if (!interactive()) {
     R_used <- length(nR2)
     ok <- is.finite(real$R2) && R_used > 0L
     rows[[fs]] <- list(
-      ID = this_id, feature_set = fs, `Event Type` = this_et,
+      ID = this_id,
+      feature_set = fs,
+      `Event Type` = this_et,
       transcript_filter = this_tf,
-      n_samples = nrow(feature_data), n_features = real$n_features,
-      R_used = R_used, lambda = real$lambda, screen_df = real$df,
-      screen_R2 = real$R2, screen_CCC = real$CCC,
+      n_samples = nrow(feature_data),
+      n_features = real$n_features,
+      R_used = R_used,
+      lambda = real$lambda,
+      screen_df = real$df,
+      screen_R2 = real$R2,
+      screen_CCC = real$CCC,
       null_R2_mean = if (R_used > 0L) mean(nR2) else NA_real_,
       null_R2_sd = if (R_used > 0L) stats::sd(nR2) else NA_real_,
       # Always NA in the per-feature-set screen: `control_fs_R2` returns only R2 per
@@ -288,13 +368,20 @@ if (!interactive()) {
       null_CCC_mean = NA_real_,
       p_emp = if (ok) (1 + sum(nR2 >= real$R2)) / (1 + R_used) else NA_real_,
       effect = if (ok) real$R2 - mean(nR2) else NA_real_,
-      note = NA_character_
+      note = NA_character_,
+      # Provenance stamp: which version of the statistic produced this row. The
+      # resume gate above discards anything not matching SCREEN_STAT_VERSION.
+      stat_version = SCREEN_STAT_VERSION
     )
-    # Per-event null sidecar (feature_set-tagged) for 09-2's null histograms.
+    # Per-event null sidecar (feature_set-tagged) for 09-2's null histograms AND
+    # for the aggregator's floor-free sensitivity p -- stamped for the same reason.
     if (nrow(null_mat) > 0L) {
       null_side[[fs]] <- data.table::data.table(
-        ID = this_id, feature_set = fs, control_id = sampled,
-        null_R2 = null_mat[, fs]
+        ID = this_id,
+        feature_set = fs,
+        control_id = sampled,
+        null_R2 = null_mat[, fs],
+        stat_version = SCREEN_STAT_VERSION
       )
     }
   }
@@ -310,9 +397,25 @@ if (!interactive()) {
     write_atomic(null_out, null_file)
   }
   message(
-    "Done screen: ", this_id, " (", this_et, ") — ",
-    paste(vapply(feature_sets, function(fs) sprintf(
-      "%s R2=%.3f p=%.3g", fs, rows[[fs]]$screen_R2, rows[[fs]]$p_emp
-    ), character(1)), collapse = " | ")
+    "Done screen: ",
+    this_id,
+    " (",
+    this_et,
+    ") — ",
+    paste(
+      vapply(
+        feature_sets,
+        function(fs) {
+          sprintf(
+            "%s R2=%.3f p=%.3g",
+            fs,
+            rows[[fs]]$screen_R2,
+            rows[[fs]]$p_emp
+          )
+        },
+        character(1)
+      ),
+      collapse = " | "
+    )
   )
 }
