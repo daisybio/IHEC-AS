@@ -5,11 +5,119 @@ output: pdf_document
 
 # Epigenetic Prediction of Alternative Splicing: Per-Event Models
 
-Each AS event is modelled independently with elastic net regression (glmnet) using IHEC epigenetic features. Predictive performance is evaluated against 10 **rotated negative controls** — models trained on PSI values from unrelated events that preserve data structure while breaking the epigenetic–splicing link.
+## What this report asks, and what would count as an answer
 
-**Feature sets**: `local` (event-overlapping regions only), `short` (±50 kb), `long` (±500 kb).
-**Lambda selection**: `min` (lowest CV error) vs `1se` (most regularised model within 1 SE of min).
-**Expression bias**: a real-PSI model is labelled *Epigenetic Only* if no `gene_expression`-containing feature survives robust cross-fold selection; otherwise *Expression Bias*.
+One question, asked per alternative-splicing event: **can that event's PSI be predicted from the
+epigenetic state of its own locus, beyond what a matched but unrelated locus would predict?**
+
+The "beyond a matched locus" clause carries the whole argument. Chromatin marks, DNA methylation and
+gene expression all track **cell-type identity**, and PSI does too. So a model can predict an event's
+PSI very well while learning nothing about that event: it learns *which cell type this sample is* and
+exploits the fact that PSI differs between cell types. This is the **cell-type fingerprint confound**,
+and it is why a high R² is not evidence of epigenetic control of splicing. What separates the two is a
+**matched null**: refit the same model on a *different, unrelated* locus's features while keeping this
+event's PSI. If the unrelated locus predicts just as well, the signal was fingerprint, not regulation.
+
+This is the analysis the manuscript's "revisiting" framing rests on, so the report is deliberately
+ordered so that *null-calibration* evidence comes before any hit list.
+
+## Two tiers, and why the work is split
+
+Significance and interpretation are different jobs wanting different models, so they are separated:
+
+|                | **Tier 1 — screen**                                   | **Tier 2 — elastic net**              |
+| -------------- | ----------------------------------------------------- | ------------------------------------- |
+| Question       | *Is* this event predictable beyond its matched null?  | *Which features* carry the signal?    |
+| Model          | closed-form ridge partial-R², group-LOO by ontology   | tuned elastic net (glmnet/tidymodels) |
+| Runs on        | **every** event (~34k)                                | **hits only**                         |
+| Null           | ~200 matched control loci → empirical p → FDR q       | none (real PSI only)                  |
+| Script         | `09s-ridge-screen.R` → `09s-aggregate.R`              | `09-1-ml-local.R` → `09zz-…glmnet….R` |
+
+Tier 1 wants an **omnibus, high-power, closed-form** detector: ridge's L2 penalty aggregates diffuse,
+correlated chromatin signal instead of arbitrarily picking one of several collinear windows, and being
+closed-form makes a several-hundred-locus null essentially free. Tier 2 wants **sparsity**, because its
+deliverable is a short, readable feature list — but sparse selection among collinear features is
+unstable, which is exactly why it must not be the thing that decides significance.
+
+A consequence worth stating plainly: **if Tier 1 returns no hits, Tier 2 has nothing to run on** and
+every elastic-net section renders empty. That is a real, expected production state, not a failure — see
+*How to read a report with no hits* below.
+
+## Feature spaces (and why they are tested separately)
+
+Both tiers use the same three nested spaces:
+
+- **`local`** — event-overlapping regions only
+- **`short`** — plus near-vicinity chromHMM windows
+- **`long`** — plus far-vicinity chromHMM windows; i.e. all epigenetic features
+
+Tier 1 screens **each space separately** and computes FDR **within each
+(`transcript_filter`, `Event Type`, `feature_set`) group**. Reason: a signal confined to the exon's
+immediate neighbourhood is *diluted* when hundreds of far chromHMM windows go into one omnibus ridge,
+so an event with genuine local signal can be missed by `long` and found by `local`.
+
+Two rules follow from the nesting (`local ⊂ short ⊂ long`) and must be respected when reading any table
+below:
+
+1. **Never sum per-set hit counts.** The sets are not independent tests of different things; they are
+   three views of the same event. An event is a Tier-2 **hit if significant in *any* set**.
+2. **Never compare raw R² across sets.** Dropping chromHMM lowers R² mechanically. `effect`
+   (`real R² − mean null R²`) *is* comparable, because the matched null drops with it.
+
+## Other conventions
+
+- **Lambda selection** (Tier 2): `min` (lowest CV error) vs `1se` (most regularised model within 1 SE
+  of the minimum). `1se` is the conservative read.
+- **Expression bias** (Tier 2): a real-PSI model is *Epigenetic Only* if no `gene_expression`-derived
+  feature survives robust cross-fold selection, else *Expression Bias*. Gene expression is a confound
+  here, not a feature of interest — it co-varies with differentiation state, so an *Expression Bias*
+  model's chromatin coefficients cannot be attributed to splicing regulation.
+- **CV groups are ontology supergroups**, never random folds — a random split would let the same cell
+  type appear in train and test and re-import the fingerprint confound through the back door.
+- **`n_robust`** = features selected in *every* CV fold. `has_model == FALSE` means `n_robust == 0`:
+  nothing survived, so the event has no interpretable model.
+
+## Document structure (mirrors the order the code runs)
+
+0. **Setup and table construction** — session, Tier-1 screen, Tier-2 per-event tables, and every
+   derived table used later. No analysis, no plots.
+1. **Tier 1 — the screen.** QC/calibration *first* (is the null honest?), then the significance
+   results, then the per-event raw material behind them.
+2. **Tier 2 — elastic net on hits.** How many events got models, which hyperparameters were chosen,
+   and fit quality.
+3. **What distinguishes significant events?** Variability, feature-count robustness, fold-to-fold
+   consistency, lambda stability.
+4. **Mark-level analysis.** Which marks are selected, stratified by significance; TSS-proximity
+   control.
+5. **PSI variability vs model quality.**
+6. **Inter-model feature variation** — is mark selection structured across events, or idiosyncratic?
+
+## How to read a report with no hits
+
+If Tier 1 yields no significant events, sections 2–6 are empty by construction (`en_available` is
+`FALSE`, those chunks are skipped). The report is still **complete and interpretable** — the evidence
+lives in section 1:
+
+- a **flat** empirical-p histogram says the null is calibrated, so "no hits" is a real negative result
+  rather than a broken test;
+- a p-histogram **piled up at 0** would instead mean the null is optimistic and nothing can be
+  concluded;
+- `effect ≈ 0` **across all raw-R² strata, including the highest**, is the fingerprint signature: the
+  best-predicted events are the ones a random locus predicts equally well.
+
+That combination — calibrated null, no surviving events, high R² with zero effect — is the quantitative
+form of the manuscript's claim that reported epigenetic control of splicing is largely a
+cell-type-identity confound.
+
+# 0. Setup and table construction
+
+Loading and derived-table construction only, kept free of analysis so the analytical sections below
+read top-to-bottom without side effects. Nothing here produces a plot.
+
+`load-tier1-screen` also sets **`en_available`**, the gate for every Tier-2 chunk. It is deliberately
+*data*-driven (are there readable elastic-net metric rows?) rather than file-driven (does a file
+exist?), because a cancelled run leaves truncated files and skip-stubs behind, and gating on mere
+presence would let the build chunks run and then crash on missing columns.
 
 ```{r setup}
 library(tidymodels)
@@ -50,9 +158,7 @@ activeChromHMM <- readRDS(sprintf("processed_data/activeChromHMM_%s.rds", tf))
 # already scoped to exactly `tf`.
 ```
 
-## Hyperparameter diagnostics
-
-```{r load-data, cache = TRUE}
+```{r load-tier1-screen, cache = TRUE}
 event_dir <- file.path("processed_data", "event_models", tf)
 
 plot_dir_ev <- file.path(plot_dir, "event_models", tf)
@@ -207,7 +313,7 @@ screen_sig_ids <- sort(unique(screen_dt[sig %in% TRUE, ID]))
 en_available <- nrow(.en_all_metrics) > 0L && ".metric" %in% names(.en_all_metrics)
 ```
 
-```{r load-en-tables, eval = en_available, cache = TRUE, dependson = "load-data"}
+```{r load-en-tables, eval = en_available, cache = TRUE, dependson = "load-tier1-screen"}
 if (en_available) {
 # Tier-2 elastic-net per-event tables (HITS ONLY). This whole chunk is skipped
 # when en_available is FALSE (no Tier-1 hits) — see load-data — so downstream
@@ -243,77 +349,7 @@ fit_metrics_table[,
 }
 ```
 
-```{r exploratory-plots, eval = en_available}
-if (en_available) {
-# How do hyperparameter choices vary across feature sets and real vs rotated response?
-# A systematic difference in penalty/mixture suggests the model uses different
-# regularisation regimes for real vs random targets.
-print(ggplot(
-  best_params_table[!is.na(lambda_selection)],
-  aes(
-    x = lambda_selection,
-    y = -log10(penalty),
-    color = as.factor(mixture),
-    group = interaction(ID, wflow_id)
-  )
-) +
-  geom_line(alpha = 0.2) +
-  geom_boxplot(
-    aes(group = lambda_selection),
-    color = "grey30",
-    fill = NA,
-    outliers = FALSE
-  ) +
-  geom_point(alpha = 0.4, size = 0.8) +
-  facet_grid(response_type ~ feature_set) +
-  scale_color_brewer(palette = "Set1", name = "mixture") +
-  labs(
-    title = "Selected penalty by lambda rule, feature set, and response type",
-    x = "Lambda selection rule",
-    y = "-log10(penalty)"
-  ) +
-  theme_bw())
-
-print(ggplot(
-  best_params_table,
-  aes(x = as.character(mixture), y = -log10(penalty), color = feature_set)
-) +
-  geom_boxplot(alpha = .5) +
-  facet_grid(. ~ response == "PSI") +
-  labs(
-    title = "Penalty distribution by mixture and response type",
-    x = "Mixture (0 = ridge, 1 = lasso)",
-    y = "-log10(penalty)"
-  ) +
-  theme_bw())
-
-# In-sample R² will be inflated by overfitting; compare to CV in paired-rotation-analysis.
-print(ggplot(
-  fit_metrics_table,
-  aes(x = response == "PSI", y = .estimate, color = feature_set)
-) +
-  geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
-  geom_jitter(
-    alpha = .2,
-    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.5),
-    size = .5
-  ) +
-  facet_grid(.metric ~ lambda_selection, scales = "free_y") +
-  labs(
-    title = "In-sample fit metrics: real PSI vs rotated (overfitting diagnostic)",
-    x = "Real PSI response",
-    y = "Fit estimate (PSI scale)"
-  ) +
-  main_theme(16) +
-  coord_cartesian(ylim = c(0, NA)))
-}
-```
-
-**What to look for:** penalty should be similar for real and rotated responses — systematic differences would suggest the CV procedure is leaking information. Mixture near 1 (lasso) implies sparse solutions; near 0 (ridge) implies dense regularisation.
-
-## Data tables
-
-```{r build-cv-tables, eval = en_available, cache = TRUE, dependson = c("load-data", "load-en-tables")}
+```{r build-cv-tables, eval = en_available, cache = TRUE, dependson = c("load-tier1-screen", "load-en-tables")}
 if (en_available) {
 # cv_metrics_table: per-fold CV metrics at selected config, tagged by lambda_selection
 # cv_rsq: mean CV R² per (event, workflow) — used downstream by paired-rotation-analysis
@@ -347,7 +383,7 @@ cv_rsq <- cv_metrics_table[
 }
 ```
 
-```{r build-summary-tables, eval = en_available, cache = TRUE, dependson = c("load-data", "load-en-tables", "build-cv-tables")}
+```{r build-summary-tables, eval = en_available, cache = TRUE, dependson = c("load-tier1-screen", "load-en-tables", "build-cv-tables")}
 if (en_available) {
 # event_summary_table: one row per (event, workflow, lambda_selection).
 # Includes n_robust, expression_bias, mean CV R², rotated_hit flag.
@@ -420,7 +456,7 @@ event_summary_table[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 }
 ```
 
-```{r build-feature-coef-tables, eval = en_available, cache = TRUE, dependson = c("load-data", "load-en-tables", "build-summary-tables")}
+```{r build-feature-coef-tables, eval = en_available, cache = TRUE, dependson = c("load-tier1-screen", "load-en-tables", "build-summary-tables")}
 if (en_available) {
 # feature_table: features selected per CV fold per workflow.
 # coef_table: robust non-zero coefficients per workflow.
@@ -517,244 +553,24 @@ for (.dt in list(feature_table, coef_table)) {
 }
 ```
 
-## 1. Event counts and filtering
-
-How many events survive each filtering step, and how many receive a model?
-A model requires at least one feature to be robustly selected across all CV folds (`n_robust > 0`).
-`lambda.min` produces weaker regularisation — more features selected, more events modelled.
-`lambda.1se` is stricter — fewer events have any robust features (`has_model == FALSE`).
-
-```{r counting-events, eval = en_available}
+```{r build-emp-p-table, eval = en_available, cache = TRUE, dependson = c("load-tier1-screen", "load-en-tables", "build-summary-tables")}
 if (en_available) {
-event_counts <- rbindlist(
-  lapply(unique(event_summary_table$lambda_selection), function(sel) {
-    rbindlist(
-      lapply(unique(event_summary_table$feature_set), function(fs) {
-        this_summary <- event_summary_table[
-          lambda_selection == sel & feature_set == fs
-        ]
-        modeled_ids <- this_summary[
-          response_type == "real" & has_model == TRUE,
-          unique(ID)
-        ]
-        rbindlist(
-          list(
-            Quantified = aggregated_dt[
-              ID %in% keep_rows,
-              .(N = uniqueN(ID)),
-              by = `Event Type`
-            ],
-            Filtered = event_dt[ID %in% keep_rows, .(.N), by = .(`Event Type`)],
-            `No Model` = aggregated_dt[
-              !ID %in% modeled_ids & ID %in% keep_rows,
-              .(N = uniqueN(ID)),
-              by = `Event Type`
-            ],
-            `Model` = this_summary[
-              response_type == "real" & has_model == TRUE,
-              .(.N),
-              by = .(`Event Type`)
-            ],
-            `Epigenetic\nOnly Model` = this_summary[
-              response_type == "real" &
-                expression_bias == "Epigenetic Only" &
-                has_model == TRUE,
-              .(.N),
-              by = .(`Event Type`)
-            ]
-          ),
-          idcol = "filtering"
-        )[, c("lambda_selection", "feature_set") := .(sel, fs)]
-      }),
-      fill = TRUE
-    )
-  }),
-  fill = TRUE
-)
-
-print(event_summary_table[
-  response_type == "real",
-  table(expression_bias, `Event Type`, lambda_selection, feature_set)
-])
-
-event_counts[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
-event_counts[,
-  feature_set := factor(feature_set, levels = c("long", "short", "local"))
-]
-
-print(ggplot(
-  event_counts,
-  aes(x = N, y = reorder(filtering, N), fill = lambda_selection)
-) +
-  geom_col(position = "dodge") +
-  theme_bw() +
-  theme(
-    strip.background = element_rect(fill = "white"),
-    text = element_text(size = 20),
-    axis.text.x = element_blank()
-  ) +
-  facet_grid(feature_set ~ `Event Type`, scales = "free_x") +
-  geom_text(
-    aes(label = N),
-    position = position_dodge(width = 0.9),
-    vjust = 1.1,
-    size = 4,
-    angle = 90
-  ) +
-  labs(
-    title = "Event waterfall: counts at each filtering stage",
-    x = "Number of Events",
-    y = NULL
-  ))
-ggsave(file.path(plot_dir_ev, "event_counts.pdf"), width = 12, height = 5)
-}
-```
-
-Events without any robust features (`has_model == FALSE`) are excluded from all downstream analyses.
-Expression bias is classified per real-PSI model and propagated to its associated rotated controls.
-
-```{r generate-count-plots, eval = en_available}
-if (en_available) {
-event_summary_table[,
-  Variability := factor(
-    sub(" Variability", "", Variability, fixed = TRUE),
-    levels = c("High", "Low")
-  )
-]
-event_summary_table[,
-  `Event Type` := factor(`Event Type`, levels = to_analyze)
-]
-
-event_count_dt <- event_summary_table[
-  has_model == TRUE,
-  {
-    # Group by rotation_rank (0 for real, 1-10 for rotated) and count unique events.
-    # For real: one rank (0), uniqueN(ID) = N events. mean_count = N.
-    # For rotated: ranks 1-10, uniqueN(ID) per rank = events in that slot. mean/SD across slots.
-    counts <- .SD[, .(count = uniqueN(ID)), by = rotation_rank][, count]
-    .(
-      mean_count = mean(counts),
-      sd_count = sd(counts) / sqrt(uniqueN(rotation_rank))
-    )
-  },
-  by = .(
-    `Event Type`,
-    feature_set,
-    response_type,
-    expression_bias,
-    Variability,
-    lambda_selection
-  )
-]
-
-event_count_dt[response_type == "real", response_type := "Real"]
-event_count_dt[response_type == "rotated", response_type := "Rotated"]
-event_count_dt[,
-  response_type := factor(response_type, levels = c("Real", "Rotated"))
-]
-event_count_dt[
-  expression_bias == "Expression Bias",
-  expression_bias := "Expression\nBias"
-]
-event_count_dt[
-  expression_bias == "Epigenetic Only",
-  expression_bias := "Epigenetic\nOnly"
-]
-event_count_dt[
-  order(Variability, decreasing = TRUE),
-  cumsum_mean_count := cumsum(mean_count),
-  by = .(
-    `Event Type`,
-    feature_set,
-    response_type,
-    expression_bias,
-    lambda_selection
-  )
-]
-
-print(ggplot(
-  event_count_dt,
-  aes(y = mean_count, x = response_type, fill = Variability)
-) +
-  geom_col() +
-  ggh4x::facet_nested_wrap(
-    `Event Type` ~ feature_set + lambda_selection + expression_bias
-  ) +
-  theme_bw() +
-  theme(
-    legend.box = "vertical",
-    strip.background = element_rect(fill = "white"),
-    legend.position = "bottom",
-    axis.title.x = element_blank()
-  ) +
-  scale_fill_manual(values = variability_colors) +
-  labs(
-    title = "Model counts by expression bias, variability, and response type",
-    y = "Number of Events"
-  ) +
-  geom_errorbar(
-    aes(
-      y = cumsum_mean_count,
-      ymin = cumsum_mean_count - sd_count,
-      ymax = cumsum_mean_count + sd_count
-    ),
-    width = .2
-  ))
-ggsave(
-  file.path(plot_dir_ev, "events_rotation.png"),
-  width = 16,
-  height = 3,
-  dpi = 600
-)
-}
-```
-```{r generate-proportion-plots, eval = en_available}
-if (en_available) {
-event_count_dt[
-  response_type == "Real",
-  expression_bias := sub("\n", " ", expression_bias, fixed = TRUE)
-]
-print(ggplot(
-  event_count_dt[response_type == "Real"],
-  aes(y = mean_count, x = Variability, fill = expression_bias)
-) +
-  geom_col(position = "fill") +
-  geom_text(aes(label = mean_count), position = position_fill(vjust = 0.5)) +
-  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
-  theme_bw() +
-  theme(
-    legend.box = "vertical",
-    strip.background = element_rect(fill = "white"),
-    legend.position = "bottom"
-  ) +
-  scale_fill_manual(
-    values = c(`Epigenetic Only` = "orange", `Expression Bias` = "steelblue")
-  ) +
-  labs(
-    title = "Proportion of real-PSI models by variability: Epigenetic Only vs Expression Bias",
-    y = "Proportion of Events",
-    fill = NULL
-  ))
-ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 10, height = 3)
-}
-```
-
-## 2. Tier-1 ridge screen: does epigenetic signal exceed chance?
-
-Significance is decided by the **Tier-1 fit-free ridge screen** (`09s-ridge-screen.R` → `screen_results.csv.gz`), run on *every* event, not by the elastic-net. For each event it computes a closed-form group-leave-one-ontology-out ridge **partial-R²** (epigenetics beyond protocol/expression/TSS) and tests it against a **matched feature-rotation null** (hundreds of unrelated control loci, each a cheap closed-form re-fit) → empirical p → FDR **q**. An event is significant when **q < threshold AND effect > 0**, where `effect = real R² − mean(null R²)`.
-
-The screen runs **per feature space**, the same three the elastic-net uses: `long` (all epigenetic features), `short` (drop the far-vicinity chromHMM windows), `local` (drop chromHMM entirely). Reason: a signal confined to the exon's immediate neighbourhood is *diluted* when hundreds of far chromHMM windows are bundled into one omnibus ridge, so testing the narrower spaces separately recovers power the single omnibus test loses. Consequently **FDR is computed within each (`transcript_filter`, `Event Type`, `feature_set`) group** — a local-only signal is compared against other local screens, not against a mixed family — and every table/plot below is keyed by `(ID, feature_set)`, not by event alone. The three spaces are *nested* (`local ⊂ short ⊂ long`), so their per-set hit counts are correlated and must not be summed; an event is a **Tier-2 hit if it is significant in any set**.
-
-Key point (fingerprint unmasking): **high raw R² is not sufficient**. Cell-type-fingerprint events have high R² but `effect ≈ 0` — a *random* control locus's chromatin predicts their PSI just as well, because both track cell-type identity. Only `effect > 0 & q < threshold` events carry genuinely event-specific epigenetic signal. This is also why raw R² cannot be compared across feature sets while `effect` can: dropping chromHMM lowers raw R², but it lowers the matched null by the same token.
-
-Plot 1 (real in-sample vs CV R²) is retained as an overfitting diagnostic; Plots 2–3 show the screen's p-value distribution and the effect-vs-R² unmasking, both split by feature set.
-
-```{r paired-rotation-analysis, eval = en_available}
-if (en_available) {
-# EN-only (Plot 1 real-R2 diagnostic + emp_p_dt broadcast for downstream
-# feature-set analyses). Gated on en_available — the screen significance plots
-# were moved to the always-on `screen-significance-plots` chunk below.
-# Defensive re-assignment (already set in build chunks)
+# emp_p_dt — the bridge table between Tier 1 and Tier 2: it attaches each event's
+# SCREEN significance to each elastic-net workflow that was fit for it. Every
+# "do significant events differ in X?" analysis downstream reads this table, so it
+# is built once here rather than inside an analysis chunk.
+#
+# KEY: the join is on (ID, feature_set), NOT on ID. The screen runs in the same
+# three feature spaces the elastic-net uses, so each EN workflow gets the
+# significance of the space it was actually fit in. Joining on ID alone would both
+# triplicate every EN row (3 screen rows per event) and cross feature spaces —
+# attributing, say, a `local` screen result to a `long` model. Only
+# lambda_selection is broadcast, since the screen has no lambda analogue (it is a
+# single closed-form ridge with lambda chosen by GCV, not a regularisation path).
+#
+# `sig` = significant in THIS feature space; `sig_any` = significant in any space
+# (the Tier-2 hit definition). Use `sig` when the analysis is per-feature-set,
+# `sig_any` when it is per-event.
 fit_metrics_table[,
   response_type := fifelse(response == "PSI", "real", "rotated")
 ]
@@ -762,82 +578,6 @@ cv_metrics_table[,
   response_type := fifelse(response == "PSI", "real", "rotated")
 ]
 
-# Average CV folds to one value per workflow
-cv_wflow <- cv_metrics_table[
-  .metric == "rsq_trad",
-  .(.estimate = mean(.estimate, na.rm = TRUE)),
-  by = .(ID, wflow_id, feature_set, lambda_selection, response_type)
-]
-
-# Combine in-sample and CV for overfitting diagnostic (Plot 1 only).
-# emp_p and t-statistic use CV only — in-sample R² is biased by overfitting.
-wflow_fit <- rbindlist(
-  list(
-    `In-sample` = fit_metrics_table[
-      .metric == "rsq_trad",
-      .(ID, wflow_id, feature_set, lambda_selection, response_type, .estimate)
-    ],
-    CV = cv_wflow
-  ),
-  idcol = "metric_type"
-)
-wflow_fit[event_dt, on = "ID", `Event Type` := `Event Type`]
-wflow_fit[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
-wflow_fit[, metric_type := factor(metric_type, levels = c("In-sample", "CV"))]
-
-# ------------------------------------------------------------------
-# Plot 1: Real R² distribution — overfitting diagnostic only.
-# In-sample R² is inflated; the rotation test below uses CV only.
-# ------------------------------------------------------------------
-real_rsq_dt <- wflow_fit[
-  response_type == "real",
-  .(
-    ID,
-    `Event Type`,
-    feature_set,
-    lambda_selection,
-    metric_type,
-    real_rsq = .estimate
-  )
-]
-
-print(ggplot(real_rsq_dt, aes(x = feature_set, y = real_rsq, color = feature_set)) +
-  geom_violin(alpha = .5) +
-  geom_jitter() +
-  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
-  coord_cartesian(ylim = c(0, 1)) +
-  main_theme(base_size = 16) +
-  labs(
-    title = "Real PSI R2: in-sample vs CV (in-sample inflated by overfitting)",
-    x = NULL,
-    y = "R2 (real PSI)"
-  ))
-ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
-
-# ------------------------------------------------------------------
-# Plot 2: Empirical p-value (in-sample and CV)
-# For each event: p = (# rotations with R² >= real R² + 1) / (# rotations + 1)
-# With 10 rotations: min achievable p = 1/11 ≈ 0.091.
-# Conventional p < 0.05 requires >= 19 rotations.
-# Computed for both in-sample and CV; see rationale below.
-# ------------------------------------------------------------------
-# ------------------------------------------------------------------
-# Significance now comes from the Tier-1 ridge SCREEN (screen_dt), not from
-# elastic-net rotations — Tier-2 (09zz) is hits-only, real PSI, so there are no
-# rotated rows here. screen_dt is per-EVENT: a closed-form group-leave-one-
-# ontology-out ridge partial-R² (epigenetics beyond protocol/expression/TSS)
-# tested against a matched FEATURE-rotation null (hundreds of control loci) →
-# empirical p → FDR q; `sig := q < threshold & effect > 0` (effect = real R² −
-# mean null R²). The screen is run PER FEATURE SET (long/short/local — the same
-# three spaces the elastic-net uses), so this joins on (ID, feature_set), NOT on ID
-# alone: each EN workflow gets the significance of the feature space it was actually
-# fit in. Only lambda_selection is broadcast (the screen has no lambda analogue).
-# Joining on ID alone would both triplicate the rows and cross feature spaces.
-#
-# NOTE (fingerprint unmasking): high raw screen_R2 is NOT sufficient — cell-type
-# fingerprint events have high R² but effect ≈ 0 (a random control locus predicts
-# their PSI just as well). Only effect > 0 & q < threshold events are genuinely
-# event-specific. See screen_effect_vs_r2.pdf below.
 fs_lambda_combos <- unique(
   best_params_table[, .(ID, feature_set, lambda_selection)]
 )
@@ -852,11 +592,207 @@ emp_p_dt <- merge(
 )
 emp_p_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
 emp_p_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+# NB: EN-side ordering (local -> long, increasing window size), the reverse of
+# screen_dt's (long -> local, decreasing feature count). Downstream EN plots were
+# built against this ordering; screen plots keep theirs.
 emp_p_dt[,
   feature_set := factor(feature_set, levels = c("local", "short", "long"))
 ]
+cat(sprintf(
+  "emp_p_dt: %d EN workflow rows, %d unique events, %d rows significant in their own feature space\n",
+  nrow(emp_p_dt), uniqueN(emp_p_dt$ID), sum(emp_p_dt$sig %in% TRUE)
+))
 }
 ```
+
+# 1. Tier 1 — the ridge screen: is any event predictable beyond its matched null?
+
+This section decides significance for **every** event; nothing downstream can add an event the screen
+did not select. `09s-ridge-screen.R` computes, per event and per feature space, a closed-form
+group-leave-one-ontology-out ridge **partial-R²** — the variance in PSI explained by epigenetics *after*
+protocol, gene expression and TSS distance are absorbed as unpenalised confounds — then re-computes that
+same statistic on ~200 **matched control loci** (same event type, same variability tier, different
+chromosome) while keeping this event's PSI. That gives an empirical p, and `09s-aggregate.R` turns the
+p-values into FDR **q** within each (`transcript_filter`, `Event Type`, `feature_set`) group.
+
+**An event is significant when `q < threshold` AND `effect > 0`**, where `effect = real R² − mean(null R²)`.
+Both conditions are load-bearing: `q` controls the false-discovery rate, `effect > 0` enforces the
+*direction* (the real locus must beat its null, not merely differ from it).
+
+### The order of this section is the argument
+
+The QC/calibration chunk comes **first, on purpose**. A hit list from a miscalibrated null is
+meaningless, so the null is audited before any result is read:
+
+1. **`screen-diagnostics`** — is the null honest, is the fingerprint pattern present, is the
+   negative-R² tail explained?
+2. **`screen-significance-plots`** — the actual per-group results and hit counts.
+3. **`screen-null-histograms`** — the raw material: where each real R² falls inside its own null.
+
+### Hypotheses this section discriminates between
+
+- **H1 — genuine event-specific epigenetic control.** Some events' local chromatin predicts their PSI
+  better than unrelated loci do. *Signature:* an excess of events in the leftmost p bin over uniform,
+  `effect > 0` concentrated in those events, and surviving q.
+- **H2 — cell-type fingerprint only.** All apparent predictability is shared cell-type identity.
+  *Signature:* flat p histogram, `effect ≈ 0` at every raw-R² level *including the highest*, no
+  survivors after FDR. High-R² events are the clearest fingerprint cases, not the best hits.
+- **H3 — broken/optimistic null** (a nuisance hypothesis that must be excluded before H1 or H2 can be
+  read). *Signature:* p piling up toward 0 monotonically across all bins, or an implausibly large
+  fraction of `effect > 0`.
+
+H2 vs H1 is the manuscript's central question; H3 is why the diagnostics run first.
+
+## 1.1 Screen QC: is the null honest? (read this before the results)
+
+Three checks, each with an expected shape and a specific failure mode:
+
+**(1) Null calibration — empirical-p distribution, per feature set.**
+*Expected under no genome-wide signal:* flat (uniform), because a matched control locus should beat the
+real locus about as often as chance dictates.
+*Expected under genuine signal:* flat, **plus** a bump in the leftmost bin — the hits.
+*Failure:* a monotone pile-up toward 0 across all bins means the null is systematically too weak
+(controls handicapped somehow — e.g. mismatched sample sets or fewer usable features), and **no hit list
+from this run can be trusted**. Checked per feature set because each is its own FDR family: one space's
+null can be broken while another's is fine.
+
+**(2) Fingerprint check — `effect` and p within raw-R² strata.**
+*Hypothesis:* if predictability were event-specific, the best-predicted events would also be the ones
+that most beat their null, so `effect` should rise with raw R².
+*Fingerprint prediction (H2):* `effect` stays ≈ 0 and median p stays ≈ 0.5 **even in the highest R²
+stratum** — a random locus predicts those events just as well.
+*Deduction if the highest-R² stratum shows near-zero effect:* raw R² is measuring cell-type identity,
+and any published ranking of "most epigenetically predictable events" built on R² alone is a ranking of
+fingerprint strength.
+
+**(3) Negative-R² tail vs sample size.**
+Group-LOO R² can go sharply negative; the question is whether that is a bug or expected instability.
+*Expected:* the negative tail concentrates in **small-n** events, where holding out a whole ontology
+group removes a large share of the data. It should also shrink from `long` → `local` as the p ≫ n
+pressure eases.
+*Deduction if very negative R² appears at large n, or does not ease as features are dropped:* suspect a
+data or confound-partition problem rather than small-sample noise.
+
+```{r screen-diagnostics}
+sd_fin <- screen_dt[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
+
+# Coverage per feature set: rotations used, n_features (the point of the split),
+# and degenerate-event notes (NA = fit fine).
+cat("Screen coverage per feature set:\n")
+print(screen_dt[, .(
+  n_events        = .N,
+  finite_p        = sum(is.finite(p_emp)),
+  median_features = as.integer(median(n_features, na.rm = TRUE)),
+  R_used_median   = median(R_used, na.rm = TRUE),
+  R_used_below_max = sum(R_used < max(R_used, na.rm = TRUE), na.rm = TRUE)
+), by = feature_set][order(feature_set)])
+cat("Degenerate-event notes (NA = screened cleanly):\n")
+print(screen_dt[, .N, by = .(feature_set, note)][order(feature_set, -N)])
+
+# (1) NULL CALIBRATION — p_emp should be ~flat under the null. A broken/optimistic
+# null piles p toward 0 across all bins; genuine signal shows only as a modest
+# excess in the leftmost bin over the uniform (dashed) line.
+# Calibration must be checked PER feature set — each is its own family of tests with
+# its own FDR, so one set's null can be broken while another's is fine.
+n_bins <- 10L
+.unif_dt <- sd_fin[, .(y = .N / n_bins), by = feature_set]
+print(ggplot(sd_fin, aes(x = p_emp)) +
+  geom_histogram(
+    breaks = seq(0, 1, 1 / n_bins), fill = "grey70", color = "white"
+  ) +
+  geom_hline(
+    data = .unif_dt, aes(yintercept = y), linetype = "dashed", color = "firebrick"
+  ) +
+  facet_wrap(~feature_set, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Tier-1 null calibration: empirical p-value distribution per feature set",
+    x = "Empirical p (matched feature-rotation null)",
+    y = "Number of events",
+    caption = paste(
+      "Dashed = uniform expectation (per panel). Flat = well-calibrated null; excess",
+      "in the leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
+      "indicate an optimistic (broken) null."
+    )
+  ))
+ggsave(file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"),
+  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
+
+# (2) FINGERPRINT — effect & p within raw-R2 strata. High raw R2 with effect ≈ 0
+# and non-small p = cell-type fingerprint, not event-specific signal (binned
+# complement to screen_effect_vs_r2.pdf).
+sd_fin[, r2_stratum := cut(
+  screen_R2, c(-Inf, 0, 0.1, 0.2, 0.5, Inf),
+  labels = c("<=0", "(0,0.1]", "(0.1,0.2]", "(0.2,0.5]", ">0.5")
+)]
+cat("Fingerprint check — effect & p within raw-R2 strata, per feature set:\n")
+print(sd_fin[, .(
+  n              = .N,
+  median_R2      = round(median(screen_R2), 3),
+  median_effect  = round(median(effect), 4),
+  pct_effect_pos = round(100 * mean(effect > 0), 1),
+  median_p       = round(median(p_emp), 3)
+), by = .(feature_set, r2_stratum)][order(feature_set, r2_stratum)])
+
+# (3) SMALL-n INSTABILITY — very-negative group-LOO R2 concentrates in small
+# events (expected), not a bug. y clipped at the 1st percentile for readability.
+print(ggplot(sd_fin, aes(x = n_samples, y = screen_R2, color = sig)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+  geom_point(alpha = .3, size = .7) +
+  scale_color_manual(
+    values = c(`TRUE` = "firebrick", `FALSE` = "grey60"),
+    labels = c(`TRUE` = "significant", `FALSE` = "not sig"), name = NULL
+  ) +
+  coord_cartesian(
+    ylim = c(quantile(sd_fin$screen_R2, 0.01, na.rm = TRUE), 1)
+  ) +
+  facet_wrap(~feature_set) +
+  theme_bw() +
+  labs(
+    title = "Screen R2 vs sample size (very-negative R2 = small-n LOO instability)",
+    x = "n samples (event)",
+    y = "Group-LOO screen R2",
+    caption = paste(
+      "Per feature set: the p >> n regime eases as features are dropped, so the",
+      "negative-R2 tail should shrink from long -> short -> local."
+    )
+  ))
+ggsave(file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"),
+  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
+```
+
+## 1.2 Screen results: hit counts, p-values, and fingerprint unmasking
+
+Only read this once section 1.1 has established the null is calibrated.
+
+**Per-group counts.** Reported by `(Event Type, feature_set)` — the exact grouping the FDR was computed
+within, so these *are* the per-family hit counts. The roll-up table beside it gives `n_sig_any_set`
+(the Tier-2 hit definition) and `n_sig_all_sets`. Because the spaces are nested, expect
+`n_sig_all_sets ≤ n_sig_any_set` and expect the two to be *close* if signal is broad, far apart if
+signal is space-specific.
+
+**Plot 2 — empirical p per event.** Same calibration logic as §1.1, now split by event type as well, so
+a signal restricted to one event type is visible. SE and RI differ in sample size and in baseline
+predictability, so their p distributions should be read separately rather than pooled.
+
+**Plot 3 — `effect` vs raw R²: the fingerprint unmasking.** The single most important plot in the
+report.
+*Expected under H2 (fingerprint):* a horizontal band at `effect ≈ 0` that extends all the way to the
+highest R², with significant points absent or scattered.
+*Expected under H1 (real signal):* points lifting off the `effect = 0` line, and — importantly — the
+lift-off need **not** be at high R². Genuine event-specific signal is expected at *modest* R² with a
+clearly-beaten null, precisely because it is not riding the cell-type axis.
+*Deduction:* the vertical position (`effect`), never the horizontal one (R²), is what identifies a hit.
+
+**Plot 4 (new) — does narrowing the feature space recover diluted signal?** Per event, `effect` in the
+narrower space vs `effect` in `long`, with the identity line drawn.
+*Hypothesis being tested:* the omnibus `long` ridge dilutes exon-local signal across hundreds of far
+chromHMM windows, so genuinely local signal should sit **above** the identity line.
+*Deduction if a substantial fraction lies above the line:* the per-feature-set split is doing real work
+and a single omnibus screen under-reports; the accompanying `median_delta` / `pct_improved` table
+quantifies it.
+*Deduction if points cluster on the line:* the far chromHMM windows were contributing neither signal nor
+meaningful dilution, and the three spaces are largely redundant for significance purposes.
 
 ```{r screen-significance-plots}
 # Screen significance plots — built DIRECTLY from screen_dt (one row per event),
@@ -983,7 +919,151 @@ if (.n_fs > 1L) {
 }
 ```
 
-Plot 4 shows, per event **and feature set**, exactly *where* the real partial-R² sits inside its own matched feature-rotation null distribution — the raw material behind the empirical p. This reads the full null vectors persisted by `09s-ridge-screen.R` (`screen/<ID>_screen_null.csv.gz`, one row per control locus per feature set), which the summary `screen_results.csv.gz` collapses to mean/sd. Only a manageable subset is drawn (all significant `(event, feature set)` pairs, plus the top pairs by effect) — the full set is far too many to facet, and only those events' sidecars are read.
+## 1.3 Could the test have found anything? The p-floor and the floor-free sensitivity p
+
+The exceedance p cannot go below **`1/(R_used + 1)`** — 0.00498 at the default 200 rotations. BH at
+`q < threshold` only passes a p-value at rank *k* if `p ≤ k·q/m`. Those two facts can conflict: if a
+family's floor sits *above* what BH allows, **no event in it can pass FDR regardless of how strong its
+signal is**, and a 0-hit result there says nothing on its own. On the completed `long` screen that was
+exactly the situation — SE needed ≥ 1,613 events tied at the floor and had 215; RI needed ≥ 88 and had 5.
+
+This is a distinct nuisance hypothesis from the three in §1, and it must be excluded before the negative
+result can be read:
+
+> **H4 — the test lacked the resolution to reject anything.** *Signature:* every candidate event tied at
+> exactly `1/(R_used + 1)`, and `floor_can_pass = FALSE` in the table below. A flat p-histogram does
+> **not** exclude H4 — it only excludes a broken null (H3).
+
+Raising the rotation count cannot fix it (the matched-control pool is smaller than the ~1,500 needed, and
+for RI smaller than the RI event count itself), and neither can dropping low-variance events (the BH
+threshold `k·q/m` is scale-invariant, since *k* shrinks with *m*). What does fix it is a second,
+**floor-free** p-value: standardise each event's statistic by its own matched null
+(`z = (R² − mean null)/sd null`) and read the p off a reference of leave-one-out-standardised **null** z
+values pooled **within the FDR family** `(transcript_filter, Event Type, feature_set)`. Only the
+dimensionless deviation *shape* is borrowed — each event's own R² level and scale stay local, so a
+cell-type-fingerprint event (high null **mean**) still gets a small z and is not rescued by this.
+
+The family stratification is not cosmetic: pooling across Event Types measures as 1.43× anti-conservative
+for SE and 0.41× conservative for RI (α = 10⁻⁴), errors that cancel to a deceptive 1.01 when averaged over
+a 95%-SE sample. Within-family it is 1.00 (SE) / 0.91–1.05 (RI). A median/MAD scale is 2.6–5.2×
+anti-conservative and must not be substituted.
+
+**This is a sensitivity analysis, not the primary result.** `sig` and the Tier-2 hit list stay on the
+exceedance p, which assumes only that an event's own controls are exchangeable with it; the pooled-z p
+additionally assumes a family-common deviation shape. Two independent constructions agreeing is the
+claim; the pooled-z alone is the weaker of the two.
+
+*Deduction if both give 0 hits (the current state):* the negative result is not an artifact of resolution —
+it survives a construction with ~4 orders more of it.
+*Deduction if pooled-z yields hits where the exceedance p could not:* those are candidates the floor was
+hiding, but they inherit the extra assumption, so check the calibration ratio for that family and the
+effect-size guard below before treating any as real.
+
+```{r screen-floor-sensitivity}
+# (a) p-FLOOR ARITHMETIC per FDR family -- can the primary statistic pass at all?
+screen_min_effect <- getOption("EpiATLAS_AS_SCREEN_MIN_EFFECT", 0)
+.has_tf <- "transcript_filter" %in% names(screen_dt)
+.by <- if (.has_tf) c("transcript_filter", "Event Type", "feature_set") else
+  c("Event Type", "feature_set")
+floor_tab <- screen_dt[is.finite(p_emp), {
+  m <- .N
+  fl <- 1 / (max(R_used, na.rm = TRUE) + 1)
+  k <- sum(p_emp <= fl + 1e-12 & effect > screen_min_effect, na.rm = TRUE)
+  .(m_tests = m, p_floor = signif(fl, 3), k_at_floor = k,
+    bh_allows = if (k > 0L) signif(k * screen_q_threshold / m, 3) else NA_real_,
+    floor_can_pass = k > 0L && fl <= k * screen_q_threshold / m,
+    k_needed = ceiling(fl * m / screen_q_threshold))
+}, by = .by]
+cat("Can the primary (exceedance) p clear FDR in each family?\n")
+print(floor_tab[order(`Event Type`, feature_set)])
+if (any(!floor_tab$floor_can_pass)) {
+  cat("\n!! floor_can_pass = FALSE above: in those families NO event could pass FDR\n",
+      "   via the exceedance p at this rotation count, whatever its signal. A 0-hit\n",
+      "   result there is uninterpretable WITHOUT the sensitivity p below.\n")
+}
+
+# (b) PRIMARY vs SENSITIVITY, side by side.
+if (!"p_pooled_z" %in% names(screen_dt)) {
+  cat("\nNo `p_pooled_z` column -- this aggregate predates the floor-free sensitivity p.\n",
+      "Re-run 09s-aggregate.R to add it (needs the screen/*_screen_null.csv.gz sidecars).\n")
+} else if (!any(is.finite(screen_dt$p_pooled_z))) {
+  cat("\n`p_pooled_z` present but all NA -- the null sidecars were missing or unreadable\n",
+      "when 09s-aggregate.R ran.\n")
+} else {
+  cmp <- screen_dt[is.finite(p_emp), .(
+    n_tested = .N,
+    min_p_primary = signif(min(p_emp, na.rm = TRUE), 3),
+    min_p_pooled_z = signif(min(p_pooled_z, na.rm = TRUE), 3),
+    hits_primary = sum(is.finite(q) & q < screen_q_threshold &
+                         effect > screen_min_effect, na.rm = TRUE),
+    hits_pooled_z = sum(is.finite(q_pooled_z) & q_pooled_z < screen_q_threshold &
+                          effect > screen_min_effect, na.rm = TRUE)
+  ), by = .by]
+  cat("\nHit counts and resolution, primary vs floor-free sensitivity p:\n")
+  print(cmp[order(`Event Type`, feature_set)])
+
+  # (c) EFFECT-SIZE GUARD. A large z can come from a collapsed denominator rather
+  # than signal: null_R2_sd is never 0 (min ~1e-5) but can be proportionally tiny,
+  # so an event with R2 = 0.005 and null sd = 3e-4 scores z = 17 on no real signal.
+  # Effect size -- not null sd -- is the instrument that separates these.
+  top <- screen_dt[is.finite(p_pooled_z)][order(p_pooled_z)][
+    seq_len(min(15L, .N)),
+    .(ID, `Event Type`, feature_set, n_samples,
+      screen_R2 = signif(screen_R2, 3), null_R2_sd = signif(null_R2_sd, 3),
+      z = round(z_screen, 1), effect = signif(effect, 3),
+      p_pooled_z = signif(p_pooled_z, 3), q_pooled_z = signif(q_pooled_z, 3),
+      artifact_suspect = effect < 0.01)
+  ]
+  cat("\nTop events by the sensitivity p (artifact_suspect = effect < 0.01,\n",
+      "i.e. z inflated by a small null sd rather than by signal):\n")
+  print(top)
+  cat(sprintf(
+    "\n%d of the top %d have effect < 0.01. screen_min_effect is currently %g;\n raise EpiATLAS_AS_SCREEN_MIN_EFFECT to exclude them from hit calls.\n",
+    sum(top$artifact_suspect), nrow(top), screen_min_effect
+  ))
+
+  print(ggplot(screen_dt[is.finite(p_pooled_z) & is.finite(p_emp)],
+               aes(x = p_emp, y = p_pooled_z)) +
+    geom_point(alpha = .2, size = .6) +
+    scale_y_log10() +
+    geom_hline(yintercept = floor_tab$bh_allows[1], linetype = "dashed",
+               color = "firebrick") +
+    facet_grid(feature_set ~ `Event Type`) +
+    theme_bw() +
+    labs(
+      title = "Floor-free sensitivity p vs floored primary p",
+      x = "Exceedance p (vertical stripe at its 1/(R+1) floor)",
+      y = "Pooled-z p (log scale)",
+      caption = paste(
+        "The primary p piles into a vertical stripe at its floor; the sensitivity p",
+        "spreads those events out. Dashed = the BH threshold the primary p could not",
+        "reach. Points below it are events the floor was hiding."
+      )
+    ))
+  ggsave(file.path(plot_dir_ev, "screen_floor_sensitivity.pdf"),
+    width = 10, height = 2 + 2.2 * max(1L, uniqueN(screen_dt$feature_set)),
+    limitsize = FALSE)
+}
+```
+
+## 1.4 Per-event null distributions: the raw material behind each p-value
+
+Everything above summarises the null by its mean and SD. This shows the null itself: for a selected
+`(event, feature set)` pair, the histogram of ~200 matched-control R² values with the event's own real R²
+drawn as a vertical line. The empirical p *is* the tail mass to the right of that line
+(`p = (1 + #{null ≥ real}) / (1 + R_used)`), so the plot and the p-value are the same fact shown two ways.
+
+*Expected for a hit:* the line sits in the far right tail, clear of the bulk.
+*Expected for a fingerprint event:* the line sits inside the bulk — often at a **high absolute R²**,
+which is exactly the point: the controls reach the same R².
+*Deduction if a null distribution is bimodal or extremely wide:* the matched-control pool is
+heterogeneous for that event (e.g. controls with very different feature availability), so its p-value is
+noisier than the summary table suggests — worth checking `R_used` for that event.
+
+A panel is an `(event, feature set)` **pair**, not an event, since the same event has a different real R²
+and a different null in each space; seeing one event across its three spaces side by side is the useful
+comparison. Panels are capped (all significant pairs first, then top-by-effect) and only the selected
+events' sidecar files are read — the full set is tens of thousands of files.
 
 ```{r screen-null-histograms}
 # Per-event null-distribution histograms: real screen_R2 (vertical line) over the
@@ -1080,99 +1160,452 @@ if (nrow(plot_pairs) == 0L || length(null_files) == 0L) {
 }
 ```
 
-Finally, screen QC / calibration diagnostics: is the feature-rotation null honest (empirical-p roughly uniform, not piled toward 0), is the fingerprint pattern present (raw R² rises but effect stays ≈0), and are the very-negative group-LOO R² just small-n instability rather than a bug? These are the checks to eyeball before trusting the hit list.
+# 2. Tier 2 — elastic net on the hits: which features, and how well?
 
-```{r screen-diagnostics}
-sd_fin <- screen_dt[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
+Everything from here on runs **only on Tier-1 hits**, on **real PSI only** (no rotated responses), and is
+gated by `en_available`. If section 1 produced no hits, the rest of this report is empty — that is the
+designed behaviour, not a failure.
 
-# Coverage per feature set: rotations used, n_features (the point of the split),
-# and degenerate-event notes (NA = fit fine).
-cat("Screen coverage per feature set:\n")
-print(screen_dt[, .(
-  n_events        = .N,
-  finite_p        = sum(is.finite(p_emp)),
-  median_features = as.integer(median(n_features, na.rm = TRUE)),
-  R_used_median   = median(R_used, na.rm = TRUE),
-  R_used_below_max = sum(R_used < max(R_used, na.rm = TRUE), na.rm = TRUE)
-), by = feature_set][order(feature_set)])
-cat("Degenerate-event notes (NA = screened cleanly):\n")
-print(screen_dt[, .N, by = .(feature_set, note)][order(feature_set, -N)])
+**What Tier 2 is and is not.** It is a *description* of the signal Tier 1 already certified: which
+features, with what sign, how stably across folds. It is **not** a second significance test. Reading an
+elastic-net CV R² as evidence of epigenetic control would reintroduce exactly the error Tier 1 exists to
+prevent, because a good CV R² is just as achievable by fingerprint as by regulation.
 
-# (1) NULL CALIBRATION — p_emp should be ~flat under the null. A broken/optimistic
-# null piles p toward 0 across all bins; genuine signal shows only as a modest
-# excess in the leftmost bin over the uniform (dashed) line.
-# Calibration must be checked PER feature set — each is its own family of tests with
-# its own FDR, so one set's null can be broken while another's is fine.
-n_bins <- 10L
-.unif_dt <- sd_fin[, .(y = .N / n_bins), by = feature_set]
-print(ggplot(sd_fin, aes(x = p_emp)) +
-  geom_histogram(
-    breaks = seq(0, 1, 1 / n_bins), fill = "grey70", color = "white"
-  ) +
-  geom_hline(
-    data = .unif_dt, aes(yintercept = y), linetype = "dashed", color = "firebrick"
-  ) +
-  facet_wrap(~feature_set, scales = "free_y") +
-  theme_bw() +
-  labs(
-    title = "Tier-1 null calibration: empirical p-value distribution per feature set",
-    x = "Empirical p (matched feature-rotation null)",
-    y = "Number of events",
-    caption = paste(
-      "Dashed = uniform expectation (per panel). Flat = well-calibrated null; excess",
-      "in the leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
-      "indicate an optimistic (broken) null."
+**Why coefficients here need care even for genuine hits.** The features are strongly collinear
+(neighbouring windows of the same mark, and all marks with cell-type identity). The elastic net will pick
+one of a correlated group and zero the rest, and which one it picks can change with the fold — so
+*absence* of a mark is weak evidence, and the `n_robust` / fold-consistency diagnostics in section 3 are
+the guard against over-reading any single coefficient.
+
+## 2.1 How many events have an interpretable model?
+
+A model "exists" only if at least one feature is robustly selected in **every** CV fold
+(`n_robust > 0`, i.e. `has_model == TRUE`). Events failing that are excluded from all downstream
+feature-level analysis.
+
+*Expected:* `lambda.min` (weaker regularisation) yields more selected features and therefore more events
+with a model; `lambda.1se` is stricter and drops more events to `has_model == FALSE`.
+*Deduction if the `min` → `1se` attrition is severe:* the selected features are only marginally
+informative — they survive at the CV optimum but not once regularisation is tightened by one standard
+error, so their interpretation should be treated as provisional.
+*Deduction if attrition is mild:* the selected features carry enough signal to survive conservative
+regularisation, which strengthens their interpretation.
+
+Note on `rotated_hit` in these tables: it flags whether an event's **features** were borrowed as a
+matched control for some other event (Tier 1's rotation is a *feature* rotation, not a PSI permutation).
+It is bookkeeping about control reuse, not a result about that event.
+
+```{r counting-events, eval = en_available}
+if (en_available) {
+event_counts <- rbindlist(
+  lapply(unique(event_summary_table$lambda_selection), function(sel) {
+    rbindlist(
+      lapply(unique(event_summary_table$feature_set), function(fs) {
+        this_summary <- event_summary_table[
+          lambda_selection == sel & feature_set == fs
+        ]
+        modeled_ids <- this_summary[
+          response_type == "real" & has_model == TRUE,
+          unique(ID)
+        ]
+        rbindlist(
+          list(
+            Quantified = aggregated_dt[
+              ID %in% keep_rows,
+              .(N = uniqueN(ID)),
+              by = `Event Type`
+            ],
+            Filtered = event_dt[ID %in% keep_rows, .(.N), by = .(`Event Type`)],
+            `No Model` = aggregated_dt[
+              !ID %in% modeled_ids & ID %in% keep_rows,
+              .(N = uniqueN(ID)),
+              by = `Event Type`
+            ],
+            `Model` = this_summary[
+              response_type == "real" & has_model == TRUE,
+              .(.N),
+              by = .(`Event Type`)
+            ],
+            `Epigenetic\nOnly Model` = this_summary[
+              response_type == "real" &
+                expression_bias == "Epigenetic Only" &
+                has_model == TRUE,
+              .(.N),
+              by = .(`Event Type`)
+            ]
+          ),
+          idcol = "filtering"
+        )[, c("lambda_selection", "feature_set") := .(sel, fs)]
+      }),
+      fill = TRUE
     )
-  ))
-ggsave(file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"),
-  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
+  }),
+  fill = TRUE
+)
 
-# (2) FINGERPRINT — effect & p within raw-R2 strata. High raw R2 with effect ≈ 0
-# and non-small p = cell-type fingerprint, not event-specific signal (binned
-# complement to screen_effect_vs_r2.pdf).
-sd_fin[, r2_stratum := cut(
-  screen_R2, c(-Inf, 0, 0.1, 0.2, 0.5, Inf),
-  labels = c("<=0", "(0,0.1]", "(0.1,0.2]", "(0.2,0.5]", ">0.5")
-)]
-cat("Fingerprint check — effect & p within raw-R2 strata, per feature set:\n")
-print(sd_fin[, .(
-  n              = .N,
-  median_R2      = round(median(screen_R2), 3),
-  median_effect  = round(median(effect), 4),
-  pct_effect_pos = round(100 * mean(effect > 0), 1),
-  median_p       = round(median(p_emp), 3)
-), by = .(feature_set, r2_stratum)][order(feature_set, r2_stratum)])
+print(event_summary_table[
+  response_type == "real",
+  table(expression_bias, `Event Type`, lambda_selection, feature_set)
+])
 
-# (3) SMALL-n INSTABILITY — very-negative group-LOO R2 concentrates in small
-# events (expected), not a bug. y clipped at the 1st percentile for readability.
-print(ggplot(sd_fin, aes(x = n_samples, y = screen_R2, color = sig)) +
-  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-  geom_point(alpha = .3, size = .7) +
-  scale_color_manual(
-    values = c(`TRUE` = "firebrick", `FALSE` = "grey60"),
-    labels = c(`TRUE` = "significant", `FALSE` = "not sig"), name = NULL
-  ) +
-  coord_cartesian(
-    ylim = c(quantile(sd_fin$screen_R2, 0.01, na.rm = TRUE), 1)
-  ) +
-  facet_wrap(~feature_set) +
+event_counts[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+event_counts[,
+  feature_set := factor(feature_set, levels = c("long", "short", "local"))
+]
+
+print(ggplot(
+  event_counts,
+  aes(x = N, y = reorder(filtering, N), fill = lambda_selection)
+) +
+  geom_col(position = "dodge") +
   theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    text = element_text(size = 20),
+    axis.text.x = element_blank()
+  ) +
+  facet_grid(feature_set ~ `Event Type`, scales = "free_x") +
+  geom_text(
+    aes(label = N),
+    position = position_dodge(width = 0.9),
+    vjust = 1.1,
+    size = 4,
+    angle = 90
+  ) +
   labs(
-    title = "Screen R2 vs sample size (very-negative R2 = small-n LOO instability)",
-    x = "n samples (event)",
-    y = "Group-LOO screen R2",
-    caption = paste(
-      "Per feature set: the p >> n regime eases as features are dropped, so the",
-      "negative-R2 tail should shrink from long -> short -> local."
-    )
+    title = "Event waterfall: counts at each filtering stage",
+    x = "Number of Events",
+    y = NULL
   ))
-ggsave(file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"),
-  width = 4 + 3 * max(1L, uniqueN(sd_fin$feature_set)), height = 4, limitsize = FALSE)
+ggsave(file.path(plot_dir_ev, "event_counts.pdf"), width = 12, height = 5)
+}
 ```
 
-## 3. Biological context of significant events
+Events without any robust features (`has_model == FALSE`) are excluded from every downstream analysis.
+Expression bias is classified on the real-PSI model and propagated to that event's other rows, so the
+*Epigenetic Only* filter means the same thing everywhere it is applied.
 
-The following analyses ask *which events* show the strongest epigenetic signal and *why*, probing whether significance associates with biologically meaningful properties.
+*Deduction to draw from the proportion plots:* a large *Expression Bias* share means gene expression —
+not chromatin — is carrying much of the fit for those events. Since expression tracks differentiation
+state, those events cannot support a chromatin-regulation claim even if they passed Tier 1; the
+*Epigenetic Only* subset is the one to interpret.
+
+```{r generate-count-plots, eval = en_available}
+if (en_available) {
+event_summary_table[,
+  Variability := factor(
+    sub(" Variability", "", Variability, fixed = TRUE),
+    levels = c("High", "Low")
+  )
+]
+event_summary_table[,
+  `Event Type` := factor(`Event Type`, levels = to_analyze)
+]
+
+event_count_dt <- event_summary_table[
+  has_model == TRUE,
+  {
+    # Group by rotation_rank (0 for real, 1-10 for rotated) and count unique events.
+    # For real: one rank (0), uniqueN(ID) = N events. mean_count = N.
+    # For rotated: ranks 1-10, uniqueN(ID) per rank = events in that slot. mean/SD across slots.
+    counts <- .SD[, .(count = uniqueN(ID)), by = rotation_rank][, count]
+    .(
+      mean_count = mean(counts),
+      sd_count = sd(counts) / sqrt(uniqueN(rotation_rank))
+    )
+  },
+  by = .(
+    `Event Type`,
+    feature_set,
+    response_type,
+    expression_bias,
+    Variability,
+    lambda_selection
+  )
+]
+
+event_count_dt[response_type == "real", response_type := "Real"]
+event_count_dt[response_type == "rotated", response_type := "Rotated"]
+event_count_dt[,
+  response_type := factor(response_type, levels = c("Real", "Rotated"))
+]
+event_count_dt[
+  expression_bias == "Expression Bias",
+  expression_bias := "Expression\nBias"
+]
+event_count_dt[
+  expression_bias == "Epigenetic Only",
+  expression_bias := "Epigenetic\nOnly"
+]
+event_count_dt[
+  order(Variability, decreasing = TRUE),
+  cumsum_mean_count := cumsum(mean_count),
+  by = .(
+    `Event Type`,
+    feature_set,
+    response_type,
+    expression_bias,
+    lambda_selection
+  )
+]
+
+print(ggplot(
+  event_count_dt,
+  aes(y = mean_count, x = response_type, fill = Variability)
+) +
+  geom_col() +
+  ggh4x::facet_nested_wrap(
+    `Event Type` ~ feature_set + lambda_selection + expression_bias
+  ) +
+  theme_bw() +
+  theme(
+    legend.box = "vertical",
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  scale_fill_manual(values = variability_colors) +
+  labs(
+    title = "Model counts by expression bias, variability, and response type",
+    y = "Number of Events"
+  ) +
+  geom_errorbar(
+    aes(
+      y = cumsum_mean_count,
+      ymin = cumsum_mean_count - sd_count,
+      ymax = cumsum_mean_count + sd_count
+    ),
+    width = .2
+  ))
+ggsave(
+  file.path(plot_dir_ev, "events_rotation.png"),
+  width = 16,
+  height = 3,
+  dpi = 600
+)
+}
+```
+
+```{r generate-proportion-plots, eval = en_available}
+if (en_available) {
+event_count_dt[
+  response_type == "Real",
+  expression_bias := sub("\n", " ", expression_bias, fixed = TRUE)
+]
+print(ggplot(
+  event_count_dt[response_type == "Real"],
+  aes(y = mean_count, x = Variability, fill = expression_bias)
+) +
+  geom_col(position = "fill") +
+  geom_text(aes(label = mean_count), position = position_fill(vjust = 0.5)) +
+  facet_grid(`Event Type` ~ feature_set + lambda_selection) +
+  theme_bw() +
+  theme(
+    legend.box = "vertical",
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom"
+  ) +
+  scale_fill_manual(
+    values = c(`Epigenetic Only` = "orange", `Expression Bias` = "steelblue")
+  ) +
+  labs(
+    title = "Proportion of real-PSI models by variability: Epigenetic Only vs Expression Bias",
+    y = "Proportion of Events",
+    fill = NULL
+  ))
+ggsave(file.path(plot_dir_ev, "events_hit.png"), width = 10, height = 3)
+}
+```
+
+## 2.2 Hyperparameters actually selected
+
+A sanity check on the tuning itself, before any coefficient is read.
+
+*Expected:* `mixture` near 1 (lasso-like) gives sparse solutions, near 0 (ridge-like) dense ones; with
+strongly collinear features the CV optimum often drifts toward the ridge end, because spreading weight
+across correlated windows predicts better than committing to one.
+*Deduction if `mixture` sits near 0 for most events:* the data are telling you the signal is diffuse and
+not attributable to individual windows — so treat the per-feature coefficient lists in section 4 as
+"which correlated group", not "which window".
+*Deduction if the selected penalty is at the edge of the search grid:* the grid is truncating the
+optimum and the fits are not converged in the tuning sense; widen the grid before interpreting.
+
+The `response_type` facet is a historical artifact: Tier 2 has been real-PSI-only since the screen took
+over significance, so the "rotated" panel is empty by construction.
+
+```{r en-hyperparameters, eval = en_available}
+if (en_available) {
+# How do hyperparameter choices vary across feature sets and real vs rotated response?
+# A systematic difference in penalty/mixture suggests the model uses different
+# regularisation regimes for real vs random targets.
+print(ggplot(
+  best_params_table[!is.na(lambda_selection)],
+  aes(
+    x = lambda_selection,
+    y = -log10(penalty),
+    color = as.factor(mixture),
+    group = interaction(ID, wflow_id)
+  )
+) +
+  geom_line(alpha = 0.2) +
+  geom_boxplot(
+    aes(group = lambda_selection),
+    color = "grey30",
+    fill = NA,
+    outliers = FALSE
+  ) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  facet_grid(response_type ~ feature_set) +
+  scale_color_brewer(palette = "Set1", name = "mixture") +
+  labs(
+    title = "Selected penalty by lambda rule, feature set, and response type",
+    x = "Lambda selection rule",
+    y = "-log10(penalty)"
+  ) +
+  theme_bw())
+
+print(ggplot(
+  best_params_table,
+  aes(x = as.character(mixture), y = -log10(penalty), color = feature_set)
+) +
+  geom_boxplot(alpha = .5) +
+  facet_grid(. ~ response == "PSI") +
+  labs(
+    title = "Penalty distribution by mixture and response type",
+    x = "Mixture (0 = ridge, 1 = lasso)",
+    y = "-log10(penalty)"
+  ) +
+  theme_bw())
+
+# In-sample R² will be inflated by overfitting; compare to CV in paired-rotation-analysis.
+print(ggplot(
+  fit_metrics_table,
+  aes(x = response == "PSI", y = .estimate, color = feature_set)
+) +
+  geom_violin(alpha = .5, position = position_dodge(width = 0.8)) +
+  geom_jitter(
+    alpha = .2,
+    position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.5),
+    size = .5
+  ) +
+  facet_grid(.metric ~ lambda_selection, scales = "free_y") +
+  labs(
+    title = "In-sample fit metrics: real PSI vs rotated (overfitting diagnostic)",
+    x = "Real PSI response",
+    y = "Fit estimate (PSI scale)"
+  ) +
+  main_theme(16) +
+  coord_cartesian(ylim = c(0, NA)))
+}
+```
+
+## 2.3 Fit quality: in-sample vs cross-validated R²
+
+An overfitting diagnostic, not a significance test.
+
+*Expected:* in-sample R² well above CV R², since the model was tuned on the folds it reports. The gap is
+the overfitting penalty, and `lambda.1se` should show a smaller gap than `lambda.min` by construction.
+*Deduction if CV R² is ≈ 0 or negative while in-sample R² is high:* the fit memorises its training folds
+and transfers nothing — expected for events that only just cleared the Tier-1 threshold, and a reason not
+to interpret their coefficients.
+*Deduction if the gap is small and CV R² is decent:* the fit is stable across held-out ontology groups,
+so its coefficients are worth interpreting.
+*Deduction if `1se` does not shrink the gap:* the CV curve is flat, so the lambda choice is not doing
+meaningful work and `min` vs `1se` differences elsewhere are noise.
+
+```{r en-fit-quality, eval = en_available}
+if (en_available) {
+# In-sample vs cross-validated R2 for the Tier-2 elastic-net fits — an OVERFITTING
+# diagnostic, not a significance test (significance was already settled in Tier 1).
+#
+# EXPECTATION: in-sample R2 sits well above CV R2, because the EN was tuned on the
+# same folds it reports; the gap is the overfitting penalty. Read only the CV panel
+# as a performance estimate.
+# DEDUCTION if CV R2 is near zero or negative while in-sample R2 is high: the model
+# is memorising its training folds and carries no transferable signal — expected for
+# events that only just cleared the Tier-1 threshold.
+# DEDUCTION if the gap is small AND CV R2 is decent: the fit is genuinely stable
+# across held-out ontology groups, so its coefficients are worth interpreting.
+# Note lambda.1se should show a smaller gap than lambda.min by construction (more
+# regularisation, less capacity to overfit) — if it does not, the CV curve is flat
+# and the lambda choice is not doing meaningful work.
+
+# Average CV folds to one value per workflow
+cv_wflow <- cv_metrics_table[
+  .metric == "rsq_trad",
+  .(.estimate = mean(.estimate, na.rm = TRUE)),
+  by = .(ID, wflow_id, feature_set, lambda_selection, response_type)
+]
+
+wflow_fit <- rbindlist(
+  list(
+    `In-sample` = fit_metrics_table[
+      .metric == "rsq_trad",
+      .(ID, wflow_id, feature_set, lambda_selection, response_type, .estimate)
+    ],
+    CV = cv_wflow
+  ),
+  idcol = "metric_type"
+)
+wflow_fit[event_dt, on = "ID", `Event Type` := `Event Type`]
+wflow_fit[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+wflow_fit[, metric_type := factor(metric_type, levels = c("In-sample", "CV"))]
+
+real_rsq_dt <- wflow_fit[
+  response_type == "real",
+  .(
+    ID,
+    `Event Type`,
+    feature_set,
+    lambda_selection,
+    metric_type,
+    real_rsq = .estimate
+  )
+]
+
+print(ggplot(real_rsq_dt, aes(x = feature_set, y = real_rsq, color = feature_set)) +
+  geom_violin(alpha = .5) +
+  geom_jitter() +
+  facet_grid(`Event Type` ~ metric_type + lambda_selection) +
+  coord_cartesian(ylim = c(0, 1)) +
+  main_theme(base_size = 16) +
+  labs(
+    title = "Tier-2 elastic net, real PSI: in-sample vs CV R2",
+    x = NULL,
+    y = "R2 (real PSI)",
+    caption = paste(
+      "In-sample is inflated by tuning on the same folds; only the CV panel is a",
+      "performance estimate. The in-sample-minus-CV gap is the overfitting penalty."
+    )
+  ))
+ggsave(file.path(plot_dir_ev, "real_rsq.pdf"), width = 10, height = 4)
+}
+```
+
+# 3. What distinguishes the significant events?
+
+If Tier-1 significance reflects genuine event-specific regulation, it should **correlate with independent
+properties** of the events — properties the screen never saw. If instead it is residual noise on top of a
+fingerprint, significance should look random with respect to everything else. That is the shared logic of
+this section: each analysis is a weak external validation of the hit list.
+
+Every analysis here reads `emp_p_dt`, so `sig` is significance **in that workflow's own feature space**
+(use `sig_any` for per-event statements).
+
+**Caveat that applies throughout:** with few hits these comparisons have little power, and a null result
+is then uninformative rather than evidence against H1. Read the group sizes before the p-values.
+
+## 3.1 Do High-Variability events pass more often?
+
+*Hypothesis:* epigenetic regulation should be most detectable where splicing actually changes across
+samples, so High-Variability events should pass at a higher rate than Low-Variability ones.
+*Deduction if High > Low:* consistent with regulation tracking dynamic splicing — though note it is also
+consistent with a purely statistical explanation, since more PSI variance means more signal to fit.
+*Deduction if the rates are equal:* significance is not tracking the dynamic range of splicing at all,
+which is what one expects if it tracks cell-type identity instead.
+*Caveat:* "High/Low Variability" is a between- vs within-tissue variance classification, **not** a PSI
+range cutoff — both groups span the full PSI range (see section 5), so this is not a proxy for effect
+size.
 
 ```{r variability-significance, eval = en_available}
 if (en_available) {
@@ -1229,6 +1662,23 @@ ggsave(
 )
 }
 ```
+
+## 3.2 Do significant events have more robustly selected features?
+
+`n_robust` counts features selected in **every** CV fold, i.e. features whose usefulness survives holding
+out each ontology group in turn. It is an independent stability measure: Tier 1 never saw it.
+
+*Hypothesis:* genuine signal should be stable across held-out cell types, so significant events should
+carry higher `n_robust`.
+*Deduction if significant events have higher `n_robust`:* the two methods agree using different
+machinery (closed-form ridge vs sparse EN across folds) — mutual corroboration, and the strongest cheap
+evidence available here for H1.
+*Deduction if `n_robust` is unrelated to significance:* the features driving the ridge screen are not the
+ones the elastic net can pin down stably — consistent with a diffuse, collinear (fingerprint-like) signal
+rather than a few specific regulatory marks.
+*Deduction if significant events have systematically **lower** `n_robust`:* suspect the hits are
+small-n/high-variance events where both the screen statistic and the fold-wise selection are unstable —
+check against the R²-vs-n diagnostic in §1.1.
 
 ```{r n-robust-significance, eval = en_available}
 if (en_available) {
@@ -1299,6 +1749,19 @@ ggsave(
 }
 ```
 
+## 3.3 Fold-to-fold selection consistency
+
+The same idea as `n_robust` but per *feature* rather than per event: how often is a given feature chosen
+when a different ontology group is held out? Fold `0` (the full-training fit) is excluded, as it is not a
+held-out fold.
+
+*Expected under genuine locus-specific regulation:* a subset of features with high consistency — the same
+marks are chosen no matter which cell types are held out.
+*Expected under the fingerprint confound:* consistency spread broadly and low, because the model can
+substitute any cell-type-correlated feature for any other, and which one wins depends on the fold.
+*Deduction:* only high-consistency features are defensible candidates for follow-up; a feature selected
+in one fold is indistinguishable from a collinear stand-in.
+
 ```{r feature-consistency, eval = en_available}
 if (en_available) {
 # Research question: how consistently is each feature selected across CV folds?
@@ -1362,13 +1825,28 @@ ggsave(
 }
 ```
 
-If significant events consistently have more robust features, this suggests that the rotation test is not just detecting noise but events where epigenetic marks provide a stable, cross-tissue predictive signal.
+## 3.4 `n_robust`: real PSI vs rotated controls — **retired comparison**
 
-```{r real-vs-rotated-n-robust, eval = en_available}
+**This analysis no longer has a comparison arm and is kept only for provenance.** It was written for the
+old design, where each event was re-fit with the elastic net against ~10 rotated responses and
+significance came from that comparison. Under the two-tier design, Tier 2 fits **real PSI only** — the
+null lives entirely in Tier 1, where it is far cheaper and uses hundreds rather than ten controls — so
+there are no `response_type == "rotated"` rows and the "Rotated PSI" violin is empty by construction.
+
+The chunk therefore reports the real-PSI `n_robust` distribution only, and prints the rotated row count so
+the absence is explicit rather than a silently half-drawn plot. The equivalent question — *does the real
+locus beat unrelated loci?* — is answered properly in §1.2 and §1.3.
+
+```{r n-robust-real-vs-null, eval = en_available}
 if (en_available) {
-# Research question: do real PSI models robustly select more features than
-# rotated (permutation) controls? More robust features in real models supports
-# genuine epigenetic signal rather than overfitting to PSI structure.
+# RETIRED COMPARISON — kept for provenance, no longer has a second arm.
+# Original question: do real-PSI models robustly select more features than rotated
+# (permutation) controls? Under the two-tier design that question is answered in
+# Tier 1 (§1.2/§1.3) against HUNDREDS of matched control loci, not 10 rotated
+# responses, and Tier 2 fits real PSI ONLY — so `response_type == "rotated"` rows do
+# not exist and the "Rotated PSI" violin is empty by construction.
+# The row count is printed so the absence is explicit rather than a silently
+# half-drawn two-arm plot. Do NOT read a one-sided version of this as a result.
 
 nrob_comp_dt <- event_summary_table[
   !is.na(n_robust),
@@ -1394,6 +1872,16 @@ nrob_comp_dt[,
     levels = c("Real PSI", "Rotated PSI")
   )
 ]
+cat(sprintf(
+  "n_robust real-vs-rotated: %d real rows, %d rotated rows%s\n",
+  sum(nrob_comp_dt$response_type == "real"),
+  sum(nrob_comp_dt$response_type == "rotated"),
+  if (sum(nrob_comp_dt$response_type == "rotated") == 0L) {
+    " -- rotated arm EMPTY as expected (Tier 2 is real-PSI only); the plot below shows the real distribution only, it is NOT a comparison"
+  } else {
+    ""
+  }
+))
 nrob_comp_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 
 print(ggplot(
@@ -1423,7 +1911,21 @@ ggsave(
 }
 ```
 
-Feature selection consistency across folds measures whether the same marks are chosen regardless of which tissue group is held out. Events with high consistency provide more reliable targets for follow-up validation.
+## 3.5 Is the result stable across the lambda rule?
+
+A robustness check on the regularisation choice, not a biological question.
+
+*Expected:* high concordance — events should be significant (or not) under both `min` and `1se`.
+*Deduction for "min only" events:* significance depends on the weaker regularisation, so it rests on
+features that do not survive a one-standard-error tightening — treat as fragile.
+*Deduction for "1se only" events:* rare and slightly odd (the stricter model passing where the looser one
+fails); usually a sign of an unstable CV curve for that event rather than a stronger result.
+*Deduction if concordance is low overall:* the feature selection is dominated by the penalty setting
+rather than by the data, and no per-event coefficient list should be reported without stating which
+lambda rule produced it.
+
+Note that Tier-1 significance itself has **no** lambda dimension (the screen's ridge λ is set by GCV, not
+by a path), so any discordance here reflects the elastic-net side only.
 
 ```{r lambda-switching, eval = en_available}
 if (en_available) {
@@ -1509,9 +2011,25 @@ ggsave(file.path(plot_dir_ev, "lambda_switching.pdf"), width = 8, height = 4)
 }
 ```
 
-## 4. Epigenetic mark-level analysis
+# 4. Mark-level analysis: which epigenetic features get selected?
 
-Which specific histone marks drive prediction in Epigenetic Only models? Comparing real vs rotated mark usage tests whether the mark composition reflects genuine epigenetic–splicing associations or chance feature selection. Events where the same marks are selected for both real and rotated PSI are less convincing.
+The question shifts from *which events* to *which marks*. Feature names encode both a mark and a position
+(which window relative to the event), and `feature_set` distinguishes marks that overlap the event itself
+(`local`) from window marks further out (`short`/`long`) — a distinction that matters for every
+interpretation below, because a mark selected only in a wide window may simply be reporting a neighbouring
+promoter rather than anything about the exon.
+
+## 4.1 Which marks are selected in Epigenetic Only models?
+
+*Hypothesis under genuine regulation:* a few marks with known splicing links should dominate —
+canonically H3K36me3 (co-transcriptional, exon-biased) and DNA methylation over exon bodies.
+*Hypothesis under the fingerprint confound:* selection should look like a generic "active chromatin"
+mixture with no particular splicing logic, and should be broadly similar whichever events you look at.
+*Deduction if selection is dominated by promoter marks (H3K4me3/H3K27ac) in wide windows only:* the models
+are reading promoter/expression state, which §4.3's TSS control tests directly.
+*Deduction if `local` selection is negligible while `short`/`long` selection is rich:* nothing at the exon
+itself is informative, and the apparent signal comes from genomic neighbourhood — evidence against
+event-level epigenetic control specifically.
 
 ```{r plot-mark-counts, eval = en_available}
 if (en_available) {
@@ -1626,11 +2144,29 @@ ggsave(file.path(plot_dir_ev, "mark_counts_error.pdf"), width = 18, height = 10)
 }
 ```
 
-### Rotation-test stratified mark analysis
+## 4.2 Mark profiles stratified by Tier-1 significance
 
-The overall Real > Rotated gap in mark counts conflates two groups: events that **pass** the rotation test (genuine epigenetic–splicing signal) and events that **fail** (likely fingerprint confound). Only the passing group has trustworthy feature associations. If mark profiles are identical between the two groups, all selection is fingerprint-driven. Different profiles support causal interpretation for the significant subset.
+The sharpest version of the mark question: do events that **pass** the screen select *different* marks
+from those that fail? Per mark, a Fisher's exact test compares selection frequency between the passing and
+failing strata (Fisher rather than chi-squared because the passing group is small).
 
-```{r mark-counts-rotation-stratified, eval = en_available}
+Three outcomes, with what each licenses:
+
+- **POSITIVE — distinct profiles, specific marks enriched in the passing group.** Particular marks drive
+  genuine epigenetic–splicing associations beyond the fingerprint, and feature interpretation is
+  trustworthy for the significant subset. This is the result that would support a mechanistic claim.
+- **NULL — indistinguishable profiles.** Two explanations that this comparison **cannot** separate:
+  (a) all mark selection reflects cell-type identity and the passing events cleared the threshold by
+  chance; or (b) genuine signal uses the *same* marks as the fingerprint, so profile comparison is blind
+  to the difference. Distinguishing them needs a different design (e.g. perturbation, or matched-cell-type
+  replicates), not more of this analysis.
+- **CONFOUND — protocol/RNA-seq features enriched in the passing group.** Technical protocol effects, not
+  epigenetics, are driving apparent signal. This is a flag to investigate, not a result.
+
+*Power caveat, stated before the p-values:* with a small passing group, Fisher has little power, so a NULL
+here is weak evidence. Check `n_group` per stratum first.
+
+```{r mark-counts-screen-stratified, eval = en_available}
 if (en_available) {
 # Research question: do events passing the rotation test select different marks
 # than failing events?
@@ -1843,14 +2379,23 @@ ggsave(
 }
 ```
 
-### TSS proximity of promoter-mark-selected events
+## 4.3 TSS-proximity control for promoter-mark selection
 
-H3K4me3 and H3K27ac are promoter-associated marks. If events where these marks are robustly
-selected are systematically closer to the TSS than unselected events, the mark selection may
-reflect promoter chromatin contaminating the feature window rather than event-level regulation.
-The `local` feature set (event-overlapping only) is the critical comparator: if H3K4me3 is
-selected even in `local`, the mark genuinely overlaps the exon/intron body. Selection in
-`short`/`long` windows near TSS is more likely window contamination.
+H3K4me3 and H3K27ac are promoter marks. If events whose models select them are systematically **closer to
+the TSS** than unselected events, then the selection plausibly reflects promoter chromatin leaking into the
+feature window — not event-level regulation. This is a targeted confound test, not an exploratory look.
+
+The `local` feature set is the critical comparator, and the logic is a genuine dissociation:
+
+- **`local`, H3K4me3 selected, no TSS enrichment** → the mark genuinely overlaps the exon/intron body;
+  promoter contamination is not the explanation.
+- **`short`/`long`, significant TSS enrichment** → the window is capturing a nearby promoter; the mark's
+  coefficient should not be read as an exon-level effect.
+- **RI events near the TSS** → expected biologically (first-intron retention is common), so RI enrichment
+  is not by itself evidence of contamination — interpret RI and SE separately.
+
+The Wilcoxon test is one-tailed (`alternative = "less"`), i.e. it asks specifically whether selected events
+are *closer* to the TSS, which is the direction the confound would produce.
 
 ```{r tss-proximal, eval = en_available}
 if (en_available) {
@@ -2061,22 +2606,52 @@ print(wilcox_dt[order(`Event Type`, feature_set, lambda_selection)])
 }
 ```
 
-Interpretation guide:
-- **`local` feature set, H3K4me3, no TSS enrichment**: mark genuinely overlaps exon/intron; event-level regulation plausible.
-- **`short`/`long` feature set, significant TSS enrichment**: window captures nearby promoter; selection may be a positional confound. Add as Discussion note; consider TSS-distance filter (e.g., exclude events within 5 kb of TSS from H3K4me3/H3K27ac interpretation).
-- **RI events near TSS**: first-intron retention is common and biologically expected near promoters; TSS proximity alone does not disqualify RI H3K4me3 associations.
+# 5. PSI variability vs model quality
 
-## 5. PSI variability and model performance
+Does the *magnitude* of PSI change across samples predict how well an event can be modelled?
 
-Does the magnitude of PSI change across samples predict model quality? Events with larger PSI range provide more signal for feature learning but may also show stronger expression bias (gene expression co-varies with large PSI shifts).
+**Read the binning caveat first — and note it was previously stated wrongly.** An older comment here
+claimed `aggregated_dt` is "pre-filtered to variable events, all with PSI range > 0.25". That is **false**:
+there is no variance or range filter anywhere in the pipeline. The only PSI-based event filter is Wang
+et al. 2024 Procedure 2 as implemented upstream in `02-3` (`psi_q95 >= 0.05 & psi_q05 <= 0.95`), which is
+a **non-constitutive** test — it removes only always-excluded and always-included events, and says nothing
+about how much PSI varies in between. Measured on the real `biotype_filtered` set: PSI range is ≤ 0.25 for
+**33%** of events and ≤ 0.15 for 11%, and **39% of SE events have `q05 > 0.90`**, i.e. they sit hard against
+the constitutive-inclusion ceiling and were retained by a margin of ≤ 0.05.
+
+Quantile tertiles are therefore used because they are robust, **not** because the low bin is
+"variable-but-less-so": the low tertile genuinely contains near-constant events, whose PSI variance is
+small enough that little can be explained in principle. That matters for reading everything below —
+`Variability = Low` SE events have a median range of only 0.23 — and it matters for Tier 1, where a
+near-constant response is a plausible source of the wild negative group-LOO R² values seen in §1.1.
+
+*Hypothesis (signal-strength):* larger PSI swings give more variance to explain, so high-dPSI events
+should more often get a model and reach higher CV R².
+*Deduction if the R²-vs-range slope is flat:* within this range, how much an event's PSI moves does not
+predict how well chromatin explains it — consistent with the marks capturing static cell-type identity
+rather than the intensity of dynamic regulation.
+*Deduction if high-dPSI events show more Expression Bias:* gene expression co-varies with large PSI shifts
+(differentiation state), so the *Epigenetic Only* label is least reliable exactly where the effect sizes are
+biggest — an important caveat for any "top events" list.
+*Deduction from High/Low Variability groups spanning the same PSI range:* confirms that the Variability
+label captures between- vs within-tissue variance structure, **not** effect size, so §3.1 and this section
+are testing different things and should not be conflated.
 
 ```{r dpsi-analysis, eval = en_available}
 if (en_available) {
 # Research question: do high-dPSI events yield better models and more expression bias?
 #
-# NOTE: aggregated_dt is pre-filtered to variable splicing events — all events have
-# PSI range > 0.25. Absolute cutoffs (e.g., "stable <= 0.1") produce empty bins.
-# Use quantile-based tertile bins to compare within the observed range.
+# CORRECTED 2026-07-29 — the old note here ("pre-filtered to variable splicing
+# events, all events have PSI range > 0.25") was WRONG. There is no variance/range
+# filter in the pipeline. `02-3`'s only PSI-based event filter is Wang Procedure 2,
+# `psi_q95 >= 0.05 & psi_q05 <= 0.95`, which merely drops CONSTITUTIVE events
+# (always ~0 or always ~1) and constrains variability not at all.
+# Real numbers (biotype_filtered): 33% of events have PSI range <= 0.25, 11% <= 0.15,
+# and 39% of SE events have q05 > 0.90 (retained by <= 0.05 of margin).
+# Tertile bins are used because they are robust to that skew — NOT because the low
+# bin is merely "less variable". The low bin contains genuinely near-constant events
+# with almost no variance to explain, which is a confound for any
+# "does dPSI predict model quality?" reading below.
 #
 # Interpretation guide:
 #   HIGH dPSI → more models built + higher CV R²:
@@ -2129,7 +2704,7 @@ print(ggplot(
     y = "PSI range (max - min)",
     caption = paste(
       "Range = max(PSI) - min(PSI) across IHEC samples ~ max pairwise dPSI.",
-      "All events have range > 0.25 (pre-filtered). High/Low Variability groups overlap",
+      "NB: there is NO range pre-filter -- 33% of events have range <= 0.25. High/Low Variability groups overlap",
       "almost completely -- the Variability label is not based on PSI range magnitude."
     )
   ))
@@ -2244,7 +2819,7 @@ print(ggplot(
     y = "Mean CV R2",
     caption = paste(
       "Loess trend per Variability group. Null: flat slope within the pre-filtered high-change range.",
-      "All events have range > 0.25; variation above that threshold may not drive model quality."
+      "No range pre-filter exists (33% of events have range <= 0.25); a flat slope means PSI range does not drive model quality."
     )
   ))
 ggsave(file.path(plot_dir_ev, "dpsi_cv_rsq.pdf"), width = 16, height = 5)
@@ -2295,9 +2870,34 @@ ggsave(
 }
 ```
 
-## 6. Inter-model feature variation
+# 6. Inter-model feature variation: is mark selection structured, or idiosyncratic?
 
-Why do individual event models differ from each other? Coherent groups of events sharing the same marks would imply shared epigenetic regulatory programs. Idiosyncratic, uncorrelated mark selection would support fingerprint confound.
+Final question: do event models share regulatory logic, or is each one its own story? Two views —
+coefficient *signs* per mark, and mark *co-occurrence* across events.
+
+*Hypothesis A — coherent clusters.* Groups of events share mark patterns, i.e. distinct chromatin contexts
+predict splicing in distinct genomic settings (promoter-proximal vs enhancer-associated, say). Supports
+genuine regulatory logic.
+*Hypothesis B — no cluster structure.* Selection is idiosyncratic; no shared logic. Consistent with the
+fingerprint confound, where marks enter via cell-type correlation rather than event-specific regulation.
+
+**The co-occurrence matrix is the decisive panel, and its expected shape is the confound's fingerprint.**
+If marks entered models because of local regulatory state, biologically antagonistic marks should be
+*negatively* correlated — active (H3K27ac) and repressive (H3K27me3) states are largely mutually exclusive
+at the same locus. An **all-positive** matrix, including for antagonistic pairs, means selection is driven
+by something all marks share: cell-type identity. This mirrors the sample-axis correlation result reported
+elsewhere in the project (H3K27ac vs H3K27me3 r ≈ 0.65 across samples, while the *spatial* window-axis
+correlation for the same pair is negative, as biology predicts) — so the all-positive pattern here is
+expected and is evidence about the confound, not a bug.
+
+*Deduction from mixed coefficient signs for the same mark* (positive in some events, negative in others):
+the mark's effect is context-dependent — e.g. H3K27ac coinciding with inclusion at one locus and exclusion
+at another. Consistent sign across events would instead indicate a universal association. Mixed signs are
+also, less charitably, what unstable selection among collinear features produces, so cross-check against
+the fold-consistency results in §3.3 before claiming context dependence.
+
+*Watch for r = 1.00 pairs:* these are duplicate features (identical values under two names), not two marks
+that happen to agree perfectly — e.g. the `Protocol mRNA-Seq` / `Protocol total-RNA-Seq` pair.
 
 ```{r feature-heatmap, eval = en_available}
 if (en_available) {
