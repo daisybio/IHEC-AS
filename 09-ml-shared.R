@@ -194,7 +194,14 @@ resolve_supergroup_folds <- function(ontology_vec, nfolds = 5L) {
 # clarity), QC/provenance, the pooled getmm expression, and the
 # target-leakage columns IJC/SJC/PSI (PSI = IJC/(IJC+SJC)).
 #
-# Column selection is by an explicit blocklist (mirrors 09zz::build_explanatory_vars)
+# Column selection is by an explicit blocklist. NOTE it is deliberately STRICTER
+# than 09zz::build_explanatory_vars, which blocks only the id/meta/target columns:
+# this one additionally excludes `H3K*_source` (observed-vs-imputed provenance,
+# which tracks which epigenome a sample is and is therefore a cell-type/batch
+# proxy), `width;*` event geometry, distance_TES/gene_start/gene_end, and
+# qc_flag_count. Tier-2 currently admits all of those as elastic-net predictors --
+# an inconsistency, not a designed asymmetry (see the 09-event-models-redesign
+# audit note). Do not "align" this by loosening it.
 # plus pattern rules, so a genuinely new epigenetic column is auto-included, and
 # `_source`/`width;`/geometry meta are auto-excluded.
 screen_partition_columns <- function(col_names, grouping_col = "ontology") {

@@ -747,6 +747,40 @@ if (!interactive() && .is_09zz_script) {
   # (event models use vst), AND `IJC`/`SJC`/`PSI` — the latter are ILLEGAL
   # features: PSI = IJC/(IJC+SJC), so using the junction counts as predictors is
   # trivial target leakage (same rule as splicing_ml's IJC/SJC/PSI drop).
+  #
+  # ---------------------------------------------------------------------------
+  # AUDIT NOTE 2026-07-30 — KNOWN INCONSISTENCY WITH TIER 1. NOT FIXED (fixing it
+  # would change results, and the current screen results were produced with this
+  # behaviour). Documented here so nobody assumes the two tiers agree.
+  #
+  # This blocklist is LOOSER than Tier-1's `screen_partition_columns()`
+  # (09-ml-shared.R). Columns Tier-1 deliberately excludes but that become
+  # elastic-net PREDICTORS here:
+  #   H3K*_source (6 cols)  — observed-vs-imputed PROVENANCE per mark
+  #   qc_flag_count         — per-sample QC covariate
+  #   width;* (3 cols)      — event geometry
+  #   distance_TES, distance_gene_start, distance_gene_end
+  #
+  # Measured on 40 random real feature tables: `H3K*_source` VARIES within the
+  # event in 100% of them (mean 5.75 of 6 columns), and `qc_flag_count` varies in
+  # 100%. So these are live predictors for essentially every event, not a corner
+  # case. The nominal-level fixing below only drops a `_source` column when it is
+  # GLOBALLY constant across the event, which is almost never.
+  #
+  # Why it matters: `H3K*_source` encodes whether that mark's signal was imputed.
+  # Imputation status tracks which epigenome a sample is (not all IHEC epigenomes
+  # have all marks), so it is a direct cell-type/batch proxy — precisely the
+  # fingerprint confound this project exists to expose — and it also flags that the
+  # other features for that sample are model-derived. A "significant" chromatin
+  # coefficient could be reading imputation status instead of biology.
+  # `width;*` and the distance_* columns are constant within an event, so
+  # `step_zv()` removes them; they are harmless, unlike the two above.
+  #
+  # Consequence for interpretation: when reading coef_table, check whether any
+  # `H3K*_source_*` dummy or `qc_flag_count` carries weight before attributing a
+  # model to chromatin. Currently dormant (Tier-2 only runs on Tier-1 hits, and the
+  # last completed screen produced none), but live the moment there are hits.
+  # ---------------------------------------------------------------------------
   build_explanatory_vars <- function(feat_dt, ev_id, resp) {
     explanatory <- names(feat_dt)[
       !names(feat_dt) %in%
@@ -788,6 +822,16 @@ if (!interactive() && .is_09zz_script) {
       }),
       rep(TRUE, length(chromhmm_explanatory))
     )]
+    # AUDIT NOTE 2026-07-30 — this mapping is POSITIONAL and therefore fragile.
+    # It assumes `feature_sets` is exactly c("long", "short", "local") IN THAT
+    # ORDER (it is, defined at 09-1-ml-local.R:53), because the list below is
+    # built as all / drop-far-chromHMM / drop-all-chromHMM. Reorder or subset
+    # `feature_sets` and the labels silently swap — a `long` model would be
+    # reported as `local`, with no error anywhere. NOT changed (a named-list
+    # construction would be the fix, but it is a behaviour-neutral refactor only
+    # if the vector really is in this order, and touching it now would put the
+    # current results in question). If you ever make `feature_sets` configurable,
+    # fix this first.
     setNames(
       list(
         explanatory,
