@@ -353,6 +353,12 @@ rule rmats_event_filtering:
         file_table = "processed_data/file_table.csv.gz",
         gene_expression_normalised =
             "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
+        # Read at 02-3:31 into `command_dt` and used as live code (~:361/:467/:487/:524)
+        # to resolve rMATS run names and to recover sample UUIDs in rMATS input-file
+        # order. Was an UNDECLARED dependency: Snakemake would neither re-run this rule
+        # when the file changed, nor fail the dry run if it went missing — the error
+        # would have surfaced as a bare fread() failure deep inside the rule instead.
+        rmats_commands = "data/rmats_split_post_commands.tsv",
     output:
         psi_files = expand(
             "splicing_analysis/rmats/{{transcript_filter}}/event_{et}.psi",

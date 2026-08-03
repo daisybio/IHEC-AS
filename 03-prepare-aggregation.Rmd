@@ -22,9 +22,14 @@ metadata <- metadata[
   epirr_id_without_version %in%
     file_metadata[, unique(epirr_id_without_version)]
 ]
-rmats_command_file <- "data/rmats_split_post_commands.tsv"
-command_dt <- fread(rmats_command_file)
-bam_dt <- fread("rmats_mapping/rmats_commands.tsv")
+# Removed 2026-08-01: `rmats_command_file` / `command_dt` / `bam_dt` were read here and
+# then never referenced again anywhere in this file — three dead lines carrying two
+# mandatory file reads. The `bam_dt` one was the harmful half: it read
+# `rmats_mapping/rmats_commands.tsv`, which is NOT tracked by git, so a fresh checkout
+# failed at this line for no benefit. `02-3-rmats-event-filtering.Rmd` keeps its own
+# genuinely-used `command_dt` (it drives run-name lookups at ~:361/:467/:487/:524), so
+# `data/rmats_split_post_commands.tsv` remains a real pipeline input — just not one that
+# stage 03 needs.
 ```
 
 ```{r, load-events}
