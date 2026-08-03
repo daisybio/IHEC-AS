@@ -158,3 +158,23 @@ Useful W&B detail controls:
 - `--wandb-no-tuning-details`: disable structured tuning logs
 - `--wandb-no-baseline-metrics`: disable baseline and delta logs
 - `--wandb-fold-subruns`: optional per-fold sub-runs (higher run/API volume)
+
+## Local run artifacts (written with or without W&B)
+
+Two artifacts are written to disk regardless of tracking, so a run remains inspectable with no W&B
+account and after `--no-wandb`:
+
+- `logs/hp_search_{config_key}.jsonl` — one line per (fold, model) with scores, train scores and the
+  selected hyperparameters. Keyed by config (`{event_type}-{transcript_filter}-{variability}-{group_col}-{task}`,
+  plus a `-feat_…` suffix for ablation runs), the same key used for the W&B child-run name, so a local
+  line can be matched to its hosted run.
+- `qc/model_input_sanity_{config_key}.json` — what the model actually receives *after* preprocessing:
+  shape, per-feature min/max/mean/sd, non-finite counts, one-hot column count vs expected, and
+  zero-variance columns. NaN or Inf here is treated as a failure rather than a data quirk, because the
+  numeric branch median-imputes and the categorical branch one-hot-encodes, so nothing missing should
+  survive; zero variance is only a warning.
+
+HTML reports additionally render a SHAP importance panel per model (xgb/lgbm via `TreeExplainer`,
+linear via `LinearExplainer`) plus a cross-model **rank**-agreement table. SHAP magnitudes are
+comparable only within a model — different tree families assign systematically different absolute
+magnitudes to the same ranking — so only rankings are compared across models.
