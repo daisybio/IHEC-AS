@@ -17,7 +17,111 @@ from typing import Any
 import numpy as np
 
 
-__all__ = ["NullTracker", "WandbTracker", "make_tracker"]
+__all__ = [
+    "NullTracker",
+    "WandbTracker",
+    "append_hp_search_jsonl",
+    "build_config_key",
+    "make_tracker",
+]
+
+
+def build_config_key(cfg: Any, task: str, run_cfg: Any = None) -> str:
+    """Stable identifier for one subset config + task.
+
+    Single definition shared by the W&B child-run name and the local JSONL
+    trajectory file, so the two cannot drift apart and a JSONL line can always be
+    matched to its hosted run.
+    """
+    feature_groups = getattr(run_cfg, "feature_groups", None) if run_cfg else None
+    feature_groups_label = "+".join(feature_groups) if feature_groups else "all"
+    key = (
+        f"{cfg.event_type}-{cfg.transcript_filter}-{cfg.variability}-"
+        f"{cfg.group_col}-{task}"
+    )
+    if feature_groups_label != "all":
+        key += f"-feat_{feature_groups_label}"
+    return key
+
+
+def append_hp_search_jsonl(
+    *,
+    config_key: str,
+    model_name: str,
+    fold_id: int,
+    task: str,
+    scores: dict[str, Any] | None,
+    train_scores: dict[str, Any] | None,
+    tuning_info: dict[str, Any] | None,
+    primary_metric: str | None,
+    timestamp: str | None = None,
+    log_dir: str | Path = "logs",
+) -> None:
+    """Append one JSON line per fold/model to ``logs/hp_search_{run_id}.jsonl``.
+
+    Deliberately a module-level function rather than a ``WandbTracker`` method.
+    ``WandbTracker`` is not even instantiated when ``--no-wandb`` is passed or when
+    credentials are missing (``make_tracker`` hands back a ``NullTracker``), and
+    ``log_fold_result`` early-returns when there is no child run -- so anything living
+    inside the class cannot be a fallback for the case the fallback exists for. This is
+    called unconditionally from the pipeline instead, so the hyperparameter-search
+    trajectory persists with or without a W&B account.
+
+    Also NOT wrapped in ``contextlib.suppress(Exception)`` the way the W&B calls are.
+    Those are suppressed because losing remote telemetry must never fail a run; this
+    writes to the local filesystem, where a failure means something is genuinely wrong
+    (unwritable log dir, full disk) and should surface rather than silently produce an
+    empty trajectory file. Only the JSON-serialisation of tuning params is defended,
+    since those come from arbitrary estimator objects.
+    """
+
+    def _plain(value: Any) -> Any:
+        """Coerce numpy scalars/arrays and estimator objects to JSON-safe values."""
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return [_plain(v) for v in value.tolist()]
+        if isinstance(value, dict):
+            return {str(k): _plain(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_plain(v) for v in value]
+        return str(value)
+
+    def _finite_only(d: dict[str, Any] | None) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for k, v in (d or {}).items():
+            if isinstance(v, (int, float, np.generic)) and np.isfinite(float(v)):
+                out[str(k)] = float(v)
+        return out
+
+    info = tuning_info or {}
+    record = {
+        "timestamp": timestamp,
+        "config_key": str(config_key),
+        "model_name": str(model_name),
+        "fold_id": int(fold_id),
+        "task": str(task),
+        "primary_metric": primary_metric,
+        "scores": _finite_only(scores),
+        "train_scores": _finite_only(train_scores),
+        "best_params": _plain(info.get("best_params")),
+        "best_score": _plain(info.get("best_score")),
+        "n_candidates": _plain(info.get("n_candidates")),
+        "search_backend": _plain(info.get("search_backend")),
+        "tree_es_applied": _plain(info.get("tree_es_applied")),
+        "tree_es_n_estimators": _plain(info.get("tree_es_n_estimators")),
+    }
+    out_dir = Path(log_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Keyed by config rather than by a run id: without W&B there is no run id to use,
+    # and inventing one would scatter a single config's folds across files. One file per
+    # (subset config x task) keeps a whole search trajectory in one place and is
+    # self-describing on disk.
+    path = out_dir / f"hp_search_{config_key}.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, default=str) + "\n")
 
 
 class NullTracker:
@@ -265,12 +369,11 @@ class WandbTracker:
         # configs are filterable and groupable like the other split axes.
         feature_groups = getattr(run_cfg, "feature_groups", None)
         feature_groups_label = "+".join(feature_groups) if feature_groups else "all"
-        run_name = (
-            f"{cfg.event_type}-{cfg.transcript_filter}-{cfg.variability}-"
-            f"{cfg.group_col}-{task}"
-        )
-        if feature_groups_label != "all":
-            run_name += f"-feat_{feature_groups_label}"
+        # build_config_key() reproduces exactly the string that used to be built inline
+        # here; shared with the local JSONL trajectory writer so the two identifiers
+        # cannot drift. NB run_name also drives _delete_existing_run(), so any change to
+        # this string changes which hosted run gets replaced.
+        run_name = build_config_key(cfg, task, run_cfg)
         tags = [
             f"event:{cfg.event_type}",
             f"tx:{cfg.transcript_filter}",

@@ -288,6 +288,34 @@ _PLOTLY_JS_HELPERS = """
         );
     }
 
+    // ── SHAP importance, horizontal bars, one panel per model ──────────────
+    // Bars are sorted most-important-first by the payload builder. Plotly draws the
+    // first category at the BOTTOM of a horizontal bar chart, so the arrays are
+    // reversed here to put the strongest feature at the top -- the same axis-direction
+    // trap as the confusion-matrix heatmap needing yaxis.autorange 'reversed'.
+    function plotShapImportance(divId, features, values, modelName, nExplained, nTotal) {
+        if (!features || !features.length) return;
+        const f = features.slice().reverse();
+        const v = values.slice().reverse();
+        const shown = features.length;
+        const subtitle = (nTotal && nTotal > shown)
+            ? `top ${shown} of ${nTotal} features, ${nExplained} rows explained`
+            : `${shown} features, ${nExplained} rows explained`;
+        Plotly.newPlot(
+            divId,
+            [{ x: v, y: f, type: 'bar', orientation: 'h',
+               marker: { color: '#4c78a8' },
+               hovertemplate: '%{y}<br>mean |SHAP| = %{x:.4g}<extra></extra>' }],
+            {
+                title: { text: `${modelName} — ${subtitle}`, font: { size: 12 } },
+                margin: { l: 190, r: 20, t: 40, b: 45 },
+                xaxis: { title: 'mean |SHAP| (within-model scale)' },
+                yaxis: { automargin: true, tickfont: { size: 9 } }
+            },
+            { responsive: true }
+        );
+    }
+
     // ── ROC + PR combined panel (shared legend) ────────────────────────────
     function plotRocPrCurves(divId, rocByModel, prByModel, prevalence, palette) {
         const el = document.getElementById(divId);
@@ -859,6 +887,60 @@ def write_subset_html_report(
           featureNames.forEach((name, i) => {{
             plotFeatureHistogram(fdDivs[i].id, featureDist[name], name);
           }});
+        }}
+
+        // ── SHAP feature importance (per model; xgb/lgbm/linear only) ───────
+        const shapImp = (tr.shap_importance || {{}}).models || {{}};
+        const shapModels = Object.keys(shapImp);
+        if (shapModels.length) {{
+          const shHeader = document.createElement('h3');
+          shHeader.textContent = 'SHAP feature importance (mean |SHAP| across folds)';
+          card.appendChild(shHeader);
+          const shNote = document.createElement('p');
+          shNote.style.color = '#666'; shNote.style.fontSize = '0.85rem';
+          shNote.textContent = 'One panel per model. Magnitudes are comparable only WITHIN a model, never between models: on real data xgb and lgbm agree on ranking (Spearman ~0.885) while lgbm assigns ~1.6x larger absolute SHAP to strong features and 6-35x to weak ones. Values are subsampled to shap_max_samples per fold; the explained-row count is shown per panel.';
+          card.appendChild(shNote);
+          const shGrid = document.createElement('div');
+          shGrid.style.display = 'grid';
+          shGrid.style.gridTemplateColumns = 'repeat(auto-fit, minmax(340px, 1fr))';
+          shGrid.style.gap = '12px';
+          card.appendChild(shGrid);
+          // Two-pass render: all containers first, then plot (CSS-grid/Plotly race).
+          const shDivs = shapModels.map((m) => {{
+            const safeM = String(m).replace(/[^a-zA-Z0-9_]/g, '_');
+            const d = document.createElement('div');
+            d.id = `shap_${{tr.task}}_${{safeM}}`;
+            d.style.height = '420px';
+            shGrid.appendChild(d);
+            return d;
+          }});
+          shapModels.forEach((m, i) => {{
+            const e = shapImp[m];
+            plotShapImportance(shDivs[i].id, e.features, e.mean_abs_shap, m, e.n_samples_explained, e.n_features_total);
+          }});
+        }}
+
+        // ── Cross-model SHAP RANK agreement ────────────────────────────────
+        const shapCmp = tr.shap_rank_comparison || {{}};
+        if ((shapCmp.pairs || []).length) {{
+          const rcHeader = document.createElement('h3');
+          rcHeader.textContent = 'Cross-model SHAP rank agreement';
+          card.appendChild(rcHeader);
+          const rcNote = document.createElement('p');
+          rcNote.style.color = '#666'; rcNote.style.fontSize = '0.85rem';
+          rcNote.textContent = 'Ranks, not magnitudes -- ranking is the part that replicates across model families. Spearman rho is computed over each pair\\u2019s shared feature set.';
+          card.appendChild(rcNote);
+          const rcTable = document.createElement('table');
+          rcTable.innerHTML = '<thead><tr><th>Model A</th><th>Model B</th><th>Shared features</th><th>Rank Spearman</th></tr></thead>';
+          const rcBody = document.createElement('tbody');
+          (shapCmp.pairs || []).forEach((p) => {{
+            const row = document.createElement('tr');
+            const rho = (p.rank_spearman === null || p.rank_spearman === undefined || !isFinite(p.rank_spearman)) ? 'n/a' : p.rank_spearman.toFixed(3);
+            row.innerHTML = `<td>${{p.model_a}}</td><td>${{p.model_b}}</td><td>${{p.n_shared_features}}</td><td>${{rho}}</td>`;
+            rcBody.appendChild(row);
+          }});
+          rcTable.appendChild(rcBody);
+          card.appendChild(rcTable);
         }}
       }}
 

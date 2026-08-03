@@ -31,6 +31,7 @@ __all__ = [
     "build_preprocessor",
     "FEATURE_GROUPS",
     "select_feature_group_columns",
+    "build_model_input_sanity",
 ]
 
 # Substring patterns (lower-cased) that mark a column for log1p transformation.
@@ -533,3 +534,87 @@ def build_preprocessor(
         level="info",
     )
     return preprocessor, details
+
+
+def build_model_input_sanity(
+    fitted_prep: Any,
+    x: pd.DataFrame,
+    *,
+    expected_categories: dict[str, list[Any]] | None = None,
+    max_report_columns: int = 400,
+) -> dict[str, Any]:
+    """Summarise what the model actually receives, after preprocessing (§4.13i).
+
+    Every other sanity gate in this project checks the data going *into*
+    preprocessing; nothing checked what came out. A NaN or Inf here is not a data
+    quirk, it is a bug -- the numeric branch median-imputes and the categorical branch
+    one-hot-encodes, so by construction no missing value should survive. Those two are
+    therefore reported as hard failures (``ok = False``), while a zero-variance feature
+    is only a warning: it is legitimate for a rare one-hot level or a mark that happens
+    to be constant within one subset.
+
+    Returns a plain dict, ready for ``json.dump``. Column statistics are capped at
+    ``max_report_columns`` because the post-one-hot matrix runs to hundreds of columns
+    and the point of the artifact is triage, not a full dump.
+    """
+    x_t = fitted_prep.transform(x)
+    if not isinstance(x_t, pd.DataFrame):
+        # build_preprocessor sets .set_output(transform="pandas"), so this is a
+        # fallback for a hand-built preprocessor rather than the normal path.
+        x_t = pd.DataFrame(np.asarray(x_t))
+    numeric = x_t.select_dtypes(include=[np.number])
+
+    n_nan = int(numeric.isna().to_numpy().sum())
+    arr = numeric.to_numpy(dtype=float, copy=False)
+    n_inf = int(np.isinf(arr).sum())
+    nan_cols = sorted(numeric.columns[numeric.isna().any()].astype(str).tolist())
+    inf_cols = sorted(
+        numeric.columns[np.isinf(arr).any(axis=0)].astype(str).tolist()
+    )
+
+    sd = numeric.std(axis=0, ddof=0)
+    zero_var_cols = sorted(sd.index[(sd.fillna(0.0) <= 0.0)].astype(str).tolist())
+
+    onehot_cols = [c for c in map(str, x_t.columns) if c.startswith("cat__")]
+    expected_onehot = None
+    if expected_categories:
+        # drop="first" in _make_one_hot_encoder, so each column contributes
+        # len(categories) - 1 indicator columns
+        expected_onehot = int(
+            sum(max(0, len(v) - 1) for v in expected_categories.values())
+        )
+
+    stats: dict[str, dict[str, float]] = {}
+    for col in list(numeric.columns)[:max_report_columns]:
+        v = numeric[col].to_numpy(dtype=float, copy=False)
+        finite = v[np.isfinite(v)]
+        stats[str(col)] = {
+            "min": float(finite.min()) if finite.size else float("nan"),
+            "max": float(finite.max()) if finite.size else float("nan"),
+            "mean": float(finite.mean()) if finite.size else float("nan"),
+            "sd": float(finite.std(ddof=0)) if finite.size else float("nan"),
+            "n_nonfinite": int(v.size - finite.size),
+        }
+
+    return {
+        "shape": [int(x_t.shape[0]), int(x_t.shape[1])],
+        "n_numeric_columns": int(numeric.shape[1]),
+        "n_onehot_columns": len(onehot_cols),
+        "expected_onehot_columns": expected_onehot,
+        "onehot_count_matches_expected": (
+            None if expected_onehot is None else len(onehot_cols) == expected_onehot
+        ),
+        "n_nan": n_nan,
+        "n_inf": n_inf,
+        "nan_columns": nan_cols[:50],
+        "inf_columns": inf_cols[:50],
+        "n_zero_variance_columns": len(zero_var_cols),
+        "zero_variance_columns": zero_var_cols[:50],
+        "column_stats_truncated": int(numeric.shape[1]) > max_report_columns,
+        "column_stats": stats,
+        # A NaN/Inf after imputation+encoding is a bug, not a data property.
+        "ok": n_nan == 0 and n_inf == 0,
+        "warnings": (
+            [f"{len(zero_var_cols)} zero-variance column(s)"] if zero_var_cols else []
+        ),
+    }

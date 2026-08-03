@@ -12,6 +12,7 @@ implementation details are delegated to specialized sibling modules:
 """
 
 import argparse
+import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,11 +61,17 @@ from .ontology_hierarchy import map_ontology_to_supergroups
 from .preprocessing import (
     FEATURE_GROUPS,
     add_protocol_expression_interactions,
+    build_model_input_sanity,
     build_preprocessor,
     select_feature_group_columns,
 )
 from .reporting import generate_html_reports
-from .tracking import NullTracker, make_tracker
+from .tracking import (
+    NullTracker,
+    append_hp_search_jsonl,
+    build_config_key,
+    make_tracker,
+)
 from .utils import progress_iter, set_log_level, vlog
 
 
@@ -318,6 +325,11 @@ def run_single_configuration(
     fold_results: list[dict[str, Any]] = []
     primary_scores: list[float] = []
     warnings: list[str] = []
+    # §4.13i model-input sanity is written once per configuration, from the first
+    # fold's fitted preprocessor. Per-fold would repeat the same summary N times for
+    # an extra transform pass each; the point is to catch a preprocessing bug, which
+    # is not fold-specific.
+    model_input_sanity_written = False
 
     outer_fold_iter = progress_iter(
         list(enumerate(outer_splits, start=1)),
@@ -735,6 +747,53 @@ def run_single_configuration(
                     baseline_scores=result.get("baseline_scores", {}),
                     delta_vs_baseline=result.get("delta_vs_baseline", {}),
                 )
+                # Local hyperparameter-search trajectory, written regardless of the
+                # tracker in use. Called here rather than inside WandbTracker because
+                # that class is not instantiated at all under --no-wandb or on missing
+                # credentials, so a fallback living inside it could never fire.
+                append_hp_search_jsonl(
+                    config_key=build_config_key(cfg, task, run_cfg),
+                    model_name=str(result["model_name"]),
+                    fold_id=int(fold_id),
+                    task=task,
+                    scores=result.get("scores", {}),
+                    train_scores=result.get("train_scores", {}),
+                    tuning_info=result.get("tuning", {}),
+                    primary_metric=metric_key(task),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+                if not model_input_sanity_written:
+                    prep_step = None
+                    if estimator is not None:
+                        prep_step = getattr(estimator, "named_steps", {}).get("prep")
+                    if prep_step is None:
+                        # A calibrated/frozen wrapper has no named_steps; not a failure,
+                        # just means this model cannot supply the fitted preprocessor.
+                        # A later model in the same fold will.
+                        pass
+                    else:
+                        sanity = build_model_input_sanity(prep_step, x_train)
+                        sanity_dir = Path("qc")
+                        sanity_dir.mkdir(parents=True, exist_ok=True)
+                        sanity_path = sanity_dir / (
+                            "model_input_sanity_"
+                            f"{build_config_key(cfg, task, run_cfg)}.json"
+                        )
+                        with sanity_path.open("w", encoding="utf-8") as fh:
+                            json.dump(sanity, fh, indent=2, default=str)
+                        model_input_sanity_written = True
+                        if not sanity["ok"]:
+                            # NaN/Inf downstream of median-imputation + one-hot encoding
+                            # cannot be a data property -- it is a preprocessing bug, so
+                            # it is surfaced as a run warning rather than buried in a
+                            # file nobody opens on a green run.
+                            msg = (
+                                "model input sanity FAILED: "
+                                f"n_nan={sanity['n_nan']} n_inf={sanity['n_inf']} "
+                                f"(see {sanity_path})"
+                            )
+                            warnings.append(msg)
+                            vlog(run_cfg.verbose, msg, level="warning")
                 train_primary = result.get("train_scores", {}).get(metric_key(task))
                 train_str = (
                     f", train_{metric_key(task)}={train_primary:.6f}"
