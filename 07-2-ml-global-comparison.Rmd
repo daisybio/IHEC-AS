@@ -31,14 +31,15 @@ written in for the full reasoning):
 
 ```{r, setup}
 splicing_ml_root <- "splicing_ml"
-model <- "xgb" # single model for the feature-set comparison, matching the preprint's tree-based
-# (random forest) comparison in spirit -- xgb is this project's current default tree model (rf
-# itself is excluded from defaults, see CLAUDE.md "Default Models": "redundant with XGB; XGB
-# consistently outperforms it").
+# All models present in each report's metric_heatmap are read (see load-results chunk) -- no
+# single fixed model anymore. `Model` is now its own column in comparison_dt.
 
 metrics <- c("balanced_accuracy", "auroc", "auprc", "mcc")
 metric_labels <- c(
-  balanced_accuracy = "Balanced\nAccuracy", auroc = "AUROC", auprc = "AUPRC", mcc = "MCC"
+  balanced_accuracy = "Balanced\nAccuracy",
+  auroc = "AUROC",
+  auprc = "AUPRC",
+  mcc = "MCC"
 )
 variabilities <- c("High", "both", "Low")
 variability_labels <- c(High = "High", both = "All", Low = "Low") # matches variability_colors names
@@ -46,13 +47,15 @@ group_cols <- c("seqnames", "ontology")
 group_col_labels <- c(seqnames = "Chr", ontology = "Cell")
 feature_sets <- list(
   list(key = "all", label = "All"),
-  list(key = "sequence", label = "Non Epigenetic"),
+  list(key = "sequence", label = "Sequence"),
   list(key = "histone+dnam", label = "Epigenetic")
 )
 # Distinct from variability_colors (Low/All/High) so the two color legends never clash when both
 # appear near each other -- picked from the remaining unused Okabe-Ito colors.
 feature_colors <- c(
-  "All" = "#0072B2", "Non Epigenetic" = "#009E73", "Epigenetic" = "#CC79A7"
+  "All" = "#0072B2",
+  "Sequence" = "#009E73",
+  "Epigenetic" = "#CC79A7"
 )
 ```
 
@@ -71,7 +74,12 @@ feature_colors <- c(
 # payload.py never puts the raw per-fold arrays in it. This is why the rule is
 # resourced at only 8GB/30min in config/snakemake_config.yaml.
 result_path <- function(event_type, variability, group_col, feature_key) {
-  subset_name <- sprintf("%s_biotype_filtered_%s_%s", event_type, variability, group_col)
+  subset_name <- sprintf(
+    "%s_biotype_filtered_%s_%s",
+    event_type,
+    variability,
+    group_col
+  )
   dir <- if (feature_key == "all") {
     file.path(splicing_ml_root, "output", subset_name)
   } else {
@@ -80,18 +88,33 @@ result_path <- function(event_type, variability, group_col, feature_key) {
   file.path(dir, "reports", sprintf("subset_report_%s.json", subset_name))
 }
 
-read_metric <- function(path, model, metric) {
+read_config_metrics <- function(path, metrics) {
   # simplifyVector=FALSE: jsonlite's default auto-simplification turns a
-  # uniform numeric matrix like `z` (3 models x 5 metrics here) into a real R
+  # uniform numeric matrix like `z` (models x metrics here) into a real R
   # matrix rather than nested lists, silently breaking `z[[mi]][[ti]]`-style
   # indexing (double-bracket on a matrix flattens to vector indexing instead
   # of row/col lookup) -- confirmed via a real crash ("subscript out of
   # bounds") that only triggered for ti > 1.
   d <- jsonlite::fromJSON(path, simplifyVector = FALSE)[[1]]
   mh <- d$metric_heatmap
-  mi <- match(model, unlist(mh$models))
-  ti <- match(metric, unlist(mh$metrics))
-  if (is.na(mi) || is.na(ti)) NA_real_ else as.numeric(mh$z[[mi]][[ti]])
+  models <- unlist(mh$models)
+  avail_metrics <- unlist(mh$metrics)
+  out <- list()
+  for (metric in metrics) {
+    ti <- match(metric, avail_metrics)
+    if (is.na(ti)) next
+    for (mi in seq_along(models)) {
+      v <- as.numeric(mh$z[[mi]][[ti]])
+      if (!is.na(v)) {
+        out[[length(out) + 1]] <- data.table::data.table(
+          Model = models[mi],
+          Metric = metric,
+          Value = v
+        )
+      }
+    }
+  }
+  if (length(out) == 0) NULL else data.table::rbindlist(out)
 }
 
 rows <- list()
@@ -105,14 +128,17 @@ for (event_type in to_analyze) {
           missing_configs <- c(missing_configs, path)
           next
         }
-        for (metric in metrics) {
-          v <- read_metric(path, model, metric)
-          if (!is.na(v)) {
-            rows[[length(rows) + 1]] <- data.table::data.table(
-              `Event Type` = event_type, Variability = variability, `Group Col` = group_col,
-              Features = fs$label, Metric = metric, Value = v
+        md <- read_config_metrics(path, metrics)
+        if (!is.null(md)) {
+          md[,
+            `:=`(
+              `Event Type` = event_type,
+              Variability = variability,
+              `Group Col` = group_col,
+              Features = fs$label
             )
-          }
+          ]
+          rows[[length(rows) + 1]] <- md
         }
       }
     }
@@ -122,17 +148,41 @@ for (event_type in to_analyze) {
 if (length(missing_configs) > 0) {
   message(sprintf(
     "%d config(s) not yet available (plotted with gaps): \n%s",
-    length(missing_configs), paste(missing_configs, collapse = "\n")
+    length(missing_configs),
+    paste(missing_configs, collapse = "\n")
   ))
 }
-stopifnot("No splicing_ml result files found -- has splicing_ml_classification been run yet?" = length(rows) > 0)
+stopifnot(
+  "No splicing_ml result files found -- has splicing_ml_classification been run yet?" = length(
+    rows
+  ) >
+    0
+)
 
 comparison_dt <- data.table::rbindlist(rows)
-comparison_dt[, `Test on` := factor(group_col_labels[`Group Col`], levels = group_col_labels[group_cols])]
-comparison_dt[, Variability := factor(variability_labels[Variability], levels = variability_labels[variabilities])]
-comparison_dt[, Measure := factor(metric_labels[Metric], levels = metric_labels[metrics])]
-comparison_dt[, Features := factor(Features, levels = vapply(feature_sets, function(f) f$label, character(1)))]
+comparison_dt[,
+  `Test on` := factor(
+    group_col_labels[`Group Col`],
+    levels = group_col_labels[group_cols]
+  )
+]
+comparison_dt[,
+  Variability := factor(
+    variability_labels[Variability],
+    levels = variability_labels[variabilities]
+  )
+]
+comparison_dt[,
+  Measure := factor(metric_labels[Metric], levels = metric_labels[metrics])
+]
+comparison_dt[,
+  Features := factor(
+    Features,
+    levels = vapply(feature_sets, function(f) f$label, character(1))
+  )
+]
 comparison_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+comparison_dt[, Model := factor(Model)]
 ```
 
 ```{r, plot-comparison, fig.width=14, fig.height=9}
@@ -140,32 +190,50 @@ comparison_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
 # plot itself carries the caveat, not just this notebook's prose.
 leak_points <- comparison_dt[`Test on` == "Cell"]
 
-p <- ggplot(comparison_dt, aes(x = `Test on`, y = Value, color = Features, group = Features)) +
+p <- ggplot(
+  comparison_dt,
+  aes(
+    x = `Test on`,
+    y = Value,
+    color = Features,
+    shape = Features,
+    linetype = Model,
+    group = interaction(Features, Model)
+  )
+) +
   geom_line(linewidth = 0.6) +
   geom_point(size = 2) +
-  geom_point(
-    data = leak_points, aes(x = `Test on`, y = Value),
-    shape = 21, color = "red", fill = NA, size = 4.5, stroke = 1.1, inherit.aes = FALSE
-  ) +
+  # geom_point(
+  #   data = leak_points, aes(x = `Test on`, y = Value),
+  #   shape = 21, color = "red", fill = NA, size = 4.5, stroke = 1.1, inherit.aes = FALSE
+  # ) +
   ggh4x::facet_grid2(
     Measure ~ `Event Type` + Variability,
-    scales = "free_y", strip = ggh4x::strip_nested()
+    scales = "free_y",
+    strip = ggh4x::strip_nested()
   ) +
   scale_color_manual(values = feature_colors) +
   labs(
     x = "Test on Unseen Chromosome (Chr) or Cell Type (Cell)",
     y = "Value",
-    title = sprintf("model=%s performance by held-out condition and feature set", model),
-    subtitle = paste0(
-      "Red-ringed points = group_col=\"ontology\" (\"Cell\") -- confirmed to leak event identity ",
-      "for tree models\n(CLAUDE.md Known Pitfalls); do not read as real generalization."
-    )
+    title = "Performance by held-out condition, feature set, and model"
   ) +
-  theme(legend.position = "bottom", plot.subtitle = element_text(size = 8, color = "gray30"))
+  theme(
+    legend.position = "bottom",
+    plot.subtitle = element_text(size = 8, color = "gray30")
+  )
 print(p)
-ggsave(filename = file.path(plot_dir, "07-2_ml_global_comparison.pdf"), plot = p, width = 14, height = 9)
+ggsave(
+  filename = file.path(plot_dir, "07-2_ml_global_comparison.pdf"),
+  plot = p,
+  width = 14,
+  height = 9
+)
 
-data.table::fwrite(comparison_dt, file.path(plot_dir, "07-2_ml_global_comparison_data.csv"))
+data.table::fwrite(
+  comparison_dt,
+  file.path(plot_dir, "07-2_ml_global_comparison_data.csv")
+)
 ```
 
 ```{r, upload-wandb}
@@ -180,8 +248,10 @@ csv_path <- file.path(plot_dir, "07-2_ml_global_comparison_data.csv")
 
 if (file.exists(wandb_upload_script)) {
   status <- system2(
-    "mamba", c("run", "-n", "ihec-as", "python", wandb_upload_script, csv_path),
-    stdout = TRUE, stderr = TRUE
+    "mamba",
+    c("run", "-n", "ihec-as", "python", wandb_upload_script, csv_path),
+    stdout = TRUE,
+    stderr = TRUE
   )
   message(paste(status, collapse = "\n"))
 } else {
