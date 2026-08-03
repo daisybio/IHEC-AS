@@ -91,6 +91,9 @@ GROUP_COLS         = config["group_cols"]
 ML_TASKS           = config.get("ml_tasks", ["classification", "regression"])
 # Ablation battery runs over a narrower variability axis than the main battery.
 ABLATION_VARIABILITIES = config.get("ablation_variabilities", VARIABILITIES)
+# Rows per fold fed to SHAP. The CLI default is 50000; the Snakefile previously passed
+# nothing, so production silently inherited that. See config comment for the cost math.
+SHAP_MAX_SAMPLES   = config.get("shap_max_samples", 50000)
 PRIMARY            = config["primary_filter"]
 
 # Pangolin device toggle (no file edit): `--config pangolin_use_gpu=true` for GPU,
@@ -907,6 +910,7 @@ rule ml_global_comparison:
         gres            = _gres("ml_global_comparison"),
     params:
         wandb_login = wandb_login_cmd(),
+        shap_max_samples = SHAP_MAX_SAMPLES,
     shell:
         f"""
         {{params.wandb_login}}Rscript -e "rmarkdown::render('07-2-ml-global-comparison.Rmd',
@@ -941,6 +945,7 @@ rule splicing_ml_classification:
         gres            = _ml_gres,
     params:
         wandb_login = wandb_login_cmd(),
+        shap_max_samples = SHAP_MAX_SAMPLES,
         wandb_args  = wandb_cli_args(),
     shell:
         """
@@ -954,6 +959,7 @@ rule splicing_ml_classification:
             --only-variability {wildcards.variability} \
             --only-group {wildcards.group_col} \
             --skip-regression \
+            --shap-max-samples {params.shap_max_samples} \
             --max-cores {threads} \
             {params.wandb_args} \
         > {log} 2>&1
@@ -978,6 +984,7 @@ rule splicing_ml_regression:
         gres            = _ml_gres,
     params:
         wandb_login = wandb_login_cmd(),
+        shap_max_samples = SHAP_MAX_SAMPLES,
         wandb_args  = wandb_cli_args(),
     shell:
         """
@@ -991,6 +998,7 @@ rule splicing_ml_regression:
             --only-variability {wildcards.variability} \
             --only-group {wildcards.group_col} \
             --skip-classification \
+            --shap-max-samples {params.shap_max_samples} \
             --max-cores {threads} \
             {params.wandb_args} \
         > {log} 2>&1
@@ -1040,6 +1048,7 @@ rule splicing_ml_ablation_classification:
         wandb_login  = wandb_login_cmd(),
         wandb_args   = wandb_cli_args(),
         feature_args = lambda wc: wc.feature_groups.replace("+", " "),
+        shap_max_samples = SHAP_MAX_SAMPLES,
     shell:
         """
         {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
@@ -1053,6 +1062,7 @@ rule splicing_ml_ablation_classification:
             --only-group {wildcards.group_col} \
             --feature-groups {params.feature_args} \
             --skip-regression \
+            --shap-max-samples {params.shap_max_samples} \
             --max-cores {threads} \
             {params.wandb_args} \
         > {log} 2>&1
@@ -1081,6 +1091,7 @@ rule splicing_ml_ablation_regression:
         wandb_login  = wandb_login_cmd(),
         wandb_args   = wandb_cli_args(),
         feature_args = lambda wc: wc.feature_groups.replace("+", " "),
+        shap_max_samples = SHAP_MAX_SAMPLES,
     shell:
         """
         {params.wandb_login}PYTHONUNBUFFERED=1 mamba run --no-capture-output -n ihec-as python run_splicing_ml.py \
@@ -1094,6 +1105,7 @@ rule splicing_ml_ablation_regression:
             --only-group {wildcards.group_col} \
             --feature-groups {params.feature_args} \
             --skip-classification \
+            --shap-max-samples {params.shap_max_samples} \
             --max-cores {threads} \
             {params.wandb_args} \
         > {log} 2>&1

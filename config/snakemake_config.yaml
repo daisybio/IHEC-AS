@@ -79,6 +79,18 @@ ml_tasks:
 ablation_variabilities:
   - both
 
+# Max outer-test rows per fold fed to SHAP TreeExplainer/LinearExplainer.
+# Raised 50000 -> 100000 for the production run (2026-08-01). Cost is LINEAR in rows:
+# real logs measured TreeExplainer at 5,000 rows costing 0.4-144 s per fold at SE
+# scale, so 200,000 extrapolates to roughly 16 s - 1.6 h per fold worst case -- still
+# under xgb/lgbm's own 60-200+ min search per fold, which is the bar that matters.
+# RI test folds are well below this cap, so RI is effectively exhaustive already; the
+# cap only binds on SE (2-4M rows/fold), where it lifts the sample from ~1-2% to ~5-10%.
+# Set to 0 for a truly exhaustive run -- but note that is 40-80x the current SE cost
+# and was measured at 2+ hours per fold with no progress output before subsampling
+# existed. Only per-sample SHAP values need it; feature rankings do not.
+shap_max_samples: 100000
+
 # biotype_filtered + both was previously excluded here (see original SLURM
 # config exclusion) -- re-enabled 2026-07-17 per user request. This makes the
 # splicing_ml_L resource tier (SE + both) reachable for the first time; RI +

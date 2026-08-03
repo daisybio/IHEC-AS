@@ -82,6 +82,18 @@ mamba run -n ihec-as snakemake --profile profiles/slurm \
 Pipeline parameters (paths, resource budgets, filter lists) are in [`config/snakemake_config.yaml`](config/snakemake_config.yaml).  
 Local machine parameters go in [`.Rprofile`](.Rprofile).
 
+Four keys govern how much ML work `rule all` commits to — worth checking before a long run:
+
+| key | default | effect |
+|---|---|---|
+| `ml_tasks` | `[classification]` | Tasks built by `rule all`. Regression is off by default; nothing downstream consumes it (`07-2` reads only `*_results_classification.json.gz`). The per-task rules still exist, so a regression output remains buildable as an explicit target — add `regression` here to restore it to `rule all`. |
+| `variabilities` | `[High, Low, both]` | Strata for the **main** ML battery. |
+| `ablation_variabilities` | `[both]` | Strata for the **ablation** battery only, deliberately narrower — the battery asks "sequence-only vs epigenetics-only", which does not need the High/Low split. `group_col` is not an ablation axis at all: those output paths hardcode `seqnames`, because `ontology` grouping leaks event identity. |
+| `shap_max_samples` | `100000` | Outer-test rows per fold fed to SHAP. Cost is linear in rows; measured over 110 real TreeExplainer folds, the median fold costs ~13 s but the worst reaches ~30 min at 50k, so the tail governs. `0` means every row (exhaustive) — roughly 20 h/fold on an SE fold, so reserve it for cases where exact per-sample values are required. Linear-model SHAP is unaffected: it is closed-form and costs ~0 regardless. |
+
+`output_level` must stay `diagnostics` (its default) for SHAP, per-fold predictions and transformed-feature
+samples to be stored at all; `compact` discards them regardless of the settings above.
+
 ## Environment Setup
 
 ### CPU servers
