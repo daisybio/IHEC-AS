@@ -464,6 +464,10 @@ rule prepare_aggregation:
         ss5up_fasta           = "processed_data/5ss_up_{transcript_filter}.fasta",
         ss3_fasta             = "processed_data/3ss_{transcript_filter}.fasta",
         ss3down_fasta         = "processed_data/3ss_down_{transcript_filter}.fasta",
+        # §3.7 GC content of the four 200bp splice-site-flanking windows. Produced in
+        # the same chunk as the splice-site FASTAs because it reuses that chunk's
+        # already-loaded genome and window GRanges.
+        gc_content            = "processed_data/gc_content_{transcript_filter}.csv.gz",
         sample_cols           = "processed_data/sample_cols_{transcript_filter}.rds",
         # 09-1's chromHMM-vicinity per-event feature engineering (a separate
         # local-modelling path from splicing_ml's pooled genome-wide route) —
@@ -747,6 +751,8 @@ rule create_aggregated_dt:
         ss3_fasta             = "processed_data/3ss_{transcript_filter}.fasta",
         ss5_fasta             = "processed_data/5ss_{transcript_filter}.fasta",
         pangolin_scores       = "processed_data/pangolin_scores_{transcript_filter}.csv",
+        # §3.7 GC content, joined on ID in 05's join-maxentscan chunk
+        gc_content            = "processed_data/gc_content_{transcript_filter}.csv.gz",
         # RBP + core-spliceosome expression features (04-6 Step 2, §3.4/§4.12f)
         rbp_score             = "processed_data/rbp_score_dt_{transcript_filter}.csv.gz",
         spliceosome_expr      = "processed_data/splicing_factor_expression_{transcript_filter}.csv.gz",

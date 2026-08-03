@@ -46,8 +46,11 @@ FEATURE_GROUPS: dict[str, str] = {
     # WGBS methylation + CpG coverage windows
     "dnam": r"^(DNAm|CpGs);",
     # Sequence-only splice-site strength: MaxEntScan (3ss/3ssdown/5ss/5ssup) +
-    # pangolin (sequence+tissue CNN, no per-sample RNA-seq data used)
-    "sequence": r"^(pangolin_|[35]ss)",
+    # pangolin (sequence+tissue CNN, no per-sample RNA-seq data used) + GC content
+    # of the four 200bp splice-site-flanking windows (gc_5up/gc_5down/gc_3up/gc_3down,
+    # added by 03-prepare-aggregation.Rmd's §3.7 block). GC belongs here for the same
+    # reason pangolin does: derived from genome sequence alone, no per-sample data.
+    "sequence": r"^(pangolin_|[35]ss|gc_[35])",
     # RNA-binding-protein eCLIP binding-site aggregates
     "rbp": r"^rbp_",
     # Core spliceosome component expression

@@ -1407,6 +1407,63 @@ ss3down_score_file <- sprintf("processed_data/3down_scores_%s.txt", tf)
 ss5_score_file <- sprintf("processed_data/5scores_%s.txt", tf)
 ss5up_score_file <- sprintf("processed_data/5up_scores_%s.txt", tf)
 
+# --- §3.7 GC content of the four 200bp splice-site-flanking windows ----------
+# Motivation is sequence-composition feature engineering, and it also lets the
+# DNAm-vs-GC confound question (§3.2) be answered with real numbers instead of a
+# Discussion-only limitation note: DNAm associations may partly reflect sequence
+# composition, and `CpGs` alone only controls CpG density, not broader GC%.
+#
+# Computed here rather than as a new 04-* step because everything needed is already
+# in memory: the genome loaded above, and the SAME window GRanges that build
+# aggregateOver_{tf}.bed (five_prime_up/down, three_prime_up/down). Cost is one
+# vectorised letterFrequency() call per window -- no extra genome read, no external
+# tool.
+#
+# No strand handling, deliberately: G+C is invariant under reverse complement
+# (G<->C), so a window's GC fraction is identical on either strand. Contrast the
+# splice-site FASTAs above, which DO need reverseComplement because motif POSITION
+# matters there.
+#
+# Denominator is unambiguous ACGT rather than width(): make_window()'s pintersect()
+# clamps windows to their parent interval so widths vary, and any assembly N run
+# would otherwise deflate the fraction instead of being excluded from it.
+.gc_frac <- function(gr) {
+  seqs <- genome[gr]
+  gc <- Biostrings::letterFrequency(seqs, "GC")[, 1]
+  acgt <- Biostrings::letterFrequency(seqs, "ACGT")[, 1]
+  ifelse(acgt > 0L, gc / acgt, NA_real_)
+}
+gc_content_dt <- data.table(
+  ID = keep_dt[, ID],
+  gc_5up = .gc_frac(five_prime_up[keep_idx]),
+  gc_5down = .gc_frac(five_prime_down[keep_idx]),
+  gc_3up = .gc_frac(three_prime_up[keep_idx]),
+  gc_3down = .gc_frac(three_prime_down[keep_idx])
+)
+gc_file <- sprintf("processed_data/gc_content_%s.csv.gz", tf)
+fwrite(gc_content_dt, gc_file, compress = "gzip")
+
+# sanity: a fraction must be in [0,1], and human GC around splice sites should sit
+# well inside 0.30-0.70 (genome average ~0.41, exon-adjacent windows run higher).
+# Anything outside that band means the window coordinates or the sequence extraction
+# are wrong, not that biology is surprising.
+gc_win_cols <- c("gc_5up", "gc_5down", "gc_3up", "gc_3down")
+for (w in gc_win_cols) {
+  v <- gc_content_dt[[w]]
+  stopifnot(all(is.na(v) | (v >= 0 & v <= 1)))
+  mu <- mean(v, na.rm = TRUE)
+  append_sanity(
+    sprintf("gc_content_mean_%s__%s", w, tf),
+    if (is.finite(mu) && mu > 0.30 && mu < 0.70) "PASS" else "WARN",
+    mu,
+    NA_real_,
+    sprintf("mean GC fraction over the 200bp %s window (expect ~0.4-0.6)", w)
+  )
+}
+print(gc_content_dt[, lapply(.SD, function(z) round(mean(z, na.rm = TRUE), 4)),
+  .SDcols = gc_win_cols
+])
+
 rm(genome)
 gc()
 ```

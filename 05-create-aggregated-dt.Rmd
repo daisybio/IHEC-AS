@@ -613,9 +613,19 @@ append_sanity(
 # getmm (CPM-like, >=0) is used, same convention as the other checks in this
 # chunk (vst can cross zero, making sd/mean CV ill-defined).
 housekeeping_ids <- c(GAPDH = "ENSG00000111640", ACTB = "ENSG00000075624")
+# `gene_id` in gene_expression_normalised_{tf}.csv.gz is ALWAYS version-suffixed
+# (e.g. ENSG00000111640.14), so matching the bare accession never succeeded — for
+# either gene, on any transcript_filter, on any run since this check was added
+# 2026-07-12. Both housekeeping_cv_* rows therefore always took the WARN/NA
+# "gene not found" branch and this check never once computed a real CV. Strip the
+# version first, same pattern already used for gene_id_stripped further down.
+# Stripped once into a local vector rather than added as a column: gene_quants_agg has
+# one row per (gene, uuid) and is consumed downstream, so mutating it risks an extra
+# column leaking into a later select/write.
+hk_gene_bare <- gsub("\\.\\d+$", "", gene_quants_agg$gene_id)
 for (hk_symbol in names(housekeeping_ids)) {
   hk_id <- housekeeping_ids[[hk_symbol]]
-  hk_vals <- gene_quants_agg[gene_id == hk_id, gene_expression_getmm]
+  hk_vals <- gene_quants_agg$gene_expression_getmm[hk_gene_bare == hk_id]
   if (length(hk_vals) == 0L) {
     append_sanity(
       sprintf("housekeeping_cv_%s", hk_symbol),
@@ -889,6 +899,22 @@ ss_dt <- merge(scores3, scores5, by = "ID", all = TRUE)
 
 ss_cols <- c("3ss", "3ssdown", "5ss", "5ssup")
 aggregated_dt[ss_dt, on = .(ID), (ss_cols) := mget(paste0("i.", ss_cols))]
+
+# §3.7 GC content of the four 200bp splice-site-flanking windows, computed in
+# 03-prepare-aggregation.Rmd from the same window GRanges that build
+# aggregateOver_{tf}.bed. Per-event (constant across a given ID's sample rows), so it
+# joins on ID exactly like the MaxEntScan scores above.
+gc_dt <- fread(sprintf("processed_data/gc_content_%s.csv.gz", tf))
+gc_cols <- c("gc_5up", "gc_5down", "gc_3up", "gc_3down")
+stopifnot(all(gc_cols %in% names(gc_dt)))
+aggregated_dt[gc_dt, on = .(ID), (gc_cols) := mget(paste0("i.", gc_cols))]
+append_sanity(
+  sprintf("gc_content_na_frac__%s", tf),
+  if (mean(is.na(aggregated_dt[[gc_cols[1]]])) < 0.01) "PASS" else "WARN",
+  mean(is.na(aggregated_dt[[gc_cols[1]]])),
+  0.01,
+  "fraction of aggregated_dt rows with no GC value joined (expect ~0)"
+)
 
 # sanity: distributions + NA fraction
 dir.create("qc/distributions", recursive = TRUE, showWarnings = FALSE)
