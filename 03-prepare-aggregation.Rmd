@@ -951,12 +951,33 @@ https://ihec.sd4h.ca/IHEC/post_processed_data/Analysis/IHEC_gABC_Interactions/V2
 # no natural bimodal structure exists. Median split is the most defensible
 # data-driven choice given the continuous spectrum. MAD rejected: ~27% SE and
 # ~52% RI MAD=0 events have sd > 0.1 (bimodal misclassification).
+# The median is computed over the MODELLED subset only (the same predicate
+# `keep_rows_manual` uses below), not over the full annotated set. Previously it ran on
+# every annotated event, which does guarantee an exact 50:50 split -- but of that
+# population, not of the one actually modelled. `keep_rows_manual` is a non-random
+# subset (63,039 -> 37,330 SE, 2,085 -> 1,846 RI), so the split drifted: real
+# biotype_filtered numbers were SE 44.8/55.2 and RI 49.4/50.6. Both sat inside the
+# 40-60% sanity band so nothing ever warned, but neither is the 50:50 that "median
+# split" implies, and SE drifted further precisely because it loses a larger fraction
+# (40.8% vs 11.5%) to the autosome/dedup/NA-sd_psi filter.
+#
+# Ordering note: this predicate is duplicated from `keep_rows_manual` rather than
+# reusing it, because that vector is defined ~20 lines below and the Variability label
+# is read in between. Rows outside the subset are still labelled against the same
+# threshold rather than set NA -- they are dropped downstream anyway, and labelling them
+# avoids introducing NA Variability, which `03`/`05` both have explicit guards against.
 event_annotations_dt[,
-  Variability := fifelse(
-    sd_psi > median(sd_psi, na.rm = TRUE),
-    "High",
-    "Low"
-  ),
+  Variability := {
+    modelled <- is_autosome & cluster_representative_annotated & !is.na(sd_psi)
+    thr <- if (any(modelled)) {
+      stats::median(sd_psi[modelled], na.rm = TRUE)
+    } else {
+      # no modelled event in this (Event Type x transcript_filter) group: fall back to
+      # the old full-set median so the column is still populated rather than all-NA
+      stats::median(sd_psi, na.rm = TRUE)
+    }
+    fifelse(sd_psi > thr, "High", "Low")
+  },
   by = .(`Event Type`, transcript_filter)
 ]
 event_annotations_dt[, table(
