@@ -85,6 +85,12 @@ TRANSCRIPT_FILTERS = config["transcript_filters"]
 EVENT_TYPES        = config["event_types"]
 VARIABILITIES      = config["variabilities"]
 GROUP_COLS         = config["group_cols"]
+# Tasks `rule all` commits to. Defaults to classification only (see config comment);
+# the splicing_ml_regression / splicing_ml_ablation_regression rules still exist, so a
+# regression output remains buildable as an explicit target.
+ML_TASKS           = config.get("ml_tasks", ["classification", "regression"])
+# Ablation battery runs over a narrower variability axis than the main battery.
+ABLATION_VARIABILITIES = config.get("ablation_variabilities", VARIABILITIES)
 PRIMARY            = config["primary_filter"]
 
 # Pangolin device toggle (no file edit): `--config pangolin_use_gpu=true` for GPU,
@@ -147,13 +153,16 @@ ML_CONFIGS = list(_ml_configs())
 # Feature-group ablation battery (§4.15) folded into `rule all` -- PRIMARY
 # filter only, seqnames only (ontology excluded: leaks event identity on
 # low-variability subsets, see memory project_splicing_ml_ontology_cv_event_leak.md).
-# Sequence-only vs epigenetics-only across both event types x all 3 variability
-# strata = 12 targets, matching the battery the user requested 2026-07-14.
+# Sequence-only vs epigenetics-only. Originally spanned all 3 variability strata (12
+# targets, 2026-07-14); narrowed 2026-08-01 to `ablation_variabilities` (default: the
+# full dataset only) because the question the battery answers does not need the
+# High/Low split. group_col is not an axis -- the output paths below hardcode
+# `seqnames`, deliberately, since `ontology` grouping leaks event identity.
 ABLATION_FEATURE_GROUPS = ["sequence", "histone+dnam"]
 ABLATION_CONFIGS = [
     (fg, et, var) for fg in ABLATION_FEATURE_GROUPS
     for et in EVENT_TYPES
-    for var in VARIABILITIES
+    for var in ABLATION_VARIABILITIES
 ]
 
 wildcard_constraints:
@@ -231,10 +240,10 @@ rule all:
         # ML global models (all configs) -- classification/regression run as
         # separate parallel jobs (see rule splicing_ml_classification/_regression)
         [f"splicing_ml/output/{et}_{tf}_{var}_{gc}/splicing_ml_results_{task}.pkl.gz"
-         for et, tf, var, gc in ML_CONFIGS for task in ("classification", "regression")],
+         for et, tf, var, gc in ML_CONFIGS for task in ML_TASKS],
         # Feature-group ablation battery (PRIMARY filter, seqnames only)
         [f"splicing_ml/output_ablation/{fg}/{et}_{PRIMARY}_{var}_seqnames/splicing_ml_results_{task}.pkl.gz"
-         for fg, et, var in ABLATION_CONFIGS for task in ("classification", "regression")],
+         for fg, et, var in ABLATION_CONFIGS for task in ML_TASKS],
         # Fig2B-style comparison plot over the two batteries above (rule ml_global_comparison)
         f"reports/07-2-ml-global-comparison_{PRIMARY}.html",
         # Event-specific models (primary filter only — extend if needed):

@@ -61,6 +61,24 @@ group_cols:
   - seqnames
   - ontology
 
+# Tasks built by `rule all`. Regression removed from the default 2026-08-01 per user
+# request -- nothing downstream consumes it (07-2's comparison plot reads only
+# *_results_classification.json.gz for both the main and ablation batteries), and the
+# per-task rules stay available, so a regression target can still be requested
+# explicitly or re-enabled by adding it back here.
+ml_tasks:
+  - classification
+
+# Ablation battery axes, deliberately NARROWER than the main battery above.
+# Restricted 2026-08-01 to the full dataset only: the battery answers
+# "sequence-only vs epigenetics-only", which does not need the High/Low split, and
+# 2 groups x 2 event types x 3 strata x 2 tasks = 24 jobs was mostly redundant.
+# group_col is not an axis here at all -- the ablation output paths hardcode
+# `seqnames`, since `ontology` grouping leaks event identity and its numbers are not
+# usable as generalisation performance.
+ablation_variabilities:
+  - both
+
 # biotype_filtered + both was previously excluded here (see original SLURM
 # config exclusion) -- re-enabled 2026-07-17 per user request. This makes the
 # splicing_ml_L resource tier (SE + both) reachable for the first time; RI +
