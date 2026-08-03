@@ -204,12 +204,19 @@ if (!interactive()) {
         lambda = NA_real_,
         screen_df = NA_real_,
         screen_R2 = NA_real_,
+        screen_R2_bounded = NA_real_,
         screen_CCC = NA_real_,
         null_R2_mean = NA_real_,
         null_R2_sd = NA_real_,
         null_CCC_mean = NA_real_,
         p_emp = NA_real_,
         effect = NA_real_,
+        effect_bounded = NA_real_,
+        effect_ccc = NA_real_,
+        max_abs_oof = NA_real_,
+        max_abs_z = NA_real_,
+        frac_z_gt10 = NA_real_,
+        lambda_min = NA_real_,
         note = note,
         stat_version = SCREEN_STAT_VERSION
       )
@@ -299,8 +306,15 @@ if (!interactive()) {
   # --- feature-rotation null, PER FEATURE SET. Each matched control contributes
   #     one R² per feature set, computed from the CONTROL's OWN long/short/local
   #     columns (same as 09zz), on THIS event's PSI/confounds/groups (prep fixed). --
+  # Returns BOTH R2 and CCC per feature set, as `R2_<fs>` / `CCC_<fs>`. CCC used to be
+  # skipped here on the grounds that a second per-control statistic would double the null
+  # cost -- that was wrong: ridge_screen_stat computes CCC from the same fitted model, in
+  # the same call, so carrying it out is free. Having a real null CCC is what makes a
+  # CCC-based effect size possible, and CCC is the bounded, stratum-stable quantity
+  # (0 sign flips across |R2| strata on real data, vs 1 for every R2-derived arm).
+  null_names <- c(paste0("R2_", feature_sets), paste0("CCC_", feature_sets))
   control_fs_R2 <- function(cid) {
-    na <- setNames(rep(NA_real_, length(feature_sets)), feature_sets)
+    na <- setNames(rep(NA_real_, length(null_names)), null_names)
     cdt <- tryCatch(
       data.table::fread(
         file.path(feature_table_dir, paste0("feature_table_", cid, ".csv.gz"))
@@ -317,7 +331,14 @@ if (!interactive()) {
     }
     cparts <- screen_partition_columns(names(cdt), grouping_col)
     cfs <- feature_set_columns(cparts$x_cols, cid)
-    vapply(feature_sets, function(fs) ridge_R2(cfs[[fs]], cdt)$R2, numeric(1))
+    res <- lapply(feature_sets, function(fs) ridge_R2(cfs[[fs]], cdt))
+    setNames(
+      c(
+        vapply(res, function(z) z$R2, numeric(1)),
+        vapply(res, function(z) z$CCC, numeric(1))
+      ),
+      null_names
+    )
   }
 
   n_use <- min(n_rotations, length(other_ids))
@@ -331,8 +352,8 @@ if (!interactive()) {
     null_mat <- matrix(
       numeric(0),
       nrow = 0L,
-      ncol = length(feature_sets),
-      dimnames = list(NULL, feature_sets)
+      ncol = length(null_names),
+      dimnames = list(NULL, null_names)
     )
   }
 
@@ -341,8 +362,10 @@ if (!interactive()) {
   null_side <- list()
   for (fs in feature_sets) {
     real <- ridge_R2(this_fs_cols[[fs]], feature_data)
-    nR2 <- null_mat[, fs]
+    nR2 <- null_mat[, paste0("R2_", fs)]
     nR2 <- nR2[is.finite(nR2)]
+    nCCC <- null_mat[, paste0("CCC_", fs)]
+    nCCC <- nCCC[is.finite(nCCC)]
     R_used <- length(nR2)
     ok <- is.finite(real$R2) && R_used > 0L
     rows[[fs]] <- list(
@@ -356,19 +379,51 @@ if (!interactive()) {
       lambda = real$lambda,
       screen_df = real$df,
       screen_R2 = real$R2,
+      # bounded companion, R2/(1+|R2|); strictly increasing, so it cannot change any
+      # ranking or p. For tables and effect sizes only.
+      screen_R2_bounded = real$R2_bounded,
       screen_CCC = real$CCC,
       null_R2_mean = if (R_used > 0L) mean(nR2) else NA_real_,
       null_R2_sd = if (R_used > 0L) stats::sd(nR2) else NA_real_,
-      # Always NA in the per-feature-set screen: `control_fs_R2` returns only R2 per
-      # control (one numeric per feature set), so there is no null CCC to average.
-      # Deliberate — significance is defined on R2 (p_emp/effect), nothing reads this
-      # column, and computing a second per-control statistic would ~double the null
-      # cost for an unused number. Retained purely so the schema still matches the
-      # pre-2026-07-29 omnibus rows, which DO carry a real value here.
-      null_CCC_mean = NA_real_,
+      # Real value now (was hard-coded NA): control_fs_R2 returns CCC alongside R2 at no
+      # extra cost, since both come out of the same fitted model.
+      null_CCC_mean = if (length(nCCC)) mean(nCCC) else NA_real_,
+      # p_emp is computed from the RAW R2 and is unchanged. It is rank-based, so the
+      # unbounded magnitude is irrelevant to it -- and any strictly monotone rescaling
+      # (e.g. screen_R2_bounded) would give a numerically identical p.
       p_emp = if (ok) (1 + sum(nR2 >= real$R2)) / (1 + R_used) else NA_real_,
+      # Retained for continuity, but mean-based on an unbounded quantity, so it is
+      # outlier-dominated and must NOT be quoted as an effect size (measured: 61%
+      # positive for purely numerical reasons, median flipping to -222 in the worst
+      # |R2| stratum). The `effect > 0` clause has been dropped from the hit rule; the
+      # one-sided p_emp already encodes direction.
       effect = if (ok) real$R2 - mean(nR2) else NA_real_,
-      note = NA_character_,
+      # Usable effect sizes: both are differences of BOUNDED quantities, so a single
+      # extreme null cannot dominate the mean.
+      effect_bounded = if (ok) {
+        real$R2_bounded - mean(.squash_r2(nR2))
+      } else {
+        NA_real_
+      },
+      effect_ccc = if (is.finite(real$CCC) && length(nCCC)) {
+        real$CCC - mean(nCCC)
+      } else {
+        NA_real_
+      },
+      # B3 out-of-support diagnostics: the cross-cell-type extrapolation is the finding,
+      # so it is recorded per event rather than smoothed away.
+      max_abs_oof = real$max_abs_oof,
+      max_abs_z = real$max_abs_z,
+      frac_z_gt10 = real$frac_z_gt10,
+      lambda_min = real$lambda_min,
+      # prep_event's per-fold notes (rank deficiency, a confound constant or all-NA in a
+      # fold's train rows, a factor level present only in held-out rows). Previously an
+      # event voided this way carried note = NA and was indistinguishable from a clean one.
+      note = if (length(prep$notes)) {
+        paste(prep$notes, collapse = ";")
+      } else {
+        NA_character_
+      },
       # Provenance stamp: which version of the statistic produced this row. The
       # resume gate above discards anything not matching SCREEN_STAT_VERSION.
       stat_version = SCREEN_STAT_VERSION
@@ -380,7 +435,8 @@ if (!interactive()) {
         ID = this_id,
         feature_set = fs,
         control_id = sampled,
-        null_R2 = null_mat[, fs],
+        null_R2 = null_mat[, paste0("R2_", fs)],
+        null_CCC = null_mat[, paste0("CCC_", fs)],
         stat_version = SCREEN_STAT_VERSION
       )
     }

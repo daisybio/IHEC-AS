@@ -6,9 +6,12 @@
 ##   processed_data/event_models/<tf>/screen_results.csv.gz   (all events + q)
 ##   processed_data/event_models/<tf>/tier1_hits_<tf>.txt      (hit event IDs)
 ##
-## A "hit" = q < q_threshold AND effect > 0 (real screen_R2 above the matched
-## feature-rotation null — event-specific epigenetic signal, not a cell-type
-## fingerprint). The Tier-2 elastic-net (09zz via 09-1) runs on this hit list.
+## A "hit" = q < q_threshold. The one-sided exceedance p already encodes direction, so
+## the former `AND effect > 0` clause was redundant; it was also outlier-dominated on the
+## unbounded R2 (61% of real rows positive for numerical reasons), so it has been dropped
+## (2026-08-01, see the note next to `min_effect` below). An event is a hit when it beats
+## its matched feature-rotation null — event-specific epigenetic signal rather than a
+## cell-type fingerprint. The Tier-2 elastic-net (09zz via 09-1) runs on this hit list.
 ##
 ## CLI:
 ##   Rscript 09s-aggregate.R <cfg_rds> [q_threshold]
@@ -372,22 +375,58 @@ data.table::fwrite(dt, out_results)
 # max z from 17.0 to 12.9; effect > 0.05 drops it to 6.7.
 min_effect <- getOption("EpiATLAS_AS_SCREEN_MIN_EFFECT", 0)
 
+# THE `effect > 0` CLAUSE HAS BEEN DROPPED FROM THE HIT RULE (2026-08-01).
+# Two reasons:
+#   1. It is redundant. p_emp is a ONE-SIDED exceedance probability,
+#      (1 + #{null >= real})/(R + 1), so it already encodes direction: an event cannot
+#      reach a small p while sitting below its own null distribution.
+#   2. As computed on the raw statistic it was actively misleading. `effect` is
+#      mean-based on an unbounded R2, so it is outlier-dominated: measured across 678
+#      real event x feature-set combos, 61% of effects were positive for purely
+#      numerical reasons, and the median effect flipped sign by |R2| stratum
+#      (+0.31 / +0.93 / -11.9 / -222.6). A clause that passes ~3/4 of events for
+#      arithmetic reasons is not a filter.
+# `min_effect` survives as an OPT-IN instrument for a DIFFERENT job -- suppressing
+# variance-collapse artifacts (see the note above) -- and now acts on `effect_bounded`,
+# a difference of bounded quantities, rather than on the corrupted raw `effect`.
+# Default 0 = no effect filter at all (NOT "effect > 0", which is what it used to mean).
+use_effect_filter <- is.finite(min_effect) && min_effect > 0
+if (use_effect_filter && !"effect_bounded" %in% names(dt)) {
+  stop(
+    "EpiATLAS_AS_SCREEN_MIN_EFFECT > 0 but `effect_bounded` is absent -- these screen ",
+    "rows predate stat_version 3. Re-screen, or set the option back to 0."
+  )
+}
+
 # Hit = significant in ANY feature set (Tier-2 then decomposes long/short/local).
 # PRIMARY criterion only -- the sensitivity p never feeds the Tier-2 hit list.
-hit_rows <- dt[is.finite(q) & q < q_threshold & is.finite(effect) & effect > min_effect]
+hit_rows <- if (use_effect_filter) {
+  dt[is.finite(q) & q < q_threshold &
+    is.finite(effect_bounded) & effect_bounded > min_effect]
+} else {
+  dt[is.finite(q) & q < q_threshold]
+}
 hits <- sort(unique(hit_rows$ID))
 hits_file <- file.path(event_dir, sprintf("tier1_hits_%s.txt", tf))
 writeLines(as.character(hits), hits_file)
 
 message(sprintf(
-  "q<%.3g & effect>%g -> %d unique hit events (%d feature-set rows). Wrote %s + %s",
-  q_threshold, min_effect, length(hits), nrow(hit_rows), out_results, hits_file
+  "q<%.3g%s -> %d unique hit events (%d feature-set rows). Wrote %s + %s",
+  q_threshold,
+  if (use_effect_filter) sprintf(" & effect_bounded>%g", min_effect) else "",
+  length(hits), nrow(hit_rows), out_results, hits_file
 ))
 # Per-feature-set breakdown, primary vs sensitivity side by side.
 print(dt[is.finite(q), .(
   n_tested = .N,
-  n_hits = sum(q < q_threshold & effect > min_effect, na.rm = TRUE),
-  n_hits_pooled_z = sum(q_pooled_z < q_threshold & effect > min_effect, na.rm = TRUE),
+  n_hits = sum(
+    q < q_threshold & (!use_effect_filter | effect_bounded > min_effect),
+    na.rm = TRUE
+  ),
+  n_hits_pooled_z = sum(
+    q_pooled_z < q_threshold & (!use_effect_filter | effect_bounded > min_effect),
+    na.rm = TRUE
+  ),
   min_p_emp = signif(min(p_emp, na.rm = TRUE), 3),
   min_p_pooled_z = if (any(is.finite(p_pooled_z))) {
     signif(min(p_pooled_z, na.rm = TRUE), 3)
@@ -404,7 +443,10 @@ print(dt[is.finite(q), .(
 floor_tab <- dt[is.finite(p_emp), {
   m <- .N
   fl <- 1 / (max(R_used, na.rm = TRUE) + 1)
-  k <- sum(p_emp <= fl + 1e-12 & effect > min_effect, na.rm = TRUE)
+  k <- sum(
+    p_emp <= fl + 1e-12 & (!use_effect_filter | effect_bounded > min_effect),
+    na.rm = TRUE
+  )
   .(m_tests = m, R_used_max = max(R_used, na.rm = TRUE),
     p_floor = signif(fl, 3), k_at_floor = k,
     bh_allows_at_k = if (k > 0L) signif(k * q_threshold / m, 3) else NA_real_,

@@ -235,10 +235,26 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 # ===========================================================================
 # Lin's concordance correlation coefficient (population / ÷n moments), matching
 # yardstick::ccc(bias = TRUE).
+# Strictly increasing squash of an unbounded R2 onto (-1, 1). Used for REPORTING and for
+# effect sizes only -- never for p_emp, which is computed from the raw value (and would
+# be numerically identical either way, since the map is monotone).
+.squash_r2 <- function(x) x / (1 + abs(x))
+
+
 .ccc <- function(x, y) {
-  ok <- is.finite(x) & is.finite(y)
-  x <- x[ok]
-  y <- y[ok]
+  # Fail together with R2, do NOT silently compute on the survivors. Previously this
+  # opened with `ok <- is.finite(x) & is.finite(y); x <- x[ok]` so that a fold whose
+  # confound design went rank-deficient (NA out-of-fold residuals) produced an NA
+  # screen_R2 -- which has no `na.rm` -- alongside a FINITE screen_CCC computed on an
+  # unknown subset of rows. A finite number computed on an unadvertised subset is worse
+  # than NA, because it looks valid. Measured 1,137 rows / 379 events with exactly that
+  # signature before the fix.
+  if (length(x) != length(y)) {
+    return(NA_real_)
+  }
+  if (anyNA(x) || anyNA(y) || !all(is.finite(x)) || !all(is.finite(y))) {
+    return(NA_real_)
+  }
   if (length(x) < 2L) {
     return(NA_real_)
   }
@@ -279,7 +295,7 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 # A hash of the two function bodies was considered instead (no discipline needed)
 # but rejected: it would also invalidate on a comment-only edit, and a false
 # invalidation here costs a multi-hour 34k-job rerun.
-SCREEN_STAT_VERSION <- 2L
+SCREEN_STAT_VERSION <- 3L
 
 
 # prep_event(): precompute the parts fixed across the real fit AND all null
@@ -300,47 +316,115 @@ SCREEN_STAT_VERSION <- 2L
 # ridge target within that fold), ytil_oof (out-of-fold residual of every
 # row's own held-out fold — the target the OOF prediction is scored against),
 # ss_tot (built from ytil_oof, so R2's denominator matches its numerator).
-prep_event <- function(y, confound_df, groups) {
-  n <- length(y)
-  Z <- matrix(1.0, nrow = n, ncol = 1L, dimnames = list(NULL, "(Intercept)"))
+# .build_fold_z(): construct the confound design for ONE fold, deciding which columns
+# survive and what NAs are imputed with using that fold's TRAIN rows only.
+#
+# Why this cannot be a single shared Z any more: per-fold NA imputation changes the
+# VALUES in the design, not merely which columns are kept, so the train and test blocks
+# have to be materialised per fold. They are tiny (n <= ~415 rows, a handful of confound
+# columns), so the memory cost is irrelevant.
+#
+# Two leakage-relevant decisions, both train-only:
+#   * numeric NAs are filled with the TRAIN mean (was: the mean over ALL n rows, so a
+#     held-out group's own values entered the constant used to adjust it -- the same
+#     leak shape as v1's global standardisation, smaller in magnitude)
+#   * a column constant in THIS fold's train rows is dropped (was: constant over all n
+#     rows), which is what caused the rank-deficient QR -> NA out-of-fold residuals
+.build_fold_z <- function(confound_df, train_idx, test_idx) {
+  ntr <- length(train_idx)
+  nte <- length(test_idx)
+  Ztr <- matrix(1.0, nrow = ntr, ncol = 1L, dimnames = list(NULL, "(Intercept)"))
+  Zte <- matrix(1.0, nrow = nte, ncol = 1L, dimnames = list(NULL, "(Intercept)"))
+  notes <- character(0)
+  add <- function(vtr, vte, nm) {
+    Ztr <<- cbind(Ztr, vtr)
+    Zte <<- cbind(Zte, vte)
+    colnames(Ztr)[ncol(Ztr)] <<- nm
+    colnames(Zte)[ncol(Zte)] <<- nm
+  }
   if (!is.null(confound_df) && ncol(confound_df) > 0L) {
     for (nm in names(confound_df)) {
       v <- confound_df[[nm]]
       if (is.numeric(v)) {
-        if (all(is.na(v))) next
-        v[is.na(v)] <- mean(v, na.rm = TRUE)
-        if (stats::sd(v) <= 1e-12) next # constant within event → absorbed by intercept
-        Z <- cbind(Z, setNames(matrix(v, ncol = 1L), NULL))
-        colnames(Z)[ncol(Z)] <- nm
+        vtr <- v[train_idx]
+        vte <- v[test_idx]
+        if (all(is.na(vtr))) {
+          notes <- c(notes, paste0("confound_all_na_in_train:", nm))
+          next
+        }
+        mu <- mean(vtr, na.rm = TRUE) # TRAIN mean only
+        vtr[is.na(vtr)] <- mu
+        vte[is.na(vte)] <- mu
+        if (stats::sd(vtr) <= 1e-12) {
+          # constant in this fold's train rows -> absorbed by the intercept; keeping it
+          # would alias the QR and NA out the whole event
+          next
+        }
+        add(vtr, vte, nm)
       } else {
-        f <- factor(ifelse(is.na(v), "NA", as.character(v)))
-        if (nlevels(f) < 2L) next # constant → absorbed by intercept
-        mm <- stats::model.matrix(~f)[, -1L, drop = FALSE]
-        colnames(mm) <- paste0(nm, "_", levels(f)[-1L])
-        Z <- cbind(Z, mm)
+        ch <- ifelse(is.na(v), "NA", as.character(v))
+        lv_tr <- sort(unique(ch[train_idx]))
+        if (length(lv_tr) < 2L) next # constant in train -> absorbed by the intercept
+        # dummies over TRAIN levels, baseline = first. A test row whose level never
+        # appears in train gets all-zero dummies, i.e. is folded into the baseline --
+        # the only available choice, since no coefficient can exist for a level the fit
+        # never saw. Noted rather than silently absorbed.
+        for (lvl in lv_tr[-1L]) {
+          add(
+            as.numeric(ch[train_idx] == lvl),
+            as.numeric(ch[test_idx] == lvl),
+            paste0(nm, "_", lvl)
+          )
+        }
+        unseen <- base::setdiff(unique(ch[test_idx]), lv_tr)
+        if (length(unseen)) {
+          notes <- c(notes, paste0(
+            "confound_level_unseen_in_train:", nm, "=",
+            paste(unseen, collapse = "/")
+          ))
+        }
       }
     }
   }
+  list(Ztr = Ztr, Zte = Zte, notes = notes)
+}
 
+prep_event <- function(y, confound_df, groups) {
+  n <- length(y)
   group_idx <- split(seq_len(n), groups)
   fold_z <- vector("list", length(group_idx))
   names(fold_z) <- names(group_idx)
+  fold_zte <- vector("list", length(group_idx))
+  names(fold_zte) <- names(group_idx)
   ytil_train <- vector("list", length(group_idx))
   names(ytil_train) <- names(group_idx)
   ytil_oof <- numeric(n)
+  notes <- character(0)
+
   for (g in names(group_idx)) {
     test_idx <- group_idx[[g]]
-    train_idx <- setdiff(seq_len(n), test_idx)
-    qrZtr <- qr(Z[train_idx, , drop = FALSE])
+    train_idx <- base::setdiff(seq_len(n), test_idx)
+    fz <- .build_fold_z(confound_df, train_idx, test_idx)
+    notes <- c(notes, fz$notes)
+    qrZtr <- qr(fz$Ztr)
+    if (qrZtr$rank < ncol(fz$Ztr)) {
+      # should be unreachable now that constancy is decided per fold, but a residual
+      # collinearity (two confounds identical within this fold's train rows) would still
+      # land here, and it must never again pass silently
+      notes <- c(notes, "fold_rank_deficient")
+    }
     b_y <- qr.coef(qrZtr, y[train_idx])
+    b_y[!is.finite(b_y)] <- 0 # aliased columns contribute nothing rather than NA
     fold_z[[g]] <- qrZtr
+    fold_zte[[g]] <- fz$Zte
     ytil_train[[g]] <- qr.resid(qrZtr, y[train_idx])
-    ytil_oof[test_idx] <- y[test_idx] - Z[test_idx, , drop = FALSE] %*% b_y
+    ytil_oof[test_idx] <- y[test_idx] - fz$Zte %*% b_y
   }
 
   list(
-    Z = Z, n = n, group_idx = group_idx, fold_z = fold_z,
-    ytil_train = ytil_train, ytil_oof = ytil_oof, ss_tot = sum(ytil_oof^2)
+    n = n, group_idx = group_idx, fold_z = fold_z, fold_zte = fold_zte,
+    ytil_train = ytil_train, ytil_oof = ytil_oof, ss_tot = sum(ytil_oof^2),
+    notes = unique(notes)
   )
 }
 
@@ -371,8 +455,10 @@ prep_event <- function(y, confound_df, groups) {
 # plain train→test kernel projection, not a same-smoother block update.
 ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
   na_out <- list(
-    R2 = NA_real_, CCC = NA_real_, lambda = NA_real_,
-    df = NA_real_, n_features = 0L
+    R2 = NA_real_, R2_bounded = NA_real_, CCC = NA_real_, lambda = NA_real_,
+    df = NA_real_, n_features = 0L,
+    max_abs_oof = NA_real_, max_abs_z = NA_real_, frac_z_gt10 = NA_real_,
+    lambda_min = NA_real_
   )
   if (is.null(X) || ncol(X) == 0L || nrow(X) != prep$n) {
     return(na_out)
@@ -394,6 +480,13 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
   oof <- numeric(prep$n)
   lambdas <- numeric(0)
   dfs <- numeric(0)
+  # B3 out-of-support diagnostics. The leave-one-ontology-supergroup-out design means a
+  # held-out group can sit far outside the training support (measured: |z| up to 48,404
+  # on real data, and >half the held-out rows beyond 10 train SDs in 37.5% of
+  # event x feature-set combos). That is the finding the screen exists to expose, so it
+  # is recorded rather than suppressed.
+  z_max_folds <- numeric(0)
+  z_gt10 <- numeric(0)
   for (g in names(prep$group_idx)) {
     test_idx <- prep$group_idx[[g]]
     train_idx <- setdiff(seq_len(prep$n), test_idx)
@@ -416,13 +509,21 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
     Xtr <- sweep(Xtr, 2L, sdv, "/")
     Xte <- sweep(Xte, 2L, sdv, "/")
 
+    # how far outside the training support does this held-out group actually sit?
+    z_max_folds <- c(z_max_folds, max(abs(Xte)))
+    z_gt10 <- c(z_gt10, mean(apply(abs(Xte), 1L, max) > 10))
+
     # residualise X on Z using this fold's TRAIN-fitted confound coefficients
     # (prep$fold_z[[g]] was fit on train rows only in prep_event) — applied to
-    # test rows by explicit matrix projection, never refit on test.
+    # test rows by explicit matrix projection, never refit on test. The test block
+    # comes from prep$fold_zte[[g]], NOT a slice of a shared Z: the design is now
+    # built per fold (train-only imputation + train-only constancy), so there is no
+    # single Z to slice.
     qrZtr <- prep$fold_z[[g]]
     b_X <- qr.coef(qrZtr, Xtr)
+    b_X[!is.finite(b_X)] <- 0 # defensive: aliased column contributes 0, never NA
     MXtr <- qr.resid(qrZtr, Xtr)
-    MXte <- Xte - prep$Z[test_idx, , drop = FALSE] %*% b_X
+    MXte <- Xte - prep$fold_zte[[g]] %*% b_X
 
     ytil_tr <- prep$ytil_train[[g]]
     n_tr <- length(ytil_tr)
@@ -460,11 +561,35 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
     dfs <- c(dfs, sum(sfilt))
   }
 
+  r2 <- 1 - sum((prep$ytil_oof - oof)^2) / prep$ss_tot
   list(
-    R2 = 1 - sum((prep$ytil_oof - oof)^2) / prep$ss_tot,
+    # RAW R2 is retained unchanged and is what p_emp / q are computed from. It is
+    # unbounded (measured min -290,429 on real data) but p_emp is RANK-based, so the
+    # magnitude is irrelevant to inference.
+    R2 = r2,
+    # Bounded companion for reporting, tables and effect sizes: R2/(1+|R2|) in (-1,1).
+    # Strictly increasing, therefore p_emp computed from it is EXACTLY identical to
+    # p_emp from raw R2 (f(null) >= f(real) <=> null >= real; no ties are created).
+    # That is the property clamping lacks -- clamping is not injective, it collapses
+    # values onto the bound, manufactures ties, and so genuinely moved p (Spearman
+    # 0.70 vs raw, 20-23 hit flips across 678 real event x feature-set combos).
+    # Bounded values also make `effect` usable again: a mean over (-1,1) cannot be
+    # dominated by a single -290,000 null, which was the substance of TODO-2.
+    R2_bounded = .squash_r2(r2),
     CCC = .ccc(prep$ytil_oof, oof),
     lambda = mean(lambdas),
     df = mean(dfs),
-    n_features = p
+    n_features = p,
+    max_abs_oof = max(abs(oof)),
+    max_abs_z = if (length(z_max_folds)) max(z_max_folds) else NA_real_,
+    frac_z_gt10 = if (length(z_gt10)) mean(z_gt10) else NA_real_,
+    # min lambda over folds: GCV running to the bottom of its grid is the signature of a
+    # fold that nearly interpolates its train rows and then extrapolates. Tracks blow-up
+    # magnitude monotonically on real data (median 83.1 -> 2.08 -> 1.55 -> 1.04 across
+    # |R2| strata), so it is kept as a diagnostic. NB raising lambda was TESTED as a fix
+    # and REJECTED: a floor at 1e-2*trace(K)/n_tr binds in 81.8% of the worst stratum yet
+    # only moves median R2 -8.18 -> -5.10 and min -290,429 -> -282,831. The blow-up is
+    # driven by test-side kernel magnitude, not by lambda being too small.
+    lambda_min = if (length(lambdas)) min(lambdas) else NA_real_
   )
 }
