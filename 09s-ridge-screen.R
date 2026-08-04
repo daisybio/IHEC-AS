@@ -53,7 +53,10 @@ if (!interactive()) {
     getOption("EpiATLAS_AS_SEED", 42L)
   }
   # Tier-1 rotation count: cheap, so default to a few hundred (p-floor ≈ 1/(R+1)).
-  n_rotations <- if (!is.null(cfg$screen_rotations)) {
+  # PER EVENT TYPE as of 2026-08-04 — resolved further down, once this event's
+  # Event Type is known (see resolve_screen_rotations in 09-ml-shared.R for why a
+  # single scalar cannot serve both RI and SE).
+  rotation_spec <- if (!is.null(cfg$screen_rotations)) {
     cfg$screen_rotations
   } else {
     getOption("EpiATLAS_AS_SCREEN_ROTATIONS", 200L)
@@ -158,6 +161,12 @@ if (!interactive()) {
   this_et <- as.character(event_dt[ID == this_id, `Event Type`][1L])
   this_tf <- as.character(event_dt[ID == this_id, transcript_filter][1L])
 
+  # Rotation count for THIS event type. RI needs its (near-)full ~818-control pool
+  # to push the empirical-p floor under BH's bound; SE clears at 200 and would cost
+  # ~10 days at RI's setting. Errors loudly on an unknown Event Type rather than
+  # quietly using a value that decides FDR admissibility.
+  n_rotations <- resolve_screen_rotations(rotation_spec, this_et)
+
   # Writer + NA filler emit ONE ROW PER FEATURE SET, carrying the
   # feature_set / Event Type / transcript_filter keys the aggregator groups FDR by
   # (`by = .(transcript_filter, Event Type, feature_set)`).
@@ -201,6 +210,8 @@ if (!interactive()) {
         n_samples = n_samples,
         n_features = NA_integer_,
         R_used = 0L,
+        n_rotations_requested = NA_integer_,
+        n_eligible_controls = NA_integer_,
         lambda = NA_real_,
         screen_df = NA_real_,
         screen_R2 = NA_real_,
@@ -286,11 +297,45 @@ if (!interactive()) {
   this_fs_cols <- feature_set_columns(parts$x_cols, this_id)
 
   # --- matched controls (same selection as 09zz's feature-rotation) ------
-  subset_psi_matrix <- psi_table[this_uuids, , drop = FALSE]
-  other_ids <- as.integer(colnames(subset_psi_matrix)[
-    colSums(is.na(subset_psi_matrix)) == 0 &
-      apply(subset_psi_matrix, 2L, sd, na.rm = TRUE) > 0
-  ])
+  # PSI-INDEPENDENT as of 2026-08-04 (SCREEN_STAT_VERSION 4). The candidate universe
+  # is every modelable event -- psi_table's columns -- with NO condition on the
+  # control's own PSI. Eligibility is now the matching criteria alone (below).
+  #
+  # WHY. control_fs_R2 uses only the control's X, scored against THIS event's
+  # PSI/confounds/folds (`prep` is fixed), and PSI/IJC/SJC are blocked out of x_cols
+  # entirely -- so the control's PSI is never read. Two clauses used to gate on it
+  # anyway, both computed on `psi_table[this_uuids, ]`:
+  #
+  #   colSums(is.na(...)) == 0   the control had to have observed PSI on EVERY focal
+  #                              sample. Pure artifact of v1 feature tables being
+  #                              built only over rows where the control's own PSI was
+  #                              observed: eligibility tracked the control's RNA
+  #                              coverage, not its suitability. Measured cost: RI's
+  #                              usable pool ~92 against a matched-criteria ceiling
+  #                              of 791-887, which is the difference between clearing
+  #                              FDR and not. FEATURE_TABLE_VERSION 2 builds every
+  #                              table over the full cohort, so it is now moot.
+  #
+  #   sd(...) > 0                the control's PSI had to VARY across the focal
+  #                              samples. Also PSI-derived, and redundant: 09-1
+  #                              already admits only events with global sd(PSI) > 0
+  #                              (its ids_to_build filter), and psi_table is built
+  #                              from that same set, so every candidate column is
+  #                              non-constant by construction. Keeping it would ALSO
+  #                              be a live bug once the coverage clause goes: sd of a
+  #                              column with <2 non-NA values is NA, and `TRUE & NA`
+  #                              is NA, so NA would enter the logical index and then
+  #                              other_ids. The coverage clause is what masked that
+  #                              (`FALSE & NA` is FALSE).
+  #
+  # Exchangeability is preserved exactly, not traded away: every control is still
+  # scored on the focal event's exact `this_uuids`, so `ss_tot` is identical across
+  # controls. (That caveat belongs to the DIFFERENT, weaker ">=90% overlap"
+  # relaxation, where controls would be scored on differing sample subsets.)
+  #
+  # To restore the old behaviour, re-intersect other_ids with the two clauses above;
+  # note that doing so returns RI to a ~92-control pool and to failing FDR.
+  other_ids <- as.integer(colnames(psi_table))
   this_event <- event_dt[ID == this_id]
   other_ids <- other_ids[
     other_ids != this_id &
@@ -300,7 +345,8 @@ if (!interactive()) {
       other_ids %in%
         event_dt[transcript_filter == this_event$transcript_filter, ID]
   ]
-  rm(subset_psi_matrix, psi_table)
+  stopifnot(!anyNA(other_ids))
+  rm(psi_table)
   gc()
 
   # --- feature-rotation null, PER FEATURE SET. Each matched control contributes
@@ -375,7 +421,15 @@ if (!interactive()) {
       transcript_filter = this_tf,
       n_samples = nrow(feature_data),
       n_features = real$n_features,
+      # R_used counts controls that actually returned a FINITE statistic. The two
+      # columns after it are what make a shortfall diagnosable instead of just
+      # visible: n_eligible_controls is the matched pool before the cap,
+      # n_rotations_requested is the cap. R_used << eligible means controls are
+      # failing inside control_fs_R2; eligible < requested means the pool, not the
+      # cap, is the binding constraint (the whole question for RI).
       R_used = R_used,
+      n_rotations_requested = as.integer(n_rotations),
+      n_eligible_controls = length(other_ids),
       lambda = real$lambda,
       screen_df = real$df,
       screen_R2 = real$R2,
