@@ -287,6 +287,153 @@ if (length(.no_cov)) {
 }
 setkey(sample_covariates, uuid)
 
+
+chip_files <- file_table[assay_type == "ChIP-Seq", unique(local_file)]
+# all_modelable_ids, matching the Phase-1 loop below: chip_matrix's rows are the only
+# source for each event's chromHMM slice, so a region set narrowed to ids_to_build
+# would make that slice fail for any event Tier-2 had already fitted.
+active_chrom_ids <- sort(unique(to(chromhmm_hits[
+  from(chromhmm_hits) %in% which(keep_rows_manual %in% all_modelable_ids)
+])))
+
+chip_matrix_cache <- file.path(
+  "processed_data",
+  sprintf("chip_matrix_%s.rds", tf)
+)
+# STALENESS GUARD. This cache is 13.8 GB and was previously reused on file existence
+# alone, with no comparison against its inputs -- and chromHMM is ~2,370 of the ~2,460
+# control x_cols, so silently reusing a cache older than the ChIP tabs it was built
+# from would mean nearly every control feature is stale. The copy on disk at
+# implementation time was dated 2026-07-21 against 2026-07-17 data, i.e. already in the
+# regime where a production rerun of the ChIP aggregation invalidates it.
+#
+# Rebuilt (not just warned about) when any input .tab.gz is newer, or when the region
+# set it was built for no longer covers what this run needs -- the latter matters now
+# that active_chrom_ids follows all_modelable_ids.
+.chip_cache_ok <- FALSE
+if (file.exists(chip_matrix_cache)) {
+  .cache_mtime <- file.mtime(chip_matrix_cache)
+  .newest_input <- suppressWarnings(max(file.mtime(chip_files), na.rm = TRUE))
+  if (is.finite(.newest_input) && .newest_input > .cache_mtime) {
+    message(sprintf(
+      "chip_matrix cache (%s) is OLDER than its newest ChIP tab (%s) - rebuilding",
+      format(.cache_mtime, "%Y-%m-%d %H:%M"),
+      format(.newest_input, "%Y-%m-%d %H:%M")
+    ))
+  } else {
+    chip_matrix <- readRDS(chip_matrix_cache)
+    .want_rows <- sprintf("chromhmm_%d", active_chrom_ids)
+    .missing_rows <- length(base::setdiff(.want_rows, rownames(chip_matrix)))
+    .missing_cols <- length(base::setdiff(chip_files, colnames(chip_matrix)))
+    if (.missing_rows > 0L || .missing_cols > 0L) {
+      message(sprintf(
+        "chip_matrix cache lacks %d needed region(s) and %d file(s) - rebuilding",
+        .missing_rows, .missing_cols
+      ))
+      rm(chip_matrix)
+      gc()
+    } else {
+      .chip_cache_ok <- TRUE
+      message("chip_matrix cache reused (newer than all ChIP tabs, covers all regions)")
+    }
+  }
+}
+if (.chip_cache_ok) {
+  invisible(NULL)
+} else {
+  # BATCHED FILL, not pbmclapply-over-everything-then-cbind.
+  #
+  # The old shape was `all_cols <- pbmclapply(seq_along(chip_files), ...)` followed by
+  # `do.call(cbind, all_cols)`. The final matrix is 707,997 x 2,430 doubles = 12.8 GB
+  # (exactly the size of the cache on disk), so that shape needs 12.8 GB for the list
+  # PLUS 12.8 GB for the cbind result -- and much worse in practice, because
+  # mclapply/pbmclapply return results through serialization pipes: each of the 16
+  # workers holds its own ~860 MB chunk and a serialized copy of it while the parent
+  # accumulates the full 12.8 GB. Measured: OOM-killed at 62.3 GB under a 64000 limit
+  # (job 6433872) and again at 93.6 GB under 96000 (job 6433873) -- it grows to fill
+  # whatever it is given, so raising mem_mb is not the fix.
+  #
+  # Filling a preallocated matrix one batch at a time bounds the peak at
+  # (final matrix) + (one batch), i.e. ~12.8 GB + ~1 GB instead of 26 GB+ of
+  # transients. Batches still use all mc.cores, so throughput is unchanged.
+  chip_matrix <- matrix(
+    NA_real_,
+    nrow = length(active_chrom_ids),
+    ncol = length(chip_files),
+    dimnames = list(sprintf("chromhmm_%d", active_chrom_ids), chip_files)
+  )
+  .batch <- 200L
+  .starts <- seq.int(1L, length(chip_files), by = .batch)
+  message(sprintf(
+    "Building chip_matrix: %d regions x %d files (%.1f GB), %d batches of <=%d",
+    length(active_chrom_ids), length(chip_files),
+    length(active_chrom_ids) * length(chip_files) * 8 / 1024^3,
+    length(.starts), .batch
+  ))
+  for (.bi in seq_along(.starts)) {
+    .idx <- seq.int(
+      .starts[.bi], min(.starts[.bi] + .batch - 1L, length(chip_files))
+    )
+    .cols <- pbmcapply::pbmclapply(.idx, function(i) {
+      # one thread per worker: 16 forks x data.table's own 16 threads would otherwise
+      # multiply fread's buffers (the event loop below sets this for the same reason)
+      data.table::setDTthreads(1L)
+      dt <- fread(
+        cmd = paste0("zcat ", chip_files[i], " | grep -P '^chromhmm_'"),
+        select = c(1L, 6L),
+        col.names = c("name", "mean")
+      )
+      dt[, id_int := as.integer(sub("chromhmm_", "", name, fixed = TRUE))]
+      row_idx <- match(dt$id_int, active_chrom_ids)
+      col_vec <- rep(NA_real_, length(active_chrom_ids))
+      col_vec[row_idx[!is.na(row_idx)]] <- dt$mean[!is.na(row_idx)]
+      col_vec
+    })
+    # Diagnose a dead fork HERE, per batch. mclapply returns NULL for a worker the
+    # OOM killer took and warns "scheduled cores ... did not deliver results"; the
+    # old code only found out at cbind, where it surfaced as "length of 'dimnames'
+    # [2] not equal to array extent" -- saying nothing about the real cause.
+    .bad <- !vapply(
+      .cols,
+      function(z) is.numeric(z) && length(z) == length(active_chrom_ids),
+      logical(1)
+    )
+    if (any(.bad)) {
+      stop(sprintf(
+        paste0(
+          "chip_matrix batch %d/%d: %d of %d tabs returned no usable column -- ",
+          "almost certainly the OOM killer taking forked workers. Check MaxRSS ",
+          "(sacct -j <id>) against this rule's mem_mb; the matrix alone is %.1f GB."
+        ),
+        .bi, length(.starts), sum(.bad), length(.idx),
+        length(active_chrom_ids) * length(chip_files) * 8 / 1024^3
+      ))
+    }
+    for (.k in seq_along(.idx)) chip_matrix[, .idx[.k]] <- .cols[[.k]]
+    rm(.cols)
+    gc()
+  }
+  stopifnot(
+    nrow(chip_matrix) == length(active_chrom_ids),
+    ncol(chip_matrix) == length(chip_files)
+  )
+  saveRDS(chip_matrix, chip_matrix_cache, compress = FALSE)
+  message("chip_matrix built and cached")
+}
+
+# =============================================================================
+# PSI-independent sources for the full-cohort row set (LOADED LATE, ON PURPOSE)
+# =============================================================================
+# These three reads sit AFTER the chip_matrix build, not before it. The build forks
+# mc.cores workers over 2,430 ChIP tabs and already peaks hard: `all_cols` is
+# 2,430 x ~709k doubles (~13.8 GB) and `do.call(cbind, ...)` transiently doubles it.
+# R's GC dirties pages inside the forks, so copy-on-write does NOT keep a large
+# parent object free -- every extra GB held here is multiplied by the fork width.
+# Loading the grid (~5 GB) + rbp_score + gene_expr before that step is what OOM-killed
+# a real run at 62.3 GB against a 62.5 GB limit (job 6433872, 2026-08-04), with the
+# symptom surfacing as a cryptic `dimnames` length error after the workers died.
+# Nothing between here and the Phase-1 loop needs them, so keep them last.
+
 # --- the unfiltered (IHEC x ID) grid: event-proximal features for ALL samples ---
 # Written by 05 immediately before the PSI merge, so it is PSI-independent by
 # construction. Its DNAm columns are M-value-transformed there with the identical
@@ -404,80 +551,6 @@ if (.ge_hit == 0L) {
 # (they are what PSI is computed from), and a row with no PSI has no junction-count
 # reading to report either, so NA is the honest value rather than a lookup worth a
 # 76 MB join.
-
-chip_files <- file_table[assay_type == "ChIP-Seq", unique(local_file)]
-# all_modelable_ids, matching the Phase-1 loop below: chip_matrix's rows are the only
-# source for each event's chromHMM slice, so a region set narrowed to ids_to_build
-# would make that slice fail for any event Tier-2 had already fitted.
-active_chrom_ids <- sort(unique(to(chromhmm_hits[
-  from(chromhmm_hits) %in% which(keep_rows_manual %in% all_modelable_ids)
-])))
-
-chip_matrix_cache <- file.path(
-  "processed_data",
-  sprintf("chip_matrix_%s.rds", tf)
-)
-# STALENESS GUARD. This cache is 13.8 GB and was previously reused on file existence
-# alone, with no comparison against its inputs -- and chromHMM is ~2,370 of the ~2,460
-# control x_cols, so silently reusing a cache older than the ChIP tabs it was built
-# from would mean nearly every control feature is stale. The copy on disk at
-# implementation time was dated 2026-07-21 against 2026-07-17 data, i.e. already in the
-# regime where a production rerun of the ChIP aggregation invalidates it.
-#
-# Rebuilt (not just warned about) when any input .tab.gz is newer, or when the region
-# set it was built for no longer covers what this run needs -- the latter matters now
-# that active_chrom_ids follows all_modelable_ids.
-.chip_cache_ok <- FALSE
-if (file.exists(chip_matrix_cache)) {
-  .cache_mtime <- file.mtime(chip_matrix_cache)
-  .newest_input <- suppressWarnings(max(file.mtime(chip_files), na.rm = TRUE))
-  if (is.finite(.newest_input) && .newest_input > .cache_mtime) {
-    message(sprintf(
-      "chip_matrix cache (%s) is OLDER than its newest ChIP tab (%s) - rebuilding",
-      format(.cache_mtime, "%Y-%m-%d %H:%M"),
-      format(.newest_input, "%Y-%m-%d %H:%M")
-    ))
-  } else {
-    chip_matrix <- readRDS(chip_matrix_cache)
-    .want_rows <- sprintf("chromhmm_%d", active_chrom_ids)
-    .missing_rows <- length(base::setdiff(.want_rows, rownames(chip_matrix)))
-    .missing_cols <- length(base::setdiff(chip_files, colnames(chip_matrix)))
-    if (.missing_rows > 0L || .missing_cols > 0L) {
-      message(sprintf(
-        "chip_matrix cache lacks %d needed region(s) and %d file(s) - rebuilding",
-        .missing_rows, .missing_cols
-      ))
-      rm(chip_matrix)
-      gc()
-    } else {
-      .chip_cache_ok <- TRUE
-      message("chip_matrix cache reused (newer than all ChIP tabs, covers all regions)")
-    }
-  }
-}
-if (.chip_cache_ok) {
-  invisible(NULL)
-} else {
-  all_cols <- pbmcapply::pbmclapply(seq_along(chip_files), function(i) {
-    dt <- fread(
-      cmd = paste0("zcat ", chip_files[i], " | grep -P '^chromhmm_'"),
-      select = c(1L, 6L),
-      col.names = c("name", "mean")
-    )
-    dt[, id_int := as.integer(sub("chromhmm_", "", name, fixed = TRUE))]
-    row_idx <- match(dt$id_int, active_chrom_ids)
-    col_vec <- rep(NA_real_, length(active_chrom_ids))
-    col_vec[row_idx[!is.na(row_idx)]] <- dt$mean[!is.na(row_idx)]
-    col_vec
-  })
-  chip_matrix <- do.call(cbind, all_cols)
-  rm(all_cols)
-  dimnames(chip_matrix) <- list(
-    sprintf("chromhmm_%d", active_chrom_ids),
-    chip_files
-  )
-  saveRDS(chip_matrix, chip_matrix_cache, compress = FALSE)
-}
 
 # chromHMM hits within a narrower window (vicinity/10) — defines the
 # "short" feature sets as the subset of regions within this tighter radius.
