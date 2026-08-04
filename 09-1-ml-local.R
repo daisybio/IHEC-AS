@@ -502,7 +502,7 @@ chromhmm_hits_smaller <- findOverlaps(
 # file). This was masked while the v1 tables existed for all events; with a
 # FEATURE_TABLE_VERSION bump writing to an empty directory it would leave a real hole
 # for exactly the events Tier-2 had already fitted.
-pbmcapply::pbmclapply(all_modelable_ids, function(id) {
+.build_res <- pbmcapply::pbmclapply(all_modelable_ids, function(id) {
   data.table::setDTthreads(1L)
   feature_table_file <- file.path(
     feature_table_dir,
@@ -603,9 +603,73 @@ pbmcapply::pbmclapply(all_modelable_ids, function(id) {
     ]
   }
 
-  fwrite(feature_data, feature_table_file)
+  # ATOMIC: this job can hit its 1440-min wall mid-write, and a truncated .csv.gz left
+  # at the final path would be SKIPPED by the file.exists() gate above on the resubmit
+  # -- a silently corrupt table that fread may still partially accept. Write to a temp
+  # sibling and rename (atomic on one filesystem). The temp name MUST keep the .csv.gz
+  # extension and pass compress= explicitly: fwrite picks compression from the
+  # extension, so a ".tmp<pid>" suffix writes PLAIN CSV that then gets renamed to
+  # .csv.gz (fread tolerates it, zcat/gzfile do not) -- same trap already documented
+  # for 09s-ridge-screen.R's write_atomic.
+  tmp_file <- file.path(
+    dirname(feature_table_file),
+    sprintf(".tmp%d_%s", Sys.getpid(), basename(feature_table_file))
+  )
+  fwrite(feature_data, tmp_file, compress = "gzip")
+  if (!file.rename(tmp_file, feature_table_file)) {
+    unlink(tmp_file)
+    stop("Failed to rename ", tmp_file, " -> ", feature_table_file)
+  }
   invisible(NULL)
 })
+
+# --- Phase 1 completeness gate -------------------------------------------------
+# pbmclapply/mclapply do NOT abort on a worker error: the failing element comes back
+# as a try-error (or NULL if the worker was OOM-killed) and the loop reports success.
+# Previously the result was neither assigned nor inspected, so any per-event failure
+# left that table missing and this script still exited 0 -- and the screen would then
+# silently lose the event (a missing control table makes control_fs_R2 return NA, and a
+# missing focal table makes its own job fail much later, ~34k jobs in). That is the
+# exact "silently successful" mode the version stamps exist to prevent, so check it.
+# FILE EXISTENCE is the authority here, not the try-error count. With
+# mc.preschedule = TRUE (the default) mclapply hands each core a contiguous chunk and a
+# single failure poisons the RETURN VALUES of that entire chunk -- measured: asking for
+# errors at elements 3 and 5 of 6 over 2 cores reports 1, 3 and 5. At 34k events over 16
+# cores one real failure would claim ~2,100 "errored" events whose tables were in fact
+# written fine. So the error list is only used to surface a diagnostic message; whether
+# the build is complete is decided by which files are actually on disk.
+.expected <- file.path(
+  feature_table_dir, sprintf("feature_table_%d.csv.gz", all_modelable_ids)
+)
+.missing <- !file.exists(.expected)
+.build_failed <- vapply(
+  .build_res,
+  function(z) inherits(z, "try-error") || inherits(z, "condition"),
+  logical(1)
+)
+if (any(.build_failed)) {
+  .first <- which(.build_failed)[1L]
+  message(sprintf(
+    paste0(
+      "Worker error(s) reported (count %d is inflated by mc.preschedule chunk ",
+      "poisoning -- treat the missing-file count below as authoritative). First: %s"
+    ),
+    sum(.build_failed),
+    conditionMessage(attr(.build_res[[.first]], "condition"))
+  ))
+}
+if (any(.missing)) {
+  stop(sprintf(
+    "Feature-table build INCOMPLETE: %d of %d tables missing (e.g. event %s). %s",
+    sum(.missing), length(.expected),
+    paste(head(all_modelable_ids[.missing], 3L), collapse = ", "),
+    "Re-run to resume -- the build is idempotent, existing tables are skipped."
+  ))
+}
+message(sprintf(
+  "Feature tables complete: %d/%d present in %s",
+  sum(!.missing), length(.expected), feature_table_dir
+))
 
 # =============================================================================
 # Phase 2: ML runs — one SLURM job per event, minimal memory footprint
