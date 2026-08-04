@@ -315,7 +315,29 @@ resources:
     threads: 12
     gpu: 1
   event_models:
-    mem_mb: 64000
+    # 160000 (2026-08-04, third bump): the Phase-1 event loop then OOM'd at 93.4 GB
+    # under 96000 after 164 tables (job 6433878). That loop forks over a ~28 GB parent
+    # (chip_matrix 12.8 GB + aggregated_dt ~6 + grid ~4.3 + the per-(ID,uuid) sources)
+    # and each worker's GC dirties parent pages, so the cost is ~(parent) x (workers).
+    # The real fix is the fork width -- 09-1 now caps Phase 1 at 8 (EPIATLAS_AS_BUILD_CORES)
+    # and frees psi_long_dt/event_annotations_dt/event_gr/activeChromHMM before forking --
+    # this is headroom on top. Nodes on shared-cpu carry 384 GB (one has 1 TB) and 05
+    # already runs at 128000, so this is not a scheduling risk.
+    #
+    # History, because the pattern matters: 64000 -> OOM 62.3 GB (chip_matrix cbind),
+    # 96000 -> OOM 93.6 GB (same), then OOM 93.4 GB (event loop fork). Raising memory
+    # never fixed either -- the shapes did (batched fill, then fork width).
+    #
+    # 96000, up from 64000 (2026-08-04): build_feature_tables was OUT_OF_MEMORY at
+    # MaxRSS 62.3 GB against the 62.5 GB that 64000 gives (job 6433872). The
+    # chip_matrix rebuild is the peak and it is intrinsic, not a leak: `all_cols` is
+    # 2,430 tabs x ~709k regions x 8 B = 12.8 GB (matches the cache on disk) and
+    # `do.call(cbind, ...)` transiently doubles it to ~26 GB, on top of ~13 GB of
+    # parent objects, with 16 forked workers whose GC dirties pages so copy-on-write
+    # does not help. 64000 was already marginal before FEATURE_TABLE_VERSION 2 added
+    # the ~5 GB grid; 09-1 now also defers the grid/rbp_score/gene_expr reads until
+    # after that step, so this is headroom rather than the fix.
+    mem_mb: 160000
     runtime: 1440
     threads: 16
     gpu: 0

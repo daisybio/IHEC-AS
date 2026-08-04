@@ -575,7 +575,31 @@ chromhmm_hits_smaller <- findOverlaps(
 # file). This was masked while the v1 tables existed for all events; with a
 # FEATURE_TABLE_VERSION bump writing to an empty directory it would leave a real hole
 # for exactly the events Tier-2 had already fitted.
-.build_res <- pbmcapply::pbmclapply(all_modelable_ids, function(id) {
+
+# --- free everything the loop does not read, then fork -------------------------
+# The fork width below is the binding memory constraint, so shrink the parent first.
+# Each worker's GC dirties parent heap pages, and a dirtied page is COPIED -- so the
+# cost is roughly (parent heap) x (workers), not (parent heap). Measured: OOM-killed at
+# 93.4 GB under mem_mb 96000 after 164 tables, forking a ~28 GB parent 16 ways
+# (job 6433878, 2026-08-04).
+.event_dt_small <- event_annotations_dt[, .(
+  ID, `Event Type`, seqnames, Variability, transcript_filter
+)] # all session_09_1 needs after the loop; drops ~25 unused columns
+rm(psi_long_dt, event_annotations_dt, event_gr, activeChromHMM)
+gc() # compact before forking: a clean heap dirties fewer pages in the children
+
+# Phase-1 fork width. Deliberately BELOW `threads`: the chip_matrix build above is
+# memory-light per worker and wants all 16, but this loop forks over a much fatter
+# parent (chip_matrix 12.8 GB + aggregated_dt ~6 GB + grid ~4.3 GB + the per-(ID,uuid)
+# sources). 8 halves the copy-on-write multiplier at roughly double the wall-clock,
+# which is the right trade against a 1440-min limit and a measured ~90 min at 16.
+.build_cores <- as.integer(Sys.getenv("EPIATLAS_AS_BUILD_CORES", "8"))
+if (is.na(.build_cores) || .build_cores < 1L) .build_cores <- 8L
+message(sprintf(
+  "Phase 1: %d events over %d fork(s) (threads=%s); set EPIATLAS_AS_BUILD_CORES to change",
+  length(all_modelable_ids), .build_cores, Sys.getenv("SLURM_CPUS_PER_TASK", "?")
+))
+.build_res <- pbmcapply::pbmclapply(all_modelable_ids, mc.cores = .build_cores, function(id) {
   data.table::setDTthreads(1L)
   feature_table_file <- file.path(
     feature_table_dir,
@@ -762,13 +786,9 @@ saveRDS(
     # 07 reads sess$event_dt with exactly these 5 columns (ID/Event
     # Type/seqnames/Variability/transcript_filter) — event_annotations_dt has
     # them all under the same names, so 07 itself needs no change here.
-    event_dt = event_annotations_dt[, .(
-      ID,
-      `Event Type`,
-      seqnames,
-      Variability,
-      transcript_filter
-    )],
+    # Taken from .event_dt_small, subset before Phase 1 so the full
+    # event_annotations_dt could be freed ahead of the fork (see there).
+    event_dt = .event_dt_small,
     chromhmm_hits_smaller = as.matrix(chromhmm_hits_smaller),
     keep_rows_manual = keep_rows_manual
   ),
