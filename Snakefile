@@ -776,6 +776,13 @@ rule create_aggregated_dt:
         spliceosome_expr      = "processed_data/splicing_factor_expression_{transcript_filter}.csv.gz",
     output:
         csv  = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        # Unfiltered PSI-independent grid: every (IHEC, ID) pair, 100% coverage, DNAm
+        # M-value-transformed to match `csv`. 09-1 reads it for Tier-1 CONTROL event
+        # features, which never involve the control's own PSI. Per-filter path because
+        # event IDs are positions in that filter's event_gr, so one shared file would be
+        # silently overwritten across filters; declared (not a side effect) so a stale
+        # grid cannot survive a rebuild of this rule.
+        grid = "processed_data/aggregated_dt_{transcript_filter}.csv.gz",
         html = "reports/05-create-aggregated-dt_{transcript_filter}.html",
     log: "logs/05_create_aggregated_dt_{transcript_filter}.log"
     threads: R("create_aggregated_dt", "threads")
@@ -1139,6 +1146,14 @@ checkpoint build_feature_tables:
         local_glmnet     = "09zz-ml-event-glmnet-tidymodels.R",  # source()d by 09-1
         shared           = "09-ml-shared.R",
         aggregated_dt    = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        # PSI-independent sources for the FULL-cohort feature-table row set
+        # (FEATURE_TABLE_VERSION 2). The grid supplies event-proximal epigenetic
+        # features for samples where this event's PSI was never observed; the other two
+        # are the only families that vary with BOTH event and sample and so cannot be
+        # recycled from aggregated_dt's observed rows.
+        grid             = "processed_data/aggregated_dt_{transcript_filter}.csv.gz",
+        rbp_score        = "processed_data/rbp_score_dt_{transcript_filter}.csv.gz",
+        gene_expr        = "processed_data/gene_expression_normalised_{transcript_filter}.csv.gz",
         keep_rows_manual = "processed_data/keep_rows_manual_{transcript_filter}.rds",
         sample_cols      = "processed_data/sample_cols_{transcript_filter}.rds",
         event_annotations_dt = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",

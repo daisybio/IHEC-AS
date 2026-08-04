@@ -203,9 +203,63 @@ aggregated_dt[
   (source_cols) := mget(paste0("i.", source_cols))
 ]
 
-# write full table to disk
-message("Writing processed_data/aggregated_dt.csv.gz...")
-fwrite(aggregated_dt, "processed_data/aggregated_dt.csv.gz")
+# Write the full (unfiltered) grid to disk: every (IHEC, ID) pair, PSI-independent.
+#
+# DNAm MUST be M-value-transformed here, on a COPY, using the identical formula as the
+# `dnam-mvalue-transform` chunk further down. That chunk cannot simply be moved above
+# this write: `dnam-tss-sanity` between them needs the real 0-100 beta scale for its
+# "mean beta (% methylation)" plot, and by the time the transform runs
+# `expand-aggregated-dt` has already reduced `aggregated_dt` to the filtered set, so the
+# unfiltered object no longer exists.
+#
+# Why it matters: this grid is the PSI-independent source for the Tier-1 screen's
+# *control* event features (09-1 builds per-event feature tables from it), while the
+# focal event's features come from `aggregated_dt_filtered_{tf}.csv.gz`, which IS
+# M-value-transformed. Writing raw beta here would put control and focal DNAm on
+# different scales inside the same ridge fit -- silently, since both are plausible
+# numbers. Verified before this fix: the grid on disk had zero negative values while the
+# filtered table reaches -9.97.
+#
+# The same applies to the CpGs NA -> 0 fill in `expand-aggregated-dt` (NA there means
+# "no CpGs covered in this window", which is 0): it also runs after this write, so the
+# copy below has to reproduce it too. Caught by
+# .claude/scratch/verify_psi_independent_controls.R, which compares the grid against
+# the filtered table column by column -- without it the grid carried NA on every CpGs
+# column where the filtered table carried 0, and control rows would have disagreed
+# with focal rows on 4 of the 32 event-proximal features.
+#
+# GENERAL RULE: any transform applied to `aggregated_dt` BETWEEN this write and the
+# `aggregated_dt_filtered` write has to be mirrored here, or control and focal
+# features end up on different scales/encodings inside one ridge fit. There are two
+# such transforms today (DNAm M-values, CpGs NA -> 0). If you add a third, add it
+# here as well and extend that verification script.
+#
+# PER FILTER. This file's contents are transcript_filter-specific -- event `ID` is a
+# row position in that filter's own event_gr, so the same integer denotes a DIFFERENT
+# event under a different filter. Written to one shared unsuffixed path (as it was
+# before 2026-08-04) it would be overwritten by whichever 05 ran last, and 09-1 would
+# read control features for the wrong events under matching ID values, with nothing
+# to detect it. Nothing else in the repo reads this file, so the rename is free.
+.grid_file <- sprintf("processed_data/aggregated_dt_%s.csv.gz", tf)
+message("Writing ", .grid_file, "...")
+.grid_out <- copy(aggregated_dt)
+.grid_dnam_cols <- grep("^DNAm;", names(.grid_out), value = TRUE)
+if (length(.grid_dnam_cols)) {
+  .grid_out[,
+    (.grid_dnam_cols) := lapply(.SD, function(x) {
+      beta <- x / 100
+      log2((beta + 0.001) / (1 - beta + 0.001))
+    }),
+    .SDcols = .grid_dnam_cols
+  ]
+}
+# mirror expand-aggregated-dt's CpGs NA -> 0 fill (see the note above)
+for (.i in grep("^CpGs", names(.grid_out))) {
+  set(.grid_out, i = which(is.na(.grid_out[[.i]])), j = .i, value = 0)
+}
+fwrite(.grid_out, .grid_file, compress = "gzip")
+rm(.grid_out)
+gc()
 ```
 
 
@@ -254,7 +308,11 @@ melted_psi[file_metadata, on = .(uuid), IHEC := epirr_id_without_version]
 # guard against re-running this chunk on an already-expanded aggregated_dt
 # (merge() would silently produce PSI.x/PSI.y instead of erroring clearly).
 # If this trips, reload the cheap checkpoint instead of rerunning
-# build-aggregated-dt: aggregated_dt <- fread("processed_data/aggregated_dt.csv.gz")
+# build-aggregated-dt: aggregated_dt <- fread(sprintf(
+#   "processed_data/aggregated_dt_%s.csv.gz", tf))
+# NB that checkpoint is M-value-transformed (see the grid write above) while
+# aggregated_dt is still raw beta at this point in the chunk order, so reloading it
+# here skips the dnam-mvalue-transform chunk's work rather than duplicating it.
 stopifnot(!("PSI" %in% names(aggregated_dt)))
 
 # merge PSI on the aggregated table
