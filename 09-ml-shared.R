@@ -231,6 +231,204 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 
 
 # ===========================================================================
+# 2b. Full-cohort feature-table assembly (FEATURE_TABLE_VERSION 2)
+# ===========================================================================
+# Used by 09-1-ml-local.R's Phase-1 build. Lives here, with every input passed
+# explicitly rather than read from 09-1's globals, so a verification script can
+# exercise the REAL assembly without also loading 09-1's 13.8 GB chip_matrix and
+# ~9 M-row aggregated_dt.
+
+# Classify a feature table's columns by the key each one is constant over. The
+# assembly needs this because the added (previously-unobserved) rows have to source
+# each column from wherever that column actually varies.
+#
+# Exhaustive BY ASSERTION, deliberately mirroring splicing_ml's FEATURE_GROUPS
+# convention: a column 05 adds later lands in no group and this errors, rather than
+# being silently left NA on every added row. Fix by classifying it here.
+classify_feature_columns <- function(col_names) {
+  key <- intersect(c("ID", "IHEC", "uuid"), col_names)
+  # per (ID, IHEC) -- the event-proximal window features, i.e. exactly the unfiltered
+  # grid's payload. `_source` is per (sample, mark) observed-vs-imputed provenance.
+  per_epigenome <- grep(
+    "^(H3K[^;]+|DNAm|CpGs);(3|5)(up|down)$|_source$", col_names, value = TRUE
+  )
+  # per uuid -- RNA-library-level covariates and whole-spliceosome expression
+  per_uuid <- c(
+    intersect(c("protocol", "ontology", "project", "qc_flag_count"), col_names),
+    grep("^spliceosome_", col_names, value = TRUE)
+  )
+  # per (uuid, gene_id); gene_id is constant within an event, so per uuid per event
+  per_gene <- intersect(
+    c("gene_expression_vst", "gene_expression_getmm"), col_names
+  )
+  # per (ID, uuid) -- the only genuinely sample-by-event quantities
+  per_event_sample <- intersect(
+    c(
+      "PSI", "IJC", "SJC",
+      "rbp_score_sum", "rbp_score_mean", "rbp_score_max", "rbp_n"
+    ),
+    col_names
+  )
+  # everything else is constant within an event (geometry, annotation, splice-site /
+  # Pangolin / GC scores) and is recycled from the event's observed rows
+  per_event <- base::setdiff(
+    col_names,
+    c(key, per_epigenome, per_uuid, per_gene, per_event_sample)
+  )
+  out <- list(
+    key = key, per_epigenome = per_epigenome, per_uuid = per_uuid,
+    per_gene = per_gene, per_event_sample = per_event_sample,
+    per_event = per_event
+  )
+  flat <- unlist(out, use.names = FALSE)
+  if (anyDuplicated(flat) || !setequal(flat, col_names)) {
+    stop(
+      "classify_feature_columns(): groups are not an exact partition of the ",
+      length(col_names), " columns (unclassified: ",
+      paste(base::setdiff(col_names, flat), collapse = ", "),
+      "; duplicated: ", paste(flat[duplicated(flat)], collapse = ", "), ")"
+    )
+  }
+  out
+}
+
+
+# Coerce every shared column of `add` to `template`'s type. The added rows draw from
+# four sources that each round-trip through fread independently, so a column can
+# arrive as character where aggregated_dt holds a factor, or double where it holds an
+# integer. rbindlist would paper over some of that and mis-code the rest (two factors
+# with different level sets are the dangerous case: the integer codes mean different
+# things). A value that does not survive the coercion -- a factor level aggregated_dt
+# has never seen -- is an ERROR, not an NA.
+align_types <- function(add, template) {
+  for (nm in intersect(names(add), names(template))) {
+    tmpl <- template[[nm]]
+    cur <- add[[nm]]
+    if (is.factor(tmpl)) {
+      if (!is.factor(cur) || !identical(levels(cur), levels(tmpl))) {
+        chr <- as.character(cur)
+        new <- factor(chr, levels = levels(tmpl))
+        lost <- which(is.na(new) & !is.na(chr))
+        if (length(lost)) {
+          stop(
+            "Column '", nm, "' has ", length(lost),
+            " value(s) outside the template's factor levels (e.g. '",
+            chr[lost[1L]], "') -- source disagrees with aggregated_dt"
+          )
+        }
+        data.table::set(add, j = nm, value = new)
+      }
+    } else if (is.integer(tmpl) && !is.integer(cur)) {
+      if (is.numeric(cur) && !isTRUE(all.equal(cur, round(cur)))) {
+        stop("Column '", nm, "' is integer in the template but non-integral here")
+      }
+      data.table::set(add, j = nm, value = as.integer(cur))
+    } else if (is.numeric(tmpl) && !is.numeric(cur)) {
+      data.table::set(add, j = nm, value = as.numeric(cur))
+    }
+  }
+  add[]
+}
+
+
+# Expand ONE event's observed rows to the full cohort sample set.
+#
+#   obs        — aggregated_dt[ID == id], i.e. the rows where THIS event's PSI was
+#                observed. Returned VERBATIM as the first rows of the result.
+#   all_uuids  — character vector of every cohort uuid for this transcript_filter
+#   sample_cov — one row per uuid: uuid, IHEC, and the per-uuid columns
+#   cols       — classify_feature_columns(names(obs))
+#   grid       — unfiltered (ID, IHEC) grid, keyed, IHEC factor-aligned to obs$IHEC
+#   rbp_score  — (ID, uuid) RBP aggregates, keyed on ID first
+#   gene_expr  — (gene_id, uuid) expression, keyed on gene_id first
+#
+# The observed rows are copied, never rebuilt, so a bug in the assembly can degrade a
+# NULL rotation but structurally cannot perturb the focal statistic -- 09s-ridge-
+# screen.R re-applies `!is.na(PSI)` at load, so the focal fit reads only these rows.
+#
+# Every lookup is a match() on character, not a data.table join: the sources' key
+# columns are variously factor (aggregated_dt: stringsAsFactors = TRUE) and character
+# (everything else), and an implicit factor-to-character join is exactly the coercion
+# that fails quietly rather than loudly. At <=415 rows per side (after a keyed binary
+# search for the slice) match() costs nothing.
+build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
+                                  grid, rbp_score, gene_expr) {
+  add_uuids <- base::setdiff(all_uuids, as.character(obs$uuid))
+  if (length(add_uuids) == 0L) {
+    return(obs)
+  }
+  add <- data.table::copy(sample_cov[
+    match(add_uuids, as.character(sample_cov$uuid)),
+    c("uuid", "IHEC", cols$per_uuid),
+    with = FALSE
+  ])
+  if (anyNA(add$uuid)) {
+    stop("build_full_event_rows(): ", sum(is.na(add$uuid)),
+         " uuid(s) absent from sample_cov for event ", id)
+  }
+  add[, ID := id]
+  ihec_chr <- as.character(add$IHEC)
+  uuid_chr <- as.character(add$uuid)
+
+  # per-event constants: constant within the event by definition, so any observed row
+  # carries the same value; taken from row 1.
+  for (nm in cols$per_event) {
+    data.table::set(add, j = nm, value = obs[[nm]][1L])
+  }
+  # PSI / IJC / SJC: unobserved on these rows -- which is the entire point. Indexing
+  # by NA_integer_ yields a length-1 NA of the column's own type, preserving it.
+  # IJC/SJC stay NA rather than being looked up: they are blocked from x_cols (PSI is
+  # computed from them), and a sample with no PSI reading has no junction counts to
+  # report either, so NA is the honest value.
+  for (nm in cols$per_event_sample) {
+    data.table::set(add, j = nm, value = obs[[nm]][NA_integer_])
+  }
+  # per (ID, uuid): RBP aggregates
+  rbp_cols <- intersect(cols$per_event_sample, names(rbp_score))
+  if (length(rbp_cols)) {
+    rs <- rbp_score[.(id), nomatch = NULL]
+    if (nrow(rs)) {
+      i_rs <- match(uuid_chr, as.character(rs$uuid))
+      for (nm in rbp_cols) data.table::set(add, j = nm, value = rs[[nm]][i_rs])
+    }
+  }
+  # per (uuid, gene_id): expression for THIS event's gene. Columns are created
+  # UNCONDITIONALLY (typed NA) before the fill -- if they were only created inside the
+  # `nrow(ge)` branch, an event whose gene is absent from gene_expr would return a
+  # table missing these columns entirely, and the caller's setcolorder/rbindlist would
+  # then fail on that event rather than yielding NA for it.
+  for (nm in cols$per_gene) {
+    data.table::set(add, j = nm, value = obs[[nm]][NA_integer_])
+  }
+  if (length(cols$per_gene)) {
+    ge <- gene_expr[.(as.character(obs[["gene_id"]][1L])), nomatch = NULL]
+    if (nrow(ge)) {
+      i_ge <- match(uuid_chr, as.character(ge$uuid))
+      for (nm in cols$per_gene) {
+        data.table::set(add, j = nm, value = ge[[nm]][i_ge])
+      }
+    }
+  }
+  # per (ID, IHEC): event-proximal epigenetic features from the unfiltered grid
+  gr <- grid[.(id), nomatch = NULL]
+  if (!nrow(gr)) {
+    stop("build_full_event_rows(): event ", id, " has no rows in the grid")
+  }
+  i_gr <- match(ihec_chr, as.character(gr$IHEC))
+  for (nm in cols$per_epigenome) {
+    data.table::set(add, j = nm, value = gr[[nm]][i_gr])
+  }
+
+  add <- align_types(add, obs)
+  data.table::setcolorder(add, names(obs))
+  # fill = FALSE: a column present in one table and not the other must fail loudly
+  # here. (rbindlist(fill = TRUE) silently creating and filling a column is a
+  # documented trap in this codebase.)
+  data.table::rbindlist(list(obs, add), use.names = TRUE, fill = FALSE)
+}
+
+
+# ===========================================================================
 # 3. Tier-1 closed-form ridge screen statistic
 # ===========================================================================
 # Lin's concordance correlation coefficient (population / ÷n moments), matching
@@ -291,11 +489,116 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 #       that "exact" formula depended on the held-out group. Results INVALID.
 #   2 = 2026-07-29 fix: all of the above fit per fold on TRAIN rows only and
 #       applied to held-out rows via the train-fitted transform/coefficients/lambda.
+#   3 = 2026-08-01: confound design built PER FOLD (.build_fold_z) -- NA imputation
+#       uses the TRAIN mean only and constancy is decided on TRAIN rows only, which
+#       closed a smaller residual leak of the same shape as v1's. `prep$Z` is gone
+#       (replaced by fold_z/fold_zte). Added the monotone squash R2_bounded and the
+#       bounded effect sizes; .ccc() now fails together with R2 instead of silently
+#       computing on the finite survivors.
+#   4 = 2026-08-04: the matched-control NULL changed -- control features are now
+#       PSI-independent (09-1 builds per-event feature tables over the FULL cohort
+#       row set, not just rows where that event's own PSI was observed), so a
+#       control no longer has to cover every focal sample to be eligible. Different
+#       control set => different null distribution => different p_emp/q/hits. The
+#       FOCAL statistic is unchanged by this: 09s-ridge-screen.R still applies
+#       `!is.na(PSI)` at load, so the real fit sees exactly the rows it saw at v3.
+#       Bumped anyway, because the row this stamp guards carries the null summary
+#       and the p/q derived from it, not only the focal numbers.
 #
 # A hash of the two function bodies was considered instead (no discipline needed)
 # but rejected: it would also invalidate on a comment-only edit, and a false
 # invalidation here costs a multi-hour 34k-job rerun.
-SCREEN_STAT_VERSION <- 3L
+SCREEN_STAT_VERSION <- 4L
+
+
+# FEATURE_TABLE_VERSION — provenance stamp for the per-event feature TABLES, the
+# exact analogue of SCREEN_STAT_VERSION one layer upstream.
+#
+# BUMP THIS whenever 09-1-ml-local.R's Phase-1 build changes the CONTENTS of
+# feature_table_<id>.csv.gz (its row set, its column set, or any value in it).
+# It is baked into the directory name via feature_table_dir_for() below, so a bump
+# makes the pipeline write to a fresh directory and the old tables are neither read
+# nor overwritten.
+#
+# Why a version marker and not `rm -rf`: 09-1's Phase-1 loop opens with
+# `if (file.exists(feature_table_file)) return(invisible(NULL))`, and there are
+# ~34k tables on disk. WITHOUT a bump, a build with changed logic skips every
+# single event and exits 0 -- the change is silently a no-op, exactly the failure
+# mode SCREEN_STAT_VERSION exists to prevent one stage later. Deleting instead
+# would work but throws away ~72 GB with no provenance trail and no way to diff old
+# against new while verifying, so the two versions are kept side by side and the
+# stale one removed by hand once the new screen is trusted.
+#
+#   1 = rows = only the samples where THIS event's PSI was observed
+#       (`aggregated_dt_filtered[ID == id]`, ~391 of 415 for biotype_filtered).
+#   2 = 2026-08-04: rows = the FULL cohort sample set (all 415), PSI/IJC/SJC NA
+#       where unobserved. Epigenetic/expression features are filled for every
+#       sample, which is what lets a control event be scored on the focal event's
+#       samples regardless of where its own PSI happens to be missing.
+FEATURE_TABLE_VERSION <- 2L
+
+
+# Canonical per-event feature-table directory. Single definition, so 09-1 (writer),
+# any verification script, and anything reading cfg$feature_table_dir cannot drift
+# apart on the version suffix. v1 keeps the historical unsuffixed name so the 72 GB
+# of existing tables stay addressable without being moved.
+feature_table_dir_for <- function(tf, version = FEATURE_TABLE_VERSION) {
+  base <- sprintf("event_feature_tables_%s", tf)
+  if (version > 1L) base <- sprintf("%s_v%d", base, version)
+  file.path("processed_data", base)
+}
+
+
+# Resolve the Tier-1 rotation count for ONE event, given the cfg field and that
+# event's Event Type.
+#
+# Why this is per-Event-Type: 09s-ridge-screen.R caps usage at
+# `min(n_rotations, length(other_ids))`, so the eligible pool is only ever an upper
+# bound -- raising eligibility without raising this changes nothing. But the two
+# event types need wildly different values. RI has ~1,776 modelable events and a
+# matched-control pool of 791-887 (measured), and needs nearly all of it to get its
+# empirical-p floor 1/(R+1) below BH's `k*q/m` bound. SE has ~32,370 events and a
+# pool of ~15,000, is already comfortably inside its bound at 200, and would cost
+# ~10 days if raised to match RI. A single scalar cannot serve both.
+#
+# Accepts either form:
+#   * a length-1 unnamed value -> used for every event (backward compatible with
+#     every cfg written before 2026-08-04)
+#   * a named vector/list keyed by Event Type, e.g. c(RI = 818L, SE = 200L)
+#
+# An unrecognised Event Type is a hard ERROR, not a fallback to some default. A
+# silent fallback here would reintroduce the precise bug this function exists to
+# fix (a new event type quietly screening at 200 rotations and failing FDR for
+# arithmetic reasons); the fix is to add the event type to the cfg, the same
+# convention splicing_ml's FEATURE_GROUPS uses for a new feature column.
+resolve_screen_rotations <- function(spec, event_type, default = 200L) {
+  if (is.null(spec) || length(spec) == 0L) {
+    return(as.integer(default))
+  }
+  nms <- names(spec)
+  if (is.null(nms) || !any(nzchar(nms))) {
+    if (length(spec) != 1L) {
+      stop(
+        "cfg$screen_rotations is unnamed but has length ", length(spec),
+        " -- give it one value per Event Type, e.g. c(RI = 818L, SE = 200L)"
+      )
+    }
+    return(as.integer(spec[[1L]]))
+  }
+  et <- as.character(event_type)
+  if (!length(et) || is.na(et) || !nzchar(et)) {
+    stop("resolve_screen_rotations(): event_type is missing/empty")
+  }
+  if (!et %in% nms) {
+    stop(
+      "cfg$screen_rotations has no entry for Event Type '", et,
+      "' (has: ", paste(nms, collapse = ", "),
+      "). Add it rather than defaulting -- a wrong rotation count silently ",
+      "decides whether this event type can clear FDR at all."
+    )
+  }
+  as.integer(spec[[et]])
+}
 
 
 # prep_event(): precompute the parts fixed across the real fit AND all null

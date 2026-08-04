@@ -53,6 +53,10 @@ nrotations <- 0L
 feature_sets <- c("long", "short", "local") # explanatory-set names and dir suffixes
 
 source("09zz-ml-event-glmnet-tidymodels.R")
+# FEATURE_TABLE_VERSION / feature_table_dir_for() live next to SCREEN_STAT_VERSION,
+# so the build stamp and the statistic stamp are maintained side by side. Safe to
+# source here: 09-ml-shared.R is pure definitions with no top-level side effects.
+source("09-ml-shared.R")
 tidymodels::tidymodels_prefer()
 
 # =============================================================================
@@ -207,23 +211,252 @@ ids_to_build <- base::setdiff(ids_to_build, already_computed_ids)
 # Build chip_matrix — rows = chromHMM regions, cols = ChIP-Seq files (cached)
 # =============================================================================
 # Pre-slicing the full matrix once avoids re-reading ~2,262 files per event.
-feature_table_dir <- file.path(
-  "processed_data",
-  sprintf("event_feature_tables_%s", tf)
+# Version-suffixed (FEATURE_TABLE_VERSION, 09-ml-shared.R): the Phase-1 loop skips
+# any event whose table already exists, so writing v2 tables into the v1 directory
+# would silently skip all ~34k of them and exit 0. A fresh directory also keeps the
+# v1 tables readable for side-by-side verification instead of deleting 72 GB.
+feature_table_dir <- feature_table_dir_for(tf)
+dir.create(feature_table_dir, recursive = TRUE, showWarnings = FALSE)
+message(sprintf(
+  "Feature tables: v%d -> %s", FEATURE_TABLE_VERSION, feature_table_dir
+))
+
+# =============================================================================
+# PSI-independent row set for the feature tables (FEATURE_TABLE_VERSION 2)
+# =============================================================================
+# WHY. Tier-1's matched-control null takes a CONTROL event's epigenetic features and
+# scores them against the FOCAL event's PSI/confounds/folds (`prep` is fixed; see
+# 09s-ridge-screen.R's control_fs_R2). The control's own PSI is never read -- it is
+# blocked out of x_cols entirely. But a control could only ever be used if it had a
+# row for every focal sample, and at v1 a feature table was built from
+# `aggregated_dt_filtered[ID == id]`, i.e. ONLY the samples where that event's own
+# PSI was observed (mean 263 of 415 cohort-wide). So control eligibility was gated on
+# a quantity the statistic never uses -- an artifact of the row set, not a design
+# choice. It bit RI hardest: RI's usable pool measured ~92 against a matched-criteria
+# ceiling of ~818, which is the difference between clearing FDR and not.
+#
+# FIX. Build every table over the FULL cohort sample set. PSI/IJC/SJC stay NA where
+# unobserved (that is the point -- they are blocked from x_cols and the focal fit
+# re-applies `!is.na(PSI)` at load in 09s-ridge-screen.R, so the FOCAL statistic is
+# untouched); every epigenetic and expression feature is filled for all samples.
+#
+# HOW, and why it is safe. Observed rows are taken VERBATIM from aggregated_dt --
+# not reassembled -- and only the previously-missing rows are built from the
+# PSI-independent sources. A join bug in the assembly can therefore degrade a null,
+# but it structurally cannot perturb the focal statistic, which reads only the
+# verbatim rows. Sources are chosen for the same reason: every per-uuid and
+# per-event-constant column is lifted from aggregated_dt itself, so its values and
+# its factor levels agree with the observed rows by construction rather than by a
+# join that has to be checked.
+all_uuids <- sample_cols # 415 for biotype_filtered (03's PSI-matrix sample columns)
+
+# --- classify every aggregated_dt column by the key it is constant over ---------
+# classify_feature_columns() (09-ml-shared.R) errors on any column it cannot place,
+# so a new column added by 05 stops the build instead of being silently left NA on
+# every added row.
+feature_cols <- classify_feature_columns(names(aggregated_dt))
+message(sprintf(
+  paste0(
+    "Feature-table column classes: %d key / %d per-(ID,IHEC) / %d per-uuid / ",
+    "%d per-(uuid,gene) / %d per-(ID,uuid) / %d per-event"
+  ),
+  length(feature_cols$key), length(feature_cols$per_epigenome),
+  length(feature_cols$per_uuid), length(feature_cols$per_gene),
+  length(feature_cols$per_event_sample), length(feature_cols$per_event)
+))
+
+# --- per-uuid covariates, taken from aggregated_dt itself -----------------------
+# Verified 1:1 over all 415 uuids, so this is the complete cohort covariate table
+# without touching file_table/metadata/qc_flag_covariates again -- and therefore
+# without any chance of disagreeing with the observed rows on a value or a factor
+# level. anyDuplicated() would catch a uuid whose covariates were not in fact
+# constant (e.g. a qc_flag_count join gone wrong upstream).
+sample_covariates <- unique(
+  aggregated_dt[, c("uuid", "IHEC", feature_cols$per_uuid), with = FALSE]
 )
-dir.create(feature_table_dir, showWarnings = FALSE)
+stopifnot(!anyDuplicated(sample_covariates$uuid))
+.no_cov <- base::setdiff(all_uuids, as.character(sample_covariates$uuid))
+if (length(.no_cov)) {
+  # A uuid with no observed PSI anywhere in this filter has no covariate row and no
+  # epigenetic data to attach, so it cannot contribute a usable row to any event.
+  message(sprintf(
+    "%d of %d cohort uuids have no row in aggregated_dt - excluded from the full row set",
+    length(.no_cov), length(all_uuids)
+  ))
+  all_uuids <- base::intersect(all_uuids, as.character(sample_covariates$uuid))
+}
+setkey(sample_covariates, uuid)
+
+# --- the unfiltered (IHEC x ID) grid: event-proximal features for ALL samples ---
+# Written by 05 immediately before the PSI merge, so it is PSI-independent by
+# construction. Its DNAm columns are M-value-transformed there with the identical
+# formula 05 applies to the filtered table -- WITHOUT that, control and focal DNAm
+# would sit on different scales inside one ridge fit, silently, since raw beta
+# (0-100) and M-values (-9.97..9.97) are both plausible numbers.
+#
+# Path is PER FILTER. The grid's *content* is filter-specific (event IDs are row
+# positions in that filter's event_gr, so the same integer denotes a different event
+# under a different filter), so a single shared aggregated_dt.csv.gz would be
+# overwritten by whichever 05 ran last and read back here as silently wrong features
+# under matching ID values. Nothing else in the repo reads this file.
+grid_file <- sprintf("processed_data/aggregated_dt_%s.csv.gz", tf)
+if (!file.exists(grid_file)) {
+  stop(
+    "Missing ", grid_file, " -- the PSI-independent grid 05 writes before the PSI ",
+    "merge. Re-run 05 for this transcript_filter (a pre-2026-08-04 05 wrote it to ",
+    "the unsuffixed processed_data/aggregated_dt.csv.gz, in RAW beta; that file is ",
+    "NOT usable here)."
+  )
+}
+# stringsAsFactors = FALSE deliberately: only the join key needs to be factor-aligned
+# with aggregated_dt (below), and every other character column is reconciled by
+# align_types() at assembly time. Reading as factors instead would create columns
+# whose integer codes index a DIFFERENT level set than aggregated_dt's -- which joins
+# and rbindlist can silently mismatch.
+grid <- fread(grid_file, stringsAsFactors = FALSE)
+grid <- grid[ID %in% all_modelable_ids]
+stopifnot(all(c("ID", "IHEC", feature_cols$per_epigenome) %in% names(grid)))
+.grid_missing_ids <- base::setdiff(all_modelable_ids, grid[, unique(ID)])
+if (length(.grid_missing_ids)) {
+  stop(
+    length(.grid_missing_ids), " events to build are absent from ", grid_file,
+    " (e.g. ", paste(head(.grid_missing_ids, 3L), collapse = ", "),
+    ") -- the grid is stale or was written for a different transcript_filter."
+  )
+}
+# Guard the scale explicitly rather than trusting the 05 comment: M-values are
+# negative for any window below 50% methylation, raw beta never is.
+.grid_dnam <- grep("^DNAm;", names(grid), value = TRUE)
+if (length(.grid_dnam)) {
+  .dnam_min <- suppressWarnings(min(vapply(
+    .grid_dnam, function(cn) min(grid[[cn]], na.rm = TRUE), numeric(1)
+  )))
+  if (is.finite(.dnam_min) && .dnam_min >= 0) {
+    stop(
+      "DNAm in ", grid_file, " has no negative values (min ", .dnam_min,
+      ") -- it is RAW beta, not M-values. Re-run 05: mixing this with the ",
+      "M-value-transformed filtered table puts control and focal DNAm on ",
+      "different scales inside the same ridge fit."
+    )
+  }
+}
+# Align the join key with aggregated_dt's IHEC factor so the (ID, IHEC) joins below
+# compare like with like. An IHEC in the grid but absent from aggregated_dt's levels
+# has no sample in the modelled cohort, so it can never be joined to and dropping it
+# to NA is correct -- but report the count rather than assume it is zero.
+.grid_ihec_chr <- as.character(grid$IHEC)
+grid[, IHEC := factor(.grid_ihec_chr, levels = levels(aggregated_dt$IHEC))]
+.grid_ihec_unmatched <- sum(is.na(grid$IHEC) & !is.na(.grid_ihec_chr))
+if (.grid_ihec_unmatched > 0L) {
+  message(sprintf(
+    "%d grid rows carry an IHEC not present in aggregated_dt (no modelled sample) - not joinable",
+    .grid_ihec_unmatched
+  ))
+}
+rm(.grid_ihec_chr)
+setkey(grid, ID, IHEC)
+
+# --- per-(ID, uuid) and per-(uuid, gene_id) sources ----------------------------
+# The only two families that cannot be recycled from aggregated_dt: they vary with
+# BOTH the event and the sample, so the added rows have no observed row to copy.
+rbp_score_dt <- fread(sprintf("processed_data/rbp_score_dt_%s.csv.gz", tf))
+rbp_score_dt <- rbp_score_dt[
+  uuid %in% all_uuids & ID %in% all_modelable_ids,
+  c("ID", "uuid", intersect(feature_cols$per_event_sample, names(rbp_score_dt))),
+  with = FALSE
+]
+setkey(rbp_score_dt, ID, uuid)
+
+gene_expr_dt <- fread(
+  sprintf("processed_data/gene_expression_normalised_%s.csv.gz", tf)
+)
+gene_expr_dt <- gene_expr_dt[
+  uuid %in% all_uuids,
+  c("gene_id", "uuid", feature_cols$per_gene),
+  with = FALSE
+]
+# STRIP THE ENSEMBL VERSION SUFFIX. gene_expression_normalised carries versioned ids
+# ("ENSG00000000419.12") while aggregated_dt/event_annotations_dt carry bare ones
+# ("ENSG00000000419"), so keying on the raw value matches NOTHING and every added row
+# silently gets NA expression. Same mismatch that bit 05's housekeeping-gene check.
+gene_expr_dt[, gene_id := sub("\\.\\d+$", "", gene_id)]
+if (anyDuplicated(gene_expr_dt, by = c("gene_id", "uuid"))) {
+  # two versions of one gene collapsing onto the same key would make the match()
+  # below pick an arbitrary one
+  stop(
+    "gene_expression_normalised_", tf,
+    " has duplicate (gene_id, uuid) rows after stripping version suffixes"
+  )
+}
+setkey(gene_expr_dt, gene_id, uuid)
+.ge_hit <- uniqueN(gene_expr_dt$gene_id[
+  gene_expr_dt$gene_id %in% as.character(unique(aggregated_dt$gene_id))
+])
+message(sprintf(
+  "gene_expression_normalised: %d of %d aggregated_dt genes matched after version strip",
+  .ge_hit, uniqueN(aggregated_dt$gene_id)
+))
+if (.ge_hit == 0L) {
+  stop("No gene_id overlap with aggregated_dt -- expression join would be all-NA")
+}
+
+# IJC/SJC are deliberately left NA on the added rows. They are blocked from x_cols
+# (they are what PSI is computed from), and a row with no PSI has no junction-count
+# reading to report either, so NA is the honest value rather than a lookup worth a
+# 76 MB join.
 
 chip_files <- file_table[assay_type == "ChIP-Seq", unique(local_file)]
+# all_modelable_ids, matching the Phase-1 loop below: chip_matrix's rows are the only
+# source for each event's chromHMM slice, so a region set narrowed to ids_to_build
+# would make that slice fail for any event Tier-2 had already fitted.
 active_chrom_ids <- sort(unique(to(chromhmm_hits[
-  from(chromhmm_hits) %in% which(keep_rows_manual %in% ids_to_build)
+  from(chromhmm_hits) %in% which(keep_rows_manual %in% all_modelable_ids)
 ])))
 
 chip_matrix_cache <- file.path(
   "processed_data",
   sprintf("chip_matrix_%s.rds", tf)
 )
+# STALENESS GUARD. This cache is 13.8 GB and was previously reused on file existence
+# alone, with no comparison against its inputs -- and chromHMM is ~2,370 of the ~2,460
+# control x_cols, so silently reusing a cache older than the ChIP tabs it was built
+# from would mean nearly every control feature is stale. The copy on disk at
+# implementation time was dated 2026-07-21 against 2026-07-17 data, i.e. already in the
+# regime where a production rerun of the ChIP aggregation invalidates it.
+#
+# Rebuilt (not just warned about) when any input .tab.gz is newer, or when the region
+# set it was built for no longer covers what this run needs -- the latter matters now
+# that active_chrom_ids follows all_modelable_ids.
+.chip_cache_ok <- FALSE
 if (file.exists(chip_matrix_cache)) {
-  chip_matrix <- readRDS(chip_matrix_cache)
+  .cache_mtime <- file.mtime(chip_matrix_cache)
+  .newest_input <- suppressWarnings(max(file.mtime(chip_files), na.rm = TRUE))
+  if (is.finite(.newest_input) && .newest_input > .cache_mtime) {
+    message(sprintf(
+      "chip_matrix cache (%s) is OLDER than its newest ChIP tab (%s) - rebuilding",
+      format(.cache_mtime, "%Y-%m-%d %H:%M"),
+      format(.newest_input, "%Y-%m-%d %H:%M")
+    ))
+  } else {
+    chip_matrix <- readRDS(chip_matrix_cache)
+    .want_rows <- sprintf("chromhmm_%d", active_chrom_ids)
+    .missing_rows <- length(base::setdiff(.want_rows, rownames(chip_matrix)))
+    .missing_cols <- length(base::setdiff(chip_files, colnames(chip_matrix)))
+    if (.missing_rows > 0L || .missing_cols > 0L) {
+      message(sprintf(
+        "chip_matrix cache lacks %d needed region(s) and %d file(s) - rebuilding",
+        .missing_rows, .missing_cols
+      ))
+      rm(chip_matrix)
+      gc()
+    } else {
+      .chip_cache_ok <- TRUE
+      message("chip_matrix cache reused (newer than all ChIP tabs, covers all regions)")
+    }
+  }
+}
+if (.chip_cache_ok) {
+  invisible(NULL)
 } else {
   all_cols <- pbmcapply::pbmclapply(seq_along(chip_files), function(i) {
     dt <- fread(
@@ -260,7 +493,16 @@ chromhmm_hits_smaller <- findOverlaps(
 # =============================================================================
 # Idempotent — already-built tables are skipped.  Completes before Phase 2.
 # Requires all large shared objects above; Phase 2 workers need none of them.
-pbmcapply::pbmclapply(ids_to_build, function(id) {
+#
+# Loops all_modelable_ids, NOT ids_to_build. ids_to_build has already had
+# already_computed_ids (events with a Tier-2 _all_metrics.csv.gz) subtracted, but that
+# subtraction is about skipping Tier-2 FITS, not table builds: the Tier-1 screen runs
+# on every modelable event, and every event is also a candidate matched CONTROL, so a
+# missing table costs a control silently (control_fs_R2 returns NA on an unreadable
+# file). This was masked while the v1 tables existed for all events; with a
+# FEATURE_TABLE_VERSION bump writing to an empty directory it would leave a real hole
+# for exactly the events Tier-2 had already fitted.
+pbmcapply::pbmclapply(all_modelable_ids, function(id) {
   data.table::setDTthreads(1L)
   feature_table_file <- file.path(
     feature_table_dir,
@@ -270,13 +512,24 @@ pbmcapply::pbmclapply(ids_to_build, function(id) {
     return(invisible(NULL))
   }
 
-  feature_data <- aggregated_dt[ID == id]
+  # Observed rows VERBATIM, then the full-cohort row set built around them. The
+  # verbatim half is what 09s-ridge-screen.R's focal fit sees (it re-applies
+  # `!is.na(PSI)` at load), so the focal statistic is bit-identical to v1 regardless
+  # of anything the assembly does; the added rows exist only so this event can serve
+  # as a matched CONTROL for events whose samples it does not itself cover.
+  feature_data <- build_full_event_rows(
+    aggregated_dt[ID == id], id, all_uuids, sample_covariates, feature_cols,
+    grid, rbp_score_dt, gene_expr_dt
+  )
   chromhmm_ids <- to(chromhmm_hits[
     from(chromhmm_hits) == which(keep_rows_manual == id)
   ])
+  # Now spans every cohort sample, not just the ones with observed PSI, because
+  # feature_data does -- so the chromHMM slice and the WGBS CJ below widen with it
+  # automatically and need no separate change.
   event_files <- file_table[
     assay_type == "ChIP-Seq" &
-      epirr_id_without_version %in% feature_data[, unique(IHEC)],
+      epirr_id_without_version %in% as.character(feature_data[, unique(IHEC)]),
     local_file
   ]
 
@@ -398,7 +651,25 @@ saveRDS(
   # Tier-1 ridge-screen rotation count (feature-rotation controls per event);
   # cheap → a few hundred gives an empirical-p floor ≈ 1/(R+1). Consumed by
   # 09s-ridge-screen.R, not by the elastic-net.
-  screen_rotations = getOption("EpiATLAS_AS_SCREEN_ROTATIONS", 200L),
+  #
+  # PER EVENT TYPE, and it has to be. 09s-ridge-screen.R caps usage at
+  # min(screen_rotations, eligible_controls), so the PSI-independent control pool
+  # (FEATURE_TABLE_VERSION 2) is only an upper bound -- at a flat 200 the whole
+  # change buys nothing. BH admits a p at rank k only if p <= k*q/m, and the
+  # empirical p is floored at 1/(R+1):
+  #   RI  m ~= 1,776 per (tf, Event Type, feature_set) family, matched pool measured
+  #       791-887. At R=818 the floor is 1.22e-3, needing k >= 22 against a real
+  #       (v2, partial) k of 25/20/11 for local/short/long -- so `local` plausibly
+  #       clears and `long` does not. At R=200 the floor is 4.98e-3, needing k >= 88.
+  #       RI cannot clear at 200 for arithmetic reasons alone.
+  #   SE  m ~= 32,370, pool ~15,000, already inside its bound at 200. Raising SE to
+  #       match RI would cost ~10 days of screen wall-clock for no inferential gain,
+  #       which is why this is not a single global number.
+  # An Event Type with no entry here is a hard error in resolve_screen_rotations()
+  # rather than a silent 200 -- see 09-ml-shared.R.
+  screen_rotations = getOption(
+    "EpiATLAS_AS_SCREEN_ROTATIONS", c(RI = 818L, SE = 200L)
+  ),
   # Feature sets the Tier-1 screen runs per event (long/short/local) — SEPARATE
   # from `feature_sets` above (which 09zz/Tier-2 always needs all three of). The
   # screen splits so a spatially-local signal isn't diluted by far chromHMM in
