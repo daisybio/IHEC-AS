@@ -242,9 +242,12 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 # assembly needs this because the added (previously-unobserved) rows have to source
 # each column from wherever that column actually varies.
 #
-# Exhaustive BY ASSERTION, deliberately mirroring splicing_ml's FEATURE_GROUPS
-# convention: a column 05 adds later lands in no group and this errors, rather than
-# being silently left NA on every added row. Fix by classifying it here.
+# NOTE what the partition check below does and does NOT catch. `per_event` is a
+# catch-all setdiff, so a column 05 adds later ALWAYS lands there and the check cannot
+# fail -- it only catches duplicates and a genuine set mismatch. The real guard against
+# a misfiled column is the per-event constancy assertion in build_full_event_rows(),
+# which tests the classification against the data. If you add a column that is not
+# constant within an event, classify it explicitly here.
 classify_feature_columns <- function(col_names) {
   key <- intersect(c("ID", "IHEC", "uuid"), col_names)
   # per (ID, IHEC) -- the event-proximal window features, i.e. exactly the unfiltered
@@ -370,10 +373,28 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
   ihec_chr <- as.character(add$IHEC)
   uuid_chr <- as.character(add$uuid)
 
-  # per-event constants: constant within the event by definition, so any observed row
-  # carries the same value; taken from row 1.
+  # per-event constants: recycled from row 1 of the event's observed rows.
+  #
+  # VERIFY the constancy rather than trusting the classification. cols$per_event is a
+  # catch-all setdiff in classify_feature_columns(), so a column 05 adds later lands
+  # here by DEFAULT and no partition check can fail -- an earlier version of this file
+  # claimed such a column would error, which was wrong. A genuinely per-sample column
+  # misfiled here would be silently recycled, giving every added row the first observed
+  # sample's value. Checking against this event's own rows costs ~30 columns x a few
+  # hundred rows and turns that silent corruption into a loud failure. NA counts as a
+  # level, so a column that is NA for some samples of one event also trips this -- which
+  # is correct, since an event property cannot be present for only some of its samples.
   for (nm in cols$per_event) {
-    data.table::set(add, j = nm, value = obs[[nm]][1L])
+    v <- obs[[nm]]
+    if (length(v) > 1L && data.table::uniqueN(v) > 1L) {
+      stop(
+        "Column '", nm, "' is classified per-event but varies WITHIN event ", id,
+        " (", data.table::uniqueN(v), " distinct values over ", length(v),
+        " observed rows). Classify it in classify_feature_columns() -- recycling it ",
+        "would give every added row the first sample's value."
+      )
+    }
+    data.table::set(add, j = nm, value = v[1L])
   }
   # PSI / IJC / SJC: unobserved on these rows -- which is the entire point. Indexing
   # by NA_integer_ yields a length-1 NA of the column's own type, preserving it.
