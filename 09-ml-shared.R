@@ -401,7 +401,15 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     data.table::set(add, j = nm, value = obs[[nm]][NA_integer_])
   }
   if (length(cols$per_gene)) {
-    ge <- gene_expr[.(as.character(obs[["gene_id"]][1L])), nomatch = NULL]
+    # Strip the Ensembl version on the focal side too, not only when building
+    # gene_expr. aggregated_dt's gene_id is bare only because 05 strips it (05:586)
+    # AFTER joining expression on the versioned id (05:496) -- i.e. correctness here
+    # depends on where that strip sits relative to the file write. Stripping both
+    # sides makes the lookup work whichever format arrives, and is a no-op today.
+    ge <- gene_expr[
+      .(sub("\\.\\d+$", "", as.character(obs[["gene_id"]][1L]))),
+      nomatch = NULL
+    ]
     if (nrow(ge)) {
       i_ge <- match(uuid_chr, as.character(ge$uuid))
       for (nm in cols$per_gene) {

@@ -582,8 +582,21 @@ append_sanity(
 # log the expression, we do that later
 # aggregated_dt[, gene_expression := log2(gene_expression)]
 
-# remove the gene_id version
-aggregated_dt[, gene_id := gsub(pattern = ".\\d+$", "", gene_id)]
+# remove the gene_id version ("ENSG00000000419.12" -> "ENSG00000000419")
+#
+# The dot MUST be escaped. With an unescaped `.` this pattern is not idempotent: on an
+# already-bare id it matches any-char + trailing digits, so "ENSG00000000419" collapses
+# to "ENS" (the `.` binds to the "G" and `\d+$` swallows "00000000419"). It happened to
+# be safe only because it runs exactly once, on versioned ids from 03 -- a second
+# evaluation of this chunk, or 03 ever emitting bare ids, would have silently mangled
+# every gene_id in the table. This is also the only unescaped instance in the repo; the
+# nine other version-strip sites (incl. :683, :1317, :1326 below) already escape it.
+#
+# NB ordering: the gene-expression join at :496 keys on the VERSIONED id, matching
+# gene_expression_normalised, so this strip has to stay after it. Consumers therefore
+# see a bare gene_id in aggregated_dt_filtered while event_annotations_dt keeps the
+# version -- 09-ml-shared.R's build_full_event_rows strips both sides for that reason.
+aggregated_dt[, gene_id := gsub(pattern = "\\.\\d+$", "", gene_id)]
 
 # max promoter and summed enhancer are not used anymore
 # # get the epirrs for which there is observed H3K27ac because only they have max_promoter and summed_enhancer
