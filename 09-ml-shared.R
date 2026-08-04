@@ -237,6 +237,20 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 # explicitly rather than read from 09-1's globals, so a verification script can
 # exercise the REAL assembly without also loading 09-1's 13.8 GB chip_matrix and
 # ~9 M-row aggregated_dt.
+#
+# WHY EVERY BASE CALL IS `base::`-QUALIFIED BELOW. This file is sourced from two
+# different package environments: 09s-ridge-screen.R (data.table only) and
+# 09-1-ml-local.R, which source()s 09zz and thereby attaches dplyr + GenomicRanges and
+# calls tidymodels_prefer(). With `conflicted` active, dplyr's set-operation exports
+# make some names ambiguous across three packages and a BARE call is a hard ERROR.
+# Measured in that real environment (2026-08-04): of 30 candidate names, exactly
+# `setequal` and `union` error -- 09zz already declares prefs for `setdiff`/`intersect`,
+# and the 2-way BiocGenerics-vs-base conflicts (unique, paste, grep, match,
+# anyDuplicated, colnames, ...) resolve silently, which is why bare calls elsewhere in
+# this pipeline have always worked. A bare `setequal` here took down a real
+# build_feature_tables run 4 minutes in. Qualifying everything is deliberate: it costs
+# nothing, does not depend on which caller sourced this file, and survives a future
+# change to either attach set.
 
 # Classify a feature table's columns by the key each one is constant over. The
 # assembly needs this because the added (previously-unobserved) rows have to source
@@ -249,23 +263,23 @@ screen_partition_columns <- function(col_names, grouping_col = "ontology") {
 # which tests the classification against the data. If you add a column that is not
 # constant within an event, classify it explicitly here.
 classify_feature_columns <- function(col_names) {
-  key <- intersect(c("ID", "IHEC", "uuid"), col_names)
+  key <- base::intersect(c("ID", "IHEC", "uuid"), col_names)
   # per (ID, IHEC) -- the event-proximal window features, i.e. exactly the unfiltered
   # grid's payload. `_source` is per (sample, mark) observed-vs-imputed provenance.
-  per_epigenome <- grep(
+  per_epigenome <- base::grep(
     "^(H3K[^;]+|DNAm|CpGs);(3|5)(up|down)$|_source$", col_names, value = TRUE
   )
   # per uuid -- RNA-library-level covariates and whole-spliceosome expression
   per_uuid <- c(
-    intersect(c("protocol", "ontology", "project", "qc_flag_count"), col_names),
-    grep("^spliceosome_", col_names, value = TRUE)
+    base::intersect(c("protocol", "ontology", "project", "qc_flag_count"), col_names),
+    base::grep("^spliceosome_", col_names, value = TRUE)
   )
   # per (uuid, gene_id); gene_id is constant within an event, so per uuid per event
-  per_gene <- intersect(
+  per_gene <- base::intersect(
     c("gene_expression_vst", "gene_expression_getmm"), col_names
   )
   # per (ID, uuid) -- the only genuinely sample-by-event quantities
-  per_event_sample <- intersect(
+  per_event_sample <- base::intersect(
     c(
       "PSI", "IJC", "SJC",
       "rbp_score_sum", "rbp_score_mean", "rbp_score_max", "rbp_n"
@@ -283,13 +297,13 @@ classify_feature_columns <- function(col_names) {
     per_gene = per_gene, per_event_sample = per_event_sample,
     per_event = per_event
   )
-  flat <- unlist(out, use.names = FALSE)
-  if (anyDuplicated(flat) || !setequal(flat, col_names)) {
+  flat <- base::unlist(out, use.names = FALSE)
+  if (base::anyDuplicated(flat) || !base::setequal(flat, col_names)) {
     stop(
       "classify_feature_columns(): groups are not an exact partition of the ",
       length(col_names), " columns (unclassified: ",
-      paste(base::setdiff(col_names, flat), collapse = ", "),
-      "; duplicated: ", paste(flat[duplicated(flat)], collapse = ", "), ")"
+      base::paste(base::setdiff(col_names, flat), collapse = ", "),
+      "; duplicated: ", base::paste(flat[base::duplicated(flat)], collapse = ", "), ")"
     )
   }
   out
@@ -304,7 +318,7 @@ classify_feature_columns <- function(col_names) {
 # things). A value that does not survive the coercion -- a factor level aggregated_dt
 # has never seen -- is an ERROR, not an NA.
 align_types <- function(add, template) {
-  for (nm in intersect(names(add), names(template))) {
+  for (nm in base::intersect(names(add), names(template))) {
     tmpl <- template[[nm]]
     cur <- add[[nm]]
     if (is.factor(tmpl)) {
@@ -349,11 +363,11 @@ align_types <- function(add, template) {
 # NULL rotation but structurally cannot perturb the focal statistic -- 09s-ridge-
 # screen.R re-applies `!is.na(PSI)` at load, so the focal fit reads only these rows.
 #
-# Every lookup is a match() on character, not a data.table join: the sources' key
+# Every lookup is a base::match() on character, not a data.table join: the sources' key
 # columns are variously factor (aggregated_dt: stringsAsFactors = TRUE) and character
 # (everything else), and an implicit factor-to-character join is exactly the coercion
 # that fails quietly rather than loudly. At <=415 rows per side (after a keyed binary
-# search for the slice) match() costs nothing.
+# search for the slice) base::match() costs nothing.
 build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
                                   grid, rbp_score, gene_expr) {
   add_uuids <- base::setdiff(all_uuids, as.character(obs$uuid))
@@ -361,7 +375,7 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     return(obs)
   }
   add <- data.table::copy(sample_cov[
-    match(add_uuids, as.character(sample_cov$uuid)),
+    base::match(add_uuids, as.character(sample_cov$uuid)),
     c("uuid", "IHEC", cols$per_uuid),
     with = FALSE
   ])
@@ -405,11 +419,11 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     data.table::set(add, j = nm, value = obs[[nm]][NA_integer_])
   }
   # per (ID, uuid): RBP aggregates
-  rbp_cols <- intersect(cols$per_event_sample, names(rbp_score))
+  rbp_cols <- base::intersect(cols$per_event_sample, names(rbp_score))
   if (length(rbp_cols)) {
     rs <- rbp_score[.(id), nomatch = NULL]
     if (nrow(rs)) {
-      i_rs <- match(uuid_chr, as.character(rs$uuid))
+      i_rs <- base::match(uuid_chr, as.character(rs$uuid))
       for (nm in rbp_cols) data.table::set(add, j = nm, value = rs[[nm]][i_rs])
     }
   }
@@ -432,7 +446,7 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
       nomatch = NULL
     ]
     if (nrow(ge)) {
-      i_ge <- match(uuid_chr, as.character(ge$uuid))
+      i_ge <- base::match(uuid_chr, as.character(ge$uuid))
       for (nm in cols$per_gene) {
         data.table::set(add, j = nm, value = ge[[nm]][i_ge])
       }
@@ -443,7 +457,7 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
   if (!nrow(gr)) {
     stop("build_full_event_rows(): event ", id, " has no rows in the grid")
   }
-  i_gr <- match(ihec_chr, as.character(gr$IHEC))
+  i_gr <- base::match(ihec_chr, as.character(gr$IHEC))
   for (nm in cols$per_epigenome) {
     data.table::set(add, j = nm, value = gr[[nm]][i_gr])
   }
