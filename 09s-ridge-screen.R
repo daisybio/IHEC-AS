@@ -362,6 +362,16 @@ if (!interactive()) {
   # (0 sign flips across |R2| strata on real data, vs 1 for every R2-derived arm).
   null_names <- c(paste0("R2_", feature_sets), paste0("CCC_", feature_sets))
   control_fs_R2 <- function(cid) {
+    # ONE data.table thread per fork. The parent set setDTthreads(cores) for its own
+    # reads, but this function runs inside pbmclapply's mc.cores forks, so inheriting
+    # that gives cores x cores threads on a `cores`-CPU allocation (4 x 4 = 16 on the
+    # analysis rule). 09-1's Phase-1 worker already does this; the screen did not.
+    # Measured: BLAS thread count makes NO difference to the dominant `long` ridge
+    # (0.53 s at 1 thread vs 0.55 s at 8), so serialising here costs nothing and only
+    # removes contention. BLAS/OMP are capped to 1 in the Snakefile rule for the same
+    # reason -- OpenBLAS otherwise sizes itself to the NODE's core count (80), not the
+    # cgroup's, inside every fork.
+    data.table::setDTthreads(1L)
     na <- setNames(rep(NA_real_, length(null_names)), null_names)
     cdt <- tryCatch(
       data.table::fread(

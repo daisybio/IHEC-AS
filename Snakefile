@@ -1234,6 +1234,14 @@ rule event_screen_one:
         gres            = _gres("analysis"),
     shell:
         """
+        # Cap the BLAS/OMP thread pools at 1. OpenBLAS sizes itself to the NODE's core
+        # count (80 here), NOT the cgroup's, so every one of the {threads} pbmclapply
+        # forks would otherwise spawn its own 80-thread pool on a {threads}-CPU
+        # allocation. Measured: thread count makes no difference to the dominant `long`
+        # ridge (0.53 s at 1 thread vs 0.55 s at 8) because it is allocation-bound, not
+        # FLOP-bound -- so this is pure contention removal, not a throughput trade. The
+        # real parallelism is pbmclapply over controls, which still uses {threads}.
+        OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
         Rscript 09s-ridge-screen.R {input.cfg} {wildcards.id} {threads} > {log} 2>&1
         """
 
