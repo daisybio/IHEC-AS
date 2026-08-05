@@ -252,6 +252,22 @@ if (!interactive()) {
     write_rows(na_rows(nrow(feature_data), "collapsed_to_one_group"))
     quit(save = "no", status = 0L)
   }
+  # resolve_supergroup_folds() guarantees >= 2 groups but says nothing about their SIZES.
+  # If one supergroup holds all but one sample, that fold's TRAIN partition is a single
+  # row: no standardisation, no confound fit, no kernel -- statistically meaningless, and
+  # it used to crash (stats::sd() of length 1 is NA, and .build_fold_z's
+  # `if (sd <= 1e-12)` on NA is a hard error). That killed event 28871 and, with
+  # restart-times: 0, took the whole 34k-job run down with it. Such an event is
+  # unscreenable, so record it as such and exit 0 rather than aborting the run.
+  # NB this changes no number for any event that already succeeded (those all have
+  # train >= 2 in every fold), so it needs no SCREEN_STAT_VERSION bump.
+  .min_train <- length(groups) - max(table(groups))
+  if (.min_train < 2L) {
+    write_rows(na_rows(nrow(feature_data), sprintf(
+      "fold_train_too_small:%d", .min_train
+    )))
+    quit(save = "no", status = 0L)
+  }
 
   # --- confounds (Z), shared across all feature sets --------------------
   parts <- screen_partition_columns(names(feature_data), grouping_col)

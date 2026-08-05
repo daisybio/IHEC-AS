@@ -707,7 +707,16 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
         mu <- mean(vtr, na.rm = TRUE) # TRAIN mean only
         vtr[is.na(vtr)] <- mu
         vte[is.na(vte)] <- mu
-        if (stats::sd(vtr) <= 1e-12) {
+        # NA-SAFE. stats::sd() returns NA for a length-1 vector, and a bare
+        # `if (NA <= 1e-12)` is a hard error ("missing value where TRUE/FALSE needed")
+        # that killed a real screen job (event 28871, 2026-08-05) and, with
+        # restart-times: 0, aborted the whole 34k-job run. A length-1 train partition is
+        # reachable whenever leave-one-ontology-supergroup-out puts all but one sample in
+        # a single held-out group; the worker now refuses such events up front, so this
+        # is belt-and-braces. Treat a non-finite sd as constant: drop the column and let
+        # the intercept absorb it.
+        .sd_tr <- stats::sd(vtr)
+        if (!is.finite(.sd_tr) || .sd_tr <= 1e-12) {
           # constant in this fold's train rows -> absorbed by the intercept; keeping it
           # would alias the QR and NA out the whole event
           next
