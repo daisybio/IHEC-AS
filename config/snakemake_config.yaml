@@ -324,19 +324,22 @@ resources:
     # this is headroom on top. Nodes on shared-cpu carry 384 GB (one has 1 TB) and 05
     # already runs at 128000, so this is not a scheduling risk.
     #
-    # History, because the pattern matters: 64000 -> OOM 62.3 GB (chip_matrix cbind),
-    # 96000 -> OOM 93.6 GB (same), then OOM 93.4 GB (event loop fork). Raising memory
-    # never fixed either -- the shapes did (batched fill, then fork width).
-    #
-    # 96000, up from 64000 (2026-08-04): build_feature_tables was OUT_OF_MEMORY at
-    # MaxRSS 62.3 GB against the 62.5 GB that 64000 gives (job 6433872). The
-    # chip_matrix rebuild is the peak and it is intrinsic, not a leak: `all_cols` is
-    # 2,430 tabs x ~709k regions x 8 B = 12.8 GB (matches the cache on disk) and
-    # `do.call(cbind, ...)` transiently doubles it to ~26 GB, on top of ~13 GB of
-    # parent objects, with 16 forked workers whose GC dirties pages so copy-on-write
-    # does not help. 64000 was already marginal before FEATURE_TABLE_VERSION 2 added
-    # the ~5 GB grid; 09-1 now also defers the grid/rbp_score/gene_expr reads until
-    # after that step, so this is headroom rather than the fix.
+    # History, because the pattern matters -- three OOMs, and raising memory fixed none
+    # of them; the code shapes did:
+    #   64000 -> OOM at 62.3 GB (job 6433872). Peak was the chip_matrix rebuild, and it
+    #            was intrinsic: `all_cols` is 2,430 tabs x ~709k regions x 8 B = 12.8 GB
+    #            (matches the cache on disk) and `do.call(cbind, ...)` transiently
+    #            doubled it, with mclapply shipping the whole list back through
+    #            serialization pipes. FIX: batched fill (09-1), not more memory.
+    #   96000 -> OOM at 93.6 GB (job 6433873), same cause: it grows to fill whatever it
+    #            is given, so the bump bought one extra minute of runtime.
+    #   96000 -> OOM at 93.4 GB (job 6433878), DIFFERENT cause: the Phase-1 event loop
+    #            forking over a ~28 GB parent. FIX: fork width 16 -> 8 + freeing
+    #            psi_long_dt/event_annotations_dt/event_gr/activeChromHMM before the fork.
+    # 160000 then completed at MaxRSS 156.1 GB (job 6433879, 3h37) -- i.e. the full build
+    # genuinely needs this much, it is NOT over-provisioned. A SKIP-ONLY re-run (all
+    # tables present) peaks far lower: 75.1 GB measured (job 6434908, 8m22), so an
+    # idempotent re-run can be given ~80000 via --set-resources.
     mem_mb: 160000
     runtime: 1440
     threads: 16
@@ -347,23 +350,49 @@ resources:
   # many can co-reside -- 32000 x 50 concurrent reserves 1.6 TB against ~2.05 TB free,
   # so the screen was crowding itself out for no reason.
   #
-  # mem_mb from real MaxRSS over four events chosen to span the shape space, since peak
-  # tracks n_observed x n_features:
-  #   10000  1.41 GB  (391 obs x 2,494 cols)
-  #   3883   1.29 GB  (245 obs x 4,539 cols -- the largest table on disk)
-  #   63040  1.38 GB  (RI, R=818 rotations)
-  #   42006  1.51 GB  (413 obs x ~4,400 cols -- the max of that product)
-  # Peak is flat across a 3.4x spread in that product because most of it is fixed
-  # overhead (R + packages + the 17 MB session + 4 forks' baseline), not the data. So
-  # 4000 is ~2.6x the measured ceiling, and 4000 x 50 reserves 200 GB instead of 1.6 TB.
+  # mem_mb 12000. NOTE the 50 production jobs that OOM'd at 4000 reported MaxRSS
+  # 3.65-3.75 GB, but that is the CAP, not the requirement -- an OOM-killed job's MaxRSS
+  # is wherever the killer struck, so all it establishes is "> 3.9 GB". Estimating from
+  # the parts instead: parent ~0.8 GB (R + packages + the 17 MB session + psi_table) plus
+  # 4 forks at ~1.4 GB each (the /usr/bin/time single-process figure) =~ 6.4 GB. 12000 is
+  # ~1.9x that estimate; it still reserves only 600 GB per 50 concurrent against
+  # `analysis`'s 1.6 TB, so there is no reason to shave it closer.
+  # Once real COMPLETED jobs exist, re-read `sacct MaxRSS` and tighten from data.
   #
-  # runtime deliberately UNCHANGED at 240. Measured wall: 166 s (SE R=200), 453 s (RI
-  # R=818), 588 s (42006). An earlier plan to cut this to 60 was dropped -- 588 s was
-  # only found by measuring the tail, and 240 keeps ~24x margin. A truncated job is
-  # merely recomputed on the next invocation, but 34k of them would not be.
+  # 4000 was tried first and ALL 50 JOBS OOM'd (2026-08-05). The mistake was a
+  # metric mismatch, and it is an easy one to repeat: sandbox timings via
+  # `/usr/bin/time -f %M` gave 1.29-1.51 GB across four events spanning the shape space
+  # (10000: 391 obs x 2,494 cols; 3883: 245 x 4,539, largest table on disk; 63040: RI at
+  # R=818; 42006: 413 x ~4,400, max of that product). But %M is the max RSS of a SINGLE
+  # PROCESS -- the largest fork -- whereas SLURM's cgroup sums the parent plus all 4
+  # pbmclapply forks, ~2.5x more. ALWAYS size mem_mb from `sacct MaxRSS`, never from
+  # /usr/bin/time on a forking script.
+  #
+  # Peak does NOT scale with the rotation count (RI at R=818 is no heavier than SE at
+  # R=200): controls are processed 4-at-a-time regardless, so R changes runtime, not
+  # footprint. It also barely tracks n_observed x n_features -- flat across a 3.4x spread
+  # in that product -- because most of it is fixed overhead (R + packages + the 17 MB
+  # session + the forks' baseline) rather than data.
+  #
+  # runtime 45 (CORRECTED 2026-08-05, same day it was set to 240 -- that was wrong).
+  # Measured wall: 166 s (SE R=200), 453 s (RI R=818), 588 s (42006, worst of the four),
+  # so 45 min keeps ~4.6x margin over the measured tail.
+  #
+  # Why 240 was wrong: it was chosen on truncation-safety grounds alone, ignoring
+  # schedulability -- and schedulability turned out to be the binding constraint. With
+  # 4:00:00 requested, all 50 jobs sat (Priority) behind another user's 40 running + 12
+  # queued jobs and SLURM projected the FIRST start 5-10 h out, while 558 CPUs and ~2 TB
+  # sat idle. Backfill starts a lower-priority job early only if it provably finishes
+  # before the blocking job's projected start, so a 4-hour request cannot fit a ~1-hour
+  # window whereas a 45-minute one can.
+  #
+  # The asymmetry that decides it: a truncated job costs ONE event, recomputed on the
+  # next invocation (per-event idempotency + the stat_version gate discard stale rows),
+  # whereas an over-long request costs the ENTIRE run sitting in a queue for hours.
+  # If events ever do start hitting the wall, raise this -- do not raise it pre-emptively.
   event_screen:
-    mem_mb: 4000
-    runtime: 240
+    mem_mb: 12000
+    runtime: 45
     threads: 4
     gpu: 0
   analysis:
