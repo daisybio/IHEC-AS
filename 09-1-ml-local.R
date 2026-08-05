@@ -819,9 +819,16 @@ saveRDS(
   #       (v2, partial) k of 25/20/11 for local/short/long -- so `local` plausibly
   #       clears and `long` does not. At R=200 the floor is 4.98e-3, needing k >= 88.
   #       RI cannot clear at 200 for arithmetic reasons alone.
-  #   SE  m ~= 32,370, pool ~15,000, already inside its bound at 200. Raising SE to
-  #       match RI would cost ~10 days of screen wall-clock for no inferential gain,
-  #       which is why this is not a single global number.
+  #   SE  m ~= 32,370, pool 15,353-17,712. 200 is a COST decision, NOT a sufficiency
+  #       one (corrected 2026-08-04 -- this comment previously claimed SE was "already
+  #       inside its bound at 200", which is false). At R=200 SE needs k >= 1,611, i.e.
+  #       5.0% of its events on the floor; at the k/m = 0.66% recorded in CLAUDE.md it
+  #       would need R >= 1,512 and return ZERO hits at 200. Measured cost at the real
+  #       201 s/event: R=200 is 1.5 days, R=1,500 is 11.3 days, R=5,000 is 37.7 days.
+  #       Unlike RI (hard-capped at its 817 pool), SE CAN be escalated -- so it is left
+  #       at 200 and escalation is deferred to Stage 2, which raises only the events
+  #       actually tied at the floor once the screen reveals the real k. The
+  #       n_rotations_requested / n_eligible_controls columns exist to measure that.
   # An Event Type with no entry here is a hard error in resolve_screen_rotations()
   # rather than a silent 200 -- see 09-ml-shared.R.
   screen_rotations = getOption(

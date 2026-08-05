@@ -162,9 +162,11 @@ if (!interactive()) {
   this_tf <- as.character(event_dt[ID == this_id, transcript_filter][1L])
 
   # Rotation count for THIS event type. RI needs its (near-)full ~818-control pool
-  # to push the empirical-p floor under BH's bound; SE clears at 200 and would cost
-  # ~10 days at RI's setting. Errors loudly on an unknown Event Type rather than
-  # quietly using a value that decides FDR admissibility.
+  # to push the empirical-p floor under BH's bound. SE stays at 200 on COST grounds,
+  # not because 200 suffices (see 09-1's cfg comment): SE needs k >= 1,611 at R=200,
+  # and escalation is deferred to Stage 2, which lifts only floor-tied events. Raising
+  # every SE event instead would cost ~11 days against 1.5. Errors loudly on an unknown
+  # Event Type rather than quietly using a value that decides FDR admissibility.
   n_rotations <- resolve_screen_rotations(rotation_spec, this_et)
 
   # Writer + NA filler emit ONE ROW PER FEATURE SET, carrying the

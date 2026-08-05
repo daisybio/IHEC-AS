@@ -601,7 +601,13 @@ feature_table_dir_for <- function(tf, version = FEATURE_TABLE_VERSION) {
 # event types need wildly different values. RI has ~1,776 modelable events and a
 # matched-control pool of 791-887 (measured), and needs nearly all of it to get its
 # empirical-p floor 1/(R+1) below BH's `k*q/m` bound. SE has ~32,370 events and a
-# pool of ~15,000, is already comfortably inside its bound at 200, and would cost
+# pool of ~15,000. SE at 200 is a COST decision, not a sufficiency one (corrected
+# 2026-08-04 -- an earlier version of this comment wrongly claimed SE was "already
+# comfortably inside its bound at 200"): BH needs k >= m/(q*(R+1)), so at R=200 SE
+# needs 1,611 floor-tied events (5.0% of 32,370), and at the k/m = 0.66% recorded in
+# CLAUDE.md it would need R >= 1,512 and return ZERO hits at 200. The difference from
+# RI is that RI is pool-capped at 817 and cannot be escalated at all, whereas SE's
+# ~15,000 pool can -- so SE is left at 200 because raising it costs
 # ~10 days if raised to match RI. A single scalar cannot serve both.
 #
 # Accepts either form:
