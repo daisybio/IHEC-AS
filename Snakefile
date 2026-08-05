@@ -1224,14 +1224,17 @@ rule event_screen_one:
     output:
         row = "processed_data/event_models/{transcript_filter}/screen/{id}_screen.csv.gz",
     log: "logs/09s_screen/{transcript_filter}/{id}.log"
-    threads: R("analysis", "threads")
+    # `event_screen`, not `analysis`: this rule runs ~34,146 times and its memory
+    # reservation is what caps screen concurrency. See the tier's comment in
+    # config/snakemake_config.yaml for the four MaxRSS measurements behind 4000.
+    threads: R("event_screen", "threads")
     resources:
-        mem_mb          = R("analysis", "mem_mb"),
-        runtime         = R("analysis", "runtime"),
-        slurm_partition = _partition("analysis"),
-        slurm_extra     = _extra("analysis"),
-        qos             = _qos("analysis"),
-        gres            = _gres("analysis"),
+        mem_mb          = R("event_screen", "mem_mb"),
+        runtime         = R("event_screen", "runtime"),
+        slurm_partition = _partition("event_screen"),
+        slurm_extra     = _extra("event_screen"),
+        qos             = _qos("event_screen"),
+        gres            = _gres("event_screen"),
     shell:
         """
         # Cap the BLAS/OMP thread pools at 1. OpenBLAS sizes itself to the NODE's core

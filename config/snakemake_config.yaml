@@ -341,6 +341,31 @@ resources:
     runtime: 1440
     threads: 16
     gpu: 0
+  # Tier-1 ridge screen: ONE job per event, ~34,146 of them. Split out of `analysis`
+  # (which it shared with screen_aggregate / ml_analysis / experimental_events, none of
+  # them measured) because it is the only rule in that tier whose reservation limits how
+  # many can co-reside -- 32000 x 50 concurrent reserves 1.6 TB against ~2.05 TB free,
+  # so the screen was crowding itself out for no reason.
+  #
+  # mem_mb from real MaxRSS over four events chosen to span the shape space, since peak
+  # tracks n_observed x n_features:
+  #   10000  1.41 GB  (391 obs x 2,494 cols)
+  #   3883   1.29 GB  (245 obs x 4,539 cols -- the largest table on disk)
+  #   63040  1.38 GB  (RI, R=818 rotations)
+  #   42006  1.51 GB  (413 obs x ~4,400 cols -- the max of that product)
+  # Peak is flat across a 3.4x spread in that product because most of it is fixed
+  # overhead (R + packages + the 17 MB session + 4 forks' baseline), not the data. So
+  # 4000 is ~2.6x the measured ceiling, and 4000 x 50 reserves 200 GB instead of 1.6 TB.
+  #
+  # runtime deliberately UNCHANGED at 240. Measured wall: 166 s (SE R=200), 453 s (RI
+  # R=818), 588 s (42006). An earlier plan to cut this to 60 was dropped -- 588 s was
+  # only found by measuring the tail, and 240 keeps ~24x margin. A truncated job is
+  # merely recomputed on the next invocation, but 34k of them would not be.
+  event_screen:
+    mem_mb: 4000
+    runtime: 240
+    threads: 4
+    gpu: 0
   analysis:
     mem_mb: 32000
     runtime: 240
