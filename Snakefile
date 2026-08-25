@@ -920,6 +920,7 @@ rule ml_global_comparison:
         shap_max_samples = SHAP_MAX_SAMPLES,
     shell:
         f"""
+        export PATH="/nfs/data/cluster/software/miniforge3/24.7.1/miniforge3/condabin:$PATH" && \
         {{params.wandb_login}}Rscript -e "rmarkdown::render('07-2-ml-global-comparison.Rmd',
             output_file = normalizePath('{{output.html}}', mustWork = FALSE)
         )" > {{log}} 2>&1
