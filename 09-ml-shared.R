@@ -37,34 +37,84 @@
   "mononuclear cell" = c("blood", "immune", "myeloid", "mononuclear"),
   "hematopoietic cell" = c("blood", "immune", "hematopoietic", "hematopoietic"),
   "erythroid lineage cell" = c("blood", "immune", "hematopoietic", "erythroid"),
-  "peripheral blood" = c("blood", "immune", "hematopoietic", "peripheral_blood"),
+  "peripheral blood" = c(
+    "blood",
+    "immune",
+    "hematopoietic",
+    "peripheral_blood"
+  ),
   # Somatic — ectodermal (CNS + neural-crest)
   "brain" = c("somatic", "ectodermal", "nervous_system", "brain"),
-  "nervous system" = c("somatic", "ectodermal", "nervous_system", "nervous_system"),
+  "nervous system" = c(
+    "somatic",
+    "ectodermal",
+    "nervous_system",
+    "nervous_system"
+  ),
   "neural" = c("somatic", "ectodermal", "nervous_system", "neural"),
   "melanocyte" = c("somatic", "ectodermal", "neural_crest", "melanocyte"),
   # Somatic — endodermal (gut, liver/pancreas, lung)
-  "digestive system" = c("somatic", "endodermal", "digestive", "digestive_system"),
+  "digestive system" = c(
+    "somatic",
+    "endodermal",
+    "digestive",
+    "digestive_system"
+  ),
   "colon" = c("somatic", "endodermal", "digestive", "colon"),
   "mucosa" = c("somatic", "endodermal", "digestive", "mucosa"),
   "epithelial" = c("somatic", "endodermal", "digestive", "epithelial"),
   "liver" = c("somatic", "endodermal", "hepatopancreatic", "liver"),
   "pancreas" = c("somatic", "endodermal", "hepatopancreatic", "pancreas"),
-  "endoderm-derived structure" = c("somatic", "endodermal", "general", "endodermal_structure"),
+  "endoderm-derived structure" = c(
+    "somatic",
+    "endodermal",
+    "general",
+    "endodermal_structure"
+  ),
   "lung" = c("somatic", "endodermal", "respiratory", "lung"),
   # Somatic — mesodermal (connective tissue, muscle, kidney)
-  "connective tissue cell" = c("somatic", "mesodermal", "connective", "connective_tissue"),
-  "mesoderm-derived structure" = c("somatic", "mesodermal", "connective", "mesodermal_structure"),
+  "connective tissue cell" = c(
+    "somatic",
+    "mesodermal",
+    "connective",
+    "connective_tissue"
+  ),
+  "mesoderm-derived structure" = c(
+    "somatic",
+    "mesodermal",
+    "connective",
+    "mesodermal_structure"
+  ),
   "muscle" = c("somatic", "mesodermal", "muscle", "muscle"),
   "kidney" = c("somatic", "mesodermal", "renal", "kidney"),
   # Developmental — stem / progenitor / embryonic
   "stem cell" = c("developmental", "stem_progenitor", "stem", "stem_cell"),
-  "embryonic cell (metazoa)" = c("developmental", "stem_progenitor", "embryonic", "embryonic_cell"),
-  "extraembryonic cell" = c("developmental", "stem_progenitor", "extraembryonic", "extraembryonic_cell"),
-  "placenta" = c("developmental", "stem_progenitor", "extraembryonic", "placenta"),
+  "embryonic cell (metazoa)" = c(
+    "developmental",
+    "stem_progenitor",
+    "embryonic",
+    "embryonic_cell"
+  ),
+  "extraembryonic cell" = c(
+    "developmental",
+    "stem_progenitor",
+    "extraembryonic",
+    "extraembryonic_cell"
+  ),
+  "placenta" = c(
+    "developmental",
+    "stem_progenitor",
+    "extraembryonic",
+    "placenta"
+  ),
   # Developmental — transformed (shares stem_progenitor subdomain so cancer's
   # internal distance = 0.5 < somatic germ-layer distance = 0.75)
-  "cancer cell line" = c("developmental", "stem_progenitor", "transformed", "cancer_cell_line")
+  "cancer cell line" = c(
+    "developmental",
+    "stem_progenitor",
+    "transformed",
+    "cancer_cell_line"
+  )
 )
 
 
@@ -96,7 +146,10 @@
     if (length(prefix) == 0L) break
   }
   if (length(prefix) > 0L) {
-    paste0("hc_", paste(prefix[seq_len(min(2L, length(prefix)))], collapse = "_"))
+    paste0(
+      "hc_",
+      paste(prefix[seq_len(min(2L, length(prefix)))], collapse = "_")
+    )
   } else {
     paste0("hc_cluster_", cluster_id)
   }
@@ -187,12 +240,31 @@ resolve_supergroup_folds <- function(ontology_vec, nfolds = 5L) {
 #   x_cols       — epigenetic design matrix to TEST (everything not excluded and
 #                  not a confound)
 #   confound_cols— unpenalised covariates for Z (protocol, gene_expression_vst,
-#                  distance_TSS): partial these out so the screen R² is
+#                  spliceosome_*): partial these out so the screen R² is
 #                  "epigenetic signal beyond confounds".
 # Everything else is excluded: IDs/meta, event geometry (constant within an
 # event → would drop under the variance filter anyway, excluded explicitly for
 # clarity), QC/provenance, the pooled getmm expression, and the
 # target-leakage columns IJC/SJC/PSI (PSI = IJC/(IJC+SJC)).
+#
+# `distance_TSS` was dropped from confound_cols (2026-08-19): it is CONSTANT
+# within an event (every sample has the same distance to the same event's own
+# TSS), so `.build_fold_z`'s per-fold constancy check discarded it on every
+# single fold anyway -- listing it here was dead weight, not a design error.
+# It stays in `exact_block` below (excluded from X too), so it is now simply
+# excluded outright rather than round-tripped through Z for nothing.
+#
+# `spliceosome_*` (whole-spliceosome-component expression, one value per RNA
+# library) was ADDED to confound_cols (2026-08-19): `classify_feature_columns`
+# (below) already groups it with `protocol` as a "per uuid -- RNA-library-level
+# covariate", not a locus-specific epigenetic mark -- structurally the same
+# category as `gene_expression_vst` (a systemic RNA-state proxy, not a
+# chromatin feature of this event's locus), just gene-agnostic instead of
+# gene-specific. Left in X, it let the screen pick up "this sample's general
+# splicing-machinery/transcriptional state" as if it were epigenetic signal at
+# this locus -- the same confound-as-signal shape the design already guards
+# against for `gene_expression_vst`. Excluded from `exact_block`'s X side too
+# (pattern below), so it isn't tested AND partialed out at once.
 #
 # Column selection is by an explicit blocklist. NOTE it is deliberately STRICTER
 # than 09zz::build_explanatory_vars, which blocks only the id/meta/target columns:
@@ -204,26 +276,65 @@ resolve_supergroup_folds <- function(ontology_vec, nfolds = 5L) {
 # audit note). Do not "align" this by loosening it.
 # plus pattern rules, so a genuinely new epigenetic column is auto-included, and
 # `_source`/`width;`/geometry meta are auto-excluded.
+#
+# Also excluded (2026-08-19), for the same reason as `distance_TSS` above: the
+# splice-site/GC/Pangolin scores (`3ss`/`3ssdown`/`5ss`/`5ssup`, `gc_5up`/
+# `gc_5down`/`gc_3up`/`gc_3down`, all `pangolin_*`) are sequence-derived and
+# therefore CONSTANT within an event across every one of its samples --
+# `ridge_screen_stat`'s own unsupervised `sd(col) > 1e-8` filter already
+# dropped every one of them, every event, silently. This is a documented no-op
+# (verified: identical R2/lambda/n_features on a real event before/after,
+# `.claude/scratch/verify_per_event_col_cleanup.R`), not a numeric change --
+# it just stops listing 24 columns as X candidates that could never survive
+# the fit, matching how `distance_TSS`/`width;*` are already handled. `3ss`/
+# `5ss`/`gc_*` have no shared prefix with anything else, so they're named
+# explicitly; `pangolin_*` gets a pattern so a future Pangolin score type is
+# auto-excluded too, same as the `width;`/`_source` patterns below.
 screen_partition_columns <- function(col_names, grouping_col = "ontology") {
-  confound_cols <- intersect(
-    c("protocol", "gene_expression_vst", "distance_TSS"),
-    col_names
+  confound_cols <- c(
+    intersect(c("protocol", "gene_expression_vst"), col_names),
+    grep("^spliceosome_", col_names, value = TRUE)
   )
 
   exact_block <- c(
-    "IHEC", "ID", "Event Type", "Variability", "seqnames", "gene_id",
-    "uuid", "transcript_filter", "project",
+    "IHEC",
+    "ID",
+    "Event Type",
+    "Variability",
+    "seqnames",
+    "gene_id",
+    "uuid",
+    "transcript_filter",
+    "project",
     "harmonized_sample_ontology_term_high_order_fig1",
-    "gene_expression_getmm", "gene_expression_vst",
-    "protocol", "distance_TSS", "distance_TES",
-    "distance_gene_start", "distance_gene_end",
-    "qc_flag_count", "IJC", "SJC", "PSI",
+    "gene_expression_getmm",
+    "gene_expression_vst",
+    "protocol",
+    "distance_TSS",
+    "distance_TES",
+    "distance_gene_start",
+    "distance_gene_end",
+    "qc_flag_count",
+    "IJC",
+    "SJC",
+    "PSI",
+    "3ss",
+    "3ssdown",
+    "5ss",
+    "5ssup",
+    "gc_5up",
+    "gc_5down",
+    "gc_3up",
+    "gc_3down",
     grouping_col
   )
 
-  is_blocked <- col_names %in% exact_block |
+  is_blocked <- col_names %in%
+    exact_block |
     grepl("_source$", col_names) | # H3K*_source provenance
-    grepl("^width;", col_names) # event-geometry widths (constant within event)
+    grepl("^width;", col_names) | # event-geometry widths (constant within event)
+    grepl("^pangolin_", col_names) | # sequence-derived scores (constant within event)
+    grepl("^spliceosome_", col_names) # now a confound (see above), not tested in X
 
   x_cols <- col_names[!is_blocked]
   list(x_cols = x_cols, confound_cols = confound_cols)
@@ -267,22 +378,33 @@ classify_feature_columns <- function(col_names) {
   # per (ID, IHEC) -- the event-proximal window features, i.e. exactly the unfiltered
   # grid's payload. `_source` is per (sample, mark) observed-vs-imputed provenance.
   per_epigenome <- base::grep(
-    "^(H3K[^;]+|DNAm|CpGs);(3|5)(up|down)$|_source$", col_names, value = TRUE
+    "^(H3K[^;]+|DNAm|CpGs);(3|5)(up|down)$|_source$",
+    col_names,
+    value = TRUE
   )
   # per uuid -- RNA-library-level covariates and whole-spliceosome expression
   per_uuid <- c(
-    base::intersect(c("protocol", "ontology", "project", "qc_flag_count"), col_names),
+    base::intersect(
+      c("protocol", "ontology", "project", "qc_flag_count"),
+      col_names
+    ),
     base::grep("^spliceosome_", col_names, value = TRUE)
   )
   # per (uuid, gene_id); gene_id is constant within an event, so per uuid per event
   per_gene <- base::intersect(
-    c("gene_expression_vst", "gene_expression_getmm"), col_names
+    c("gene_expression_vst", "gene_expression_getmm"),
+    col_names
   )
   # per (ID, uuid) -- the only genuinely sample-by-event quantities
   per_event_sample <- base::intersect(
     c(
-      "PSI", "IJC", "SJC",
-      "rbp_score_sum", "rbp_score_mean", "rbp_score_max", "rbp_n"
+      "PSI",
+      "IJC",
+      "SJC",
+      "rbp_score_sum",
+      "rbp_score_mean",
+      "rbp_score_max",
+      "rbp_n"
     ),
     col_names
   )
@@ -293,17 +415,23 @@ classify_feature_columns <- function(col_names) {
     c(key, per_epigenome, per_uuid, per_gene, per_event_sample)
   )
   out <- list(
-    key = key, per_epigenome = per_epigenome, per_uuid = per_uuid,
-    per_gene = per_gene, per_event_sample = per_event_sample,
+    key = key,
+    per_epigenome = per_epigenome,
+    per_uuid = per_uuid,
+    per_gene = per_gene,
+    per_event_sample = per_event_sample,
     per_event = per_event
   )
   flat <- base::unlist(out, use.names = FALSE)
   if (base::anyDuplicated(flat) || !base::setequal(flat, col_names)) {
     stop(
       "classify_feature_columns(): groups are not an exact partition of the ",
-      length(col_names), " columns (unclassified: ",
+      length(col_names),
+      " columns (unclassified: ",
       base::paste(base::setdiff(col_names, flat), collapse = ", "),
-      "; duplicated: ", base::paste(flat[base::duplicated(flat)], collapse = ", "), ")"
+      "; duplicated: ",
+      base::paste(flat[base::duplicated(flat)], collapse = ", "),
+      ")"
     )
   }
   out
@@ -328,16 +456,24 @@ align_types <- function(add, template) {
         lost <- which(is.na(new) & !is.na(chr))
         if (length(lost)) {
           stop(
-            "Column '", nm, "' has ", length(lost),
+            "Column '",
+            nm,
+            "' has ",
+            length(lost),
             " value(s) outside the template's factor levels (e.g. '",
-            chr[lost[1L]], "') -- source disagrees with aggregated_dt"
+            chr[lost[1L]],
+            "') -- source disagrees with aggregated_dt"
           )
         }
         data.table::set(add, j = nm, value = new)
       }
     } else if (is.integer(tmpl) && !is.integer(cur)) {
       if (is.numeric(cur) && !isTRUE(all.equal(cur, round(cur)))) {
-        stop("Column '", nm, "' is integer in the template but non-integral here")
+        stop(
+          "Column '",
+          nm,
+          "' is integer in the template but non-integral here"
+        )
       }
       data.table::set(add, j = nm, value = as.integer(cur))
     } else if (is.numeric(tmpl) && !is.numeric(cur)) {
@@ -368,8 +504,16 @@ align_types <- function(add, template) {
 # (everything else), and an implicit factor-to-character join is exactly the coercion
 # that fails quietly rather than loudly. At <=415 rows per side (after a keyed binary
 # search for the slice) base::match() costs nothing.
-build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
-                                  grid, rbp_score, gene_expr) {
+build_full_event_rows <- function(
+  obs,
+  id,
+  all_uuids,
+  sample_cov,
+  cols,
+  grid,
+  rbp_score,
+  gene_expr
+) {
   add_uuids <- base::setdiff(all_uuids, as.character(obs$uuid))
   if (length(add_uuids) == 0L) {
     return(obs)
@@ -380,8 +524,12 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     with = FALSE
   ])
   if (anyNA(add$uuid)) {
-    stop("build_full_event_rows(): ", sum(is.na(add$uuid)),
-         " uuid(s) absent from sample_cov for event ", id)
+    stop(
+      "build_full_event_rows(): ",
+      sum(is.na(add$uuid)),
+      " uuid(s) absent from sample_cov for event ",
+      id
+    )
   }
   add[, ID := id]
   ihec_chr <- as.character(add$IHEC)
@@ -402,8 +550,14 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     v <- obs[[nm]]
     if (length(v) > 1L && data.table::uniqueN(v) > 1L) {
       stop(
-        "Column '", nm, "' is classified per-event but varies WITHIN event ", id,
-        " (", data.table::uniqueN(v), " distinct values over ", length(v),
+        "Column '",
+        nm,
+        "' is classified per-event but varies WITHIN event ",
+        id,
+        " (",
+        data.table::uniqueN(v),
+        " distinct values over ",
+        length(v),
         " observed rows). Classify it in classify_feature_columns() -- recycling it ",
         "would give every added row the first sample's value."
       )
@@ -424,7 +578,9 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
     rs <- rbp_score[.(id), nomatch = NULL]
     if (nrow(rs)) {
       i_rs <- base::match(uuid_chr, as.character(rs$uuid))
-      for (nm in rbp_cols) data.table::set(add, j = nm, value = rs[[nm]][i_rs])
+      for (nm in rbp_cols) {
+        data.table::set(add, j = nm, value = rs[[nm]][i_rs])
+      }
     }
   }
   # per (uuid, gene_id): expression for THIS event's gene. Columns are created
@@ -547,11 +703,62 @@ build_full_event_rows <- function(obs, id, all_uuids, sample_cov, cols,
 #       `!is.na(PSI)` at load, so the real fit sees exactly the rows it saw at v3.
 #       Bumped anyway, because the row this stamp guards carries the null summary
 #       and the p/q derived from it, not only the focal numbers.
+#   5 = 2026-08-19: per-fold lambda selection switched from trace-based GCV
+#       (which.min of a single deterministic score per lambda) to exact ridge
+#       LOOCV with a 1SE rule. Trace-based GCV approximates every point's hat-
+#       matrix leverage with the fold AVERAGE (tr(H)/n); this fold's eigen-
+#       decomposition already gives the exact PER-POINT leverage for free
+#       (h_i(lam) = sum_k U_ik^2 * d_k/(d_k+lam)), so the closed-form LOOCV
+#       residual e_i = resid_i/(1-h_i) costs nothing extra. That gives n_tr
+#       per-point squared errors per lambda instead of one number, so a real
+#       standard error is computable -- something plain GCV never had. Selection
+#       now picks the MOST REGULARIZED lambda whose mean LOOCV error is within
+#       1 SE of the minimum, not the raw argmin -- more conservative on folds
+#       that nearly interpolate (the "lambda collapses toward the grid floor"
+#       instability already flagged as a diagnostic below). Changes which
+#       lambda gets chosen per fold, hence the numbers -- SCREEN_STAT_VERSION
+#       bump, full re-screen required. `lambda`/`lambda_min` keep their prior
+#       meaning (mean / min, across folds, of whichever lambda the fold
+#       selected) -- only what selects that lambda changed, not the output
+#       schema.
+#       Same-day, bundled into v5 rather than its own bump because v5 had not
+#       been run yet: `screen_partition_columns()`'s confound_cols changed --
+#       `distance_TSS` removed (constant within an event, so the per-fold
+#       constancy check in `.build_fold_z` always discarded it anyway; dead
+#       entry, not a behavior change) and `spliceosome_*` (all 8 whole-
+#       spliceosome-component expression columns) added (a per-sample,
+#       gene-agnostic RNA-state covariate, same category as the already-
+#       confounded `gene_expression_vst`, previously left in X and tested as
+#       if it were locus-specific epigenetic signal). This DOES change the
+#       numbers (different Z -> different confound residualisation -> every
+#       downstream fit), it is just still v5 because nothing has consumed v5
+#       output yet to be invalidated.
+#       2026-08-20, same reason, also bundled into v5:
+#       `09s-ridge-screen.R` now also computes and stores, per event/feature_set,
+#       `r2_confounds`/`r2_confounds_bounded` (confounds alone vs the
+#       intercept-only null -- identical across all 3 feature sets for an
+#       event, since it depends only on y/Z/groups, not X) and
+#       `r2_x_alone`/`r2_x_alone_bounded` (X alone, NO confound residualisation
+#       at all, per feature set). Both are diagnostic-only -- neither feeds
+#       p_emp/q, which are unchanged. Motivated by a same-day investigation
+#       (revision/file-changes/09-confound-projection-instability.md) that
+#       found confounds-alone underperforms the intercept-only null on the
+#       majority of real events (unregularised-OLS instability, not real
+#       anti-signal) and, separately, that neither confounds nor X alone
+#       reliably predict PSI at real-data scale -- worth surfacing per-event
+#       going forward instead of only in ad-hoc scratch scripts. Real-event-only
+#       (never computed for the null rotation -- no diagnostic benefit there,
+#       and cost would scale with R_used for nothing). Verified end-to-end
+#       against the real production worker, not just parsed:
+#       `.claude/scratch/run_screen_examples.sh fresh 10000` completed a full
+#       200-rotation x 3-feature-set run (307s, 1.5GB), `r2_confounds` came
+#       back identical (0.1424) across all 3 rows as expected, `r2_x_alone`
+#       varied sensibly by feature set, `stat_version` stamped 5 correctly.
 #
 # A hash of the two function bodies was considered instead (no discipline needed)
 # but rejected: it would also invalidate on a comment-only edit, and a false
 # invalidation here costs a multi-hour 34k-job rerun.
-SCREEN_STAT_VERSION <- 4L
+SCREEN_STAT_VERSION <- 5L
 
 
 # FEATURE_TABLE_VERSION — provenance stamp for the per-event feature TABLES, the
@@ -587,7 +794,9 @@ FEATURE_TABLE_VERSION <- 2L
 # of existing tables stay addressable without being moved.
 feature_table_dir_for <- function(tf, version = FEATURE_TABLE_VERSION) {
   base <- sprintf("event_feature_tables_%s", tf)
-  if (version > 1L) base <- sprintf("%s_v%d", base, version)
+  if (version > 1L) {
+    base <- sprintf("%s_v%d", base, version)
+  }
   file.path("processed_data", base)
 }
 
@@ -628,7 +837,8 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
   if (is.null(nms) || !any(nzchar(nms))) {
     if (length(spec) != 1L) {
       stop(
-        "cfg$screen_rotations is unnamed but has length ", length(spec),
+        "cfg$screen_rotations is unnamed but has length ",
+        length(spec),
         " -- give it one value per Event Type, e.g. c(RI = 818L, SE = 200L)"
       )
     }
@@ -640,8 +850,10 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
   }
   if (!et %in% nms) {
     stop(
-      "cfg$screen_rotations has no entry for Event Type '", et,
-      "' (has: ", paste(nms, collapse = ", "),
+      "cfg$screen_rotations has no entry for Event Type '",
+      et,
+      "' (has: ",
+      paste(nms, collapse = ", "),
       "). Add it rather than defaulting -- a wrong rotation count silently ",
       "decides whether this event type can clear FDR at all."
     )
@@ -685,8 +897,18 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
 .build_fold_z <- function(confound_df, train_idx, test_idx) {
   ntr <- length(train_idx)
   nte <- length(test_idx)
-  Ztr <- matrix(1.0, nrow = ntr, ncol = 1L, dimnames = list(NULL, "(Intercept)"))
-  Zte <- matrix(1.0, nrow = nte, ncol = 1L, dimnames = list(NULL, "(Intercept)"))
+  Ztr <- matrix(
+    1.0,
+    nrow = ntr,
+    ncol = 1L,
+    dimnames = list(NULL, "(Intercept)")
+  )
+  Zte <- matrix(
+    1.0,
+    nrow = nte,
+    ncol = 1L,
+    dimnames = list(NULL, "(Intercept)")
+  )
   notes <- character(0)
   add <- function(vtr, vte, nm) {
     Ztr <<- cbind(Ztr, vtr)
@@ -725,7 +947,9 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
       } else {
         ch <- ifelse(is.na(v), "NA", as.character(v))
         lv_tr <- sort(unique(ch[train_idx]))
-        if (length(lv_tr) < 2L) next # constant in train -> absorbed by the intercept
+        if (length(lv_tr) < 2L) {
+          next
+        } # constant in train -> absorbed by the intercept
         # dummies over TRAIN levels, baseline = first. A test row whose level never
         # appears in train gets all-zero dummies, i.e. is folded into the baseline --
         # the only available choice, since no coefficient can exist for a level the fit
@@ -739,10 +963,15 @@ resolve_screen_rotations <- function(spec, event_type, default = 200L) {
         }
         unseen <- base::setdiff(unique(ch[test_idx]), lv_tr)
         if (length(unseen)) {
-          notes <- c(notes, paste0(
-            "confound_level_unseen_in_train:", nm, "=",
-            paste(unseen, collapse = "/")
-          ))
+          notes <- c(
+            notes,
+            paste0(
+              "confound_level_unseen_in_train:",
+              nm,
+              "=",
+              paste(unseen, collapse = "/")
+            )
+          )
         }
       }
     }
@@ -783,8 +1012,13 @@ prep_event <- function(y, confound_df, groups) {
   }
 
   list(
-    n = n, group_idx = group_idx, fold_z = fold_z, fold_zte = fold_zte,
-    ytil_train = ytil_train, ytil_oof = ytil_oof, ss_tot = sum(ytil_oof^2),
+    n = n,
+    group_idx = group_idx,
+    fold_z = fold_z,
+    fold_zte = fold_zte,
+    ytil_train = ytil_train,
+    ytil_oof = ytil_oof,
+    ss_tot = sum(ytil_oof^2),
     notes = unique(notes)
   )
 }
@@ -797,9 +1031,10 @@ prep_event <- function(y, confound_df, groups) {
 #
 # Rewritten 2026-07-29 to close every train/test leak in this function:
 # standardisation (mu/sd), confound residualisation, the ridge kernel basis
-# (K/eigendecomposition), and λ selection (GCV) are now ALL computed from
-# TRAIN rows only, per fold, and applied to that fold's held-out rows purely
-# by re-using the train-fitted transform/coefficients/λ — nothing about a
+# (K/eigendecomposition), and λ selection (exact LOOCV + 1SE rule, v5; GCV
+# through v4) are now ALL computed from TRAIN rows only, per fold, and
+# applied to that fold's held-out rows purely by re-using the train-fitted
+# transform/coefficients/λ — nothing about a
 # held-out group's own X or y ever touches the model fit used to predict it.
 # (The previous version built one global smoother from ALL n rows — via
 # global standardisation, global confound-projection, and a single K/eigen
@@ -816,9 +1051,15 @@ prep_event <- function(y, confound_df, groups) {
 # plain train→test kernel projection, not a same-smoother block update.
 ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
   na_out <- list(
-    R2 = NA_real_, R2_bounded = NA_real_, CCC = NA_real_, lambda = NA_real_,
-    df = NA_real_, n_features = 0L,
-    max_abs_oof = NA_real_, max_abs_z = NA_real_, frac_z_gt10 = NA_real_,
+    R2 = NA_real_,
+    R2_bounded = NA_real_,
+    CCC = NA_real_,
+    lambda = NA_real_,
+    df = NA_real_,
+    n_features = 0L,
+    max_abs_oof = NA_real_,
+    max_abs_z = NA_real_,
+    frac_z_gt10 = NA_real_,
     lambda_min = NA_real_
   )
   if (is.null(X) || ncol(X) == 0L || nrow(X) != prep$n) {
@@ -841,6 +1082,7 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
   oof <- numeric(prep$n)
   lambdas <- numeric(0)
   dfs <- numeric(0)
+  fold_r2s <- numeric(0) # per-fold R2, comparison against the pooled R2 below
   # B3 out-of-support diagnostics. The leave-one-ontology-supergroup-out design means a
   # held-out group can sit far outside the training support (measured: |z| up to 48,404
   # on real data, and >half the held-out rows beyond 10 train SDs in 37.5% of
@@ -898,30 +1140,67 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
     fold_grid <- grid
     if (is.null(fold_grid)) {
       base <- sum(d) / n_tr
-      if (!is.finite(base) || base <= 0) base <- 1
+      if (!is.finite(base) || base <= 0) {
+        base <- 1
+      }
       fold_grid <- base * 10^seq(-3, 3, length.out = 25L)
     }
-    # standard trace-based GCV, but now legitimate: every quantity (d, ystar,
-    # n_tr) comes from train rows only, so this is a train-internal criterion,
-    # not a proxy contaminated by the held-out group.
-    gcv <- vapply(fold_grid, function(lam) {
-      ssr <- sum((lam / (d + lam) * ystar)^2)
-      tr <- sum(d / (d + lam))
-      denom <- (n_tr - tr)^2
-      if (denom <= 0) return(Inf)
-      n_tr * ssr / denom
-    }, numeric(1))
-    lam <- fold_grid[which.min(gcv)]
+    # Exact ridge LOOCV (not GCV's trace-averaged approximation): every
+    # quantity (d, U, ystar, n_tr) comes from train rows only, so this is a
+    # train-internal criterion, not a proxy contaminated by the held-out
+    # group. h_i(lam) = sum_k U_ik^2 * d_k/(d_k+lam) is the exact diagonal of
+    # the ridge hat matrix H(lam) = U diag(d/(d+lam)) U' -- the standard
+    # closed-form LOOCV shortcut for any linear smoother, generalised from the
+    # OLS hat-matrix case by the shrinkage term d/(d+lam). Since lam > 0
+    # always (fold_grid is strictly positive) and each row of U is unit norm
+    # (sum_k U_ik^2 = 1), h_i is a convex combination of terms strictly < 1,
+    # so 1 - h_i > 0 and the LOOCV residual below never divides by zero.
+    loocv <- vapply(
+      fold_grid,
+      function(lam) {
+        s <- d / (d + lam)
+        yhat <- as.numeric(U %*% (s * ystar))
+        resid <- ytil_tr - yhat
+        h_i <- as.numeric(rowSums(sweep(U^2, 2L, s, "*")))
+        cv_i <- (resid / (1 - h_i))^2
+        c(mean = mean(cv_i), se = stats::sd(cv_i) / sqrt(n_tr))
+      },
+      numeric(2)
+    )
+    mean_cv <- loocv["mean", ]
+    se_cv <- loocv["se", ]
+    min_idx <- which.min(mean_cv)
+    # 1SE rule: among lambdas whose mean LOOCV error is within 1 SE of the
+    # minimum, take the MOST regularized (largest -- fold_grid is ascending)
+    # one, not the raw argmin. More conservative on folds whose GCV/LOOCV
+    # argmin collapses toward the grid floor (the near-interpolation
+    # instability already tracked via `lambda_min` below).
+    within_1se <- which(mean_cv <= mean_cv[min_idx] + se_cv[min_idx])
+    lam <- fold_grid[max(within_1se)]
     sfilt <- d / (d + lam)
 
     alpha <- U %*% ((1 / (d + lam)) * ystar) # (K_train + λI)^-1 ỹ_train
     Ktest <- tcrossprod(MXte, MXtr) # test × train cross-Gram
     oof[test_idx] <- as.numeric(Ktest %*% alpha)
 
+    # THIS fold's own R2 (its held-out rows only, against ITS ss_tot), vs. the
+    # single POOLED R2 computed below from all folds' oof concatenated together.
+    # The two can diverge a lot -- e.g. if one fold's group sits far outside
+    # train support (the z_max_folds/z_gt10 diagnostic above), that fold alone
+    # can swing deeply negative while others stay reasonable, and the pooled
+    # number hides which fold did it. NA (not 0) when a fold's own ss_tot is 0,
+    # so it reads as "undefined here", not "perfect fit".
+    fold_ss_tot <- sum(prep$ytil_oof[test_idx]^2)
+    fold_r2 <- if (fold_ss_tot > 0) {
+      1 - sum((prep$ytil_oof[test_idx] - oof[test_idx])^2) / fold_ss_tot
+    } else {
+      NA_real_
+    }
+    fold_r2s <- c(fold_r2s, fold_r2)
+
     lambdas <- c(lambdas, lam)
     dfs <- c(dfs, sum(sfilt))
   }
-
   r2 <- 1 - sum((prep$ytil_oof - oof)^2) / prep$ss_tot
   list(
     # RAW R2 is retained unchanged and is what p_emp / q are computed from. It is
@@ -938,6 +1217,7 @@ ridge_screen_stat <- function(prep, X, groups, grid = NULL) {
     # dominated by a single -290,000 null, which was the substance of TODO-2.
     R2_bounded = .squash_r2(r2),
     CCC = .ccc(prep$ytil_oof, oof),
+    fold_r2 = fold_r2s, # per-fold R2, one per group -- comparison against pooled R2 above
     lambda = mean(lambdas),
     df = mean(dfs),
     n_features = p,

@@ -276,6 +276,23 @@ if (!interactive()) {
     feature_data[, parts$confound_cols, with = FALSE]
   )
   prep <- prep_event(feature_data[["PSI"]], confound_df, groups)
+  # Confound-free baseline prep (Z = intercept only), for two diagnostics added
+  # 2026-08-20: r2_confounds (how much do confounds alone explain, vs the
+  # intercept-only null?) and r2_x_alone (how much does X alone explain, with
+  # NO confound residualisation at all?) -- both real-event-only, never
+  # computed for the null rotation (cost would scale with R_used for no
+  # diagnostic benefit; the null's job is the beyond-confounds comparison
+  # already in screen_R2). Cheap: prep_event() itself is a few qr() calls, and
+  # ridge_screen_stat(prep_noconf, ...) below is 3 extra kernel fits (one per
+  # feature set) against an event that already pays for 1 + R_used x 3 fits.
+  # See revision/file-changes/09-confound-projection-instability.md for why
+  # these numbers matter (found confounds-alone underperforms the null on the
+  # majority of real events -- an OLS-instability artifact, not real
+  # anti-signal, but worth surfacing per-event rather than only in a scratch
+  # script). Bounded via the same R2/(1+|R2|) squash as screen_R2_bounded
+  # (v3 decision, see project_tier1_v3_scoring_decision.md) -- same
+  # non-injectivity-avoidance reasoning applies to these two new numbers.
+  prep_noconf <- prep_event(feature_data[["PSI"]], NULL, groups)
 
   # long/short/local column sets for a feature table, given its event id.
   # Mirrors 09zz's build_explanatory_vars: long = all epigenetic X; short = drop
@@ -311,6 +328,21 @@ if (!interactive()) {
       ))
     }
     ridge_screen_stat(prep, as.matrix(dt[, cols, with = FALSE]), groups)
+  }
+  # X alone, no confound residualisation at all -- same shape as ridge_R2 but
+  # closes over prep_noconf instead of prep. Real-event-only (see comment at
+  # prep_noconf's definition above).
+  ridge_R2_noconf <- function(cols, dt) {
+    if (length(cols) == 0L) {
+      return(list(
+        R2 = NA_real_,
+        CCC = NA_real_,
+        lambda = NA_real_,
+        df = NA_real_,
+        n_features = 0L
+      ))
+    }
+    ridge_screen_stat(prep_noconf, as.matrix(dt[, cols, with = FALSE]), groups)
   }
   this_fs_cols <- feature_set_columns(parts$x_cols, this_id)
 
@@ -434,8 +466,20 @@ if (!interactive()) {
   # --- per feature set: real stat + empirical p + effect ----------------
   rows <- list()
   null_side <- list()
+  # r2_confounds: how much do confounds (Z) alone explain, vs the
+  # intercept-only null? Depends only on y/Z/groups, not on X or feature_set --
+  # computed once outside the loop, same value stored on every feature_set's
+  # row (cheap, matches the existing convention of repeating event-level
+  # columns like ID/Event Type across feature_set rows).
+  r2_confounds <- if (is.finite(prep_noconf$ss_tot) && prep_noconf$ss_tot > 0) {
+    1 - prep$ss_tot / prep_noconf$ss_tot
+  } else {
+    NA_real_
+  }
+  r2_confounds_bounded <- .squash_r2(r2_confounds)
   for (fs in feature_sets) {
     real <- ridge_R2(this_fs_cols[[fs]], feature_data)
+    real_noconf <- ridge_R2_noconf(this_fs_cols[[fs]], feature_data)
     nR2 <- null_mat[, paste0("R2_", fs)]
     nR2 <- nR2[is.finite(nR2)]
     nCCC <- null_mat[, paste0("CCC_", fs)]
@@ -498,6 +542,19 @@ if (!interactive()) {
       max_abs_z = real$max_abs_z,
       frac_z_gt10 = real$frac_z_gt10,
       lambda_min = real$lambda_min,
+      # Added 2026-08-20 (v5): how much do confounds alone, and X alone with NO
+      # confound residualisation, explain vs the intercept-only null?
+      # r2_confounds is the same value across every feature_set row for this
+      # event (see its computation above the loop). Both bounded via the same
+      # R2/(1+|R2|) squash as screen_R2_bounded, same reasoning (strictly
+      # increasing, so p_emp-style rank comparisons on these would be
+      # unaffected -- though neither of these two feeds p_emp/q; they are
+      # diagnostic-only, sitting alongside screen_R2/screen_R2_bounded, not
+      # replacing them). See revision/file-changes/09-confound-projection-instability.md.
+      r2_confounds = r2_confounds,
+      r2_confounds_bounded = r2_confounds_bounded,
+      r2_x_alone = real_noconf$R2,
+      r2_x_alone_bounded = real_noconf$R2_bounded,
       # prep_event's per-fold notes (rank deficiency, a confound constant or all-NA in a
       # fold's train rows, a factor level present only in held-out rows). Previously an
       # event voided this way carried note = NA and was indistinguishable from a clean one.
