@@ -30,7 +30,7 @@ Significance and interpretation are different jobs wanting different models, so 
 | Question       | *Is* this event predictable beyond its matched null?  | *Which features* carry the signal?    |
 | Model          | closed-form ridge partial-R², group-LOO by ontology   | tuned elastic net (glmnet/tidymodels) |
 | Runs on        | **every** event (~34k)                                | **hits only**                         |
-| Null           | ~200 matched control loci → empirical p → FDR q       | none (real PSI only)                  |
+| Null           | matched control loci (RI 818, SE 200) → p → FDR q     | none (real PSI only)                  |
 | Script         | `09s-ridge-screen.R` → `09s-aggregate.R`              | `09-1-ml-local.R` → `09zz-…glmnet….R` |
 
 Tier 1 wants an **omnibus, high-power, closed-form** detector: ridge's L2 penalty aggregates diffuse,
@@ -101,20 +101,80 @@ below:
 
 ## How to read a report with no hits
 
+**Numbers below are `stat_version` 5** (re-screened 2026-08-21–25 after `09-ml-shared.R`'s ridge λ
+selection changed from GCV to exact LOOCV + a 1SE rule — see the version history at
+`SCREEN_STAT_VERSION` in that file). They supersede an earlier `stat_version` 4 pass whose figures
+this guide previously quoted; re-run `.claude/scratch/verify_09_2_reported_numbers.R` after any future
+re-screen; every figure below is checked against it.
+
 If Tier 1 yields no significant events, sections 2–6 are empty by construction (`en_available` is
 `FALSE`, those chunks are skipped). The report is still **complete and interpretable** — the evidence
-lives in section 1:
+lives in section 1, and it rests on two things:
 
 - a **flat** empirical-p histogram says the null is calibrated, so "no hits" is a real negative result
-  rather than a broken test;
-- a p-histogram **piled up at 0** would instead mean the null is optimistic and nothing can be
-  concluded;
-- `effect ≈ 0` **across all raw-R² strata, including the highest**, is the fingerprint signature: the
-  best-predicted events are the ones a random locus predicts equally well.
+  rather than a broken test. On the completed screen `p_emp <= 0.05` runs **4.39–5.97%** per
+  `(Event Type × feature set)` family against 5% expected, and the floor-free `p_pooled_z` runs
+  3.77–6.20% (and 0.056–0.169% at the 0.001 level, vs 0.1% expected) — calibrated under both
+  constructions in aggregate, so there is no *reservoir* of signal being lost to multiple testing. A
+  p-histogram **piled up at 0** would instead mean the null is optimistic and nothing could be
+  concluded. This calibration claim is about the bulk of each family, not about individual events —
+  see the pooled-z caveat below;
+- the **p gradient across signed-R² strata** (§1.1 check 2's table, cut at 0 / 0.1 / 0.2 / 0.5) is the
+  fingerprint signature, and it is cleanest in the two large-*n* families: `median_p` falls
+  monotonically as R² rises for **SE/local (0.716 → 0.030) and SE/long (0.522 → 0.127)**. It is
+  noisier elsewhere — RI's three families split only ~1,775 tested events across 5 strata (the top
+  stratum holds as few as **1** event for RI/short and **0** for RI/long), and SE/short dips
+  non-monotonically at its second-highest stratum — so only 2 of the 6 families are strictly monotone
+  under this statistic version. Even in the clean SE families the top (`> 0.5`) stratum never
+  approaches significance (family min q 0.796 / 0.842). High R² buys almost nothing once the
+  comparison is against a matched locus, which is what "fingerprint, not regulation" means
+  quantitatively — the claim just now rests on SE's larger families rather than being uniform across
+  all six.
 
-That combination — calibrated null, no surviving events, high R² with zero effect — is the quantitative
-form of the manuscript's claim that reported epigenetic control of splicing is largely a
-cell-type-identity confound.
+**Do not use `effect` (or `mean(screen_R2)`) as that signature.** An earlier version of this guide said
+the no-hit fingerprint was `effect ≈ 0` in every raw-R² stratum; the completed screen contradicts it.
+`effect = screen_R2 − mean(null_R2)` is mean-based, so the heavy-tailed R² blow-ups documented in §1
+corrupt it: it is positive for **79.3%** of rows (vs ~50% under a symmetric null), and the blow-up
+fraction itself (`|screen_R2| > 1`) is now **50.1%** of all rows — up from 29.6% under the prior λ
+selection, an unexplained side effect of the LOOCV+1SE change worth investigating separately (more
+regularization did not reduce out-of-support extrapolation blow-ups; if anything the rate roughly
+doubled). Use the rank-based `q` for inference, and `effect_bounded` / `effect_ccc` if a bounded effect
+size is wanted.
+
+**The primary hit rule (`q < 0.1`) still gives 0 hits, min q 0.551 (RI/local).** The floor-free
+pooled-z sensitivity, which previously agreed with the primary rule at 0 hits, now surfaces **7
+candidate events** (min `q_pooled_z` 0.0145) — the two constructions no longer agree, which is exactly
+the scenario §1.3 below says to treat as candidates, not hits, pending a calibration check. Of the 7,
+2 (small-*n*, `long`-space, `r2_confounds` in the hundreds-to-thousands range) look like the same
+confound-projection instability tracked in `09-confound-projection-instability.md`; the other 5 (all
+`SE/local`, n = 188–409, self-consistent `r2_confounds`) remain open and are not yet resolved one way
+or the other. Do not read "0 primary hits" as "the sensitivity analysis also found nothing" — it no
+longer does, and that gap is the most interesting open thread in this run.
+**ID 38354's `local`-space result is the strongest of the 5** — beats all 200/200 of its own matched
+controls, non-degenerate sample composition (409/415 cohort samples, 34 ontologies, no single-ontology
+dominance), well-behaved regularization (no out-of-support blow-up, unlike its own `long`/`short`
+spaces for the same event), and persisted across the GCV→LOOCV+1SE change (q_pooled_z 0.242 → 0.0145).
+Survives every internal-consistency check run so far but is **not validated as a real hit** — that was
+one event examined after seeing the ranking, not a pre-registered test, and no biological look at what
+gene/exon it is has been done. Full write-up:
+`.claude/scratch/investigate_pooled_z_candidates_v5_findings.md`.
+
+That combination — a null calibrated in aggregate under both p constructions, no surviving event under
+the primary rule, a handful of pooled-z candidates still under investigation, and a fingerprint p
+gradient that is clean for SE and noisy for RI — is close to, but not as clean as, a textbook
+confirmation of the manuscript's claim that reported epigenetic control of splicing is largely a
+cell-type-identity confound. The qualitative conclusion is unchanged from the prior statistic version;
+the margin by which it holds is smaller and the pooled-z candidates are unresolved.
+
+**The positive counterpart is cohort-level, not event-level**, and the two do not contradict each other.
+Under clean `seqnames`-grouped CV (`splicing_ml`, test AUROC, linear/xgb), sequence features alone
+recover nearly the whole model — RI 0.809/0.784 and SE 0.950/0.954, against 0.871/0.855 and 0.957/0.963
+for all features — while histone+DNAm alone reach only 0.591/0.587 and 0.641/0.659 over a 0.500 prior
+baseline. Epigenetic marks therefore do carry *some* cohort-level signal; what this screen rules out is
+that the signal is **locus-specific**. A matched null is blind to regulation shared across loci, so a
+diffuse mechanism cancels in the null and reads here as "not locus-specific" — see
+`revision/file-changes/09-psi-independent-controls.md` (OUTCOME + RESULT boxes) for the full numbers and
+for what the design cannot see.
 
 # 0. Setup and table construction
 
@@ -405,9 +465,14 @@ if (!"Event Type" %in% names(screen_dt) && nrow(screen_dt) > 0L) {
   screen_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
 }
 screen_q_threshold <- 0.1
-# Per (event, feature_set) significance …
+# Per (event, feature_set) significance. This MUST mirror 09s-aggregate.R's hit rule,
+# which is `q < q_threshold` ALONE since 2026-08-01: the one-sided exceedance p already
+# encodes direction, so the former `& effect > 0` clause was redundant, and on the raw
+# statistic it was outlier-dominated (it passed ~3/4 of events for numerical reasons —
+# see QC check 5). The aggregator's `EpiATLAS_AS_SCREEN_MIN_EFFECT` survives as an
+# opt-in variance-collapse filter acting on `effect_bounded`, and defaults to no filter.
 screen_dt[,
-  sig := is.finite(q) & q < screen_q_threshold & is.finite(effect) & effect > 0
+  sig := is.finite(q) & q < screen_q_threshold
 ]
 # … and the per-EVENT roll-up (sig in ANY feature set) — this is what defines a
 # Tier-2 hit in 09s-aggregate.R, and what the biology sections downstream split on.
@@ -425,6 +490,977 @@ screen_sig_ids <- sort(unique(screen_dt[sig %in% TRUE, ID]))
 .en_all_metrics <- read_event_csvs("^\\d+_all_metrics\\.csv\\.gz$")
 en_available <- nrow(.en_all_metrics) > 0L &&
   ".metric" %in% names(.en_all_metrics)
+```
+
+# 1. Tier 1 — the ridge screen: is any event predictable beyond its matched null?
+
+This section decides significance for **every** event; nothing downstream can add an event the screen
+did not select. `09s-ridge-screen.R` computes, per event and per feature space, a closed-form
+group-leave-one-ontology-out ridge **partial-R²** — the variance in PSI explained by epigenetics *after*
+protocol, gene expression and TSS distance are absorbed as unpenalised confounds — then re-computes that
+same statistic on **matched control loci** — same event type, same variability tier, different
+chromosome — while keeping this event's PSI. `screen_rotations` is per-Event-Type: **818 for RI**
+(its full eligible pool) and **200 for SE**. That gives an empirical p, and `09s-aggregate.R` turns the
+p-values into FDR **q** within each (`transcript_filter`, `Event Type`, `feature_set`) group.
+
+**An event is significant when `q < threshold`** — that single condition, nothing else. The one-sided
+exceedance p already encodes *direction* (it is the mass of the null at or above the real R²), so the
+`effect > 0` clause this rule used to carry was redundant; it was also actively misleading on the raw
+statistic, where `effect = real R² − mean(null R²)` is mean-based and passed ~3/4 of events for purely
+numerical reasons (§1.1 check 5). Dropped 2026-08-01; see `09s-aggregate.R`.
+
+### The order of this section is the argument
+
+The QC/calibration chunk comes **first, on purpose**. A hit list from a miscalibrated null is
+meaningless, so the null is audited before any result is read:
+
+1. **`screen-diagnostics`** — is the null honest, is the fingerprint pattern present, is the
+   negative-R² tail explained?
+2. **`screen-significance-plots`** — the actual per-group results and hit counts.
+3. **`screen-floor-sensitivity`** — could the test have rejected anything at all? The p-floor
+   arithmetic and the floor-free pooled-z sensitivity p (§1.3).
+4. **`screen-null-histograms`** — the raw material: where each real R² falls inside its own null.
+
+### Hypotheses this section discriminates between
+
+- **H1 — genuine event-specific epigenetic control.** Some events' local chromatin predicts their PSI
+  better than unrelated loci do. *Signature:* an excess of events in the leftmost p bin over uniform,
+  and survival after FDR.
+- **H2 — cell-type fingerprint only.** All apparent predictability is shared cell-type identity.
+  *Signature:* flat p histogram and no survivors after FDR, with p never approaching significance even
+  in the highest raw-R² stratum. High-R² events are the clearest fingerprint cases, not the best hits.
+  (Read this off `median_p` per R² stratum, **not** off `effect` — see check 5.)
+- **H3 — broken/optimistic null** (a nuisance hypothesis that must be excluded before H1 or H2 can be
+  read). *Signature:* p piling up toward 0 monotonically across all bins. Note that an implausibly
+  large fraction of `effect > 0` indicates a corrupted `effect`, not an optimistic null — check 5.
+
+H2 vs H1 is the manuscript's central question; H3 is why the diagnostics run first.
+
+## 1.1 Screen QC: is the null honest? (read this before the results)
+
+Five checks, each with an expected shape and a specific failure mode:
+
+**(1) Null calibration — empirical-p distribution, per (Event Type x feature set).**
+*Expected under no genome-wide signal:* flat (uniform), because a matched control locus should beat the
+real locus about as often as chance dictates.
+*Expected under genuine signal:* flat, **plus** a bump in the leftmost bin — the hits.
+*Failure:* a monotone pile-up toward 0 across all bins means the null is systematically too weak
+(controls handicapped somehow — e.g. mismatched sample sets or fewer usable features), and **no hit list
+from this run can be trusted**. Checked per **family** — `(Event Type, feature_set)`, the unit the FDR is actually computed in — not
+per feature set alone. SE outnumbers RI ~18:1, so a pooled panel is an SE panel and an RI-specific
+failure would be invisible in it; the two types' nulls are also measurably different (KS p = 0.0072 on
+their standardised null z). Every table and panel in this subsection is grouped that way.
+
+**(2) Fingerprint check — `effect` and p within raw-R² strata.**
+*Hypothesis:* if predictability were event-specific, the best-predicted events would also be the ones
+that most beat their null, so `effect` should rise with raw R².
+*Fingerprint prediction (H2):* the top stratum still fails to reject — median p well above the FDR
+threshold and no survivor after BH — even though it holds the best-predicted events in the genome.
+**Read that off `median_p`, not off `effect`.** On the completed screen `effect` is positive in
+**80–100%** of events in every stratum above the `<=0` baseline, in every family, with exactly one
+exception: RI/short's top (`> 0.5`) bucket holds a single event with a negative effect — illustrating
+how noisy a 1-event stratum is, not a reversal of the pattern. Its *magnitude* is unstable across
+strata (from near 0 to several tens), which is check 5's corruption signature, not evidence for H1: raw
+`effect` is mean-based and the R² blow-ups drag it. `median_p` behaves better: it falls cleanly with R²
+in the two large families, SE/local (0.716 → 0.030) and SE/long (0.522 → 0.127), and the `> 0.5`
+stratum never approaches significance in any family (family min q 0.551–0.842).
+*Deduction from that pattern:* raw R² is measuring cell-type identity, and any published ranking of
+"most epigenetically predictable events" built on R² alone is a ranking of fingerprint strength.
+
+**(3) Negative-R² tail vs sample size.**
+Group-LOO R² can go sharply negative; the question is whether that is a bug or expected instability.
+*Expected:* the negative tail concentrates in **small-n** events, where holding out a whole ontology
+group removes a large share of the data. It should also shrink from `long` → `local` as the p ≫ n
+pressure eases.
+*Deduction if very negative R² appears at large n, or does not ease as features are dropped:* suspect a
+data or confound-partition problem rather than small-sample noise.
+
+**(4) Silently voided events (`stat_version` ≥ 2 only).** The leak-fixed statistic fits the confound design
+per fold on training rows, but its constant-column guard is evaluated over *all* rows — so a fold whose
+training subset makes a confound constant yields a rank-deficient design, an `NA` out-of-fold residual, and
+an `NA` R² for the whole event. `screen_CCC` does **not** fail with it: `.ccc()` filters non-finite pairs
+and returns a value computed on the survivors, which looks valid.
+*Signature:* `screen_R2` NA with a **finite** `screen_CCC`, `R_used == 0`, and no `note`.
+*Expected:* a small percentage, concentrated at low `n_samples`.
+*Deduction:* those events are **excluded, not tested** — so they cannot produce false positives, but the
+loss is non-random (it hits exactly the low-*n* stratum check 3 examines), and any `screen_CCC` reported for
+them is computed on an unknown subset and must not be quoted.
+
+**(5) Is `effect` still a usable effect size?** `effect = screen_R2 − mean(null_R2)` is **mean**-based, so a
+single exploded null value corrupts it; `p_emp` is **rank**-based and does not care.
+*Expected if healthy:* the fraction with `effect > 0` is broadly consistent with the fraction at small
+`p_emp`, and median `effect` does not flip sign across `|screen_R2|` strata.
+Note that `effect > 0` at ~50% alongside `p_emp ≤ 0.05` at ~5% is **healthy**, not contradictory —
+`effect` is a symmetric difference, so half of it is positive under the null. The pathology is `effect > 0`
+drifting far from 50% (**79.3%** on the completed screen) *together with* a material fraction of
+`|screen_R2| > 1` (**50.1%** — over half of all rows, up from 29.6% under the prior GCV λ selection;
+the LOOCV+1SE change made this worse, not better, and that is not yet explained), which means the
+null mean is being dragged by exploded out-of-fold predictions.
+*Deduction if that happens:* `effect` has stopped carrying information about direction and is positive for
+numerical reasons — which is why it is no longer part of the hit rule at all. Use `q` alone for inference,
+treat raw `effect` as unreportable (`effect_bounded` / `effect_ccc` are the bounded substitutes), and see
+`revision/file-changes/09-event-models-redesign.md` TODO-2.
+
+```{r screen-diagnostics}
+sd_fin <- screen_dt[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
+sd_fin[event_dt, Variability := `Variability`, on = "ID"]
+
+# EVERY diagnostic below is grouped by (Event Type x feature_set) — the FDR family,
+# NOT feature_set alone.
+#
+# This matters more than it looks. SE outnumbers RI ~18:1 (32,368 vs 1,776 events),
+# so anything pooled across event types is an SE diagnostic with RI invisible: RI's
+# null could be badly miscalibrated and the pooled p-histogram would still look
+# flat. And the two event types demonstrably differ — a KS test on their
+# leave-one-out standardised null z gives p = 0.0072, with q99.99 of 9.73 (SE) vs
+# 5.93 (RI). This is the same trap that made a pooled-z reference read as calibrated
+# at ratio 1.01 while actually being 1.43x anti-conservative for SE and 0.41x
+# conservative for RI: majority-class dominance hiding a minority-class failure.
+# Diagnose in the unit the inference is done in.
+.diag_by <- c("Event Type", "feature_set")
+
+# Coverage per family: rotations used, n_features (the point of the split), and
+# degenerate-event notes (NA = fit fine).
+cat("Screen coverage per Event Type x feature set:\n")
+# NB every summary must have a TYPE-STABLE result across groups: median() on an
+# integer column returns integer for odd-length groups but double for even-length
+# ones, which makes data.table abort with "Column N ... is type 'double' but
+# expecting type 'integer'" as soon as the groups differ in parity. Hence the
+# explicit as.double()/as.integer() casts — do not drop them.
+print(screen_dt[,
+  .(
+    n_events = .N,
+    finite_p = sum(is.finite(p_emp)),
+    median_features = as.double(median(n_features, na.rm = TRUE)),
+    R_used_median = as.double(median(R_used, na.rm = TRUE)),
+    R_used_below_max = sum(R_used < max(R_used, na.rm = TRUE), na.rm = TRUE)
+  ),
+  by = .diag_by
+][order(`Event Type`, feature_set)])
+cat("Degenerate-event notes (NA = screened cleanly):\n")
+print(screen_dt[, .N, by = c(.diag_by, "note")][order(
+  `Event Type`,
+  feature_set,
+  -N
+)])
+
+# (1) NULL CALIBRATION — p_emp should be ~flat under the null. A broken/optimistic
+# null piles p toward 0 across all bins; genuine signal shows only as a modest
+# excess in the leftmost bin over the uniform (dashed) line.
+# Calibration must be checked PER FAMILY (Event Type x feature set) — each is its
+# own set of tests with its own FDR, so one family's null can be broken while
+# another's is fine, and a pooled panel would hide it (see .diag_by above).
+n_bins <- 100L
+.unif_dt <- sd_fin[, .(y = .N / n_bins), by = .diag_by]
+print(
+  ggplot(sd_fin, aes(x = p_emp)) +
+    geom_histogram(
+      breaks = seq(0, 1, 1 / n_bins),
+      fill = "grey70",
+      color = "white"
+    ) +
+    geom_hline(
+      data = .unif_dt,
+      aes(yintercept = y),
+      linetype = "dashed",
+      color = "firebrick"
+    ) +
+    facet_grid(
+      factor(`Event Type`, levels = to_analyze) + Variability ~ feature_set,
+      scales = "free_y"
+    ) +
+    theme_bw() +
+    labs(
+      title = "Tier-1 null calibration: empirical p per Event Type x feature set",
+      x = "Empirical p (matched feature-rotation null)",
+      y = "Number of events",
+      caption = paste(
+        "Dashed = uniform expectation (per panel). Flat = well-calibrated null; excess",
+        "in the leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
+        "indicate an optimistic (broken) null. Read RI on its own: it is ~5% of events,",
+        "so pooling it with SE would hide an RI-specific failure entirely."
+      )
+    )
+)
+ggsave(
+  file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"),
+  width = 3 + 3 * max(1L, uniqueN(sd_fin$`Event Type`)),
+  height = 2 + 2.2 * max(1L, uniqueN(sd_fin$feature_set)),
+  limitsize = FALSE
+)
+
+# (2) FINGERPRINT — effect & p within raw-R2 strata. High raw R2 with effect ≈ 0
+# and non-small p = cell-type fingerprint, not event-specific signal (binned
+# complement to screen_effect_vs_r2.pdf). READ THE `median_p` COLUMN, not the effect
+# columns: on the real screen `effect` is outlier-corrupted (check 5 below), so the
+# "effect ≈ 0" half of that signature is not observable and `median_p` carries the
+# argument on its own. NB the cut here is on SIGNED screen_R2 (0/0.1/0.2/0.5), which is
+# NOT check 5's abs(screen_R2) magnitude cut — the two give opposite-looking p gradients
+# and must not be compared to each other.
+sd_fin[,
+  r2_stratum := cut(
+    screen_R2,
+    c(-Inf, 0, 0.1, 0.2, 0.5, Inf),
+    labels = c("<=0", "(0,0.1]", "(0.1,0.2]", "(0.2,0.5]", ">0.5")
+  )
+]
+cat(
+  "Fingerprint check — effect & p within raw-R2 strata, per Event Type x feature set:\n"
+)
+print(sd_fin[,
+  .(
+    n = .N,
+    median_R2 = round(median(screen_R2), 3),
+    median_effect = round(median(effect), 4),
+    pct_effect_pos = round(100 * mean(effect > 0), 1),
+    median_p = round(median(p_emp), 3)
+  ),
+  by = c(.diag_by, "r2_stratum")
+][order(`Event Type`, feature_set, r2_stratum)])
+
+# (3) SMALL-n INSTABILITY — very-negative group-LOO R2 concentrates in small
+# events (expected), not a bug. y clipped at the 1st percentile for readability.
+print(
+  ggplot(sd_fin, aes(x = n_samples, y = screen_R2, color = sig)) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_point(alpha = .3, size = .7) +
+    scale_color_manual(
+      values = c(`TRUE` = "firebrick", `FALSE` = "grey60"),
+      labels = c(`TRUE` = "significant", `FALSE` = "not sig"),
+      name = NULL
+    ) +
+    coord_cartesian(
+      ylim = c(quantile(sd_fin$screen_R2, 0.01, na.rm = TRUE), 1)
+    ) +
+    facet_grid(feature_set ~ `Event Type`) +
+    theme_bw() +
+    labs(
+      title = "Screen R2 vs sample size (very-negative R2 = small-n LOO instability)",
+      x = "n samples (event)",
+      y = "Group-LOO screen R2",
+      caption = paste(
+        "Per feature set: the p >> n regime eases as features are dropped, so the",
+        "negative-R2 tail should shrink from long -> short -> local."
+      )
+    )
+)
+ggsave(
+  file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"),
+  width = 3 + 3 * max(1L, uniqueN(sd_fin$`Event Type`)),
+  height = 2 + 2.2 * max(1L, uniqueN(sd_fin$feature_set)),
+  limitsize = FALSE
+)
+
+# (4) SILENTLY VOIDED EVENTS. See revision/file-changes/09-event-models-redesign.md
+# TODO-1. A fold whose train rows make a confound constant gives a rank-deficient
+# design -> NA out-of-fold residual -> NA screen_R2 for the WHOLE event, while
+# .ccc() filters non-finite pairs and still returns a value. So the signature of the
+# defect is: screen_R2 NA, screen_CCC FINITE, R_used == 0, note absent.
+cat("\n=== (4) event losses and their attribution ===\n")
+screen_dt[, `:=`(
+  .r2_na = !is.finite(screen_R2),
+  .ccc_ok = is.finite(screen_CCC)
+)]
+loss_tab <- screen_dt[,
+  .(
+    n_rows = .N,
+    finite_p = sum(is.finite(p_emp)),
+    pct_finite_p = round(100 * mean(is.finite(p_emp)), 2),
+    voided_silently = sum(.r2_na & .ccc_ok), # R2 NA but CCC finite = the defect
+    voided_both = sum(.r2_na & !.ccc_ok),
+    with_note = sum(!is.na(note))
+  ),
+  by = .diag_by
+][order(`Event Type`, feature_set)]
+print(loss_tab)
+if (sum(loss_tab$voided_silently) > 0L) {
+  cat(sprintf(
+    "!! %d row(s) have screen_R2 = NA with a FINITE screen_CCC and no note.\n   Those events were EXCLUDED, not tested; their screen_CCC is computed on an\n   unknown subset of samples and must not be quoted. n_samples of affected rows:\n",
+    sum(loss_tab$voided_silently)
+  ))
+  print(summary(screen_dt[.r2_na & .ccc_ok, n_samples]))
+  cat("   (a low-n concentration is the expected signature; see TODO-1)\n")
+}
+cat("Degenerate `note` values actually recorded:\n")
+print(screen_dt[!is.na(note), .N, by = note][order(-N)])
+
+# (5) IS `effect` STILL A USABLE EFFECT SIZE? See TODO-2. `effect` is mean-based
+# (screen_R2 - mean(null_R2)) so one exploded null corrupts it; p_emp is rank-based
+# and immune. When the out-of-fold R2 blows up, `effect > 0` stops carrying
+# information — it holds for most events for numerical reasons. This is why the hit
+# rule no longer uses it (dropped 2026-08-01); the check stays, as a health signal.
+cat(
+  "\n=== (5) numeric health of screen_R2, and whether `effect` still means anything ===\n"
+)
+mag <- rbindlist(lapply(c(1, 10, 100, 1000), function(t) {
+  data.table(
+    threshold = t,
+    n_rows = sum(abs(sd_fin$screen_R2) > t),
+    pct = round(100 * mean(abs(sd_fin$screen_R2) > t), 2)
+  )
+}))
+cat(
+  "Rows with |screen_R2| above each threshold (an honest out-of-fold R2 should sit\nnear or below 1; large values are prediction blow-ups, not signal):\n"
+)
+print(mag)
+sd_fin[, .blow := abs(screen_R2) > 10]
+cat(
+  "\nDo blow-ups track sample size / lambda? (small n + small lambda = the known cause)\n"
+)
+print(sd_fin[,
+  .(
+    n_rows = .N,
+    median_n_samples = as.double(median(n_samples, na.rm = TRUE)),
+    median_lambda = signif(median(lambda, na.rm = TRUE), 3)
+  ),
+  by = .blow
+][order(.blow)])
+.pct_eff_pos <- 100 * mean(sd_fin$effect > 0, na.rm = TRUE)
+.pct_p_small <- 100 * mean(sd_fin$p_emp <= 0.05, na.rm = TRUE)
+cat(sprintf(
+  "\neffect > 0: %.1f%% of rows | p_emp <= 0.05: %.2f%%\n",
+  .pct_eff_pos,
+  .pct_p_small
+))
+sd_fin[,
+  .r2_mag := cut(
+    abs(screen_R2),
+    c(-Inf, 1, 10, 100, Inf),
+    labels = c("<=1", "(1,10]", "(10,100]", ">100")
+  )
+]
+print(sd_fin[,
+  .(
+    n = .N,
+    median_effect = signif(median(effect), 3),
+    median_null_mean = signif(median(null_R2_mean), 3),
+    pct_effect_pos = round(100 * mean(effect > 0), 1),
+    median_p = round(median(p_emp), 3)
+  ),
+  by = .r2_mag
+][order(.r2_mag)])
+# Trigger on the RIGHT signature. Under a well-behaved null, `effect > 0` sits near
+# 50% (it is a symmetric difference) while p_emp <= 0.05 sits near 5% — those two are
+# consistent, so their ratio is NOT evidence of anything. The pathology is `effect > 0`
+# drifting far from 50% (the null MEAN being dragged by exploded values) together with
+# a material blow-up fraction.
+.blow_pct <- 100 * mean(abs(sd_fin$screen_R2) > 1, na.rm = TRUE)
+.eff_skew <- abs(.pct_eff_pos - 50)
+if (.blow_pct > 5 || .eff_skew > 15) {
+  cat(sprintf(
+    "!! %.1f%% of rows have |screen_R2| > 1 and `effect > 0` holds for %.1f%% (expected\n   ~50%% under a symmetric null). `effect` is outlier-corrupted and is NOT a usable\n   effect size here -- which is why it is no longer part of the hit rule at all (the\n   `effect > 0` clause was dropped 2026-08-01). Use q alone for inference; do not quote\n   `effect` or mean(screen_R2); `effect_bounded`/`effect_ccc` are the bounded\n   substitutes. See revision/file-changes/09-event-models-redesign.md TODO-2.\n",
+    .blow_pct,
+    .pct_eff_pos
+  ))
+} else {
+  cat(sprintf(
+    "effect looks usable: %.1f%% of rows |screen_R2| > 1, `effect > 0` at %.1f%% (~50%%\nexpected under a symmetric null).\n",
+    .blow_pct,
+    .pct_eff_pos
+  ))
+}
+# p_emp is rank-based, so it should survive the blow-ups — verify, since the whole
+# FDR rests on it.
+.pmin <- min(sd_fin$p_emp, na.rm = TRUE)
+.rmax <- max(sd_fin$R_used, na.rm = TRUE)
+cat(sprintf(
+  "\nmin p_emp = %.6g; expected floor 1/(R_used+1) = %.6g -> %s\n",
+  .pmin,
+  1 / (.rmax + 1),
+  if (abs(.pmin - 1 / (.rmax + 1)) < 1e-9) "OK" else "UNEXPECTED, investigate"
+))
+screen_dt[, c(".r2_na", ".ccc_ok") := NULL]
+sd_fin[, c(".blow", ".r2_mag") := NULL]
+```
+
+## 1.2 Screen results: hit counts, p-values, and fingerprint unmasking
+
+Only read this once section 1.1 has established the null is calibrated.
+
+**Per-group counts.** Reported by `(Event Type, feature_set)` — the exact grouping the FDR was computed
+within, so these *are* the per-family hit counts. The roll-up table beside it gives `n_sig_any_set`
+(the Tier-2 hit definition) and `n_sig_all_sets`. Because the spaces are nested, expect
+`n_sig_all_sets ≤ n_sig_any_set` and expect the two to be *close* if signal is broad, far apart if
+signal is space-specific.
+
+**Plot 2 — empirical p per event.** Same calibration logic as §1.1, now split by event type as well, so
+a signal restricted to one event type is visible. SE and RI differ in sample size and in baseline
+predictability, so their p distributions should be read separately rather than pooled.
+
+**Plot 3 — `effect` vs raw R²: the fingerprint unmasking.** The single most important plot in the
+report.
+*Expected under H2 (fingerprint):* a horizontal band at `effect ≈ 0` that extends all the way to the
+highest R², with significant points absent or scattered.
+*Expected under H1 (real signal):* points lifting off the `effect = 0` line, and — importantly — the
+lift-off need **not** be at high R². Genuine event-specific signal is expected at *modest* R² with a
+clearly-beaten null, precisely because it is not riding the cell-type axis.
+*Read this plot with check 5 in hand.* On the completed screen neither expectation is legible, because
+the y-axis quantity is corrupted: raw `effect` is mean-based, 79.3% of rows are positive against ~50%
+under a symmetric null, and the clipping to `|R²|, |effect| ≤ 1` now drops **over half** of all rows
+(the panel's printed count gives the exact figure for this run — check it, since the blow-up rate moved
+from 29.6% to 50.1% between statistic versions and this clip fraction moves with it). So the panel
+shows where the surviving points sit, not whether anything lifted off.
+*Deduction:* **`q` identifies a hit, not `effect`** — `effect` left the hit rule on 2026-08-01. Use this
+plot as a shape diagnostic and §1.2's hit table plus §1.3's floor arithmetic as the verdict; if a bounded
+version of the vertical axis is wanted, `effect_bounded` / `effect_ccc` exist for it.
+
+**Plot 4 (new) — does narrowing the feature space recover diluted signal?** Per event, `effect` in the
+narrower space vs `effect` in `long`, with the identity line drawn.
+*Hypothesis being tested:* the omnibus `long` ridge dilutes exon-local signal across hundreds of far
+chromHMM windows, so genuinely local signal should sit **above** the identity line.
+*Deduction if a substantial fraction lies above the line:* the per-feature-set split is doing real work
+and a single omnibus screen under-reports; the accompanying `median_delta` / `pct_improved` table
+quantifies it. **Caveat, same as Plot 3:** these are differences of the *raw* `effect`, so they inherit
+its outlier corruption and 63% of the points fall outside the clip window. On the completed screen the
+narrower spaces do sit above the line (`pct_improved` 61–85%), but no family gained a single hit from it
+— so read this as "the split changes the statistic", not "the split recovers signal".
+*Deduction if points cluster on the line:* the far chromHMM windows were contributing neither signal nor
+meaningful dilution, and the three spaces are largely redundant for significance purposes.
+
+```{r screen-significance-plots}
+# Screen significance plots — built DIRECTLY from screen_dt (one row per event),
+# so they always render, even at 0 hits / on a partial run (independent of the EN
+# tables). Previously these were computed off emp_p_dt, which broadcasts screen
+# values across the EN (feature_set × lambda) rows and is therefore empty when
+# there are no hits.
+screen_plot_dt <- screen_dt[, .(
+  ID,
+  feature_set,
+  emp_p = p_emp,
+  q,
+  effect,
+  screen_R2,
+  sig
+)]
+screen_plot_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
+screen_plot_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
+.n_fs <- max(1L, uniqueN(screen_plot_dt$feature_set))
+
+# Significance summary per (Event Type × feature_set) — the exact grouping the FDR
+# was computed within, so these counts are the per-group hit counts.
+print(screen_plot_dt[,
+  .(
+    n_sig = sum(sig, na.rm = TRUE),
+    n_total = sum(!is.na(q)),
+    pct_sig = round(100 * mean(sig, na.rm = TRUE), 1)
+  ),
+  by = .(`Event Type`, feature_set)
+][order(`Event Type`, feature_set)])
+
+# Roll-up: an event counts as a hit if significant in ANY feature set (Tier-2's
+# definition). Reported alongside the per-set counts because the sets are nested
+# (local ⊂ short ⊂ long), so per-set counts are not independent and don't add up.
+print(screen_plot_dt[,
+  .(n_sig_sets = sum(sig, na.rm = TRUE)),
+  by = .(`Event Type`, ID)
+][,
+  .(
+    n_events = uniqueN(ID),
+    n_sig_any_set = uniqueN(ID[n_sig_sets > 0L]),
+    n_sig_all_sets = uniqueN(ID[n_sig_sets == .n_fs])
+  ),
+  by = `Event Type`
+][order(`Event Type`)])
+
+# Plot 2: screen empirical-p per event, event type × feature set.
+print(
+  ggplot(
+    screen_plot_dt[is.finite(emp_p)],
+    aes(x = emp_p, fill = `Event Type`)
+  ) +
+    geom_histogram(bins = 100, alpha = .7, position = "identity") +
+    geom_vline(
+      xintercept = screen_q_threshold,
+      linetype = "dashed",
+      color = "red"
+    ) +
+    facet_grid(`Event Type` ~ feature_set, scales = "free_y") +
+    theme_bw() +
+    labs(
+      title = "Tier-1 ridge-screen empirical p-value (per event, per feature set)",
+      x = "Empirical p (matched feature-rotation null)",
+      y = "Number of events",
+      caption = paste(
+        "Rows = feature set (long = all epigenetic; short = drop far chromHMM;",
+        "local = drop all chromHMM). FDR is computed within each row × column cell.",
+        "Significant = q < threshold AND effect (real - mean null R2) > 0."
+      )
+    )
+)
+ggsave(
+  file.path(plot_dir_ev, "screen_pvalue.pdf"),
+  width = 10,
+  height = 2 + 2.2 * .n_fs,
+  limitsize = FALSE
+)
+
+# Plot 3: effect vs raw R² — the fingerprint unmasking. High raw R² with effect
+# ≈ 0 = cell-type fingerprint (a random locus predicts as well). Colour is the real
+# hit rule, q < threshold alone — `effect` is diagnostic here, not a criterion.
+# CLIPPED, deliberately. `effect = screen_R2 - mean(null_R2)`, so while the v2
+# out-of-fold R2 blows up (see QC check 5) the y-axis is dominated by its own x-axis:
+# cor(effect, screen_R2) measured 0.988 across all rows vs -0.05 restricted to
+# |R2| <= 1. Unclipped, this panel is one dot plus a diagonal streak and shows NO
+# fingerprint structure. The excluded count is printed, not hidden.
+.p3 <- screen_plot_dt[is.finite(effect) & is.finite(screen_R2)]
+.p3_lim <- 1
+.p3_out <- .p3[abs(screen_R2) > .p3_lim | abs(effect) > .p3_lim, .N]
+cat(sprintf(
+  "Plot 3 clipped to |R2| and |effect| <= %g: %d of %d rows (%.1f%%) outside, not drawn.\n",
+  .p3_lim,
+  .p3_out,
+  nrow(.p3),
+  100 * .p3_out / max(1L, nrow(.p3))
+))
+print(
+  ggplot(.p3, aes(x = screen_R2, y = effect, color = sig)) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_point(alpha = .4, size = .8) +
+    coord_cartesian(
+      xlim = c(-.p3_lim, .p3_lim),
+      ylim = c(-.p3_lim, .p3_lim)
+    ) +
+    facet_grid(`Event Type` ~ feature_set, scales = "free_y") +
+    scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey60")) +
+    theme_bw() +
+    labs(
+      title = "Screen effect (real - null) vs raw R2: fingerprint unmasking",
+      x = "Raw group-LOO screen R2",
+      y = "Effect = real R2 - mean null R2",
+      color = "Significant\n(q < threshold)",
+      caption = paste(
+        "High raw R2 with effect near 0 = cell-type fingerprint (random control",
+        "loci predict as well). CLIPPED axes -- see the printed count of excluded",
+        "rows. While the out-of-fold R2 blows up, `effect` is outlier-corrupted and",
+        "is NOT comparable across rows; read q, not effect. See TODO-2 in",
+        "revision/file-changes/09-event-models-redesign.md."
+      )
+    )
+)
+ggsave(
+  file.path(plot_dir_ev, "screen_effect_vs_r2.pdf"),
+  width = 10,
+  height = 2 + 2.2 * .n_fs,
+  limitsize = FALSE
+)
+
+# Does narrowing the feature space actually recover diluted local signal? Per event,
+# compare effect across sets — the motivation for splitting the screen at all. A
+# positive local-minus-long effect means the omnibus ridge was diluting that event.
+if (.n_fs > 1L) {
+  eff_wide <- dcast(
+    screen_plot_dt[is.finite(effect)],
+    ID + `Event Type` ~ feature_set,
+    value.var = "effect"
+  )
+  .pairs <- intersect(c("short", "local"), names(eff_wide))
+  if ("long" %in% names(eff_wide) && length(.pairs) > 0L) {
+    eff_delta <- melt(
+      eff_wide,
+      id.vars = c("ID", "Event Type", "long"),
+      measure.vars = .pairs,
+      variable.name = "feature_set",
+      value.name = "effect"
+    )[is.finite(effect) & is.finite(long)]
+    eff_delta[, delta := effect - long]
+    cat("Effect gain from narrowing the feature space (vs `long`):\n")
+    print(eff_delta[,
+      .(
+        n = .N,
+        median_delta = round(median(delta), 4),
+        pct_improved = round(100 * mean(delta > 0), 1)
+      ),
+      by = .(`Event Type`, feature_set)
+    ][order(`Event Type`, feature_set)])
+
+    .ed_lim <- 1
+    .ed_out <- eff_delta[abs(long) > .ed_lim | abs(effect) > .ed_lim, .N]
+    cat(sprintf(
+      "Clipped to |effect| <= %g on both axes: %d of %d points (%.1f%%) not drawn.\n",
+      .ed_lim,
+      .ed_out,
+      nrow(eff_delta),
+      100 * .ed_out / max(1L, nrow(eff_delta))
+    ))
+    print(
+      ggplot(eff_delta, aes(x = long, y = effect, color = `Event Type`)) +
+        coord_cartesian(
+          xlim = c(-.ed_lim, .ed_lim),
+          ylim = c(-.ed_lim, .ed_lim)
+        ) +
+        geom_abline(
+          slope = 1,
+          intercept = 0,
+          linetype = "dashed",
+          color = "grey40"
+        ) +
+        geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+        geom_vline(xintercept = 0, linetype = "dotted", color = "grey60") +
+        geom_point(alpha = .3, size = .7) +
+        facet_grid(feature_set ~ `Event Type`) +
+        theme_bw() +
+        labs(
+          title = "Does a narrower feature space recover diluted local signal?",
+          x = "Effect in `long` (all epigenetic features)",
+          y = "Effect in the narrower feature set",
+          caption = paste(
+            "Dashed = equality; points above it = the narrower space beats the omnibus",
+            "ridge. NB the dilution rationale predicts local >= short >= long, but the",
+            "measured ordering is short > long > local (local is the only set that gets",
+            "WORSE), which argues against dilution as the mechanism. Axes clipped; see",
+            "the printed excluded count, and TODO-2 on effect being outlier-corrupted."
+          )
+        )
+    )
+    ggsave(
+      file.path(plot_dir_ev, "screen_effect_by_feature_set.pdf"),
+      width = 10,
+      height = 2 + 2.2 * length(.pairs),
+      limitsize = FALSE
+    )
+  }
+}
+```
+
+## 1.3 Could the test have found anything? The p-floor and the floor-free sensitivity p
+
+The exceedance p cannot go below **`1/(R_used + 1)`** — 0.00498 at SE's 200 rotations, 0.00122 at RI's
+818. BH at `q < threshold` only passes a p-value at rank *k* if `p ≤ k·q/m`. Those two facts can conflict:
+if a family's floor sits *above* what BH allows, **no event in it can pass FDR regardless of how strong
+its signal is**, and a 0-hit result there says nothing on its own. On the completed screen that is the
+situation in **every one of the six families** (`floor_can_pass = FALSE` throughout): SE needed ≥ 1,608
+events tied at the floor and has 191 / 208 / 199 (long / short / local), RI needed ≥ 22 and has
+2 / 2 / 2 — the same count in every one of RI's three feature spaces, unlike the earlier statistic
+version where RI's counts differed sharply across spaces (0 / 3 / 1). Whether that is the same 2 events
+recurring in all three spaces or 2 different events per space has not been checked.
+
+This is a distinct nuisance hypothesis from the three in §1, and it must be excluded before the negative
+result can be read:
+
+> **H4 — the test lacked the resolution to reject anything.** *Signature:* every candidate event tied at
+> exactly `1/(R_used + 1)`, and `floor_can_pass = FALSE` in the table below. A flat p-histogram does
+> **not** exclude H4 — it only excludes a broken null (H3).
+
+Raising the rotation count cannot fix it, and the reason is **not** simply that the pool is too small —
+SE's matched pool runs to ~15,000 loci. `k_at_floor` counts events that beat **every** one of their `R`
+controls, so a larger pool is a *higher* bar: if an event sits at quantile *u* among its controls,
+P(beat all R) ≈ *u*^R decays geometrically, while the BH requirement `p_floor·m/q` eases only like 1/R.
+Measured across this project's own rotation counts (under the prior, `stat_version` 4 statistic), the
+requirement eased 9× (198.5 → 22) while RI/local's `k_at_floor` fell 25× (25 → 1) — the gap got ~3×
+worse. Under the current `stat_version` 5 statistic at the same R = 818, RI/local's `k_at_floor` is 2,
+not 1 — the λ-selection change moved this specific count, though the conclusion it supports (RI's ~818
+control ceiling is far below what its k needs) is unaffected either way. RI is additionally capped: its
+~818 eligible controls are set by the RI event count itself, so no rotation setting reaches the
+thousands its measured *k* would need. Dropping low-variance events does not help either (the BH
+threshold `k·q/m` is scale-invariant, since *k* shrinks with *m*). What does fix it is a second,
+**floor-free** p-value: standardise each event's statistic by its own matched null
+(`z = (R² − mean null)/sd null`) and read the p off a reference of leave-one-out-standardised **null** z
+values pooled **within the FDR family** `(transcript_filter, Event Type, feature_set)`. Only the
+dimensionless deviation *shape* is borrowed — each event's own R² level and scale stay local, so a
+cell-type-fingerprint event (high null **mean**) still gets a small z and is not rescued by this.
+
+The family stratification is not cosmetic: pooling across Event Types measures as 1.43× anti-conservative
+for SE and 0.41× conservative for RI (α = 10⁻⁴), errors that cancel to a deceptive 1.01 when averaged over
+a 95%-SE sample. Within-family it is 1.00 (SE) / 0.91–1.05 (RI). A median/MAD scale is 2.6–5.2×
+anti-conservative and must not be substituted.
+
+**This is a sensitivity analysis, not the primary result.** `sig` and the Tier-2 hit list stay on the
+exceedance p, which assumes only that an event's own controls are exchangeable with it; the pooled-z p
+additionally assumes a family-common deviation shape. Two independent constructions agreeing is the
+claim; the pooled-z alone is the weaker of the two.
+
+*Deduction if both give 0 hits (the current state):* the negative result is not an artifact of resolution —
+it survives a construction with ~4 orders more of it.
+*Deduction if pooled-z yields hits where the exceedance p could not:* those are candidates the floor was
+hiding, but they inherit the extra assumption, so check the calibration ratio for that family and the
+effect-size guard below before treating any as real.
+
+```{r screen-floor-sensitivity}
+# (a) p-FLOOR ARITHMETIC per FDR family -- can the primary statistic pass at all?
+screen_min_effect <- getOption("EpiATLAS_AS_SCREEN_MIN_EFFECT", 0)
+.has_tf <- "transcript_filter" %in% names(screen_dt)
+.by <- if (.has_tf) {
+  c("transcript_filter", "Event Type", "feature_set")
+} else {
+  c("Event Type", "feature_set")
+}
+floor_tab <- screen_dt[
+  is.finite(p_emp),
+  {
+    m <- .N
+    fl <- 1 / (max(R_used, na.rm = TRUE) + 1)
+    k <- sum(p_emp <= fl + 1e-12 & effect > screen_min_effect, na.rm = TRUE)
+    .(
+      m_tests = m,
+      p_floor = signif(fl, 3),
+      k_at_floor = k,
+      bh_allows = if (k > 0L) {
+        signif(k * screen_q_threshold / m, 3)
+      } else {
+        NA_real_
+      },
+      floor_can_pass = k > 0L && fl <= k * screen_q_threshold / m,
+      k_needed = ceiling(fl * m / screen_q_threshold)
+    )
+  },
+  by = .by
+]
+cat("Can the primary (exceedance) p clear FDR in each family?\n")
+print(floor_tab[order(`Event Type`, feature_set)])
+if (any(!floor_tab$floor_can_pass)) {
+  cat(
+    "\n!! floor_can_pass = FALSE above: in those families NO event could pass FDR\n",
+    "   via the exceedance p at this rotation count, whatever its signal. A 0-hit\n",
+    "   result there is uninterpretable WITHOUT the sensitivity p below.\n"
+  )
+}
+
+# (b) PRIMARY vs SENSITIVITY, side by side.
+if (!"p_pooled_z" %in% names(screen_dt)) {
+  cat("\nNo `p_pooled_z` column. Which of the two reasons applies:\n")
+  if (!file.exists(.screen_results_file)) {
+    cat(
+      "  -> screen_results.csv.gz does NOT exist, so screen_dt came from the PER-EVENT\n",
+      "     fallback path, which computes only a BH-proxy q. The sensitivity p needs the\n",
+      "     null sidecars AND the family-stratified reference, and only 09s-aggregate.R\n",
+      "     builds those. Run it once the screen completes -- nothing is stale here.\n"
+    )
+  } else {
+    cat(
+      "  -> the aggregate exists but predates the sensitivity p; re-run 09s-aggregate.R\n",
+      "     (needs the screen/*_screen_null.csv.gz sidecars).\n"
+    )
+  }
+} else if (!any(is.finite(screen_dt$p_pooled_z))) {
+  cat(
+    "\n`p_pooled_z` present but all NA -- the null sidecars were missing or unreadable\n",
+    "when 09s-aggregate.R ran.\n"
+  )
+} else {
+  cmp <- screen_dt[
+    is.finite(p_emp),
+    .(
+      n_tested = .N,
+      min_p_primary = signif(min(p_emp, na.rm = TRUE), 3),
+      min_p_pooled_z = signif(min(p_pooled_z, na.rm = TRUE), 3),
+      hits_primary = sum(
+        is.finite(q) & q < screen_q_threshold & effect > screen_min_effect,
+        na.rm = TRUE
+      ),
+      hits_pooled_z = sum(
+        is.finite(q_pooled_z) &
+          q_pooled_z < screen_q_threshold &
+          effect > screen_min_effect,
+        na.rm = TRUE
+      )
+    ),
+    by = .by
+  ]
+  cat("\nHit counts and resolution, primary vs floor-free sensitivity p:\n")
+  print(cmp[order(`Event Type`, feature_set)])
+
+  # (c) EFFECT-SIZE GUARD. A large z can come from a collapsed denominator rather
+  # than signal: null_R2_sd is never 0 (min ~1e-5) but can be proportionally tiny,
+  # so an event with R2 = 0.005 and null sd = 3e-4 scores z = 17 on no real signal.
+  # Effect size -- not null sd -- is the instrument that separates these.
+  top <- screen_dt[is.finite(p_pooled_z)][order(p_pooled_z)][
+    seq_len(min(15L, .N)),
+    .(
+      ID,
+      `Event Type`,
+      feature_set,
+      n_samples,
+      screen_R2 = signif(screen_R2, 3),
+      null_R2_sd = signif(null_R2_sd, 3),
+      z = round(z_screen, 1),
+      effect = signif(effect, 3),
+      p_pooled_z = signif(p_pooled_z, 3),
+      q_pooled_z = signif(q_pooled_z, 3),
+      artifact_suspect = effect < 0.01
+    )
+  ]
+  cat(
+    "\nTop events by the sensitivity p (artifact_suspect = effect < 0.01,\n",
+    "i.e. z inflated by a small null sd rather than by signal):\n"
+  )
+  print(top)
+  cat(sprintf(
+    "\n%d of the top %d have effect < 0.01. screen_min_effect is currently %g;\n raise EpiATLAS_AS_SCREEN_MIN_EFFECT to exclude them from hit calls.\n",
+    sum(top$artifact_suspect),
+    nrow(top),
+    screen_min_effect
+  ))
+
+  print(
+    ggplot(
+      screen_dt[is.finite(p_pooled_z) & is.finite(p_emp)],
+      aes(x = p_emp, y = p_pooled_z)
+    ) +
+      geom_point(alpha = .2, size = .6) +
+      scale_y_log10() +
+      geom_hline(
+        yintercept = floor_tab$bh_allows[1],
+        linetype = "dashed",
+        color = "firebrick"
+      ) +
+      facet_grid(feature_set ~ `Event Type`) +
+      theme_bw() +
+      labs(
+        title = "Floor-free sensitivity p vs floored primary p",
+        x = "Exceedance p (vertical stripe at its 1/(R+1) floor)",
+        y = "Pooled-z p (log scale)",
+        caption = paste(
+          "The primary p piles into a vertical stripe at its floor; the sensitivity p",
+          "spreads those events out. Dashed = the BH threshold the primary p could not",
+          "reach. Points below it are events the floor was hiding."
+        )
+      )
+  )
+  ggsave(
+    file.path(plot_dir_ev, "screen_floor_sensitivity.pdf"),
+    width = 10,
+    height = 2 + 2.2 * max(1L, uniqueN(screen_dt$feature_set)),
+    limitsize = FALSE
+  )
+}
+```
+
+## 1.4 Per-event null distributions: the raw material behind each p-value
+
+Everything above summarises the null by its mean and SD. This shows the null itself: for a selected
+`(event, feature set)` pair, the histogram of that event's `R_used` matched-control R² values (818 for
+RI, 200 for SE) with the event's own real R² drawn as a vertical line. The empirical p *is* the tail mass to the right of that line
+(`p = (1 + #{null ≥ real}) / (1 + R_used)`), so the plot and the p-value are the same fact shown two ways.
+
+*Expected for a hit:* the line sits in the far right tail, clear of the bulk.
+*Expected for a fingerprint event:* the line sits inside the bulk — often at a **high absolute R²**,
+which is exactly the point: the controls reach the same R².
+*Deduction if a null distribution is bimodal or extremely wide:* the matched-control pool is
+heterogeneous for that event (e.g. controls with very different feature availability), so its p-value is
+noisier than the summary table suggests — worth checking `R_used` for that event.
+
+A panel is an `(event, feature set)` **pair**, not an event, since the same event has a different real R²
+and a different null in each space; seeing one event across its three spaces side by side is the useful
+comparison. Panels are capped (all significant pairs first, then top-by-effect) and only the selected
+events' sidecar files are read — the full set is tens of thousands of files.
+
+```{r screen-null-histograms}
+# Per-event null-distribution histograms: real screen_R2 (vertical line) over the
+# R_used matched feature-rotation null R2 values (818 for RI, 200 for SE). These are
+# the SAME quantity
+# the empirical p is computed from (p = (1 + #{null >= real}) / (1 + R_used)), so
+# a real line far in the right tail = small p = event-specific epigenetic signal;
+# a real line buried in the bulk = fingerprint / no signal.
+# Which panels to draw is decided from screen_dt ALONE, so the file selection happens
+# FIRST: the full sidecar set is ~34k files / hundreds of MB at genome scale, and
+# reading all of it to then plot <=24 panels dominated the render. Read only the
+# events actually drawn.
+#
+# A facet is an (event, feature_set) PAIR, not an event — the same event has a
+# different real R2 and a different null in each feature space, which is exactly the
+# comparison worth seeing. Draw every significant pair, then top-by-effect, capped so
+# the full-run set can't explode the grid.
+max_facets <- 24L
+.key <- c("ID", "feature_set")
+screen_pairs <- copy(screen_dt)[, feature_set := as.character(feature_set)]
+hit_pairs <- screen_pairs[sig %in% TRUE, .(ID, feature_set)]
+top_pairs <- screen_pairs[is.finite(effect)][order(-effect), .(ID, feature_set)]
+plot_pairs <- unique(rbindlist(list(hit_pairs, top_pairs)))
+plot_pairs <- plot_pairs[seq_len(min(max_facets, nrow(plot_pairs)))]
+
+null_files <- file.path(
+  event_dir,
+  "screen",
+  sprintf("%d_screen_null.csv.gz", unique(plot_pairs$ID))
+)
+null_files <- null_files[file.exists(null_files)]
+
+if (nrow(plot_pairs) == 0L || length(null_files) == 0L) {
+  message(
+    "No screen_null sidecars for the selected events — skipping per-event ",
+    "null histograms. (Re-run 09s-ridge-screen.R to populate them.)"
+  )
+} else {
+  null_long <- rbindlist(lapply(null_files, fread), fill = TRUE)
+  null_long[, ID := as.integer(ID)]
+  # Sidecars written before the per-feature-set screen hold the omnibus null = `long`.
+  if (!"feature_set" %in% names(null_long)) {
+    null_long[, feature_set := "long"]
+  }
+  null_long[, feature_set := as.character(feature_set)]
+  null_long <- null_long[is.finite(null_R2)]
+
+  n_omitted <- nrow(unique(screen_pairs[
+    is.finite(effect),
+    .(ID, feature_set)
+  ])) -
+    nrow(plot_pairs)
+  if (n_omitted > 0L) {
+    message(sprintf(
+      "Null histograms: drawing %d (event × feature set) panel(s) (%d significant + top-by-effect); %d omitted.",
+      nrow(plot_pairs),
+      nrow(hit_pairs),
+      n_omitted
+    ))
+  }
+
+  nd <- null_long[plot_pairs, on = .key, nomatch = NULL]
+  # Per-(event, feature_set) real value + significance + a compact facet label.
+  ev_lab <- screen_pairs[
+    plot_pairs,
+    on = .key,
+    nomatch = NULL
+  ][, .(ID, feature_set, screen_R2, p_emp, q, sig)]
+  ev_lab[event_dt, on = "ID", `Event Type` := `Event Type`]
+  ev_lab[,
+    facet := sprintf(
+      "ID %d (%s) [%s]\nR2=%.3f p=%.2g q=%.2g%s",
+      ID,
+      `Event Type`,
+      feature_set,
+      screen_R2,
+      p_emp,
+      q,
+      fifelse(sig %in% TRUE, " *", "")
+    )
+  ]
+  nd[ev_lab, on = .key, facet := facet]
+  vlines <- ev_lab[, .(ID, feature_set, facet, screen_R2, sig)]
+
+  print(
+    ggplot(nd, aes(x = null_R2)) +
+      geom_histogram(bins = 30, fill = "grey70", color = NA) +
+      geom_vline(
+        data = vlines,
+        aes(xintercept = screen_R2, color = sig %in% TRUE),
+        linewidth = 0.7
+      ) +
+      facet_wrap(~facet, scales = "free") +
+      scale_color_manual(
+        values = c(`TRUE` = "firebrick", `FALSE` = "steelblue"),
+        labels = c(`TRUE` = "significant", `FALSE` = "not sig"),
+        name = "real R2 (event)"
+      ) +
+      theme_bw(base_size = 10) +
+      labs(
+        title = "Tier-1: real partial-R2 vs its matched feature-rotation null (per event × feature set)",
+        x = "R2 (grey = null control loci; line = this event's real R2)",
+        y = "Number of null control loci",
+        caption = paste(
+          "One panel per (event, feature set): each grey histogram = that event's",
+          "matched-control null R2 computed in THAT feature space, with the vertical",
+          "line that event's own real R2 in the same space. Right-tail line = small",
+          "empirical p = event-specific signal. * = FDR-significant (q < threshold",
+          "FDR within tf x Event Type x feature set)."
+        )
+      )
+  )
+  ggsave(
+    file.path(plot_dir_ev, "screen_null_histograms.pdf"),
+    width = 14,
+    height = 10
+  )
+}
 ```
 
 ```{r load-en-tables, eval = en_available, cache = TRUE, dependson = "load-tier1-screen"}
@@ -723,928 +1759,6 @@ if (en_available) {
     uniqueN(emp_p_dt$ID),
     sum(emp_p_dt$sig %in% TRUE)
   ))
-}
-```
-
-# 1. Tier 1 — the ridge screen: is any event predictable beyond its matched null?
-
-This section decides significance for **every** event; nothing downstream can add an event the screen
-did not select. `09s-ridge-screen.R` computes, per event and per feature space, a closed-form
-group-leave-one-ontology-out ridge **partial-R²** — the variance in PSI explained by epigenetics *after*
-protocol, gene expression and TSS distance are absorbed as unpenalised confounds — then re-computes that
-same statistic on ~200 **matched control loci** (same event type, same variability tier, different
-chromosome) while keeping this event's PSI. That gives an empirical p, and `09s-aggregate.R` turns the
-p-values into FDR **q** within each (`transcript_filter`, `Event Type`, `feature_set`) group.
-
-**An event is significant when `q < threshold` AND `effect > 0`**, where `effect = real R² − mean(null R²)`.
-Both conditions are load-bearing: `q` controls the false-discovery rate, `effect > 0` enforces the
-*direction* (the real locus must beat its null, not merely differ from it).
-
-### The order of this section is the argument
-
-The QC/calibration chunk comes **first, on purpose**. A hit list from a miscalibrated null is
-meaningless, so the null is audited before any result is read:
-
-1. **`screen-diagnostics`** — is the null honest, is the fingerprint pattern present, is the
-   negative-R² tail explained?
-2. **`screen-significance-plots`** — the actual per-group results and hit counts.
-3. **`screen-null-histograms`** — the raw material: where each real R² falls inside its own null.
-
-### Hypotheses this section discriminates between
-
-- **H1 — genuine event-specific epigenetic control.** Some events' local chromatin predicts their PSI
-  better than unrelated loci do. *Signature:* an excess of events in the leftmost p bin over uniform,
-  `effect > 0` concentrated in those events, and surviving q.
-- **H2 — cell-type fingerprint only.** All apparent predictability is shared cell-type identity.
-  *Signature:* flat p histogram, `effect ≈ 0` at every raw-R² level *including the highest*, no
-  survivors after FDR. High-R² events are the clearest fingerprint cases, not the best hits.
-- **H3 — broken/optimistic null** (a nuisance hypothesis that must be excluded before H1 or H2 can be
-  read). *Signature:* p piling up toward 0 monotonically across all bins, or an implausibly large
-  fraction of `effect > 0`.
-
-H2 vs H1 is the manuscript's central question; H3 is why the diagnostics run first.
-
-## 1.1 Screen QC: is the null honest? (read this before the results)
-
-Three checks, each with an expected shape and a specific failure mode:
-
-**(1) Null calibration — empirical-p distribution, per (Event Type x feature set).**
-*Expected under no genome-wide signal:* flat (uniform), because a matched control locus should beat the
-real locus about as often as chance dictates.
-*Expected under genuine signal:* flat, **plus** a bump in the leftmost bin — the hits.
-*Failure:* a monotone pile-up toward 0 across all bins means the null is systematically too weak
-(controls handicapped somehow — e.g. mismatched sample sets or fewer usable features), and **no hit list
-from this run can be trusted**. Checked per **family** — `(Event Type, feature_set)`, the unit the FDR is actually computed in — not
-per feature set alone. SE outnumbers RI ~18:1, so a pooled panel is an SE panel and an RI-specific
-failure would be invisible in it; the two types' nulls are also measurably different (KS p = 0.0072 on
-their standardised null z). Every table and panel in this subsection is grouped that way.
-
-**(2) Fingerprint check — `effect` and p within raw-R² strata.**
-*Hypothesis:* if predictability were event-specific, the best-predicted events would also be the ones
-that most beat their null, so `effect` should rise with raw R².
-*Fingerprint prediction (H2):* `effect` stays ≈ 0 and median p stays ≈ 0.5 **even in the highest R²
-stratum** — a random locus predicts those events just as well.
-*Deduction if the highest-R² stratum shows near-zero effect:* raw R² is measuring cell-type identity,
-and any published ranking of "most epigenetically predictable events" built on R² alone is a ranking of
-fingerprint strength.
-
-**(3) Negative-R² tail vs sample size.**
-Group-LOO R² can go sharply negative; the question is whether that is a bug or expected instability.
-*Expected:* the negative tail concentrates in **small-n** events, where holding out a whole ontology
-group removes a large share of the data. It should also shrink from `long` → `local` as the p ≫ n
-pressure eases.
-*Deduction if very negative R² appears at large n, or does not ease as features are dropped:* suspect a
-data or confound-partition problem rather than small-sample noise.
-
-**(4) Silently voided events (`stat_version` ≥ 2 only).** The leak-fixed statistic fits the confound design
-per fold on training rows, but its constant-column guard is evaluated over *all* rows — so a fold whose
-training subset makes a confound constant yields a rank-deficient design, an `NA` out-of-fold residual, and
-an `NA` R² for the whole event. `screen_CCC` does **not** fail with it: `.ccc()` filters non-finite pairs
-and returns a value computed on the survivors, which looks valid.
-*Signature:* `screen_R2` NA with a **finite** `screen_CCC`, `R_used == 0`, and no `note`.
-*Expected:* a small percentage, concentrated at low `n_samples`.
-*Deduction:* those events are **excluded, not tested** — so they cannot produce false positives, but the
-loss is non-random (it hits exactly the low-*n* stratum check 3 examines), and any `screen_CCC` reported for
-them is computed on an unknown subset and must not be quoted.
-
-**(5) Is `effect` still a usable effect size?** `effect = screen_R2 − mean(null_R2)` is **mean**-based, so a
-single exploded null value corrupts it; `p_emp` is **rank**-based and does not care.
-*Expected if healthy:* the fraction with `effect > 0` is broadly consistent with the fraction at small
-`p_emp`, and median `effect` does not flip sign across `|screen_R2|` strata.
-Note that `effect > 0` at ~50% alongside `p_emp ≤ 0.05` at ~5% is **healthy**, not contradictory —
-`effect` is a symmetric difference, so half of it is positive under the null. The pathology is `effect > 0`
-drifting far from 50% (e.g. 77%) *together with* a material fraction of `|screen_R2| > 1`, which means the
-null mean is being dragged by exploded out-of-fold predictions.
-*Deduction if that happens:* the `effect > 0` clause of the hit rule has stopped carrying information and is
-passing events for numerical reasons. Use `q` alone for inference, treat `effect` as unreportable, and see
-`revision/file-changes/09-event-models-redesign.md` TODO-2.
-
-```{r screen-diagnostics}
-sd_fin <- screen_dt[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
-sd_fin[event_dt, Variability := `Variability`, on = "ID"]
-
-# EVERY diagnostic below is grouped by (Event Type x feature_set) — the FDR family,
-# NOT feature_set alone.
-#
-# This matters more than it looks. SE outnumbers RI ~18:1 (32,368 vs 1,776 events),
-# so anything pooled across event types is an SE diagnostic with RI invisible: RI's
-# null could be badly miscalibrated and the pooled p-histogram would still look
-# flat. And the two event types demonstrably differ — a KS test on their
-# leave-one-out standardised null z gives p = 0.0072, with q99.99 of 9.73 (SE) vs
-# 5.93 (RI). This is the same trap that made a pooled-z reference read as calibrated
-# at ratio 1.01 while actually being 1.43x anti-conservative for SE and 0.41x
-# conservative for RI: majority-class dominance hiding a minority-class failure.
-# Diagnose in the unit the inference is done in.
-.diag_by <- c("Event Type", "feature_set")
-
-# Coverage per family: rotations used, n_features (the point of the split), and
-# degenerate-event notes (NA = fit fine).
-cat("Screen coverage per Event Type x feature set:\n")
-# NB every summary must have a TYPE-STABLE result across groups: median() on an
-# integer column returns integer for odd-length groups but double for even-length
-# ones, which makes data.table abort with "Column N ... is type 'double' but
-# expecting type 'integer'" as soon as the groups differ in parity. Hence the
-# explicit as.double()/as.integer() casts — do not drop them.
-print(screen_dt[,
-  .(
-    n_events = .N,
-    finite_p = sum(is.finite(p_emp)),
-    median_features = as.double(median(n_features, na.rm = TRUE)),
-    R_used_median = as.double(median(R_used, na.rm = TRUE)),
-    R_used_below_max = sum(R_used < max(R_used, na.rm = TRUE), na.rm = TRUE)
-  ),
-  by = .diag_by
-][order(`Event Type`, feature_set)])
-cat("Degenerate-event notes (NA = screened cleanly):\n")
-print(screen_dt[, .N, by = c(.diag_by, "note")][order(
-  `Event Type`,
-  feature_set,
-  -N
-)])
-
-# (1) NULL CALIBRATION — p_emp should be ~flat under the null. A broken/optimistic
-# null piles p toward 0 across all bins; genuine signal shows only as a modest
-# excess in the leftmost bin over the uniform (dashed) line.
-# Calibration must be checked PER FAMILY (Event Type x feature set) — each is its
-# own set of tests with its own FDR, so one family's null can be broken while
-# another's is fine, and a pooled panel would hide it (see .diag_by above).
-n_bins <- 100L
-.unif_dt <- sd_fin[, .(y = .N / n_bins), by = .diag_by]
-print(
-  ggplot(sd_fin, aes(x = p_emp)) +
-    geom_histogram(
-      breaks = seq(0, 1, 1 / n_bins),
-      fill = "grey70",
-      color = "white"
-    ) +
-    geom_hline(
-      data = .unif_dt,
-      aes(yintercept = y),
-      linetype = "dashed",
-      color = "firebrick"
-    ) +
-    facet_grid(
-      factor(`Event Type`, levels = to_analyze) + Variability ~ feature_set,
-      scales = "free_y"
-    ) +
-    theme_bw() +
-    labs(
-      title = "Tier-1 null calibration: empirical p per Event Type x feature set",
-      x = "Empirical p (matched feature-rotation null)",
-      y = "Number of events",
-      caption = paste(
-        "Dashed = uniform expectation (per panel). Flat = well-calibrated null; excess",
-        "in the leftmost bin = genome-wide signal; a monotone pile-up toward 0 would",
-        "indicate an optimistic (broken) null. Read RI on its own: it is ~5% of events,",
-        "so pooling it with SE would hide an RI-specific failure entirely."
-      )
-    )
-)
-ggsave(
-  file.path(plot_dir_ev, "screen_pvalue_calibration.pdf"),
-  width = 3 + 3 * max(1L, uniqueN(sd_fin$`Event Type`)),
-  height = 2 + 2.2 * max(1L, uniqueN(sd_fin$feature_set)),
-  limitsize = FALSE
-)
-
-# (2) FINGERPRINT — effect & p within raw-R2 strata. High raw R2 with effect ≈ 0
-# and non-small p = cell-type fingerprint, not event-specific signal (binned
-# complement to screen_effect_vs_r2.pdf).
-sd_fin[,
-  r2_stratum := cut(
-    screen_R2,
-    c(-Inf, 0, 0.1, 0.2, 0.5, Inf),
-    labels = c("<=0", "(0,0.1]", "(0.1,0.2]", "(0.2,0.5]", ">0.5")
-  )
-]
-cat(
-  "Fingerprint check — effect & p within raw-R2 strata, per Event Type x feature set:\n"
-)
-print(sd_fin[,
-  .(
-    n = .N,
-    median_R2 = round(median(screen_R2), 3),
-    median_effect = round(median(effect), 4),
-    pct_effect_pos = round(100 * mean(effect > 0), 1),
-    median_p = round(median(p_emp), 3)
-  ),
-  by = c(.diag_by, "r2_stratum")
-][order(`Event Type`, feature_set, r2_stratum)])
-
-# (3) SMALL-n INSTABILITY — very-negative group-LOO R2 concentrates in small
-# events (expected), not a bug. y clipped at the 1st percentile for readability.
-print(
-  ggplot(sd_fin, aes(x = n_samples, y = screen_R2, color = sig)) +
-    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-    geom_point(alpha = .3, size = .7) +
-    scale_color_manual(
-      values = c(`TRUE` = "firebrick", `FALSE` = "grey60"),
-      labels = c(`TRUE` = "significant", `FALSE` = "not sig"),
-      name = NULL
-    ) +
-    coord_cartesian(
-      ylim = c(quantile(sd_fin$screen_R2, 0.01, na.rm = TRUE), 1)
-    ) +
-    facet_grid(feature_set ~ `Event Type`) +
-    theme_bw() +
-    labs(
-      title = "Screen R2 vs sample size (very-negative R2 = small-n LOO instability)",
-      x = "n samples (event)",
-      y = "Group-LOO screen R2",
-      caption = paste(
-        "Per feature set: the p >> n regime eases as features are dropped, so the",
-        "negative-R2 tail should shrink from long -> short -> local."
-      )
-    )
-)
-ggsave(
-  file.path(plot_dir_ev, "screen_r2_vs_nsamples.pdf"),
-  width = 3 + 3 * max(1L, uniqueN(sd_fin$`Event Type`)),
-  height = 2 + 2.2 * max(1L, uniqueN(sd_fin$feature_set)),
-  limitsize = FALSE
-)
-
-# (4) SILENTLY VOIDED EVENTS. See revision/file-changes/09-event-models-redesign.md
-# TODO-1. A fold whose train rows make a confound constant gives a rank-deficient
-# design -> NA out-of-fold residual -> NA screen_R2 for the WHOLE event, while
-# .ccc() filters non-finite pairs and still returns a value. So the signature of the
-# defect is: screen_R2 NA, screen_CCC FINITE, R_used == 0, note absent.
-cat("\n=== (4) event losses and their attribution ===\n")
-screen_dt[, `:=`(
-  .r2_na = !is.finite(screen_R2),
-  .ccc_ok = is.finite(screen_CCC)
-)]
-loss_tab <- screen_dt[,
-  .(
-    n_rows = .N,
-    finite_p = sum(is.finite(p_emp)),
-    pct_finite_p = round(100 * mean(is.finite(p_emp)), 2),
-    voided_silently = sum(.r2_na & .ccc_ok), # R2 NA but CCC finite = the defect
-    voided_both = sum(.r2_na & !.ccc_ok),
-    with_note = sum(!is.na(note))
-  ),
-  by = .diag_by
-][order(`Event Type`, feature_set)]
-print(loss_tab)
-if (sum(loss_tab$voided_silently) > 0L) {
-  cat(sprintf(
-    "!! %d row(s) have screen_R2 = NA with a FINITE screen_CCC and no note.\n   Those events were EXCLUDED, not tested; their screen_CCC is computed on an\n   unknown subset of samples and must not be quoted. n_samples of affected rows:\n",
-    sum(loss_tab$voided_silently)
-  ))
-  print(summary(screen_dt[.r2_na & .ccc_ok, n_samples]))
-  cat("   (a low-n concentration is the expected signature; see TODO-1)\n")
-}
-cat("Degenerate `note` values actually recorded:\n")
-print(screen_dt[!is.na(note), .N, by = note][order(-N)])
-
-# (5) IS `effect` STILL A USABLE EFFECT SIZE? See TODO-2. `effect` is mean-based
-# (screen_R2 - mean(null_R2)) so one exploded null corrupts it; p_emp is rank-based
-# and immune. When the out-of-fold R2 blows up, `effect > 0` stops carrying
-# information — it starts passing most events for numerical reasons.
-cat(
-  "\n=== (5) numeric health of screen_R2, and whether `effect` still means anything ===\n"
-)
-mag <- rbindlist(lapply(c(1, 10, 100, 1000), function(t) {
-  data.table(
-    threshold = t,
-    n_rows = sum(abs(sd_fin$screen_R2) > t),
-    pct = round(100 * mean(abs(sd_fin$screen_R2) > t), 2)
-  )
-}))
-cat(
-  "Rows with |screen_R2| above each threshold (an honest out-of-fold R2 should sit\nnear or below 1; large values are prediction blow-ups, not signal):\n"
-)
-print(mag)
-sd_fin[, .blow := abs(screen_R2) > 10]
-cat(
-  "\nDo blow-ups track sample size / lambda? (small n + small lambda = the known cause)\n"
-)
-print(sd_fin[,
-  .(
-    n_rows = .N,
-    median_n_samples = as.double(median(n_samples, na.rm = TRUE)),
-    median_lambda = signif(median(lambda, na.rm = TRUE), 3)
-  ),
-  by = .blow
-][order(.blow)])
-.pct_eff_pos <- 100 * mean(sd_fin$effect > 0, na.rm = TRUE)
-.pct_p_small <- 100 * mean(sd_fin$p_emp <= 0.05, na.rm = TRUE)
-cat(sprintf(
-  "\neffect > 0: %.1f%% of rows | p_emp <= 0.05: %.2f%%\n",
-  .pct_eff_pos,
-  .pct_p_small
-))
-sd_fin[,
-  .r2_mag := cut(
-    abs(screen_R2),
-    c(-Inf, 1, 10, 100, Inf),
-    labels = c("<=1", "(1,10]", "(10,100]", ">100")
-  )
-]
-print(sd_fin[,
-  .(
-    n = .N,
-    median_effect = signif(median(effect), 3),
-    median_null_mean = signif(median(null_R2_mean), 3),
-    pct_effect_pos = round(100 * mean(effect > 0), 1),
-    median_p = round(median(p_emp), 3)
-  ),
-  by = .r2_mag
-][order(.r2_mag)])
-# Trigger on the RIGHT signature. Under a well-behaved null, `effect > 0` sits near
-# 50% (it is a symmetric difference) while p_emp <= 0.05 sits near 5% — those two are
-# consistent, so their ratio is NOT evidence of anything. The pathology is `effect > 0`
-# drifting far from 50% (the null MEAN being dragged by exploded values) together with
-# a material blow-up fraction.
-.blow_pct <- 100 * mean(abs(sd_fin$screen_R2) > 1, na.rm = TRUE)
-.eff_skew <- abs(.pct_eff_pos - 50)
-if (.blow_pct > 5 || .eff_skew > 15) {
-  cat(sprintf(
-    "!! %.1f%% of rows have |screen_R2| > 1 and `effect > 0` holds for %.1f%% (expected\n   ~50%% under a symmetric null). `effect` is outlier-corrupted and is NOT a usable\n   effect size here: the `effect > 0` clause of the hit rule is passing events for\n   numerical reasons. Use q alone for inference; do not quote `effect` or\n   mean(screen_R2). See revision/file-changes/09-event-models-redesign.md TODO-2.\n",
-    .blow_pct,
-    .pct_eff_pos
-  ))
-} else {
-  cat(sprintf(
-    "effect looks usable: %.1f%% of rows |screen_R2| > 1, `effect > 0` at %.1f%% (~50%%\nexpected under a symmetric null).\n",
-    .blow_pct,
-    .pct_eff_pos
-  ))
-}
-# p_emp is rank-based, so it should survive the blow-ups — verify, since the whole
-# FDR rests on it.
-.pmin <- min(sd_fin$p_emp, na.rm = TRUE)
-.rmax <- max(sd_fin$R_used, na.rm = TRUE)
-cat(sprintf(
-  "\nmin p_emp = %.6g; expected floor 1/(R_used+1) = %.6g -> %s\n",
-  .pmin,
-  1 / (.rmax + 1),
-  if (abs(.pmin - 1 / (.rmax + 1)) < 1e-9) "OK" else "UNEXPECTED, investigate"
-))
-screen_dt[, c(".r2_na", ".ccc_ok") := NULL]
-sd_fin[, c(".blow", ".r2_mag") := NULL]
-```
-
-## 1.2 Screen results: hit counts, p-values, and fingerprint unmasking
-
-Only read this once section 1.1 has established the null is calibrated.
-
-**Per-group counts.** Reported by `(Event Type, feature_set)` — the exact grouping the FDR was computed
-within, so these *are* the per-family hit counts. The roll-up table beside it gives `n_sig_any_set`
-(the Tier-2 hit definition) and `n_sig_all_sets`. Because the spaces are nested, expect
-`n_sig_all_sets ≤ n_sig_any_set` and expect the two to be *close* if signal is broad, far apart if
-signal is space-specific.
-
-**Plot 2 — empirical p per event.** Same calibration logic as §1.1, now split by event type as well, so
-a signal restricted to one event type is visible. SE and RI differ in sample size and in baseline
-predictability, so their p distributions should be read separately rather than pooled.
-
-**Plot 3 — `effect` vs raw R²: the fingerprint unmasking.** The single most important plot in the
-report.
-*Expected under H2 (fingerprint):* a horizontal band at `effect ≈ 0` that extends all the way to the
-highest R², with significant points absent or scattered.
-*Expected under H1 (real signal):* points lifting off the `effect = 0` line, and — importantly — the
-lift-off need **not** be at high R². Genuine event-specific signal is expected at *modest* R² with a
-clearly-beaten null, precisely because it is not riding the cell-type axis.
-*Deduction:* the vertical position (`effect`), never the horizontal one (R²), is what identifies a hit.
-
-**Plot 4 (new) — does narrowing the feature space recover diluted signal?** Per event, `effect` in the
-narrower space vs `effect` in `long`, with the identity line drawn.
-*Hypothesis being tested:* the omnibus `long` ridge dilutes exon-local signal across hundreds of far
-chromHMM windows, so genuinely local signal should sit **above** the identity line.
-*Deduction if a substantial fraction lies above the line:* the per-feature-set split is doing real work
-and a single omnibus screen under-reports; the accompanying `median_delta` / `pct_improved` table
-quantifies it.
-*Deduction if points cluster on the line:* the far chromHMM windows were contributing neither signal nor
-meaningful dilution, and the three spaces are largely redundant for significance purposes.
-
-```{r screen-significance-plots}
-# Screen significance plots — built DIRECTLY from screen_dt (one row per event),
-# so they always render, even at 0 hits / on a partial run (independent of the EN
-# tables). Previously these were computed off emp_p_dt, which broadcasts screen
-# values across the EN (feature_set × lambda) rows and is therefore empty when
-# there are no hits.
-screen_plot_dt <- screen_dt[, .(
-  ID,
-  feature_set,
-  emp_p = p_emp,
-  q,
-  effect,
-  screen_R2,
-  sig
-)]
-screen_plot_dt[event_dt, on = "ID", `Event Type` := `Event Type`]
-screen_plot_dt[, `Event Type` := factor(`Event Type`, levels = to_analyze)]
-.n_fs <- max(1L, uniqueN(screen_plot_dt$feature_set))
-
-# Significance summary per (Event Type × feature_set) — the exact grouping the FDR
-# was computed within, so these counts are the per-group hit counts.
-print(screen_plot_dt[,
-  .(
-    n_sig = sum(sig, na.rm = TRUE),
-    n_total = sum(!is.na(q)),
-    pct_sig = round(100 * mean(sig, na.rm = TRUE), 1)
-  ),
-  by = .(`Event Type`, feature_set)
-][order(`Event Type`, feature_set)])
-
-# Roll-up: an event counts as a hit if significant in ANY feature set (Tier-2's
-# definition). Reported alongside the per-set counts because the sets are nested
-# (local ⊂ short ⊂ long), so per-set counts are not independent and don't add up.
-print(screen_plot_dt[,
-  .(n_sig_sets = sum(sig, na.rm = TRUE)),
-  by = .(`Event Type`, ID)
-][,
-  .(
-    n_events = uniqueN(ID),
-    n_sig_any_set = uniqueN(ID[n_sig_sets > 0L]),
-    n_sig_all_sets = uniqueN(ID[n_sig_sets == .n_fs])
-  ),
-  by = `Event Type`
-][order(`Event Type`)])
-
-# Plot 2: screen empirical-p per event, event type × feature set.
-print(
-  ggplot(
-    screen_plot_dt[is.finite(emp_p)],
-    aes(x = emp_p, fill = `Event Type`)
-  ) +
-    geom_histogram(bins = 100, alpha = .7, position = "identity") +
-    geom_vline(
-      xintercept = screen_q_threshold,
-      linetype = "dashed",
-      color = "red"
-    ) +
-    facet_grid(`Event Type` ~ feature_set, scales = "free_y") +
-    theme_bw() +
-    labs(
-      title = "Tier-1 ridge-screen empirical p-value (per event, per feature set)",
-      x = "Empirical p (matched feature-rotation null)",
-      y = "Number of events",
-      caption = paste(
-        "Rows = feature set (long = all epigenetic; short = drop far chromHMM;",
-        "local = drop all chromHMM). FDR is computed within each row × column cell.",
-        "Significant = q < threshold AND effect (real - mean null R2) > 0."
-      )
-    )
-)
-ggsave(
-  file.path(plot_dir_ev, "screen_pvalue.pdf"),
-  width = 10,
-  height = 2 + 2.2 * .n_fs,
-  limitsize = FALSE
-)
-
-# Plot 3: effect vs raw R² — the fingerprint unmasking. High raw R² with effect
-# ≈ 0 = cell-type fingerprint (a random locus predicts as well); only effect > 0
-# & q < threshold events pass.
-# CLIPPED, deliberately. `effect = screen_R2 - mean(null_R2)`, so while the v2
-# out-of-fold R2 blows up (see QC check 5) the y-axis is dominated by its own x-axis:
-# cor(effect, screen_R2) measured 0.988 across all rows vs -0.05 restricted to
-# |R2| <= 1. Unclipped, this panel is one dot plus a diagonal streak and shows NO
-# fingerprint structure. The excluded count is printed, not hidden.
-.p3 <- screen_plot_dt[is.finite(effect) & is.finite(screen_R2)]
-.p3_lim <- 1
-.p3_out <- .p3[abs(screen_R2) > .p3_lim | abs(effect) > .p3_lim, .N]
-cat(sprintf(
-  "Plot 3 clipped to |R2| and |effect| <= %g: %d of %d rows (%.1f%%) outside, not drawn.\n",
-  .p3_lim,
-  .p3_out,
-  nrow(.p3),
-  100 * .p3_out / max(1L, nrow(.p3))
-))
-print(
-  ggplot(.p3, aes(x = screen_R2, y = effect, color = sig)) +
-    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-    geom_point(alpha = .4, size = .8) +
-    coord_cartesian(
-      xlim = c(-.p3_lim, .p3_lim),
-      ylim = c(-.p3_lim, .p3_lim)
-    ) +
-    facet_grid(`Event Type` ~ feature_set, scales = "free_y") +
-    scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey60")) +
-    theme_bw() +
-    labs(
-      title = "Screen effect (real - null) vs raw R2: fingerprint unmasking",
-      x = "Raw group-LOO screen R2",
-      y = "Effect = real R2 - mean null R2",
-      color = "Significant\n(q < thresh, effect > 0)",
-      caption = paste(
-        "High raw R2 with effect near 0 = cell-type fingerprint (random control",
-        "loci predict as well). CLIPPED axes -- see the printed count of excluded",
-        "rows. While the out-of-fold R2 blows up, `effect` is outlier-corrupted and",
-        "is NOT comparable across rows; read q, not effect. See TODO-2 in",
-        "revision/file-changes/09-event-models-redesign.md."
-      )
-    )
-)
-ggsave(
-  file.path(plot_dir_ev, "screen_effect_vs_r2.pdf"),
-  width = 10,
-  height = 2 + 2.2 * .n_fs,
-  limitsize = FALSE
-)
-
-# Does narrowing the feature space actually recover diluted local signal? Per event,
-# compare effect across sets — the motivation for splitting the screen at all. A
-# positive local-minus-long effect means the omnibus ridge was diluting that event.
-if (.n_fs > 1L) {
-  eff_wide <- dcast(
-    screen_plot_dt[is.finite(effect)],
-    ID + `Event Type` ~ feature_set,
-    value.var = "effect"
-  )
-  .pairs <- intersect(c("short", "local"), names(eff_wide))
-  if ("long" %in% names(eff_wide) && length(.pairs) > 0L) {
-    eff_delta <- melt(
-      eff_wide,
-      id.vars = c("ID", "Event Type", "long"),
-      measure.vars = .pairs,
-      variable.name = "feature_set",
-      value.name = "effect"
-    )[is.finite(effect) & is.finite(long)]
-    eff_delta[, delta := effect - long]
-    cat("Effect gain from narrowing the feature space (vs `long`):\n")
-    print(eff_delta[,
-      .(
-        n = .N,
-        median_delta = round(median(delta), 4),
-        pct_improved = round(100 * mean(delta > 0), 1)
-      ),
-      by = .(`Event Type`, feature_set)
-    ][order(`Event Type`, feature_set)])
-
-    .ed_lim <- 1
-    .ed_out <- eff_delta[abs(long) > .ed_lim | abs(effect) > .ed_lim, .N]
-    cat(sprintf(
-      "Clipped to |effect| <= %g on both axes: %d of %d points (%.1f%%) not drawn.\n",
-      .ed_lim,
-      .ed_out,
-      nrow(eff_delta),
-      100 * .ed_out / max(1L, nrow(eff_delta))
-    ))
-    print(
-      ggplot(eff_delta, aes(x = long, y = effect, color = `Event Type`)) +
-        coord_cartesian(
-          xlim = c(-.ed_lim, .ed_lim),
-          ylim = c(-.ed_lim, .ed_lim)
-        ) +
-        geom_abline(
-          slope = 1,
-          intercept = 0,
-          linetype = "dashed",
-          color = "grey40"
-        ) +
-        geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
-        geom_vline(xintercept = 0, linetype = "dotted", color = "grey60") +
-        geom_point(alpha = .3, size = .7) +
-        facet_grid(feature_set ~ `Event Type`) +
-        theme_bw() +
-        labs(
-          title = "Does a narrower feature space recover diluted local signal?",
-          x = "Effect in `long` (all epigenetic features)",
-          y = "Effect in the narrower feature set",
-          caption = paste(
-            "Dashed = equality; points above it = the narrower space beats the omnibus",
-            "ridge. NB the dilution rationale predicts local >= short >= long, but the",
-            "measured ordering is short > long > local (local is the only set that gets",
-            "WORSE), which argues against dilution as the mechanism. Axes clipped; see",
-            "the printed excluded count, and TODO-2 on effect being outlier-corrupted."
-          )
-        )
-    )
-    ggsave(
-      file.path(plot_dir_ev, "screen_effect_by_feature_set.pdf"),
-      width = 10,
-      height = 2 + 2.2 * length(.pairs),
-      limitsize = FALSE
-    )
-  }
-}
-```
-
-## 1.3 Could the test have found anything? The p-floor and the floor-free sensitivity p
-
-The exceedance p cannot go below **`1/(R_used + 1)`** — 0.00498 at the default 200 rotations. BH at
-`q < threshold` only passes a p-value at rank *k* if `p ≤ k·q/m`. Those two facts can conflict: if a
-family's floor sits *above* what BH allows, **no event in it can pass FDR regardless of how strong its
-signal is**, and a 0-hit result there says nothing on its own. On the completed `long` screen that was
-exactly the situation — SE needed ≥ 1,613 events tied at the floor and had 215; RI needed ≥ 88 and had 5.
-
-This is a distinct nuisance hypothesis from the three in §1, and it must be excluded before the negative
-result can be read:
-
-> **H4 — the test lacked the resolution to reject anything.** *Signature:* every candidate event tied at
-> exactly `1/(R_used + 1)`, and `floor_can_pass = FALSE` in the table below. A flat p-histogram does
-> **not** exclude H4 — it only excludes a broken null (H3).
-
-Raising the rotation count cannot fix it (the matched-control pool is smaller than the ~1,500 needed, and
-for RI smaller than the RI event count itself), and neither can dropping low-variance events (the BH
-threshold `k·q/m` is scale-invariant, since *k* shrinks with *m*). What does fix it is a second,
-**floor-free** p-value: standardise each event's statistic by its own matched null
-(`z = (R² − mean null)/sd null`) and read the p off a reference of leave-one-out-standardised **null** z
-values pooled **within the FDR family** `(transcript_filter, Event Type, feature_set)`. Only the
-dimensionless deviation *shape* is borrowed — each event's own R² level and scale stay local, so a
-cell-type-fingerprint event (high null **mean**) still gets a small z and is not rescued by this.
-
-The family stratification is not cosmetic: pooling across Event Types measures as 1.43× anti-conservative
-for SE and 0.41× conservative for RI (α = 10⁻⁴), errors that cancel to a deceptive 1.01 when averaged over
-a 95%-SE sample. Within-family it is 1.00 (SE) / 0.91–1.05 (RI). A median/MAD scale is 2.6–5.2×
-anti-conservative and must not be substituted.
-
-**This is a sensitivity analysis, not the primary result.** `sig` and the Tier-2 hit list stay on the
-exceedance p, which assumes only that an event's own controls are exchangeable with it; the pooled-z p
-additionally assumes a family-common deviation shape. Two independent constructions agreeing is the
-claim; the pooled-z alone is the weaker of the two.
-
-*Deduction if both give 0 hits (the current state):* the negative result is not an artifact of resolution —
-it survives a construction with ~4 orders more of it.
-*Deduction if pooled-z yields hits where the exceedance p could not:* those are candidates the floor was
-hiding, but they inherit the extra assumption, so check the calibration ratio for that family and the
-effect-size guard below before treating any as real.
-
-```{r screen-floor-sensitivity}
-# (a) p-FLOOR ARITHMETIC per FDR family -- can the primary statistic pass at all?
-screen_min_effect <- getOption("EpiATLAS_AS_SCREEN_MIN_EFFECT", 0)
-.has_tf <- "transcript_filter" %in% names(screen_dt)
-.by <- if (.has_tf) {
-  c("transcript_filter", "Event Type", "feature_set")
-} else {
-  c("Event Type", "feature_set")
-}
-floor_tab <- screen_dt[
-  is.finite(p_emp),
-  {
-    m <- .N
-    fl <- 1 / (max(R_used, na.rm = TRUE) + 1)
-    k <- sum(p_emp <= fl + 1e-12 & effect > screen_min_effect, na.rm = TRUE)
-    .(
-      m_tests = m,
-      p_floor = signif(fl, 3),
-      k_at_floor = k,
-      bh_allows = if (k > 0L) {
-        signif(k * screen_q_threshold / m, 3)
-      } else {
-        NA_real_
-      },
-      floor_can_pass = k > 0L && fl <= k * screen_q_threshold / m,
-      k_needed = ceiling(fl * m / screen_q_threshold)
-    )
-  },
-  by = .by
-]
-cat("Can the primary (exceedance) p clear FDR in each family?\n")
-print(floor_tab[order(`Event Type`, feature_set)])
-if (any(!floor_tab$floor_can_pass)) {
-  cat(
-    "\n!! floor_can_pass = FALSE above: in those families NO event could pass FDR\n",
-    "   via the exceedance p at this rotation count, whatever its signal. A 0-hit\n",
-    "   result there is uninterpretable WITHOUT the sensitivity p below.\n"
-  )
-}
-
-# (b) PRIMARY vs SENSITIVITY, side by side.
-if (!"p_pooled_z" %in% names(screen_dt)) {
-  cat("\nNo `p_pooled_z` column. Which of the two reasons applies:\n")
-  if (!file.exists(.screen_results_file)) {
-    cat(
-      "  -> screen_results.csv.gz does NOT exist, so screen_dt came from the PER-EVENT\n",
-      "     fallback path, which computes only a BH-proxy q. The sensitivity p needs the\n",
-      "     null sidecars AND the family-stratified reference, and only 09s-aggregate.R\n",
-      "     builds those. Run it once the screen completes -- nothing is stale here.\n"
-    )
-  } else {
-    cat(
-      "  -> the aggregate exists but predates the sensitivity p; re-run 09s-aggregate.R\n",
-      "     (needs the screen/*_screen_null.csv.gz sidecars).\n"
-    )
-  }
-} else if (!any(is.finite(screen_dt$p_pooled_z))) {
-  cat(
-    "\n`p_pooled_z` present but all NA -- the null sidecars were missing or unreadable\n",
-    "when 09s-aggregate.R ran.\n"
-  )
-} else {
-  cmp <- screen_dt[
-    is.finite(p_emp),
-    .(
-      n_tested = .N,
-      min_p_primary = signif(min(p_emp, na.rm = TRUE), 3),
-      min_p_pooled_z = signif(min(p_pooled_z, na.rm = TRUE), 3),
-      hits_primary = sum(
-        is.finite(q) & q < screen_q_threshold & effect > screen_min_effect,
-        na.rm = TRUE
-      ),
-      hits_pooled_z = sum(
-        is.finite(q_pooled_z) &
-          q_pooled_z < screen_q_threshold &
-          effect > screen_min_effect,
-        na.rm = TRUE
-      )
-    ),
-    by = .by
-  ]
-  cat("\nHit counts and resolution, primary vs floor-free sensitivity p:\n")
-  print(cmp[order(`Event Type`, feature_set)])
-
-  # (c) EFFECT-SIZE GUARD. A large z can come from a collapsed denominator rather
-  # than signal: null_R2_sd is never 0 (min ~1e-5) but can be proportionally tiny,
-  # so an event with R2 = 0.005 and null sd = 3e-4 scores z = 17 on no real signal.
-  # Effect size -- not null sd -- is the instrument that separates these.
-  top <- screen_dt[is.finite(p_pooled_z)][order(p_pooled_z)][
-    seq_len(min(15L, .N)),
-    .(
-      ID,
-      `Event Type`,
-      feature_set,
-      n_samples,
-      screen_R2 = signif(screen_R2, 3),
-      null_R2_sd = signif(null_R2_sd, 3),
-      z = round(z_screen, 1),
-      effect = signif(effect, 3),
-      p_pooled_z = signif(p_pooled_z, 3),
-      q_pooled_z = signif(q_pooled_z, 3),
-      artifact_suspect = effect < 0.01
-    )
-  ]
-  cat(
-    "\nTop events by the sensitivity p (artifact_suspect = effect < 0.01,\n",
-    "i.e. z inflated by a small null sd rather than by signal):\n"
-  )
-  print(top)
-  cat(sprintf(
-    "\n%d of the top %d have effect < 0.01. screen_min_effect is currently %g;\n raise EpiATLAS_AS_SCREEN_MIN_EFFECT to exclude them from hit calls.\n",
-    sum(top$artifact_suspect),
-    nrow(top),
-    screen_min_effect
-  ))
-
-  print(
-    ggplot(
-      screen_dt[is.finite(p_pooled_z) & is.finite(p_emp)],
-      aes(x = p_emp, y = p_pooled_z)
-    ) +
-      geom_point(alpha = .2, size = .6) +
-      scale_y_log10() +
-      geom_hline(
-        yintercept = floor_tab$bh_allows[1],
-        linetype = "dashed",
-        color = "firebrick"
-      ) +
-      facet_grid(feature_set ~ `Event Type`) +
-      theme_bw() +
-      labs(
-        title = "Floor-free sensitivity p vs floored primary p",
-        x = "Exceedance p (vertical stripe at its 1/(R+1) floor)",
-        y = "Pooled-z p (log scale)",
-        caption = paste(
-          "The primary p piles into a vertical stripe at its floor; the sensitivity p",
-          "spreads those events out. Dashed = the BH threshold the primary p could not",
-          "reach. Points below it are events the floor was hiding."
-        )
-      )
-  )
-  ggsave(
-    file.path(plot_dir_ev, "screen_floor_sensitivity.pdf"),
-    width = 10,
-    height = 2 + 2.2 * max(1L, uniqueN(screen_dt$feature_set)),
-    limitsize = FALSE
-  )
-}
-```
-
-## 1.4 Per-event null distributions: the raw material behind each p-value
-
-Everything above summarises the null by its mean and SD. This shows the null itself: for a selected
-`(event, feature set)` pair, the histogram of ~200 matched-control R² values with the event's own real R²
-drawn as a vertical line. The empirical p *is* the tail mass to the right of that line
-(`p = (1 + #{null ≥ real}) / (1 + R_used)`), so the plot and the p-value are the same fact shown two ways.
-
-*Expected for a hit:* the line sits in the far right tail, clear of the bulk.
-*Expected for a fingerprint event:* the line sits inside the bulk — often at a **high absolute R²**,
-which is exactly the point: the controls reach the same R².
-*Deduction if a null distribution is bimodal or extremely wide:* the matched-control pool is
-heterogeneous for that event (e.g. controls with very different feature availability), so its p-value is
-noisier than the summary table suggests — worth checking `R_used` for that event.
-
-A panel is an `(event, feature set)` **pair**, not an event, since the same event has a different real R²
-and a different null in each space; seeing one event across its three spaces side by side is the useful
-comparison. Panels are capped (all significant pairs first, then top-by-effect) and only the selected
-events' sidecar files are read — the full set is tens of thousands of files.
-
-```{r screen-null-histograms}
-# Per-event null-distribution histograms: real screen_R2 (vertical line) over the
-# ~200 matched feature-rotation null R2 values. The nulls are the SAME quantity
-# the empirical p is computed from (p = (1 + #{null >= real}) / (1 + R_used)), so
-# a real line far in the right tail = small p = event-specific epigenetic signal;
-# a real line buried in the bulk = fingerprint / no signal.
-# Which panels to draw is decided from screen_dt ALONE, so the file selection happens
-# FIRST: the full sidecar set is ~34k files / hundreds of MB at genome scale, and
-# reading all of it to then plot <=24 panels dominated the render. Read only the
-# events actually drawn.
-#
-# A facet is an (event, feature_set) PAIR, not an event — the same event has a
-# different real R2 and a different null in each feature space, which is exactly the
-# comparison worth seeing. Draw every significant pair, then top-by-effect, capped so
-# the full-run set can't explode the grid.
-max_facets <- 24L
-.key <- c("ID", "feature_set")
-screen_pairs <- copy(screen_dt)[, feature_set := as.character(feature_set)]
-hit_pairs <- screen_pairs[sig %in% TRUE, .(ID, feature_set)]
-top_pairs <- screen_pairs[is.finite(effect)][order(-effect), .(ID, feature_set)]
-plot_pairs <- unique(rbindlist(list(hit_pairs, top_pairs)))
-plot_pairs <- plot_pairs[seq_len(min(max_facets, nrow(plot_pairs)))]
-
-null_files <- file.path(
-  event_dir,
-  "screen",
-  sprintf("%d_screen_null.csv.gz", unique(plot_pairs$ID))
-)
-null_files <- null_files[file.exists(null_files)]
-
-if (nrow(plot_pairs) == 0L || length(null_files) == 0L) {
-  message(
-    "No screen_null sidecars for the selected events — skipping per-event ",
-    "null histograms. (Re-run 09s-ridge-screen.R to populate them.)"
-  )
-} else {
-  null_long <- rbindlist(lapply(null_files, fread), fill = TRUE)
-  null_long[, ID := as.integer(ID)]
-  # Sidecars written before the per-feature-set screen hold the omnibus null = `long`.
-  if (!"feature_set" %in% names(null_long)) {
-    null_long[, feature_set := "long"]
-  }
-  null_long[, feature_set := as.character(feature_set)]
-  null_long <- null_long[is.finite(null_R2)]
-
-  n_omitted <- nrow(unique(screen_pairs[
-    is.finite(effect),
-    .(ID, feature_set)
-  ])) -
-    nrow(plot_pairs)
-  if (n_omitted > 0L) {
-    message(sprintf(
-      "Null histograms: drawing %d (event × feature set) panel(s) (%d significant + top-by-effect); %d omitted.",
-      nrow(plot_pairs),
-      nrow(hit_pairs),
-      n_omitted
-    ))
-  }
-
-  nd <- null_long[plot_pairs, on = .key, nomatch = NULL]
-  # Per-(event, feature_set) real value + significance + a compact facet label.
-  ev_lab <- screen_pairs[
-    plot_pairs,
-    on = .key,
-    nomatch = NULL
-  ][, .(ID, feature_set, screen_R2, p_emp, q, sig)]
-  ev_lab[event_dt, on = "ID", `Event Type` := `Event Type`]
-  ev_lab[,
-    facet := sprintf(
-      "ID %d (%s) [%s]\nR2=%.3f p=%.2g q=%.2g%s",
-      ID,
-      `Event Type`,
-      feature_set,
-      screen_R2,
-      p_emp,
-      q,
-      fifelse(sig %in% TRUE, " *", "")
-    )
-  ]
-  nd[ev_lab, on = .key, facet := facet]
-  vlines <- ev_lab[, .(ID, feature_set, facet, screen_R2, sig)]
-
-  ggplot(nd, aes(x = null_R2)) +
-    geom_histogram(bins = 30, fill = "grey70", color = NA) +
-    geom_vline(
-      data = vlines,
-      aes(xintercept = screen_R2, color = sig %in% TRUE),
-      linewidth = 0.7
-    ) +
-    facet_wrap(~facet, scales = "free") +
-    scale_color_manual(
-      values = c(`TRUE` = "firebrick", `FALSE` = "steelblue"),
-      labels = c(`TRUE` = "significant", `FALSE` = "not sig"),
-      name = "real R2 (event)"
-    ) +
-    theme_bw(base_size = 10) +
-    labs(
-      title = "Tier-1: real partial-R2 vs its matched feature-rotation null (per event × feature set)",
-      x = "R2 (grey = null control loci; line = this event's real R2)",
-      y = "Number of null control loci",
-      caption = paste(
-        "One panel per (event, feature set): each grey histogram = the ~200",
-        "matched-control null R2 computed in THAT feature space, with the vertical",
-        "line that event's own real R2 in the same space. Right-tail line = small",
-        "empirical p = event-specific signal. * = FDR-significant (q < threshold",
-        "& effect > 0; FDR within tf x Event Type x feature set)."
-      )
-    )
-  ggsave(
-    file.path(plot_dir_ev, "screen_null_histograms.pdf"),
-    width = 14,
-    height = 10
-  )
 }
 ```
 
@@ -2172,7 +2286,7 @@ if (en_available) {
         y = "% events significant (FDR within tf x Event Type x feature set)",
         fill = "Feature set",
         caption = paste(
-          "Significance is the Tier-1 ridge screen's (q < threshold & effect > 0), not",
+          "Significance is the Tier-1 ridge screen's (q < threshold), not",
           "the retired 10-rotation elastic-net p <= 1/11 test. Positive result:",
           "High-Variability bars taller than Low-Variability, consistent with epigenetic",
           "signal tracking dynamic splicing -- though more PSI variance also means more",
@@ -2237,7 +2351,7 @@ if (en_available) {
   # silently desynchronises from this one (it did: the scale still keyed on the
   # retired "Significant (p <= 1/11)" text, so every significant violin fell through
   # to NA fill).
-  .sig_lab <- sprintf("Significant (q < %g, effect > 0)", screen_q_threshold)
+  .sig_lab <- sprintf("Significant (q < %g)", screen_q_threshold)
   nrob_sig_dt[
     !is.na(emp_p),
     sig_label := fifelse(sig, .sig_lab, "Not significant")
@@ -2739,7 +2853,7 @@ if (en_available) {
   #     epigenetic regulation. Flag for investigation.
 
   # Collapse Tier-1 screen significance to (ID, lambda_selection): significant if
-  # ANY feature set passes (q < threshold & effect > 0). `sig` comes from the screen
+  # ANY feature set passes (q < threshold). `sig` comes from the screen
   # via emp_p_dt, so there is no 1/11 p-floor involved any more.
   sig_collapse_dt <- emp_p_dt[,
     .(sig_any = any(sig, na.rm = TRUE)),
