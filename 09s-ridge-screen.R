@@ -62,7 +62,81 @@ if (!interactive()) {
     getOption("EpiATLAS_AS_SCREEN_ROTATIONS", 200L)
   }
 
-  screen_dir <- file.path(event_dir, "screen")
+  # --- DETECTION-FLOOR INJECTION (opt-in; unset => ZERO behaviour change) -----
+  # Positive control for the screen: replace this event's PSI with a synthetic response
+  # built from its OWN epigenetic features at a controlled effect size, keep confounds,
+  # folds and control pool byte-identical, and run the real worker. Answers "how small an
+  # effect could this screen have found?", which the 0-hit result cannot be interpreted
+  # without. See revision/EXECUTION-PLAN.md item 1.
+  #
+  # EPIATLAS_AS_SCREEN_INJECT="rho=0.05;s=10;mode=rankmap;fs=local;seed=1"
+  #   rho  target in-sample signal variance fraction. The two sanity anchors:
+  #        rho=1 is pure signal and MUST be detected -- if it is not, the harness is
+  #        broken, not the data.
+  #        rho=0 is pure noise rank-mapped onto the event's own PSI values, i.e. a
+  #        PERMUTATION of PSI across samples. It is NOT the real screen rerun (the real
+  #        PSI-sample pairing is destroyed), so do not expect identical numbers -- expect
+  #        a calibrated null: p_emp ~ Uniform and no hits. The "identical to production"
+  #        check is simply leaving the env var unset, which this block is gated on.
+  #   s    number of non-zero coefficients in the sparse random direction (default 10)
+  #   mode Three response shapes, and the differences between them decompose WHY PSI is a
+  #        hard response for a linear screen:
+  #        "gaussian" leaves the latent signal untransformed -- unbounded and exactly linear
+  #          in the features, so it is the ceiling (measured: R2 = 1.000 at rho=1).
+  #        "logit" maps it through plogis(signal * logit_scale) -- bounded in (0,1), smooth,
+  #          NO boundary mass. Isolates the cost of a monotone bounding transform per se.
+  #          No epsilon is needed here because the response is GENERATED on the logit scale
+  #          rather than transformed from observed PSI, so it never reaches 0 or 1 exactly
+  #          (unlike logit(observed PSI), where the epsilon choice moves the event ranking --
+  #          see CLAUDE.md).
+  #        "rankmap" (default) maps it onto this event's OWN observed PSI values -- preserves
+  #          the real marginal exactly, boundary mass included, still monotone (measured:
+  #          R2 = 0.518 at rho=1).
+  #        gaussian - logit  = cost of bounding.  logit - rankmap = cost of PSI's specific,
+  #        boundary-heavy marginal. Together they say how much detectability the response
+  #        distribution itself costs.
+  #   logit_scale  multiplier inside plogis for mode=logit (default 2; larger = wider spread)
+  #   fs   feature space the signal is drawn from: "local" (default) or "long"
+  .inject <- local({
+    spec <- Sys.getenv("EPIATLAS_AS_SCREEN_INJECT", "")
+    if (!nzchar(spec)) {
+      return(NULL)
+    }
+    kv <- strsplit(strsplit(spec, ";", fixed = TRUE)[[1]], "=", fixed = TRUE)
+    p <- stats::setNames(vapply(kv, function(x) x[2L], character(1)),
+      vapply(kv, function(x) x[1L], character(1)))
+    g <- function(k, default) if (k %in% names(p) && nzchar(p[[k]])) p[[k]] else default
+    if (!"rho" %in% names(p)) stop("EPIATLAS_AS_SCREEN_INJECT needs rho=")
+    rho <- as.numeric(p[["rho"]])
+    if (!is.finite(rho) || rho < 0 || rho > 1) stop("inject rho must be in [0, 1]")
+    mode <- g("mode", "rankmap")
+    if (!mode %in% c("rankmap", "gaussian", "logit")) {
+      stop("inject mode must be rankmap|gaussian|logit")
+    }
+    fs <- g("fs", "local")
+    if (!fs %in% c("local", "long")) stop("inject fs must be local|long")
+    list(rho = rho, s = as.integer(g("s", "10")), mode = mode, fs = fs,
+      seed = as.integer(g("seed", "1")),
+      logit_scale = as.numeric(g("logit_scale", "2")))
+  })
+
+  # An injection run MUST NOT write into the production screen directory -- out_file is
+  # screen/<id>_screen.csv.gz and would silently clobber the real result (and be picked up
+  # by the resume gate below as if it were real). Redirect before read_existing() runs.
+  screen_dir <- if (is.null(.inject)) {
+    file.path(event_dir, "screen")
+  } else {
+    file.path(event_dir, sprintf(
+      "screen_inject_rho%s_s%d_%s_%s%s",
+      sub("\\.", "p", format(.inject$rho, trim = TRUE)),
+      .inject$s, .inject$mode, .inject$fs,
+      if (identical(.inject$mode, "logit")) {
+        paste0("_ls", sub("\\.", "p", format(.inject$logit_scale, trim = TRUE)))
+      } else {
+        ""
+      }
+    ))
+  }
   dir.create(screen_dir, recursive = TRUE, showWarnings = FALSE)
   out_file <- file.path(screen_dir, paste0(this_id, "_screen.csv.gz"))
   null_file <- file.path(screen_dir, paste0(this_id, "_screen_null.csv.gz"))
@@ -200,6 +274,15 @@ if (!interactive()) {
       }
       dt <- data.table::rbindlist(list(existing_rows, dt), fill = TRUE)
     }
+    # provenance for injection runs -- without this an injected result is
+    # indistinguishable from a real one once it leaves this directory
+    if (!is.null(.inject)) {
+      dt[, `:=`(
+        inject_rho = .inject$rho, inject_s = .inject$s,
+        inject_mode = .inject$mode, inject_fs = .inject$fs,
+        inject_seed = .inject$seed, inject_logit_scale = .inject$logit_scale
+      )]
+    }
     write_atomic(dt, out_file)
   }
   na_rows <- function(n_samples = NA_integer_, note = NA_character_) {
@@ -271,6 +354,53 @@ if (!interactive()) {
 
   # --- confounds (Z), shared across all feature sets --------------------
   parts <- screen_partition_columns(names(feature_data), grouping_col)
+
+  # Replace PSI with the synthetic response BEFORE prep_event, so every downstream step --
+  # confound projection, folds, kernel, control rotations, p_emp -- sees it exactly as it
+  # would see real PSI. Placed after `parts` because it needs x_cols, and before `prep`
+  # because prep is built from PSI.
+  if (!is.null(.inject)) {
+    .xa <- parts$x_cols
+    .chm <- .xa[grepl("chromhmm", .xa, fixed = TRUE)]
+    .cols <- if (.inject$fs == "long") .xa else base::setdiff(.xa, .chm)
+    .X <- as.matrix(feature_data[, .cols, with = FALSE])
+    storage.mode(.X) <- "double"
+    # same standardisation the screen itself applies, so the injected direction lives on
+    # the scale the ridge will actually see
+    .sd0 <- apply(.X, 2L, stats::sd, na.rm = TRUE)
+    .X <- .X[, is.finite(.sd0) & .sd0 > 1e-8, drop = FALSE]
+    if (ncol(.X) < 1L) stop("inject: no usable feature columns for event ", this_id)
+    .mu <- colMeans(.X, na.rm = TRUE)
+    .mu[!is.finite(.mu)] <- 0
+    .X <- sweep(.X, 2L, .mu, "-")
+    .X[!is.finite(.X)] <- 0
+    .sdv <- sqrt(colSums(.X^2) / max(1L, nrow(.X) - 1L))
+    .sdv[!is.finite(.sdv) | .sdv <= 1e-8] <- 1
+    .X <- sweep(.X, 2L, .sdv, "/")
+
+    set.seed(seed_base + this_id + .inject$seed +
+      as.integer(round(1e6 * .inject$rho)))
+    .s <- min(.inject$s, ncol(.X))
+    .beta <- numeric(ncol(.X))
+    .beta[sample.int(ncol(.X), .s)] <- sample(c(-1, 1), .s, replace = TRUE)
+    .sig <- as.numeric(.X %*% .beta)
+    .sdsig <- stats::sd(.sig)
+    if (!is.finite(.sdsig) || .sdsig <= 1e-12) {
+      stop("inject: degenerate signal direction for event ", this_id)
+    }
+    .sig <- (.sig - mean(.sig)) / .sdsig
+    .ylat <- sqrt(.inject$rho) * .sig +
+      sqrt(1 - .inject$rho) * stats::rnorm(length(.sig))
+    feature_data[, PSI := switch(.inject$mode,
+      gaussian = .ylat,
+      # bounded in (0,1), smooth, no boundary mass -- isolates the cost of bounding alone
+      logit = stats::plogis(.ylat * .inject$logit_scale),
+      # rank-map onto this event's OWN observed PSI values: exact marginal, monotone
+      rankmap = sort(feature_data[["PSI"]])[rank(.ylat, ties.method = "first")]
+    )]
+    rm(.X)
+  }
+
   this_uuids <- feature_data[["uuid"]]
   confound_df <- as.data.frame(
     feature_data[, parts$confound_cols, with = FALSE]
