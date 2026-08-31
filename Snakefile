@@ -1369,9 +1369,15 @@ def _floor_targets(wildcards):
         tf=tf, rho=FLOOR_RHOS, id=ids,
     )
 
-# Scores injected events against the REAL screen's pooled-z reference (24M null z
-# values), NOT one rebuilt from the injected sample's own ~120k -- three orders coarser,
-# and the wrong question. Needs the real screen's null sidecars as an explicit input.
+# Scores injected events against the REAL screen's pooled-z reference (23.7M null z values
+# in v5), NOT one rebuilt from the injected sample's own ~120k -- three orders coarser, and
+# the wrong question.
+#
+# The scorer reads screen/*_screen_null.csv.gz at runtime via a NON-RECURSIVE list.files on a
+# pinned screen_dir, so injected sidecars under floor/ can never leak in. Those sidecars are
+# an UNDECLARED side-product of event_screen_one (only *_screen.csv.gz is a declared output),
+# so they cannot be listed here -- their presence is guaranteed transitively: screen_results
+# is an input, and it cannot be up to date unless every event_screen_one job has run.
 rule floor_score:
     input:
         scorer  = "09f-floor-score.R",
