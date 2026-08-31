@@ -169,6 +169,9 @@ ABLATION_CONFIGS = [
 ]
 
 wildcard_constraints:
+    # rho encodes a decimal, so constrain it explicitly -- an unconstrained wildcard is
+    # greedy and would match across the "/" in floor/rho{rho}/{id}_screen.csv.gz
+    rho               = r"[0-9]+(\.[0-9]+)?",
     transcript_filter = "|".join(ALL_TRANSCRIPT_FILTERS),
     event_type        = "|".join(EVENT_TYPES),
     variability       = "|".join(VARIABILITIES),
@@ -252,6 +255,7 @@ rule all:
         # Event-specific models (primary filter only — extend if needed):
         # Tier-1 ridge-screen results + Tier-2 elastic-net on hits.
         f"processed_data/event_models/{PRIMARY}/screen_results.csv.gz",
+        f"processed_data/event_models/{PRIMARY}/floor/floor_results.csv.gz",
         f"processed_data/event_models/{PRIMARY}/.done",
         # QC / diagnostic notebooks (previously standalone-only; now part of
         # the default build per user direction 2026-07-14: "all should be all")
@@ -1275,6 +1279,121 @@ checkpoint screen_aggregate:
         Rscript 09s-aggregate.R {input.cfg} > {log} 2>&1
         """
 
+# ── Step 09f: DETECTION FLOOR — the screen's positive control ─────────────────
+# "How small a locus-specific effect could this screen have found?" The 0-hit result
+# cannot be read without it: absence of evidence is only evidence of absence once the
+# resolution is stated. See revision/EXECUTION-PLAN.md item 1.
+#
+# In `rule all` deliberately: the floor is a property of the STATISTIC, so it must
+# regenerate whenever SCREEN_STAT_VERSION changes. Left out, it goes stale silently --
+# the same failure the two version stamps exist to prevent. Cost is ~3 h against the
+# screen's ~81 h.
+FLOOR_RHOS = ["0", "0.01", "0.02", "0.05", "0.1", "0.2", "0.4", "1"]
+
+# CHECKPOINT: the stratified sample is chosen FROM the screen results (blow-up status
+# depends on the statistic version), so the id list cannot be known at DAG-build time.
+checkpoint floor_sample:
+    input:
+        sampler = "09f-floor-sample.R",
+        results = "processed_data/event_models/{transcript_filter}/screen_results.csv.gz",
+        ann     = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+    output:
+        events = "processed_data/event_models/{transcript_filter}/floor/floor_events.tsv",
+    log: "logs/09f_floor_sample_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} FLOOR_OUT={output.events} \
+        Rscript 09f-floor-sample.R > {log} 2>&1
+        """
+
+# One injected screen per (event, rho). Same worker as the real screen -- a separate
+# implementation would drift from prep_event/fold logic with nothing to detect it.
+# `outdir` is passed VERBATIM so this rule owns the path; the worker refuses any outdir
+# resolving to the real screen/ directory.
+rule floor_inject_one:
+    input:
+        screen  = "09s-ridge-screen.R",
+        shared  = "09-ml-shared.R",
+        cfg     = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        session = "processed_data/session_09_1_ml_local_{transcript_filter}.rds",
+        events  = "processed_data/event_models/{transcript_filter}/floor/floor_events.tsv",
+    output:
+        row  = "processed_data/event_models/{transcript_filter}/floor/rho{rho}/{id}_screen.csv.gz",
+        null = "processed_data/event_models/{transcript_filter}/floor/rho{rho}/{id}_screen_null.csv.gz",
+    params:
+        # rho as a Snakemake param, not a bare env var: params are tracked per output, so
+        # changing rho invalidates only the injected outputs. An env var is invisible to the DAG.
+        rho       = lambda w: w.rho,
+        outdir    = lambda w: f"processed_data/event_models/{w.transcript_filter}/floor/rho{w.rho}",
+        # 200 for BOTH event types. The floor scores on p_pooled_z, which needs the null's
+        # MOMENTS, not the exceedance depth RI's 818 buys -- ~4x cheaper for RI.
+        rotations = 200,
+        mode      = "rankmap",   # preserves the real PSI marginal; ceiling ~0.52, not 1.0
+        fs        = "local",     # the only space with recovery power (rho=1 fails in long)
+        sparsity  = 10,
+    log: "logs/09f_floor/{transcript_filter}/rho{rho}/{id}.log"
+    threads: R("event_screen", "threads")
+    resources:
+        mem_mb          = R("event_screen", "mem_mb"),
+        runtime         = R("event_screen", "runtime"),
+        slurm_partition = _partition("event_screen"),
+        slurm_extra     = _extra("event_screen"),
+        qos             = _qos("event_screen"),
+        gres            = _gres("event_screen"),
+    shell:
+        """
+        OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+        EPIATLAS_AS_SCREEN_INJECT="rho={params.rho};s={params.sparsity};mode={params.mode};fs={params.fs};seed=1;rotations={params.rotations};outdir={params.outdir}" \
+        Rscript 09s-ridge-screen.R {input.cfg} {wildcards.id} {threads} > {log} 2>&1
+        """
+
+def _floor_targets(wildcards):
+    tf = wildcards.transcript_filter
+    events = checkpoints.floor_sample.get(transcript_filter=tf).output.events
+    ids = []
+    with open(events) as fh:
+        header = fh.readline()
+        for ln in fh:
+            if ln.strip():
+                ids.append(ln.split("\t")[0].strip())
+    return expand(
+        "processed_data/event_models/{tf}/floor/rho{rho}/{id}_screen.csv.gz",
+        tf=tf, rho=FLOOR_RHOS, id=ids,
+    )
+
+# Scores injected events against the REAL screen's pooled-z reference (24M null z
+# values), NOT one rebuilt from the injected sample's own ~120k -- three orders coarser,
+# and the wrong question. Needs the real screen's null sidecars as an explicit input.
+rule floor_score:
+    input:
+        scorer  = "09f-floor-score.R",
+        results = "processed_data/event_models/{transcript_filter}/screen_results.csv.gz",
+        floors  = _floor_targets,
+    output:
+        scored = "processed_data/event_models/{transcript_filter}/floor/floor_results.csv.gz",
+    log: "logs/09f_floor_score_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} FLOOR_SCORED={output.scored} \
+        Rscript 09f-floor-score.R > {log} 2>&1
+        """
+
 # ── Step 09zz: Tier-2 elastic-net — ONE job per screen HIT ────────────────────
 # 09zz writes several per-event CSVs; <id>_all_metrics.csv.gz is written LAST as
 # the completion sentinel (also written as a stub for events 09zz skips), so it
@@ -1320,6 +1439,9 @@ rule ml_analysis:
         active_chromhmm = f"processed_data/activeChromHMM_{PRIMARY}.rds",
         event_models    = f"processed_data/event_models/{PRIMARY}/.done",
         screen_results  = f"processed_data/event_models/{PRIMARY}/screen_results.csv.gz",
+        # 09-2 section 1.5 reports the detection floor and must not render against a stale
+        # or absent one -- "0 hits" is only interpretable alongside the resolution.
+        floor_results   = f"processed_data/event_models/{PRIMARY}/floor/floor_results.csv.gz",
         rmd             = "09-2-ml-local-new.Rmd",
         # global model results (all configs for primary filter)
         splicing_ml = [

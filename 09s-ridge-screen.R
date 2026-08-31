@@ -97,6 +97,21 @@ if (!interactive()) {
   #        distribution itself costs.
   #   logit_scale  multiplier inside plogis for mode=logit (default 2; larger = wider spread)
   #   fs   feature space the signal is drawn from: "local" (default) or "long"
+  #   rotations  override the per-Event-Type rotation count for THIS run only. The floor
+  #        experiment scores on p_pooled_z, which needs the null's MOMENTS (mean, sd), not the
+  #        exceedance depth RI's 818 exists to buy -- so 200 for both event types is adequate
+  #        there and ~4x cheaper for RI. Without this, cfg$screen_rotations is always set and
+  #        the getOption fallback never fires.
+  #   outdir  output directory, used VERBATIM when given, so Snakemake can OWN the path
+  #        (rule floor_inject_one) without reimplementing the derived-name scheme in Python.
+  #        Omitted => derived from event_dir plus a parameter-encoded subdirectory, as before.
+  #        NB with outdir given, uniqueness is the CALLER's responsibility -- Snakemake's
+  #        output paths are unique by construction; a human passing one outdir for two rho
+  #        values would collide.
+  #        REFUSED if it resolves to <event_dir>/screen: without the derived-path guarantee
+  #        an injection run could otherwise clobber the real screen and be picked up by the
+  #        resume gate as genuine. The parameter-derived subdirectory is always appended
+  #        UNDER outdir, so two rho values can never collide inside one outdir either.
   .inject <- local({
     spec <- Sys.getenv("EPIATLAS_AS_SCREEN_INJECT", "")
     if (!nzchar(spec)) {
@@ -117,7 +132,12 @@ if (!interactive()) {
     if (!fs %in% c("local", "long")) stop("inject fs must be local|long")
     list(rho = rho, s = as.integer(g("s", "10")), mode = mode, fs = fs,
       seed = as.integer(g("seed", "1")),
-      logit_scale = as.numeric(g("logit_scale", "2")))
+      logit_scale = as.numeric(g("logit_scale", "2")),
+      outdir = g("outdir", ""),
+      rotations = {
+        r <- g("rotations", "")
+        if (nzchar(r)) as.integer(r) else NA_integer_
+      })
   })
 
   # An injection run MUST NOT write into the production screen directory -- out_file is
@@ -126,6 +146,10 @@ if (!interactive()) {
   screen_dir <- if (is.null(.inject)) {
     file.path(event_dir, "screen")
   } else {
+    # outdir given => VERBATIM (Snakemake owns the path). Absent => event_dir + derived name.
+    if (nzchar(.inject$outdir)) {
+      .inject$outdir
+    } else {
     file.path(event_dir, sprintf(
       "screen_inject_rho%s_s%d_%s_%s%s",
       sub("\\.", "p", format(.inject$rho, trim = TRUE)),
@@ -136,6 +160,16 @@ if (!interactive()) {
         ""
       }
     ))
+    }
+  }
+  # HARD GUARD, applied to the FINAL path whichever branch produced it.
+  # normalizePath(mustWork = FALSE) so a not-yet-created dir still compares, and so a
+  # relative path like ./a/../a/screen is caught as well as the literal one.
+  if (!is.null(.inject) && identical(
+    normalizePath(screen_dir, mustWork = FALSE),
+    normalizePath(file.path(event_dir, "screen"), mustWork = FALSE)
+  )) {
+    stop("refusing to write injected results into the real screen directory")
   }
   dir.create(screen_dir, recursive = TRUE, showWarnings = FALSE)
   out_file <- file.path(screen_dir, paste0(this_id, "_screen.csv.gz"))
@@ -241,7 +275,11 @@ if (!interactive()) {
   # and escalation is deferred to Stage 2, which lifts only floor-tied events. Raising
   # every SE event instead would cost ~11 days against 1.5. Errors loudly on an unknown
   # Event Type rather than quietly using a value that decides FDR admissibility.
-  n_rotations <- resolve_screen_rotations(rotation_spec, this_et)
+  n_rotations <- if (!is.null(.inject) && !is.na(.inject$rotations)) {
+    .inject$rotations
+  } else {
+    resolve_screen_rotations(rotation_spec, this_et)
+  }
 
   # Writer + NA filler emit ONE ROW PER FEATURE SET, carrying the
   # feature_set / Event Type / transcript_filter keys the aggregator groups FDR by
