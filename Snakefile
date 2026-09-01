@@ -857,6 +857,36 @@ rule create_aggregated_dt:
 # plot_dir/{feature_umap_pca,psi_embedding}/ are runtime-discovered from the
 # data (not statically enumerable) -- html report is the tracked output, same
 # treatment as irfinder_concordance's report vs its per-tree/per-metric plots.
+# ── Step 05c: cohort counts ───────────────────────────────────────────────────
+# The MODELLED cohort (379 epirrs / 415 uuids) beside the QC/metadata SUPERSET (405 / 441), in one
+# table so neither can be read without the other -- conflating them is this project's most repeated
+# error. Promoted out of `11-paper-figures.Rmd` 2026-09-01, where it was derived inline and cached to
+# a path that was NOT a declared output: Snakemake tracked nothing, so a stale cache would have been
+# read silently. It was also the only place `11` touched aggregated_dt, against that file's own rule
+# that it stay fast. Reads 3 columns, so it is seconds.
+rule cohort_counts:
+    input:
+        script     = "05c-cohort-counts.R",
+        aggregated = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+        qc         = "processed_data/qc_summary.csv",
+    output:
+        counts = "processed_data/cohort_counts_{transcript_filter}.csv",
+    log: "logs/05c_cohort_counts_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} COHORT_OUT={output.counts} \
+        Rscript 05c-cohort-counts.R > {log} 2>&1
+        """
+
+
 rule feature_pca_sanity:
     input:
         rmd            = "05b-feature-pca-sanity.Rmd",
@@ -1634,6 +1664,7 @@ rule paper_figures:
         # them, which Nature's code-at-submission requirement makes a blocker rather than tidying.
         variance       = f"processed_data/psi_variance_decomposition_{PRIMARY}.csv",
         permuted       = f"processed_data/permuted_groups_control_{PRIMARY}.csv",
+        cohort         = f"processed_data/cohort_counts_{PRIMARY}.csv",
         # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
         # must stay fast because it re-runs on every tweak.
         cv_payloads = [

@@ -106,6 +106,7 @@ ORIGIN <- list(
   tier1 = "Tier-1 ridge screen: 09s-ridge-screen.R per event -> 09s-aggregate.R FDR; SCREEN_STAT_VERSION 5, FEATURE_TABLE_VERSION 2 [leg C]",
   floor = "Detection-floor injection sweep: 09f-floor-sample.R -> 09s-ridge-screen.R under EPIATLAS_AS_SCREEN_INJECT -> 09f-floor-score.R (scored on p_pooled_z vs the real screen's 23.7 M null-z reference) [leg C]",
   permuted = "Permuted-groups negative control, paired per event: 09p-permute-groups.R (rule permuted_groups_control), supergroup LABELS permuted so fold count and sizes are preserved exactly [leg C]",
+  candidates = "Adjudication of the floor-free pooled-z candidates: screen_results.csv.gz (Tier-1) cross-referenced against floor_results.csv.gz (the injection sweep) -- no refits, reshape only [leg C]",
   design = "fixed by experimental design; not measured"
 )
 # Set per chunk. pn()/save_fig() ERROR if it is unset, so a new chunk cannot emit an
@@ -371,36 +372,17 @@ cat(
 # Two cohorts, and conflating them is the recurring error: QC/metadata scope is 405 epirrs /
 # 441 UUIDs, the MODELLED cohort is 379 / 415. Clean superset (26 QC rows never modelled, 0
 # modelled UUIDs missing QC). The 26 are the AMED-CREST gap and ALL were mRNA-Seq.
-if (have[["cohort"]]) {
-  co <- fread(INPUTS$cohort)
-} else {
-  # Self-bootstrapping: 3 columns only, so this stays cheap. PROMOTE to its own stage (spec 6.3)
-  # -- it is the one place this file reads aggregated_dt at all.
-  warning(
-    "cohort_counts absent; deriving once from aggregated_dt (3 cols) and caching it"
-  )
-  a <- fread(
-    sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf),
-    select = c("uuid", "IHEC", "protocol")
-  )
-  u <- unique(a, by = "uuid")
-  co <- data.table(
-    scope = "modelled",
-    uuids = uniqueN(a$uuid),
-    epirrs = uniqueN(a$IHEC),
-    mrna = u[protocol == "mRNA-Seq", .N],
-    total_rna = u[protocol == "total-RNA-Seq", .N],
-    both_protocols = unique(a[, .(IHEC, protocol)])[, .N, by = IHEC][N > 1, .N]
-  )
-  rm(a, u)
-  gc()
-  # NB an UNDECLARED side effect: this path is not an output of rule paper_figures, so Snakemake
-  # does not track it. Acceptable for a cache, but it is the reason spec 6.3 wants this promoted
-  # to its own stage with a declared output.
-  fwrite(co, INPUTS$cohort)
-}
+# Read only. This used to derive the counts inline from aggregated_dt and cache them to a path that
+# was NOT a declared output of rule paper_figures -- untracked by Snakemake, so a stale cache would
+# have been read silently, on the numbers this project misquotes most often. It was also the only
+# place this file touched aggregated_dt at all, against rule 2 in the header. Promoted 2026-09-01 to
+# stage 05c (rule cohort_counts), now a declared input.
+stopifnot(have[["cohort"]])
+co_all <- fread(INPUTS$cohort)
+co <- co_all[scope == "modelled"]
+stopifnot(nrow(co) == 1L)
 qcs <- if (have[["qc"]]) fread(INPUTS$qc) else NULL
-print(co)
+print(co_all)
 
 pn(
   "cohort.uuids",
@@ -1182,6 +1164,116 @@ cat(
 )
 ```
 
+## 6b. The floor-free pooled-z candidates (leg C)
+
+**Origin:** `screen_results.csv.gz` cross-referenced against `floor_results.csv.gz`. No refits — the
+adjudication is a reshape of two aggregates this file already reads.
+
+The primary exceedance test gives **0 hits**. The floor-free sensitivity statistic `p_pooled_z` does
+not: since `stat_version` 5 it flags a handful of events, and because the two tests disagree the
+report cannot simply assert "0 hits by both". This section decides which of those flags survive, and
+states the one comparison that looks decisive but is not.
+
+```{r candidates, eval = have[["screen"]] && have[["floor"]]}
+.ORIGIN_CUR <- ORIGIN$candidates
+cand_ids <- unique(scr[is.finite(q_pooled_z) & q_pooled_z < qthr, ID])
+cand <- scr[ID %in% cand_ids & is.finite(q_pooled_z) & q_pooled_z < qthr]
+
+cat(sprintf("%d candidate events, %d candidate (event, space) rows\n\n",
+  length(cand_ids), nrow(cand)))
+print(cand[order(q_pooled_z), .(ID, `Event Type`, feature_set, n_samples,
+  screen_R2 = round(screen_R2, 4), z = round(z_screen, 1),
+  q_pz = signif(q_pooled_z, 3), null_sd = signif(null_R2_sd, 3),
+  r2_confounds = round(r2_confounds, 2), r2_x_alone = round(r2_x_alone, 3))])
+
+# The artifact/candidate boundary falls exactly on FEATURE SPACE, which is why all three are shown.
+# The `local` candidates collapse to R2 -0.5 .. -510 in long/short -- the documented out-of-support
+# extrapolation failure -- while the two `long`-only ones never qualify in `local` at all.
+cat("\n--- all three spaces per candidate event: the split is by feature space ---\n")
+print(dcast(
+  scr[ID %in% cand_ids, .(ID, `Event Type`, feature_set,
+    R2 = round(screen_R2, 3), q_pz = signif(q_pooled_z, 3))],
+  ID + `Event Type` ~ feature_set, value.var = c("R2", "q_pz")
+))
+```
+
+```{r candidates-adjudicate, eval = have[["screen"]] && have[["floor"]]}
+.ORIGIN_CUR <- ORIGIN$candidates
+# THE TEST: is a candidate's null_R2_sd anomalously tight -- i.e. is its z large because the null
+# collapsed rather than because R2 is large? Reference is the injection sweep, whose events carry
+# signal KNOWN to be present, so "what a healthy null looks like" is measured rather than assumed.
+#
+# CONDITION ON EVENT SIZE, NOT ON ACHIEVED R2. Size drives null_R2_sd independently of signal, so it
+# is the fair matching variable. Conditioning on R2 instead INVERTS the answer and is invalid --
+# see the trap documented in the next chunk.
+fvc <- fl[inject_rho <= RHO_MAX_VALID & is.finite(screen_R2) & is.finite(null_R2_sd)]
+adj <- rbindlist(lapply(seq_len(nrow(cand)), function(i) {
+  nn <- cand$n_samples[i]
+  peers <- fvc[abs(n_samples - nn) <= 0.25 * nn & screen_R2 > 0]
+  data.table(
+    ID = cand$ID[i], feature_set = cand$feature_set[i], n = nn,
+    R2 = round(cand$screen_R2[i], 4), null_sd = signif(cand$null_R2_sd[i], 3),
+    n_peers = nrow(peers),
+    null_sd_pctile = if (nrow(peers) >= 20L) {
+      round(100 * mean(peers$null_R2_sd < cand$null_R2_sd[i], na.rm = TRUE), 1)
+    } else NA_real_
+  )
+}))
+adj[, verdict := fifelse(is.na(null_sd_pctile), "unassessed",
+  fifelse(null_sd_pctile < 1, "REFUTED - variance collapse",
+    fifelse(null_sd_pctile < 20, "borderline - low null sd", "survives")))]
+print(adj[order(-R2)])
+
+for (i in seq_len(nrow(adj))) {
+  pn(sprintf("candidates.null_sd_pctile.%d", adj$ID[i]), adj$null_sd_pctile[i], "percentile",
+    INPUTS$floor,
+    filter = sprintf("%s space; vs injected events within 25%% of n = %d, positive R2 only",
+      adj$feature_set[i], adj$n[i]),
+    n = adj$n_peers[i])
+}
+pn("candidates.n_flagged", length(cand_ids), "count", INPUTS$screen,
+  filter = sprintf("distinct events with q_pooled_z < %g in any feature space", qthr))
+pn("candidates.n_survives", sum(adj$verdict == "survives"), "count", INPUTS$floor,
+  filter = "null_R2_sd at or above the 20th percentile of size-matched injected events")
+pn("candidates.n_refuted", sum(grepl("^REFUTED", adj$verdict)), "count", INPUTS$floor,
+  filter = "null_R2_sd below the 1st percentile of size-matched injected events",
+  note = "both are `long`-only, with r2_confounds -117 and -7613: confound-projection instability")
+
+# How often does the screen recover signal of the candidates' magnitude when it is KNOWN to be there?
+# This is the number that says whether 4 survivors out of 32,318 SE events is a large hidden
+# population or a handful. Restricted to numerically stable events, since blown-up ones have no
+# usable power at any effect size (section 6).
+rec <- fvc[blowup %in% FALSE & screen_R2 > 0.2]
+if (nrow(rec) >= 20L) {
+  pn("candidates.recovery_rate_at_comparable_r2", mean(rec$detected), "fraction", INPUTS$floor,
+    filter = sprintf("injected, stable, achieved R2 > 0.2, %s space, rho <= %g",
+      inj_fs, RHO_MAX_VALID),
+    n = nrow(rec),
+    note = "the screen recovers real signal of this magnitude ~1 time in 5")
+  cat(sprintf(
+    "\nrecovery of KNOWN signal at R2 > 0.2 (stable): %d of %d = %.1f%%\n",
+    sum(rec$detected), nrow(rec), 100 * mean(rec$detected)))
+}
+```
+
+```{r candidates-trap, eval = have[["screen"]] && have[["floor"]]}
+.ORIGIN_CUR <- ORIGIN$candidates
+# THE TRAP, printed rather than merely warned about, because it INVERTS the verdict and it is the
+# obvious thing to try. Matching candidates to injected events on achieved R2 instead of on n makes
+# the strongest candidate look like a ~560x outlier and "refutes" it.
+#
+# It is invalid: among REAL events, high R2 is usually PRODUCED BY the numerical instability that
+# also inflates the null, so median null_R2_sd climbs monotonically with R2. Conditioning on R2
+# therefore selects unstable events, and any well-behaved event is anomalous against them. Cause and
+# effect are entangled; size is not.
+trap <- scr[feature_set == "local" & `Event Type` == "SE" &
+  is.finite(screen_R2) & is.finite(null_R2_sd)]
+trap[, r2_bin := cut(screen_R2, c(-Inf, 0, 0.02, 0.05, 0.1, 0.2, 0.35, Inf))]
+cat("REAL SE/local events: null_R2_sd rises with R2, so R2-matching selects unstable peers\n\n")
+print(trap[, .(n = .N, med_null_sd = signif(median(null_R2_sd), 3)), by = r2_bin][order(r2_bin)])
+cat("\nMatch on n, not on R2. See the chunk comment above.\n")
+```
+
 ## 7. Ablation with sequence-only as the reference (leg A)
 
 **Origin:** `splicing_ml --feature-groups` ablation runs, seqnames-grouped CV. The **all-features** arm is not an ablation output — it is the same seqnames config section 4 reads, reused as the reference, and is attributed to that analysis in the manifest.
@@ -1435,7 +1527,48 @@ replicates <- data.table(
   ),
   tails = c(NA, "one-sided", NA, NA, NA, "two-sided")
 )
-print(replicates)
+
+# The replicate UNIT and the TEST are design facts -- not measurable, correctly literal, and
+# attributed to ORIGIN$design. The exact n is NOT a design fact, and leaving it out (or writing it by
+# hand) is how a statistics section ends up claiming an n the pipeline never produced. So n is looked
+# up from the keys already emitted above, and a missing one is an ERROR rather than a blank cell:
+# Nature requires the exact n per analysis, and an appendix that silently omits one is worse than no
+# appendix. Atlas is exempt -- leg R has no keys until the atlas summary artifact exists (section 1).
+.PN_SO_FAR <- rbindlist(.PN, fill = TRUE)
+.nkey <- function(k) {
+  v <- .PN_SO_FAR[key == k, value]
+  if (!length(v)) NA_real_ else v[1]
+}
+replicates[, n_key := c(
+  "atlas.uuids",             # absent until the atlas summary exists
+  "tier1.m_max",             # largest FDR family; set below
+  NA_character_,             # fold structure: ~5 supergroups, a property of resolve_supergroup_folds
+  "cohort.uuids",
+  "variance.n_rows_total",   # set below
+  "permuted.n_events"
+)]
+# two n's the sections above did not need as keys in their own right, emitted here so the appendix
+# can cite them rather than restate them
+if (exists("fam")) {
+  pn("tier1.m_max", max(fam$m), "count", INPUTS$screen,
+    filter = "largest (Event Type x feature_set) FDR family; events carrying a finite q",
+    origin = ORIGIN$tier1)
+}
+if (exists("vb")) {
+  pn("variance.n_rows_total", sum(vb[grepl("All", stratum), n_rows]), "count", INPUTS$variance,
+    filter = "observed (event, sample) rows, both event types, All-variability strata",
+    origin = ORIGIN$variance)
+}
+.PN_SO_FAR <- rbindlist(.PN, fill = TRUE)
+replicates[, n := vapply(n_key, function(k) if (is.na(k)) NA_real_ else .nkey(k), numeric(1))]
+print(replicates[, .(analysis, replicate_unit, n, test, tails)])
+
+.missing <- replicates[!is.na(n_key) & is.na(n) & !grepl("^Atlas", analysis)]
+if (nrow(.missing)) {
+  stop("statistics appendix: no key backs the n for ",
+    paste(.missing$analysis, collapse = ", "),
+    " -- write the key or drop the row; do not hand-fill it")
+}
 ```
 
 ## 10. Write `paper_numbers`
