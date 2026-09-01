@@ -81,7 +81,7 @@ PAL <- c(
   "#666666"
 )
 scale_fill_paper <- function(...) scale_fill_manual(values = PAL, ...)
-scale_colour_paper <- function(...) scale_colour_manual(values = PAL, ...) # used once section 5 gains a scatter
+scale_colour_paper <- function(...) scale_colour_manual(values = PAL, ...)
 
 # ---- provenance: WHICH ANALYSIS EACH NUMBER AND FIGURE ORIGINALLY CAME FROM -----------------
 # `source` records the FILE this Rmd read. That is not provenance: an aggregate CSV says nothing
@@ -113,8 +113,12 @@ ORIGIN <- list(
 .ORIGIN_CUR <- NULL
 
 # ---- figure writer -------------------------------------------------------------------------
-# Vector PDF is the deliverable. Rendering the DOCUMENT to PDF is deliberately avoided (09-2 dies
-# on bookmark.sty / TinyTeX 2021 vs remote 2026), so ggsave must not depend on that toolchain.
+# Vector PDF is the deliverable, written by ggsave. Rendering the DOCUMENT to PDF is deliberately
+# avoided: this file's YAML is html_document, so the figure artifacts never depend on the LaTeX
+# toolchain. That is not hypothetical caution -- `rule ml_analysis` sat broken for a week because
+# 09-2's YAML said pdf_document (rmarkdown::render obeys the YAML, not the .html output_file it is
+# handed) and pdflatex could not find bookmark.sty under TinyTeX 2021 against a 2026 remote. Fixed
+# 2026-09-01 by correcting that header; the lesson stands regardless.
 .FIG <- list()
 save_fig <- function(
   plot,
@@ -513,7 +517,7 @@ for (i in seq_len(nrow(vb))) {
 
 ```{r artifacts}
 .ORIGIN_CUR <- ORIGIN$ml
-# Uses auroc_of()/find_payload() from section 0. Reads the small purpose-built report payloads,
+# Uses fold_metric_of()/find_payload() from section 0. Reads the small purpose-built report payloads,
 # NOT the multi-GB splicing_ml_results pickles -- this file must stay fast enough to re-run on
 # every figure tweak.
 cfgs <- CJ(split = c("seqnames", "ontology"), et = c("RI", "SE"), unique = TRUE)
@@ -1074,6 +1078,48 @@ for (etv in unique(pw$`Event Type`)) {
   }
 }
 
+# THE SWEEP'S OWN PARAMETERS. Every power number above is conditional on these, and Nature's
+# statistics section wants the exact n -- which for section 6 is the sweep size, not the screen's.
+# They lived only in prose and comments until 2026-09-01, which meant the manuscript could quote a
+# power figure with no machine-readable record of what it was measured over. All DERIVED from the
+# artifact, so a re-run with a different grid updates them instead of contradicting them.
+pn(
+  "power.sweep_n_events",
+  uniqueN(fl$ID),
+  "count",
+  INPUTS$floor,
+  filter = sprintf("stratified sample screened under injection; %s space", inj_fs),
+  note = "8 strata: Event Type x Variability x real-PSI blow-up status"
+)
+pn(
+  "power.sweep_n_rho",
+  uniqueN(fl$inject_rho),
+  "count",
+  INPUTS$floor,
+  filter = sprintf(
+    "rho grid points: %s",
+    paste(sort(unique(fl$inject_rho)), collapse = ", ")
+  )
+)
+pn(
+  "power.rho_max_valid",
+  RHO_MAX_VALID,
+  "fraction",
+  "by construction",
+  filter = "largest rho whose response still carries noise; rho = 1 is noiseless and DEGENERATE",
+  note = "rho is a VARIANCE fraction: sqrt(rho)*signal + sqrt(1-rho)*noise"
+)
+if ("R_used" %in% names(fl)) {
+  pn(
+    "power.sweep_rotations",
+    stats::median(fl$R_used, na.rm = TRUE),
+    "count",
+    INPUTS$floor,
+    filter = "matched control rotations per injected event; 200 for BOTH event types",
+    note = "RI's production 818 buys exceedance depth the floor does not use -- it scores on p_pooled_z"
+  )
+}
+
 # 50% power is never reached at any effect size the design can represent. State it as the bound.
 pn(
   "power.max_overall",
@@ -1333,12 +1379,24 @@ for (i in seq_len(nrow(pl))) {
     n = pl$n[i]
   )
 }
+# DERIVED, never hardcoded. This read "4 strata (2 spaces x 2 event types) of 50 rows each",
+# which was true only at the n = 100 this happened to run at -- and `N_EVENTS` is now a config knob
+# (config["permuted_groups_n_events"]), so any change would leave the stated predicate lying while
+# the value silently updated. That is exactly the drift this file exists to kill.
+.pg_strata <- pg[, .N, by = .(feature_set, event_type)]
 pn(
   "permuted.n_events",
   uniqueN(pg$ID),
   "count",
   INPUTS$permuted,
-  filter = "distinct events; 4 strata (2 spaces x 2 event types) of 50 rows each"
+  filter = sprintf(
+    "distinct events; %d strata (%d feature spaces x %d event types), %s rows each",
+    nrow(.pg_strata),
+    uniqueN(pg$feature_set),
+    uniqueN(pg$event_type),
+    paste(sort(unique(.pg_strata$N)), collapse = "/")
+  ),
+  n = nrow(pg)
 )
 ```
 
@@ -1386,7 +1444,7 @@ Emits `paper_numbers_{tf}.csv` (every quoted number, with `filter`, `source` **a
 
 ```{r write-numbers}
 # `filter` and `note` are prose and DO contain commas. That is fine and deliberate: fwrite quotes
-# them and fread round-trips them losslessly (verified: 77 keys, 9 columns, values identical).
+# them and fread round-trips them losslessly (verified at 77 keys; 224 keys as of 2026-09-01).
 # Mangling the text to suit `cut -d,` was considered and rejected -- it would degrade the one field
 # whose job is to make a number's predicate legible. CONSUME THIS FILE WITH A REAL CSV PARSER.
 PN <- rbindlist(.PN, fill = TRUE)
