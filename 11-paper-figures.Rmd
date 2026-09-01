@@ -92,16 +92,20 @@ scale_colour_paper <- function(...) scale_colour_manual(values = PAL, ...) # use
 #
 # Anything reading from .claude/scratch/ is flagged UNPROMOTED here, not silently treated as
 # pipeline output -- a completed analysis whose only copy is in scratch is not reproducible.
+# As of 2026-09-01 nothing is UNPROMOTED: the variance budget (12 keys) and the permuted-groups
+# control (7 keys) -- the 19 that had no stage behind them -- became rules `psi_variance_decomposition`
+# (step 03b) and `permuted_groups_control` (step 09p), and both are declared inputs of
+# `rule paper_figures`. Keep the flagging mechanism: it is what made the gap countable.
 ORIGIN <- list(
   atlas = "rMATS-turbo quantification (/nfs/data/IHEC/RNAseq/rmats/) -> atlas summary stage [leg R]",
   cohort = "01-gather-data.Rmd -> 05 create_aggregated_dt; aggregated_dt_filtered_{tf}.csv.gz (modelled cohort)",
   qc = "01-gather-data.Rmd QC pipeline, Policy A (all epirrs retained, qc_flag_count as covariate); QC scope is a SUPERSET of the modelled cohort",
-  variance = "PSI variance decomposition, fit-free, leave-one-out group means [leg A; DrEval-derived] -- UNPROMOTED (.claude/scratch, spec 6.1)",
+  variance = "PSI variance decomposition, fit-free, leave-one-out group means: 03b-psi-variance-decomposition.R (rule psi_variance_decomposition) [leg A; DrEval-derived]",
   ml = "splicing_ml nested-CV pipeline (run_splicing_ml.py -> pipeline.py), grouped outer CV, per-fold inner hyperparameter search [leg B]",
   ablation = "splicing_ml --feature-groups ablation runs, seqnames-grouped CV [leg A]",
   tier1 = "Tier-1 ridge screen: 09s-ridge-screen.R per event -> 09s-aggregate.R FDR; SCREEN_STAT_VERSION 5, FEATURE_TABLE_VERSION 2 [leg C]",
   floor = "Detection-floor injection sweep: 09f-floor-sample.R -> 09s-ridge-screen.R under EPIATLAS_AS_SCREEN_INJECT -> 09f-floor-score.R (scored on p_pooled_z vs the real screen's 23.7 M null-z reference) [leg C]",
-  permuted = "Permuted-groups negative control, paired per event -- UNPROMOTED (.claude/scratch, spec 6.4)",
+  permuted = "Permuted-groups negative control, paired per event: 09p-permute-groups.R (rule permuted_groups_control), supergroup LABELS permuted so fold count and sizes are preserved exactly [leg C]",
   design = "fixed by experimental design; not measured"
 )
 # Set per chunk. pn()/save_fig() ERROR if it is unset, so a new chunk cannot emit an
@@ -273,8 +277,8 @@ find_payload <- function(root, et, split) {
 
 # ---- input availability ---------------------------------------------------------------------
 # Gate every section on its inputs and print one manifest, rather than failing on the first
-# missing file. Several inputs are analyses that have not been promoted out of .claude/scratch/
-# yet (spec section 6) or have not been run yet (the floor sweep).
+# missing file. What is still genuinely absent is the atlas summary (spec 6.2, blocked on the
+# rMATS provenance audit) and the cohort-counts artifact (spec 6.3, self-bootstrapped below).
 INPUTS <- list(
   screen = file.path(event_dir, "screen_results.csv.gz"),
   hits = file.path(event_dir, sprintf("tier1_hits_%s.txt", tf)),
@@ -285,26 +289,37 @@ INPUTS <- list(
     ".claude/scratch/psi_variance_decomposition_%s.csv",
     tf
   ),
-  permuted = "processed_data/permuted_groups_control.csv",
+  # per-transcript_filter, like everything from 02-2 on: event `ID` is a row position in that
+  # filter's event_gr, so one shared path reads back as silently wrong events under matching IDs.
+  permuted = sprintf("processed_data/permuted_groups_control_%s.csv", tf),
   permuted_alt = ".claude/scratch/permuted_groups_control_result.csv",
   qc = "processed_data/qc_summary.csv",
   cohort = sprintf("processed_data/cohort_counts_%s.csv", tf),
   atlas = sprintf("processed_data/atlas_summary_%s.csv", tf)
 )
 have <- vapply(INPUTS, file.exists, logical(1))
-# fall back to the un-promoted scratch copies, but say so loudly
+# Both analyses were PROMOTED to pipeline stages on 2026-09-01 (rules `psi_variance_decomposition`
+# and `permuted_groups_control`), and both are declared inputs of `rule paper_figures` -- so under
+# Snakemake these files are always present and neither branch below fires. The scratch fallbacks are
+# kept for STANDALONE runs of this Rmd only, and they warn loudly because a paper number sourced
+# from scratch is not reproducible from the pipeline: the scratch copy can predate the stage, can
+# have been produced at a different N_EVENTS, and has no declared provenance.
 if (!have[["variance"]] && have[["variance_alt"]]) {
   INPUTS$variance <- INPUTS$variance_alt
   have[["variance"]] <- TRUE
   warning(
-    "variance decomposition read from .claude/scratch/ -- PROMOTE to processed_data (spec 6.1)"
+    "variance decomposition read from .claude/scratch/, NOT the pipeline output -- ",
+    "run `snakemake processed_data/psi_variance_decomposition_", tf, ".csv`; ",
+    "numbers from this path must not be quoted"
   )
 }
 if (!have[["permuted"]] && have[["permuted_alt"]]) {
   INPUTS$permuted <- INPUTS$permuted_alt
   have[["permuted"]] <- TRUE
   warning(
-    "permuted-groups control read from .claude/scratch/ -- PROMOTE to processed_data (spec 6.4)"
+    "permuted-groups control read from .claude/scratch/, NOT the pipeline output -- ",
+    "run `snakemake processed_data/permuted_groups_control_", tf, ".csv`; ",
+    "the scratch copy was measured at n = 100 and carries no declared provenance"
   )
 }
 print(data.table(
@@ -429,7 +444,7 @@ if (!is.null(qcs)) {
 
 ## 3. PSI variance budget (leg A)
 
-**Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). **UNPROMOTED** — read from `.claude/scratch/`, so this analysis is not currently reproducible from the pipeline (spec 6.1).
+**Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). Pipeline stage **03b** (`03b-psi-variance-decomposition.R`, rule `psi_variance_decomposition`), promoted out of `.claude/scratch/` on 2026-09-01. It sits before `create_aggregated_dt` on purpose: every input stops at stage 03 plus sample metadata, so the budget is established **before any epigenetic feature is considered** — which is the claim it exists to support.
 
 ```{r variance, eval = have[["variance"]], fig.width=6, fig.height=3}
 .ORIGIN_CUR <- ORIGIN$variance
@@ -1104,8 +1119,9 @@ save_fig(
   source = INPUTS$floor
 )
 
-# NOT WRITTEN, DELIBERATELY: min(screen_R2 | detected). 09f-floor-score.R prints it under a "THE
-# FLOOR" banner but labels it for reference only, and it must not be quoted -- detection is decided
+# NOT WRITTEN, DELIBERATELY: min(screen_R2 | detected). 09f-floor-score.R prints it under an
+# explicit "for reference only ... NOT a floor -- an outlier statistic ... Do not quote it" banner
+# (it said "THE FLOOR" until 47aa538), and it must not be quoted -- detection is decided
 # on z, so an event whose null variance has collapsed is detected at a trivial R2 while the median
 # event at ten times that R2 is not. It is an outlier statistic over a heterogeneous set, and there
 # is no floor here to report: the honest deliverable is the power curve above.
@@ -1272,7 +1288,7 @@ if (nrow(abl)) {
 
 ## 8. Supplementary: permuted-groups control
 
-**Origin:** permuted-groups negative control, paired per event. **UNPROMOTED** — read from `.claude/scratch/` (spec 6.4).
+**Origin:** permuted-groups negative control, paired per event. Pipeline stage **09p** (`09p-permute-groups.R`, rule `permuted_groups_control`), promoted out of `.claude/scratch/` on 2026-09-01. It sits beside `floor_sample` rather than at 03b because it samples its events *from* `screen_results.csv.gz` and reads the per-event feature tables.
 
 ```{r permuted, eval = have[["permuted"]]}
 .ORIGIN_CUR <- ORIGIN$permuted

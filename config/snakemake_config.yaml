@@ -408,6 +408,13 @@ slurm_gpu_gres: "gpu:a40:1"
 slurm_gpu_qos: "limitgpus"
 slurm_gpu_exclude: "compms-gpu-1.exbio.wzw.tum.de"
 
+# ── Permuted-groups negative control (rule permuted_groups_control, step 09p) ──
+# Events sampled per (Event Type x feature space) for the Tier-1 permuted-groups control. 100 is
+# the size the reported result was measured at (2026-08-28); the pilot used 12, and re-running the
+# stage at the pilot value would silently downgrade a published number. Passed as a rule PARAM, so
+# changing it invalidates the result rather than leaving a stale one at the old n.
+permuted_groups_n_events: 100
+
 # ── Manuscript figure sync (rule sync_paper_figures, step 11b) ────────────────
 # Target for publication figures produced by 11-paper-figures.Rmd. The rule writes into
 # <manuscript_images_dir>/generated/ and NEVER into images/ directly: everything already in

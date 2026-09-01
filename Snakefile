@@ -522,6 +522,46 @@ rule prepare_aggregation:
 
 
 # ── Step 04-1: aggregate WGBS ─────────────────────────────────────────────────
+# ── Step 03b: PSI variance decomposition (leg A) ──────────────────────────────
+# Fit-free budget: how much PSI variance is explained by event identity, sample, and ontology,
+# before any epigenetic feature is considered. This is what makes Tier-1's 0 hits and splicing_ml's
+# AUROC 0.957 provably compatible rather than merely arguable -- Tier-1 fits WITHIN an event, so the
+# within-event fraction is the entire budget it could ever explain, while splicing_ml pools ACROSS
+# events and is free to spend the between-event fraction.
+#
+# POSITION IS DELIBERATE. Every input stops at stage 03 plus sample metadata, so it runs BEFORE
+# create_aggregated_dt and reads no epigenetic data at all. That is the analysis's own claim -- the
+# budget is a property of the RESPONSE -- so placing it downstream of the marks would undercut it.
+#
+# Promoted out of .claude/scratch/ 2026-09-01. It supplies 12 of paper_numbers' keys (all of leg A),
+# and Nature requires the code behind a quoted number to be available at submission, so a completed
+# analysis whose only copy is in scratch is a submission blocker, not housekeeping.
+rule psi_variance_decomposition:
+    input:
+        script     = "03b-psi-variance-decomposition.R",
+        keep_rows  = "processed_data/keep_rows_manual_{transcript_filter}.rds",
+        ann        = "processed_data/event_annotations_dt_{transcript_filter}.csv.gz",
+        psi_long   = "processed_data/psi_long_dt_{transcript_filter}.csv.gz",
+        file_table = "processed_data/file_table.csv.gz",
+        meta       = "data/IHEC_sample_metadata_harmonization.v1.4_extended.csv",
+    output:
+        budget = "processed_data/psi_variance_decomposition_{transcript_filter}.csv",
+    log: "logs/03b_psi_variance_decomposition_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} VARIANCE_OUT={output.budget} \
+        Rscript 03b-psi-variance-decomposition.R > {log} 2>&1
+        """
+
+
 rule aggregate_wgbs:
     input:
         script = "04-1-aggregate-WGBS-matrix.R",
@@ -1294,6 +1334,52 @@ checkpoint screen_aggregate:
 # screen's ~81 h.
 FLOOR_RHOS = ["0", "0.01", "0.02", "0.05", "0.1", "0.2", "0.4", "1"]
 
+# ── Step 09p: permuted-groups negative control (leg C) ────────────────────────
+# How much of Tier-1's performance comes from the test sample's GROUP being represented in training?
+# Permutes the supergroup LABELS rather than splitting randomly, which preserves the fold count and
+# fold-size distribution exactly, so the only thing that changes is whether a fold corresponds to a
+# real group. Answer (n=100, 2026-08-28): in `local` -- the only space with recovery power --
+# destroying group identity buys a median bounded-R2 gain of 0.0024, so leave-one-ontology-out costs
+# Tier-1 next to nothing where it has power, and the 0-hit result is NOT explained by a punishing
+# split. It does not license a cell-type-identity claim: a permuted fold exposes batch, lab and
+# protocol alongside ontology.
+#
+# NOT at 03b beside the variance decomposition, despite both being promoted controls: this samples
+# its events FROM screen_results.csv.gz and reads the per-event feature tables, so it depends on
+# screen_aggregate and build_feature_tables. It is the structural twin of floor_sample below.
+#
+# Promoted out of .claude/scratch/ 2026-09-01; supplies 7 of paper_numbers' keys.
+rule permuted_groups_control:
+    input:
+        script  = "09p-permute-groups.R",
+        shared  = "09-ml-shared.R",
+        cfg     = "processed_data/event_glmnet_cfg_{transcript_filter}.rds",
+        results = "processed_data/event_models/{transcript_filter}/screen_results.csv.gz",
+    output:
+        result = "processed_data/permuted_groups_control_{transcript_filter}.csv",
+        raw    = "processed_data/permuted_groups_control_raw_{transcript_filter}.csv",
+    params:
+        # A param, not an env-var default: params are tracked per output, so changing the event
+        # count invalidates this result rather than silently leaving a stale one at the old n.
+        n_events = config.get("permuted_groups_n_events", 100),
+    log: "logs/09p_permuted_groups_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} N_EVENTS={params.n_events} \
+        PERMUTED_OUT={output.result} PERMUTED_RAW_OUT={output.raw} \
+        Rscript 09p-permute-groups.R > {log} 2>&1
+        """
+
+
 # CHECKPOINT: the stratified sample is chosen FROM the screen results (blow-up status
 # depends on the statistic version), so the id list cannot be known at DAG-build time.
 checkpoint floor_sample:
@@ -1543,6 +1629,11 @@ rule paper_figures:
         floor_results  = f"processed_data/event_models/{PRIMARY}/floor/floor_results.csv.gz",
         session        = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
         qc_summary     = "processed_data/qc_summary.csv",
+        # Promoted 2026-09-01 out of .claude/scratch/. Declaring them here is the point of the
+        # promotion: 19 of paper_numbers' keys came from analyses with no pipeline stage behind
+        # them, which Nature's code-at-submission requirement makes a blocker rather than tidying.
+        variance       = f"processed_data/psi_variance_decomposition_{PRIMARY}.csv",
+        permuted       = f"processed_data/permuted_groups_control_{PRIMARY}.csv",
         # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
         # must stay fast because it re-runs on every tweak.
         cv_payloads = [
