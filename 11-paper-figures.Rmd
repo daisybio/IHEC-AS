@@ -1,0 +1,1405 @@
+---
+title: "Paper figures, tables and numbers"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+<!--
+THIS FILE IS THE SOLE SOURCE FOR ANYTHING THE MANUSCRIPT QUOTES.
+
+`09-2-ml-local-new.Rmd` and the `splicing_ml` HTML reports are INTERNAL DIAGNOSTICS and are never
+cited. If a figure appears in both, this file wins.
+
+Spec: revision/file-changes/11-paper-figures.Rmd.md
+
+Two hard rules, both load-bearing:
+
+1. DO NOT RECOMPUTE. Read aggregates, reshape, plot. Any new computation belongs upstream as its own
+   stage with its own declared output. Recomputing here lets the paper figure and the pipeline disagree,
+   which is the same drift this file exists to kill, only in the other direction.
+2. MUST STAY FAST, because it re-runs on every figure tweak. No chip_matrix (13.8 GB), no 9 M-row
+   aggregated_dt scan, no sweep over the ~68 k per-event screen files. Anything needing those gets a
+   small precomputed summary upstream.
+
+Being a LEAF of the DAG is the point: nothing downstream, so editing it re-runs only itself. Contrast
+`01`-`05`, where a one-character edit cascades through the 117 GB feature-table build and 34,146 screen
+jobs (see revision/deferred-cosmetic-edits.md).
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE, dpi = 150)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(jsonlite)
+})
+data.table::setDTthreads(2L)
+
+tf <- Sys.getenv(
+  "TRANSCRIPT_FILTER",
+  getOption("EpiATLAS_AS_PRIMARY_FILTER", "biotype_filtered")
+)
+event_dir <- file.path("processed_data", "event_models", tf)
+fig_dir <- file.path("reports", "paper_figures", tf)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 0. Conventions
+
+```{r conventions}
+# ---- journal figure theme -------------------------------------------------------------------
+# Nature: 5-8 pt fonts at print size, one typeface, NO rainbow scale, NO red/green contrast.
+# Defined once here and used nowhere else in the project -- the Plotly heatmaps in 09-2 and
+# splicing_ml violate all three and are diagnostics, not paper figures.
+PAPER_BASE_PT <- 7
+theme_paper <- function(base_size = PAPER_BASE_PT) {
+  theme_bw(base_size = base_size, base_family = "sans") +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(linewidth = 0.3),
+      axis.ticks = element_line(linewidth = 0.3),
+      strip.background = element_rect(fill = "grey92", linewidth = 0),
+      strip.text = element_text(size = base_size, margin = margin(2, 2, 2, 2)),
+      legend.key.size = unit(3, "mm"),
+      legend.margin = margin(0, 0, 0, 0),
+      plot.title = element_text(size = base_size + 1, face = "bold")
+    )
+}
+theme_set(theme_paper())
+
+# Colour-blind-safe, no red/green pairing, no rainbow. Okabe-Ito subset.
+PAL <- c(
+  "#0072B2",
+  "#E69F00",
+  "#009E73",
+  "#CC79A7",
+  "#56B4E9",
+  "#D55E00",
+  "#666666"
+)
+scale_fill_paper <- function(...) scale_fill_manual(values = PAL, ...)
+scale_colour_paper <- function(...) scale_colour_manual(values = PAL, ...) # used once section 5 gains a scatter
+
+# ---- provenance: WHICH ANALYSIS EACH NUMBER AND FIGURE ORIGINALLY CAME FROM -----------------
+# `source` records the FILE this Rmd read. That is not provenance: an aggregate CSV says nothing
+# about which analysis computed it, under which statistic version, or whether it is still the
+# pipeline's own output rather than a scratch prototype. ORIGIN records the ANALYSIS. Both go into
+# paper_numbers and into the figure manifest, so a reviewer question ("where does 0.207 come from?")
+# is answered by the artifact instead of by grepping the repo.
+#
+# Anything reading from .claude/scratch/ is flagged UNPROMOTED here, not silently treated as
+# pipeline output -- a completed analysis whose only copy is in scratch is not reproducible.
+ORIGIN <- list(
+  atlas = "rMATS-turbo quantification (/nfs/data/IHEC/RNAseq/rmats/) -> atlas summary stage [leg R]",
+  cohort = "01-gather-data.Rmd -> 05 create_aggregated_dt; aggregated_dt_filtered_{tf}.csv.gz (modelled cohort)",
+  qc = "01-gather-data.Rmd QC pipeline, Policy A (all epirrs retained, qc_flag_count as covariate); QC scope is a SUPERSET of the modelled cohort",
+  variance = "PSI variance decomposition, fit-free, leave-one-out group means [leg A; DrEval-derived] -- UNPROMOTED (.claude/scratch, spec 6.1)",
+  ml = "splicing_ml nested-CV pipeline (run_splicing_ml.py -> pipeline.py), grouped outer CV, per-fold inner hyperparameter search [leg B]",
+  ablation = "splicing_ml --feature-groups ablation runs, seqnames-grouped CV [leg A]",
+  tier1 = "Tier-1 ridge screen: 09s-ridge-screen.R per event -> 09s-aggregate.R FDR; SCREEN_STAT_VERSION 5, FEATURE_TABLE_VERSION 2 [leg C]",
+  floor = "Detection-floor injection sweep: 09f-floor-sample.R -> 09s-ridge-screen.R under EPIATLAS_AS_SCREEN_INJECT -> 09f-floor-score.R (scored on p_pooled_z vs the real screen's 23.7 M null-z reference) [leg C]",
+  permuted = "Permuted-groups negative control, paired per event -- UNPROMOTED (.claude/scratch, spec 6.4)",
+  design = "fixed by experimental design; not measured"
+)
+# Set per chunk. pn()/save_fig() ERROR if it is unset, so a new chunk cannot emit an
+# unattributed number -- the failure mode this whole registry exists to prevent.
+.ORIGIN_CUR <- NULL
+
+# ---- figure writer -------------------------------------------------------------------------
+# Vector PDF is the deliverable. Rendering the DOCUMENT to PDF is deliberately avoided (09-2 dies
+# on bookmark.sty / TinyTeX 2021 vs remote 2026), so ggsave must not depend on that toolchain.
+.FIG <- list()
+save_fig <- function(
+  plot,
+  name,
+  width,
+  height,
+  origin = .ORIGIN_CUR,
+  source = NA_character_,
+  shows = NA_character_
+) {
+  if (is.null(origin)) {
+    stop(sprintf("save_fig('%s'): .ORIGIN_CUR unset -- attribute the figure", name))
+  }
+  f <- file.path(fig_dir, paste0(name, ".pdf"))
+  ggsave(
+    f,
+    plot,
+    width = width,
+    height = height,
+    units = "in",
+    device = cairo_pdf
+  )
+  .FIG[[length(.FIG) + 1L]] <<- data.table::data.table(
+    figure = name,
+    file = f,
+    width_in = width,
+    height_in = height,
+    shows = shows,
+    origin = origin,
+    source = paste(source, collapse = "; ")
+  )
+  message(sprintf("figure written: %s (%.1f x %.1f in)", f, width, height))
+  invisible(f)
+}
+
+# ---- paper_numbers ------------------------------------------------------------------------
+# EVERY number the manuscript states goes through pn(). `filter` is NOT optional: an unstated
+# predicate is exactly the drift this file exists to kill. Live example -- |screen_R2| > 1 is
+# 50.06% over all finite rows and 51.44% once note-carrying rows are dropped. Both correct.
+.PN <- list()
+pn <- function(
+  key,
+  value,
+  unit,
+  source,
+  filter = NA_character_,
+  n = NA_real_,
+  stat_version = NA_integer_,
+  note = NA_character_,
+  origin = .ORIGIN_CUR
+) {
+  stopifnot(is.character(key), length(key) == 1L, nzchar(key))
+  # No unattributed numbers. A key whose originating analysis is unknown cannot be defended in
+  # review, so this is a hard error rather than an NA default.
+  if (is.null(origin)) {
+    stop(sprintf("pn('%s'): .ORIGIN_CUR unset -- attribute the number", key))
+  }
+  # setDT(list(...)), NOT data.table(...): `key` is a RESERVED ARGUMENT of data.table(), so
+  # data.table(key = "cohort.uuids", ...) is read as "set that column as the table's key" and
+  # dies with `some columns are not in the data.table: [cohort.uuids]`. Passing the list
+  # positionally to setDT() makes `key` an ordinary column. (Same trap for `check.names` and
+  # `stringsAsFactors`; the other column names here are safe.)
+  .PN[[length(.PN) + 1L]] <<- data.table::setDT(list(
+    key = key,
+    value = as.numeric(value),
+    unit = unit,
+    n = as.numeric(n),
+    filter = filter,
+    source = source,
+    origin = origin,
+    stat_version = as.integer(stat_version),
+    note = note
+  ))
+  invisible(value)
+}
+
+# PER OUTER FOLD, never collapsed. This is nested CV: every outer fold runs its own inner
+# hyperparameter search, so the folds are DIFFERENT fitted models with different parameters. One
+# mean AUROC asserts a single model that does not exist, hides the fold spread, and cannot meet
+# the journal requirement to define error bars and give exact n. So read
+# `metric_fold_data[[metric]]$points` (model x outer_fold x score) and summarise only when
+# reporting -- always beside sd and the fold count. `metric_heatmap$z`/`$sd` are the fold mean and
+# spread, both derivable from these points, so the heatmap is never read for numbers.
+fold_metric_of <- function(payload_json, metric = "auroc") {
+  if (is.na(payload_json) || !file.exists(payload_json)) {
+    return(NULL)
+  }
+  d <- jsonlite::fromJSON(payload_json, simplifyVector = FALSE)[[1]]
+  pts <- d$metric_fold_data[[metric]]$points
+  if (is.null(pts) || !length(pts)) {
+    return(NULL)
+  }
+  out <- data.table::rbindlist(lapply(pts, function(x) {
+    data.table::data.table(
+      model = x$model_name,
+      outer_fold = as.integer(x$outer_fold),
+      value = as.numeric(x$score)
+    )
+  }))
+  out[, payload := payload_json][]
+}
+
+# Emit every fold AND the summary, so nothing downstream re-aggregates or guesses how.
+pn_folds <- function(prefix, dt, source, filter, origin = .ORIGIN_CUR) {
+  for (m in unique(dt$model)) {
+    v <- dt[model == m][order(outer_fold)]
+    for (i in seq_len(nrow(v))) {
+      pn(
+        sprintf("%s.%s.fold%d", prefix, m, v$outer_fold[i]),
+        v$value[i],
+        "auroc",
+        source,
+        filter = paste(filter, "- one outer fold; own tuned hyperparameters"),
+        origin = origin
+      )
+    }
+    pn(
+      sprintf("%s.%s.mean", prefix, m),
+      mean(v$value),
+      "auroc",
+      source,
+      filter = paste(filter, "- mean over outer folds"),
+      n = nrow(v),
+      origin = origin
+    )
+    pn(
+      sprintf("%s.%s.sd", prefix, m),
+      stats::sd(v$value),
+      "auroc",
+      source,
+      filter = paste(filter, "- sd over outer folds"),
+      n = nrow(v),
+      origin = origin
+    )
+  }
+}
+
+summarise_folds <- function(d, by) {
+  d[,
+    .(
+      folds = .N,
+      mean = mean(value),
+      sd = stats::sd(value),
+      min = min(value),
+      max = max(value)
+    ),
+    by = by
+  ]
+}
+find_payload <- function(root, et, split) {
+  f <- Sys.glob(sprintf(
+    "%s/%s_%s_both_%s/reports/subset_report_*.json",
+    root,
+    et,
+    tf,
+    split
+  ))
+  if (length(f)) f[1] else NA_character_
+}
+
+# ---- input availability ---------------------------------------------------------------------
+# Gate every section on its inputs and print one manifest, rather than failing on the first
+# missing file. Several inputs are analyses that have not been promoted out of .claude/scratch/
+# yet (spec section 6) or have not been run yet (the floor sweep).
+INPUTS <- list(
+  screen = file.path(event_dir, "screen_results.csv.gz"),
+  hits = file.path(event_dir, sprintf("tier1_hits_%s.txt", tf)),
+  floor = file.path(event_dir, "floor", "floor_results.csv.gz"),
+  session = sprintf("processed_data/session_09_1_ml_local_%s.rds", tf),
+  variance = sprintf("processed_data/psi_variance_decomposition_%s.csv", tf),
+  variance_alt = sprintf(
+    ".claude/scratch/psi_variance_decomposition_%s.csv",
+    tf
+  ),
+  permuted = "processed_data/permuted_groups_control.csv",
+  permuted_alt = ".claude/scratch/permuted_groups_control_result.csv",
+  qc = "processed_data/qc_summary.csv",
+  cohort = sprintf("processed_data/cohort_counts_%s.csv", tf),
+  atlas = sprintf("processed_data/atlas_summary_%s.csv", tf)
+)
+have <- vapply(INPUTS, file.exists, logical(1))
+# fall back to the un-promoted scratch copies, but say so loudly
+if (!have[["variance"]] && have[["variance_alt"]]) {
+  INPUTS$variance <- INPUTS$variance_alt
+  have[["variance"]] <- TRUE
+  warning(
+    "variance decomposition read from .claude/scratch/ -- PROMOTE to processed_data (spec 6.1)"
+  )
+}
+if (!have[["permuted"]] && have[["permuted_alt"]]) {
+  INPUTS$permuted <- INPUTS$permuted_alt
+  have[["permuted"]] <- TRUE
+  warning(
+    "permuted-groups control read from .claude/scratch/ -- PROMOTE to processed_data (spec 6.4)"
+  )
+}
+print(data.table(
+  input = names(have),
+  path = unlist(INPUTS[names(have)]),
+  available = unname(have)
+))
+```
+
+## 1. Atlas (leg R)
+
+**Origin:** rMATS-turbo quantification over `/nfs/data/IHEC/RNAseq/rmats/{tf}/` (1,522 UUIDs, 745,545 events, 5 event classes), summarised once by the atlas-summary stage. **This file must never read that 136 GB tree directly.**
+
+```{r atlas, eval = have[["atlas"]]}
+.ORIGIN_CUR <- ORIGIN$atlas
+# Requires the atlas summary artifact (spec 6.2): per-class event counts, UUID coverage,
+# per-ontology PSI summary, library-strata counts, computed ONCE from the 136 GB rMATS tree.
+# This file must never read that tree directly.
+atlas <- fread(INPUTS$atlas)
+print(atlas)
+pn("atlas.uuids", atlas[["uuids"]][1], "count", INPUTS$atlas)
+pn(
+  "atlas.events",
+  sum(atlas[["events"]]),
+  "count",
+  INPUTS$atlas,
+  filter = "all 5 rMATS classes"
+)
+```
+
+```{r atlas-missing, eval = !have[["atlas"]], results='asis'}
+cat(
+  "> **Not available.** Blocked on the atlas summary artifact (spec 6.2), which is itself blocked on",
+  "the provenance audit of `/nfs/data/IHEC/RNAseq/rmats/biotype_filtered/` (PATH-FORWARD R2):",
+  "three RI files disagree and the smallest is live.\n"
+)
+```
+
+## 2. Cohort counts
+
+**Origin:** `01-gather-data.Rmd` (QC/metadata scope) and `05 create_aggregated_dt` -> `aggregated_dt_filtered_{tf}.csv.gz` (modelled scope). The two differ and conflating them is the recurring error: **modelled 379 epirrs / 415 UUIDs**, QC scope 405 / 441, a clean superset.
+
+```{r cohort}
+.ORIGIN_CUR <- ORIGIN$cohort
+# Two cohorts, and conflating them is the recurring error: QC/metadata scope is 405 epirrs /
+# 441 UUIDs, the MODELLED cohort is 379 / 415. Clean superset (26 QC rows never modelled, 0
+# modelled UUIDs missing QC). The 26 are the AMED-CREST gap and ALL were mRNA-Seq.
+if (have[["cohort"]]) {
+  co <- fread(INPUTS$cohort)
+} else {
+  # Self-bootstrapping: 3 columns only, so this stays cheap. PROMOTE to its own stage (spec 6.3)
+  # -- it is the one place this file reads aggregated_dt at all.
+  warning(
+    "cohort_counts absent; deriving once from aggregated_dt (3 cols) and caching it"
+  )
+  a <- fread(
+    sprintf("processed_data/aggregated_dt_filtered_%s.csv.gz", tf),
+    select = c("uuid", "IHEC", "protocol")
+  )
+  u <- unique(a, by = "uuid")
+  co <- data.table(
+    scope = "modelled",
+    uuids = uniqueN(a$uuid),
+    epirrs = uniqueN(a$IHEC),
+    mrna = u[protocol == "mRNA-Seq", .N],
+    total_rna = u[protocol == "total-RNA-Seq", .N],
+    both_protocols = unique(a[, .(IHEC, protocol)])[, .N, by = IHEC][N > 1, .N]
+  )
+  rm(a, u)
+  gc()
+  # NB an UNDECLARED side effect: this path is not an output of rule paper_figures, so Snakemake
+  # does not track it. Acceptable for a cache, but it is the reason spec 6.3 wants this promoted
+  # to its own stage with a declared output.
+  fwrite(co, INPUTS$cohort)
+}
+qcs <- if (have[["qc"]]) fread(INPUTS$qc) else NULL
+print(co)
+
+pn(
+  "cohort.uuids",
+  co$uuids[1],
+  "count",
+  INPUTS$cohort,
+  filter = "modelled (aggregated_dt_filtered)"
+)
+pn("cohort.epirrs", co$epirrs[1], "count", INPUTS$cohort, filter = "modelled")
+pn("cohort.mrna", co$mrna[1], "count", INPUTS$cohort, filter = "modelled")
+pn(
+  "cohort.total_rna",
+  co$total_rna[1],
+  "count",
+  INPUTS$cohort,
+  filter = "modelled"
+)
+pn(
+  "cohort.both_protocols",
+  co$both_protocols[1],
+  "count",
+  INPUTS$cohort,
+  filter = "modelled"
+)
+pn(
+  "cohort.total_rna_frac",
+  co$total_rna[1] / co$uuids[1],
+  "fraction",
+  INPUTS$cohort,
+  filter = "modelled",
+  note = "54.7%: worse than the 214/227 near-balance older notes imply"
+)
+if (!is.null(qcs)) {
+  # kept ADJACENT to the modelled counts on purpose -- split apart, the 405-vs-379 drift recurs
+  pn(
+    "cohort.qc_epirrs",
+    uniqueN(qcs$epirr_id_without_version),
+    "count",
+    INPUTS$qc,
+    filter = "QC/metadata scope (superset)",
+    origin = ORIGIN$qc
+  )
+}
+```
+
+## 3. PSI variance budget (leg A)
+
+**Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). **UNPROMOTED** — read from `.claude/scratch/`, so this analysis is not currently reproducible from the pipeline (spec 6.1).
+
+```{r variance, eval = have[["variance"]], fig.width=6, fig.height=3}
+.ORIGIN_CUR <- ORIGIN$variance
+vb <- fread(INPUTS$variance)
+vb[, c("event_type", "variability") := tstrsplit(stratum, " / ", fixed = TRUE)]
+# LOO columns are the honest ones (in-sample group means over-fit); they differ from in-sample by
+# <= 0.3 points here, but quote LOO.
+vb[, within_event := 1 - r2_event_loo]
+print(vb[, .(
+  stratum,
+  var_psi,
+  between = r2_event_loo,
+  within = within_event,
+  ontology = r2_ontology_loo
+)])
+
+long <- melt(
+  vb[, .(stratum, between = r2_event_loo, within = within_event)],
+  id.vars = "stratum",
+  variable.name = "component",
+  value.name = "share"
+)
+p <- ggplot(long, aes(share, stratum, fill = component)) +
+  geom_col(width = 0.7) +
+  scale_fill_paper(name = NULL) +
+  scale_x_continuous(labels = scales::percent, expand = c(0, 0)) +
+  labs(
+    x = "share of PSI variance",
+    y = NULL,
+    title = "Event identity dominates PSI variance"
+  )
+print(p)
+save_fig(
+  p,
+  "fig2_variance_budget",
+  5.5,
+  2.6,
+  shows = "between- vs within-event share of PSI variance, per Event Type x Variability stratum",
+  source = INPUTS$variance
+)
+
+for (i in seq_len(nrow(vb))) {
+  k <- gsub("[^A-Za-z]+", "_", tolower(vb$stratum[i]))
+  pn(
+    paste0("variance.between_event.", k),
+    vb$r2_event_loo[i],
+    "fraction",
+    INPUTS$variance,
+    filter = "leave-one-out group means",
+    n = vb$n_rows[i]
+  )
+  pn(
+    paste0("variance.within_event.", k),
+    vb$within_event[i],
+    "fraction",
+    INPUTS$variance,
+    filter = "leave-one-out group means",
+    n = vb$n_rows[i]
+  )
+}
+```
+
+## 4. The artifacts (leg B)
+
+**Origin:** `splicing_ml` nested-CV pipeline (`run_splicing_ml.py` -> `pipeline.py`), grouped outer CV with a per-fold inner hyperparameter search. Numbers are read from the small report payloads, never the multi-GB result pickles.
+
+```{r artifacts}
+.ORIGIN_CUR <- ORIGIN$ml
+# Uses auroc_of()/find_payload() from section 0. Reads the small purpose-built report payloads,
+# NOT the multi-GB splicing_ml_results pickles -- this file must stay fast enough to re-run on
+# every figure tweak.
+cfgs <- CJ(split = c("seqnames", "ontology"), et = c("RI", "SE"), unique = TRUE)
+cfgs[,
+  payload := vapply(
+    seq_len(.N),
+    function(i) find_payload("splicing_ml/output", et[i], split[i]),
+    character(1)
+  )
+]
+grid <- rbindlist(
+  lapply(seq_len(nrow(cfgs)), function(i) {
+    a <- fold_metric_of(cfgs$payload[i])
+    if (is.null(a)) {
+      return(NULL)
+    }
+    a[, `:=`(split = cfgs$split[i], et = cfgs$et[i])][]
+  }),
+  fill = TRUE
+)
+# The prior baseline must be exactly 0.500 IN EVERY FOLD -- the sanity floor that caught a
+# transposed heatmap axis once.
+bl <- grid[grepl("Baseline", model), value]
+if (length(bl)) {
+  stopifnot(all(abs(bl - 0.5) < 1e-9))
+}
+grid <- grid[!grepl("Baseline", model)]
+print(summarise_folds(grid, c("split", "et", "model"))[order(split, et, model)])
+
+if (nrow(grid)) {
+  # One point per outer fold with a mean crossbar. A bar of the mean alone would assert a single
+  # model where there are five, each with its own tuned hyperparameters.
+  p <- ggplot(
+    grid,
+    aes(value, interaction(model, et, sep = " / "), colour = split)
+  ) +
+    stat_summary(
+      fun = mean,
+      geom = "crossbar",
+      width = 0.55,
+      linewidth = 0.25,
+      position = position_dodge(width = 0.7)
+    ) +
+    geom_point(
+      position = position_dodge(width = 0.7),
+      size = 0.7,
+      alpha = 0.85
+    ) +
+    geom_vline(xintercept = 0.5, linetype = 2, linewidth = 0.3) +
+    scale_colour_paper(name = "CV grouping") +
+    coord_cartesian(xlim = c(0.5, 1)) +
+    labs(
+      x = "test AUROC (one point per outer fold)",
+      y = NULL,
+      title = "Holding out cell types leaks event identity; holding out events does not"
+    )
+  print(p)
+  save_fig(
+    p,
+    "fig3_artifacts",
+    5.5,
+    2.8,
+    shows = "per-outer-fold test AUROC, seqnames- vs ontology-grouped CV (the event-identity leak)",
+    source = cfgs$payload
+  )
+  for (i in seq_len(nrow(cfgs))) {
+    d <- grid[split == cfgs$split[i] & et == cfgs$et[i]]
+    if (!nrow(d)) {
+      next
+    }
+    pn_folds(
+      sprintf("cv.%s.%s.auroc", cfgs$split[i], tolower(cfgs$et[i])),
+      d,
+      cfgs$payload[i],
+      "both variability tiers; classification"
+    )
+  }
+  # Capacity gap PAIRED WITHIN FOLD: xgb and linear share the outer split, so the per-fold
+  # difference is the paired contrast and its sd is interpretable.
+  w <- dcast(grid, split + et + outer_fold ~ model, value.var = "value")
+  if (all(c("linear", "xgb") %in% names(w))) {
+    w[, gap := xgb - linear]
+    gsum <- w[,
+      .(folds = .N, mean = mean(gap), sd = stats::sd(gap)),
+      by = .(split, et)
+    ]
+    print(gsum[order(split, et)])
+    for (i in seq_len(nrow(gsum))) {
+      pn(
+        sprintf(
+          "cv.%s.%s.xgb_minus_linear.mean",
+          gsum$split[i],
+          tolower(gsum$et[i])
+        ),
+        gsum$mean[i],
+        "auroc",
+        "derived",
+        filter = "capacity gap = leak signature; paired within outer fold",
+        n = gsum$folds[i]
+      )
+      pn(
+        sprintf(
+          "cv.%s.%s.xgb_minus_linear.sd",
+          gsum$split[i],
+          tolower(gsum$et[i])
+        ),
+        gsum$sd[i],
+        "auroc",
+        "derived",
+        filter = "capacity gap; sd of the paired within-fold difference",
+        n = gsum$folds[i]
+      )
+    }
+  }
+}
+```
+
+## 5. Tier-1 screen (leg C)
+
+**Origin:** `09s-ridge-screen.R` (one job per event, 34,146 events) -> `09s-aggregate.R` (BH/Storey FDR per `transcript_filter` x `Event Type` x `feature_set`). `SCREEN_STAT_VERSION` **5**, `FEATURE_TABLE_VERSION` **2**.
+
+```{r tier1, eval = have[["screen"]], fig.width=6.5, fig.height=3.2}
+.ORIGIN_CUR <- ORIGIN$tier1
+scr <- fread(INPUTS$screen)
+qthr <- 0.1
+stopifnot(uniqueN(scr$stat_version) == 1L)
+SV <- scr$stat_version[1]
+
+fam <- scr[
+  is.finite(q),
+  .(
+    m = .N,
+    min_q = min(q),
+    min_q_pz = min(q_pooled_z, na.rm = TRUE),
+    pct_p05 = 100 * mean(p_emp <= 0.05),
+    pct_ppz05 = 100 * mean(p_pooled_z <= 0.05, na.rm = TRUE)
+  ),
+  by = .(`Event Type`, feature_set)
+][order(`Event Type`, feature_set)]
+print(fam)
+
+pn(
+  "tier1.hits",
+  sum(scr$q < qthr, na.rm = TRUE),
+  "count",
+  INPUTS$screen,
+  filter = "q < 0.1, primary exceedance rule",
+  stat_version = SV
+)
+pn(
+  "tier1.hits_pooled_z",
+  sum(scr$q_pooled_z < qthr, na.rm = TRUE),
+  "count",
+  INPUTS$screen,
+  filter = "q_pooled_z < 0.1, floor-free sensitivity",
+  stat_version = SV,
+  note = "disagrees with primary since v5; 4 of 7 survive a same-n peer check"
+)
+pn(
+  "tier1.min_q",
+  min(fam$min_q),
+  "q",
+  INPUTS$screen,
+  filter = "over all 6 families",
+  stat_version = SV
+)
+pn(
+  "tier1.min_q_pooled_z",
+  min(fam$min_q_pz),
+  "q",
+  INPUTS$screen,
+  filter = "over all 6 families",
+  stat_version = SV
+)
+pn(
+  "tier1.hits_file_bytes",
+  file.info(INPUTS$hits)$size,
+  "bytes",
+  INPUTS$hits,
+  filter = "0 bytes = no hits written by 09s-aggregate.R"
+)
+
+# p-uniformity: the calibration claim, stated per family because SE outnumbers RI ~18:1 and a
+# pooled panel would be an SE panel with RI invisible.
+ph <- scr[is.finite(p_emp)]
+NBINS <- 20L
+# the uniform expectation, per facet: m / nbins. Drawn so "flat" is judged against a line rather
+# than by eye -- a p-histogram piled at 0 would mean an optimistic null and nothing concludable.
+expect <- ph[, .(y = .N / NBINS), by = .(`Event Type`, feature_set)]
+p <- ggplot(ph, aes(p_emp)) +
+  geom_histogram(
+    boundary = 0,
+    bins = NBINS,
+    fill = PAL[1],
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  geom_hline(
+    data = expect,
+    aes(yintercept = y),
+    linetype = 2,
+    linewidth = 0.3,
+    colour = PAL[6]
+  ) +
+  facet_grid(`Event Type` ~ feature_set, scales = "free_y") +
+  labs(
+    x = "empirical p (one-sided exceedance)",
+    y = "events",
+    title = sprintf("Calibrated null in every family (stat_version %d)", SV)
+  )
+print(p)
+save_fig(
+  p,
+  "fig4_tier1_pvalues",
+  6.5,
+  3.0,
+  shows = "empirical p histogram per (Event Type x feature_set) family vs the uniform expectation",
+  source = INPUTS$screen
+)
+
+pn(
+  "tier1.pct_p05_min",
+  min(fam$pct_p05),
+  "percent",
+  INPUTS$screen,
+  filter = "per family, expected 5",
+  stat_version = SV
+)
+pn(
+  "tier1.pct_p05_max",
+  max(fam$pct_p05),
+  "percent",
+  INPUTS$screen,
+  filter = "per family, expected 5",
+  stat_version = SV
+)
+
+# Numeric health. Predicate stated TWICE over because both are quoted in the docs and they differ.
+fin <- scr[is.finite(p_emp) & is.finite(screen_R2) & is.finite(effect)]
+pn(
+  "tier1.blowup_gt1",
+  mean(abs(fin$screen_R2) > 1),
+  "fraction",
+  INPUTS$screen,
+  filter = "|screen_R2| > 1 over all finite rows",
+  stat_version = SV
+)
+pn(
+  "tier1.blowup_gt1_notefree",
+  fin[is.na(note) | note == "", mean(abs(screen_R2) > 1)],
+  "fraction",
+  INPUTS$screen,
+  filter = "|screen_R2| > 1, note-carrying rows excluded",
+  stat_version = SV
+)
+# >10 and >100 are quoted in the docs beside >1 and the thresholds get confused routinely
+# (the n/lambda contrast belongs to >10 while the headline fraction is >1), so emit all three.
+pn(
+  "tier1.blowup_gt10",
+  mean(abs(fin$screen_R2) > 10),
+  "fraction",
+  INPUTS$screen,
+  filter = "|screen_R2| > 10 over all finite rows",
+  stat_version = SV
+)
+pn(
+  "tier1.blowup_gt100",
+  mean(abs(fin$screen_R2) > 100),
+  "fraction",
+  INPUTS$screen,
+  filter = "|screen_R2| > 100 over all finite rows",
+  stat_version = SV
+)
+# n/lambda contrast MUST be faceted by feature space: the three spaces disagree in DIRECTION
+# (local 57 vs 351, short 299 vs 347, long 357 vs 103 REVERSED). Pooling gives a meaningless 305/317.
+bw <- fin[,
+  .(
+    pct_gt1 = 100 * mean(abs(screen_R2) > 1),
+    n_blown = median(as.numeric(n_samples[abs(screen_R2) > 1])),
+    n_rest = median(as.numeric(n_samples[abs(screen_R2) <= 1])),
+    lam_blown = median(lambda[abs(screen_R2) > 1]),
+    lam_rest = median(lambda[abs(screen_R2) <= 1])
+  ),
+  by = feature_set
+]
+print(bw)
+for (i in seq_len(nrow(bw))) {
+  fs <- bw$feature_set[i]
+  pn(
+    sprintf("tier1.blowup_pct.%s", fs),
+    bw$pct_gt1[i],
+    "percent",
+    INPUTS$screen,
+    filter = "|screen_R2| > 1, per feature space",
+    stat_version = SV
+  )
+  # BOTH sides: a median for the blown group alone is not a contrast, and the three spaces
+  # disagree in DIRECTION, so only the pair is interpretable.
+  pn(
+    sprintf("tier1.blowup_median_n.%s.blown", fs),
+    bw$n_blown[i],
+    "count",
+    INPUTS$screen,
+    filter = "|screen_R2| > 1, per feature space",
+    stat_version = SV
+  )
+  pn(
+    sprintf("tier1.blowup_median_n.%s.rest", fs),
+    bw$n_rest[i],
+    "count",
+    INPUTS$screen,
+    filter = "|screen_R2| <= 1, per feature space",
+    stat_version = SV
+  )
+  pn(
+    sprintf("tier1.blowup_median_lambda.%s.blown", fs),
+    bw$lam_blown[i],
+    "lambda",
+    INPUTS$screen,
+    filter = "|screen_R2| > 1, per feature space",
+    stat_version = SV
+  )
+  pn(
+    sprintf("tier1.blowup_median_lambda.%s.rest", fs),
+    bw$lam_rest[i],
+    "lambda",
+    INPUTS$screen,
+    filter = "|screen_R2| <= 1, per feature space",
+    stat_version = SV
+  )
+}
+```
+
+```{r tier1-missing, eval = !have[["screen"]], results='asis'}
+cat(
+  "> **Not available**: `screen_results.csv.gz` missing. Run the screen and `screen_aggregate`.\n"
+)
+```
+
+## 6. Statistical power of the Tier-1 screen (leg C)
+
+**Origin:** detection-floor injection sweep — `09f-floor-sample.R` (596 events, 8 strata) -> `09s-ridge-screen.R` under `EPIATLAS_AS_SCREEN_INJECT` (**the production worker, not a re-implementation**) -> `09f-floor-score.R`, which scores on `p_pooled_z` against the real screen's 23,725,212 null-z values and self-validates against `09s-aggregate.R` to 5.6e-16 before scoring anything.
+
+```{r floor, eval = have[["floor"]]}
+.ORIGIN_CUR <- ORIGIN$floor
+fl <- fread(INPUTS$floor)
+stopifnot(all(
+  c(
+    "screen_R2",
+    "detected",
+    "p_pooled_z",
+    "inject_rho",
+    "blowup",
+    "feature_set"
+  ) %in%
+    names(fl)
+))
+
+# CONSTRAINT 1: READ `detected`, NEVER recompute it, and never score on p_emp. The exceedance p is
+# floored at 1/(R_used+1), so its minimum measures the ROTATION COUNT, not the data -- scoring
+# detection on it would report a property of the sweep's own budget. 09f-floor-score.R decides
+# detection on p_pooled_z against the real screen's 23.7 M null-z reference (leave-one-event-out
+# standardised within Event Type x feature_set, self-validated against 09s-aggregate.R to 5.6e-16
+# before it scores anything). Recomputing here would also break this file's rule 1.
+#
+# CONSTRAINT 2: the sweep injects into ONE feature space, but the worker screens all three, so
+# two-thirds of these rows are spaces no signal was put into (they sit at R2 ~ -3.5 and would pile
+# into the lowest bin). `local` only is deliberate: at rho=1 the injection fails to recover a signal
+# that is BY CONSTRUCTION present in `long`'s own columns, because `long` runs at median lambda ~ 7
+# against `local`'s ~ 8,050 -- three to four orders less regularisation. That is itself a finding:
+# the screen's power lives in the event-overlapping features.
+inj_fs <- if ("inject_fs" %in% names(fl)) {
+  unique(stats::na.omit(fl$inject_fs))
+} else {
+  "local"
+}
+stopifnot(length(inj_fs) == 1L)
+fl <- fl[feature_set == inj_fs]
+message(sprintf(
+  "scoring the injected space only: %s (%d rows)",
+  inj_fs,
+  nrow(fl)
+))
+
+# CONSTRAINT 3: rho <= 0.4 ONLY. rho is a VARIANCE FRACTION, not a correlation -- the worker builds
+# sqrt(rho)*signal + sqrt(1-rho)*noise, so at rho=1 the noise coefficient is exactly 0 and the
+# target is noiseless and 10-column-deterministic. Kernel ridge on the CONTROL features then fails
+# erratically, inflating the null's SPREAD without shifting its mean, and since z =
+# (R2 - null_mean)/null_sd, z FALLS as R2 rises. So rho=1 is DEGENERATE, not strong-signal, and the
+# old "rho=1 must be detected" anchor was wrong (removed 2026-09-01). It is reported below as a
+# diagnostic and excluded from every power and ceiling number.
+RHO_MAX_VALID <- 0.4
+```
+
+```{r floor-anchors, eval = have[["floor"]]}
+.ORIGIN_CUR <- ORIGIN$floor
+# The one anchor that still holds: rho=0 must not be detected. This is the calibration claim that
+# makes the screen's 0-hit result a real result rather than a broken test.
+a0 <- fl[inject_rho == 0]
+anch <- fl[,
+  .(
+    n = .N,
+    med_R2 = median(screen_R2),
+    med_null_sd = median(null_R2_sd, na.rm = TRUE),
+    med_z = median(z_inj, na.rm = TRUE),
+    det_pct = 100 * mean(detected)
+  ),
+  by = inject_rho
+][order(inject_rho)]
+print(anch)
+stopifnot(nrow(a0) > 0L, mean(a0$detected) < 0.01)
+pn(
+  "power.null_detection_rate",
+  mean(a0$detected),
+  "fraction",
+  INPUTS$floor,
+  filter = sprintf("inject_rho = 0, %s space; MUST be ~0", inj_fs),
+  n = nrow(a0),
+  note = "calibrated null: the screen's 0 hits is a result, not a broken test"
+)
+
+# Quantify the degeneracy rather than merely asserting it: null sd blows up while R2 rises.
+#
+# MUST be stratified by Event Type AND restricted to numerically stable events. Pooled, this ratio
+# reads 1.24 and the effect vanishes -- because blown-up events' median null sd FALLS over the same
+# interval (RI 95.5 -> 57.9) and cancels the stable events' rise. Two populations moving in opposite
+# directions, so a pooled median is meaningless. Stratified: RI x18.4, SE x26.5, while median R2
+# rises only x10.0 / x19.5 -- and z = (R2 - null_mean)/null_sd, so z falls as R2 rises.
+if (all(c(0.4, 1) %in% fl$inject_rho)) {
+  infl <- fl[
+    blowup == FALSE & inject_rho %in% c(0.4, 1),
+    .(
+      sd_ratio = median(null_R2_sd[inject_rho == 1], na.rm = TRUE) /
+        median(null_R2_sd[inject_rho == 0.4], na.rm = TRUE),
+      r2_ratio = median(screen_R2[inject_rho == 1]) /
+        median(screen_R2[inject_rho == 0.4]),
+      n1 = sum(inject_rho == 1)
+    ),
+    by = `Event Type`
+  ]
+  print(infl)
+  for (i in seq_len(nrow(infl))) {
+    etl <- tolower(infl$`Event Type`[i])
+    pn(
+      sprintf("power.rho1_null_sd_inflation.%s", etl),
+      infl$sd_ratio[i],
+      "ratio",
+      INPUTS$floor,
+      filter = "median null_R2_sd at rho=1 over rho=0.4; NUMERICALLY STABLE events only",
+      n = infl$n1[i],
+      note = "pooled over blowup this reads 1.24: blown-up events' null sd FALLS and cancels it"
+    )
+    pn(
+      sprintf("power.rho1_r2_inflation.%s", etl),
+      infl$r2_ratio[i],
+      "ratio",
+      INPUTS$floor,
+      filter = "median screen_R2 at rho=1 over rho=0.4; stable events only",
+      n = infl$n1[i],
+      note = "R2 rises LESS than null sd does, which is why detection falls at rho=1"
+    )
+  }
+  pn(
+    "power.rho1_detection_rate",
+    anch[inject_rho == 1]$det_pct / 100,
+    "fraction",
+    INPUTS$floor,
+    filter = "inject_rho = 1 -- DEGENERATE, excluded from power; documents the artifact",
+    n = anch[inject_rho == 1]$n
+  )
+}
+```
+
+```{r floor-power, eval = have[["floor"]], fig.width=6.5, fig.height=3.0}
+.ORIGIN_CUR <- ORIGIN$floor
+# `blowup` is JOINED by the scorer from the REAL screen's status (floor_events.tsv), never
+# recomputed from the injected R2. Recomputing lets an event change stratum when a strong injection
+# stabilises a fit that blows up on real PSI, so the per-rho rows stop being comparable -- measured,
+# one stratum ran n = 184/177/181/176/183/184/180/228 where it must be constant.
+fv <- fl[inject_rho <= RHO_MAX_VALID]
+fv[,
+  blow_lab := factor(
+    ifelse(blowup, "blown up (|R2|>1 on real PSI)", "numerically stable"),
+    levels = c("numerically stable", "blown up (|R2|>1 on real PSI)")
+  )
+]
+
+# Stratum sizes MUST be constant across rho -- the check that catches a recomputed `blowup`.
+szc <- fv[, .N, by = .(`Event Type`, blow_lab, inject_rho)][,
+  .(n_distinct = uniqueN(N)),
+  by = .(`Event Type`, blow_lab)
+]
+print(szc)
+if (any(szc$n_distinct > 1L)) {
+  warning(
+    "stratum size varies across rho -- `blowup` looks recomputed, not joined"
+  )
+}
+
+pw <- fv[,
+  .(
+    n = .N,
+    med_R2 = median(screen_R2),
+    det = sum(detected),
+    rate = mean(detected)
+  ),
+  by = .(`Event Type`, blow_lab, inject_rho)
+][order(`Event Type`, blow_lab, inject_rho)]
+print(pw)
+
+# THE HEADLINE: blown-up events have NO USABLE POWER at any effect size the design can represent,
+# and they are ~50% of the real screen. Pooling them with the stable half averages that away.
+#
+# Say "no usable power", NOT "0% at every effect size": SE is a literal 0 of 150 in all 8 arms, but
+# RI has exactly ONE detection over the whole grid (ID 64811 at rho=0.1, 1 of 146 = 0.68%), and it
+# is variance collapse rather than recovered signal -- screen_R2 0.0118 against a null_R2_sd of
+# 0.00168, so z = 6.9 off a trivial R2. It is also the SAME event that produces the
+# min_detected_R2 = 0.0118 that 09f-floor-score.R prints for RI/Low, which is exactly why that
+# statistic must never be quoted as a floor. Printed and annotated, not rounded away.
+blow_det <- fv[blowup == TRUE & detected == TRUE]
+if (nrow(blow_det)) {
+  print(blow_det[, .(ID, `Event Type`, inject_rho, screen_R2, null_R2_sd, z_inj, p_pooled_z)])
+}
+for (etv in unique(pw$`Event Type`)) {
+  for (bl in levels(pw$blow_lab)) {
+    d <- pw[`Event Type` == etv & blow_lab == bl]
+    if (!nrow(d)) {
+      next
+    }
+    top <- d[which.max(rate)]
+    k <- sprintf(
+      "power.peak.%s.%s",
+      tolower(etv),
+      if (grepl("^blown", bl)) "blownup" else "stable"
+    )
+    pn(
+      paste0(k, ".rate"),
+      top$rate,
+      "fraction",
+      INPUTS$floor,
+      filter = sprintf(
+        "max detection over rho <= %.1f; %s space; %s; NOT pooled across strata",
+        RHO_MAX_VALID,
+        inj_fs,
+        bl
+      ),
+      n = top$n
+    )
+    pn(
+      paste0(k, ".at_median_r2"),
+      top$med_R2,
+      "r2",
+      INPUTS$floor,
+      filter = "median ACHIEVED out-of-fold partial R2 in the arm where power peaks",
+      n = top$n,
+      note = "quote achieved R2, never rho -- the rho->R2 map is nonlinear and event-dependent"
+    )
+  }
+}
+
+# 50% power is never reached at any effect size the design can represent. State it as the bound.
+pn(
+  "power.max_overall",
+  max(pw$rate),
+  "fraction",
+  INPUTS$floor,
+  filter = sprintf(
+    "best stratum x rho cell, rho <= %.1f, %s space",
+    RHO_MAX_VALID,
+    inj_fs
+  ),
+  note = "never reaches 50%: the 0-hit screen is a BOUND ON WHAT WAS TESTABLE, not a null finding"
+)
+
+p <- ggplot(pw, aes(med_R2, rate, colour = `Event Type`)) +
+  geom_hline(yintercept = 0.5, linetype = 3, linewidth = 0.3, colour = PAL[7]) +
+  geom_line(linewidth = 0.4) +
+  geom_point(size = 0.9) +
+  facet_wrap(~blow_lab) +
+  scale_colour_paper(name = NULL) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "median achieved out-of-fold partial R² (injected)",
+    y = "detected",
+    title = "The screen never reaches 50% power, and none that is usable for blown-up events",
+    caption = sprintf(
+      "%s space; rho <= %.1f (rho=1 is degenerate); detection at q_pooled_z < 0.1",
+      inj_fs,
+      RHO_MAX_VALID
+    )
+  )
+print(p)
+save_fig(
+  p,
+  "fig5_power_curve",
+  6.5,
+  3.0,
+  shows = "detection rate vs achieved injected R2, faceted by real-PSI numeric stability; rho <= 0.4",
+  source = INPUTS$floor
+)
+
+# NOT WRITTEN, DELIBERATELY: min(screen_R2 | detected). 09f-floor-score.R prints it under a "THE
+# FLOOR" banner but labels it for reference only, and it must not be quoted -- detection is decided
+# on z, so an event whose null variance has collapsed is detected at a trivial R2 while the median
+# event at ten times that R2 is not. It is an outlier statistic over a heterogeneous set, and there
+# is no floor here to report: the honest deliverable is the power curve above.
+```
+
+```{r floor-missing, eval = !have[["floor"]], results='asis'}
+cat(
+  "> **Not available.** `processed_data/event_models/",
+  tf,
+  "/floor/floor_results.csv.gz` is the declared input; run the `floor_*` rules.\n",
+  sep = ""
+)
+```
+
+## 7. Ablation with sequence-only as the reference (leg A)
+
+**Origin:** `splicing_ml --feature-groups` ablation runs, seqnames-grouped CV. The **all-features** arm is not an ablation output — it is the same seqnames config section 4 reads, reused as the reference, and is attributed to that analysis in the manifest.
+
+```{r ablation, fig.width=5.5, fig.height=2.6}
+.ORIGIN_CUR <- ORIGIN$ablation
+acfg <- CJ(
+  group = c("sequence", "histone+dnam"),
+  et = c("RI", "SE"),
+  unique = TRUE
+)
+acfg[,
+  payload := vapply(
+    seq_len(.N),
+    function(i) {
+      find_payload(
+        file.path("splicing_ml/output_ablation", group[i]),
+        et[i],
+        "seqnames"
+      )
+    },
+    character(1)
+  )
+]
+# The all-features run is the THIRD group, not just an arithmetic term: the user asked for it on
+# the figure, and it belongs there -- "sequence gets you 0.950 of 0.957" is only legible with all
+# three bars visible. It comes from the same seqnames configs section 4 already read.
+abl <- rbindlist(
+  lapply(seq_len(nrow(acfg)), function(i) {
+    a <- fold_metric_of(acfg$payload[i])
+    if (is.null(a)) {
+      return(NULL)
+    }
+    a[, `:=`(group = acfg$group[i], et = acfg$et[i])][]
+  }),
+  fill = TRUE
+)
+abl <- abl[!grepl("Baseline", model)]
+# `full` = every feature group, seqnames CV. Same outer splits, so it stacks per fold.
+full <- grid[split == "seqnames", .(et, model, outer_fold, value, payload)][,
+  group := "all features"
+]
+abl <- rbind(abl, full, fill = TRUE)
+abl[,
+  group := factor(group, levels = c("histone+dnam", "sequence", "all features"))
+]
+print(summarise_folds(abl, c("group", "et", "model"))[order(group, et, model)])
+
+# The prior baseline is 0.500 BY CONSTRUCTION -- a sanity floor, not the scientific reference.
+# Sequence-only is the honest reference, and it turns "0.957" into "+0.007".
+pn(
+  "ablation.baseline_prior",
+  0.5,
+  "auroc",
+  "by construction",
+  filter = "DummyClassifier(strategy='prior'); identical in every fold"
+)
+for (g in levels(abl$group)) {
+  for (etv in unique(abl$et)) {
+    d <- abl[group == g & et == etv]
+    if (!nrow(d)) {
+      next
+    }
+    # The all-features arm is NOT an ablation run: it is the same seqnames config section 4
+    # already read, reused here as the reference. Attribute it to that analysis, or the manifest
+    # claims an ablation output that was never produced.
+    pn_folds(
+      sprintf("ablation.%s.%s.auroc", gsub("[^a-z]+", "_", g), tolower(etv)),
+      d,
+      d$payload[1],
+      sprintf("%s; seqnames CV; both variability tiers", g),
+      origin = if (g == "all features") ORIGIN$ml else ORIGIN$ablation
+    )
+  }
+}
+
+# Epigenetic gain PAIRED WITHIN OUTER FOLD, not as a difference of two means. The two runs share
+# the same deterministic split (same seed, same group_col), so fold k is the same held-out
+# chromosomes in both -- which is what makes the pairing valid. State that assumption.
+gain <- merge(
+  abl[group == "all features", .(et, model, outer_fold, full = value)],
+  abl[group == "sequence", .(et, model, outer_fold, seq_only = value)],
+  by = c("et", "model", "outer_fold")
+)
+gain[, epi_gain := full - seq_only]
+gsum <- gain[,
+  .(
+    folds = .N,
+    mean = mean(epi_gain),
+    sd = stats::sd(epi_gain),
+    min = min(epi_gain),
+    max = max(epi_gain)
+  ),
+  by = .(et, model)
+]
+print(gsum[order(et, model)])
+for (i in seq_len(nrow(gsum))) {
+  pn(
+    sprintf("ablation.epi_gain.%s.%s.mean", tolower(gsum$et[i]), gsum$model[i]),
+    gsum$mean[i],
+    "auroc",
+    "derived",
+    filter = "all features minus sequence-only; paired within outer fold",
+    n = gsum$folds[i]
+  )
+  pn(
+    sprintf("ablation.epi_gain.%s.%s.sd", tolower(gsum$et[i]), gsum$model[i]),
+    gsum$sd[i],
+    "auroc",
+    "derived",
+    filter = "sd of the paired within-fold gain",
+    n = gsum$folds[i]
+  )
+}
+
+if (nrow(abl)) {
+  p <- ggplot(abl, aes(value, paste(et, model), colour = group)) +
+    stat_summary(
+      fun = mean,
+      geom = "crossbar",
+      width = 0.55,
+      linewidth = 0.25,
+      position = position_dodge(width = 0.75)
+    ) +
+    geom_point(
+      position = position_dodge(width = 0.75),
+      size = 0.7,
+      alpha = 0.85
+    ) +
+    geom_vline(xintercept = 0.5, linetype = 2, linewidth = 0.3) +
+    scale_colour_paper(name = NULL) +
+    coord_cartesian(xlim = c(0.5, 1)) +
+    labs(
+      x = "test AUROC (one point per outer fold)",
+      y = NULL,
+      title = "Sequence carries it; marks add little"
+    )
+  print(p)
+  save_fig(
+    p,
+    "fig6_ablation",
+    5.5,
+    2.8,
+    shows = "per-outer-fold test AUROC by feature group (histone+dnam / sequence / all features)",
+    origin = paste(ORIGIN$ablation, "+ all-features arm from", ORIGIN$ml),
+    source = c(acfg$payload, unique(full$payload))
+  )
+}
+```
+
+## 8. Supplementary: permuted-groups control
+
+**Origin:** permuted-groups negative control, paired per event. **UNPROMOTED** — read from `.claude/scratch/` (spec 6.4).
+
+```{r permuted, eval = have[["permuted"]]}
+.ORIGIN_CUR <- ORIGIN$permuted
+pg <- fread(INPUTS$permuted)
+# dR2b = bounded-R2 gain from destroying group identity. `long`'s apparent gain is extrapolation
+# relief, not group exploitation -- report it faceted by out-of-support severity (`oos`), never
+# pooled, and never as a cell-type-identity claim (a permuted fold exposes batch, lab and protocol
+# alongside ontology).
+sm <- pg[,
+  .(n = .N, median_dR2b = median(dR2b)),
+  by = .(feature_set, event_type)
+]
+print(sm[order(feature_set, event_type)])
+print(pg[,
+  .(n = .N, median_dR2b = median(dR2b)),
+  by = .(feature_set, oos)
+][order(feature_set, oos)])
+for (i in seq_len(nrow(sm))) {
+  pn(
+    sprintf(
+      "permuted.median_dR2b.%s.%s",
+      sm$feature_set[i],
+      tolower(sm$event_type[i])
+    ),
+    sm$median_dR2b[i],
+    "r2_bounded",
+    INPUTS$permuted,
+    filter = "paired per event, rotations off",
+    n = sm$n[i]
+  )
+}
+# Pooled over event types. Emitted ONLY because other notes quote a pooled figure; the faceted
+# keys above are the ones to cite, because RI and SE differ materially (local 0.0090 vs 0.0014).
+pl <- pg[, .(n = .N, median_dR2b = median(dR2b)), by = feature_set]
+for (i in seq_len(nrow(pl))) {
+  pn(
+    sprintf("permuted.median_dR2b.%s.pooled", pl$feature_set[i]),
+    pl$median_dR2b[i],
+    "r2_bounded",
+    INPUTS$permuted,
+    filter = "pooled over event types - prefer the faceted keys",
+    n = pl$n[i]
+  )
+}
+pn(
+  "permuted.n_events",
+  uniqueN(pg$ID),
+  "count",
+  INPUTS$permuted,
+  filter = "distinct events; 4 strata (2 spaces x 2 event types) of 50 rows each"
+)
+```
+
+## 9. Statistics appendix
+
+**Origin:** experimental design, not measurement. Nature requires the replicate unit to be *defined*; it differs per analysis, so it is stated per analysis.
+
+```{r stats-appendix}
+.ORIGIN_CUR <- ORIGIN$design
+# Nature requires a statistics section that DEFINES THE REPLICATES and gives exact n and exact
+# non-significant P values. The replicate unit differs per analysis, so it is stated per analysis.
+replicates <- data.table(
+  analysis = c(
+    "Atlas (leg R)",
+    "Tier-1 screen",
+    "Tier-1 fold structure",
+    "splicing_ml CV",
+    "Variance budget",
+    "Permuted-groups control"
+  ),
+  replicate_unit = c(
+    "RNA-seq experiment (UUID)",
+    "splicing event",
+    "ontology supergroup",
+    "chromosome (seqnames) or ontology supergroup",
+    "observed (event, sample) row",
+    "splicing event, paired"
+  ),
+  test = c(
+    "none (descriptive)",
+    "one-sided exceedance p vs matched-locus null; BH/Storey FDR",
+    "leave-one-ontology-supergroup-out",
+    "grouped k-fold",
+    "none (variance decomposition, LOO group means)",
+    "paired difference"
+  ),
+  tails = c(NA, "one-sided", NA, NA, NA, "two-sided")
+)
+print(replicates)
+```
+
+## 10. Write `paper_numbers`
+
+Emits `paper_numbers_{tf}.csv` (every quoted number, with `filter`, `source` **and** `origin`) and `figure_provenance_{tf}.csv` beside the PDFs, so the manuscript's images directory is self-describing.
+
+```{r write-numbers}
+# `filter` and `note` are prose and DO contain commas. That is fine and deliberate: fwrite quotes
+# them and fread round-trips them losslessly (verified: 77 keys, 9 columns, values identical).
+# Mangling the text to suit `cut -d,` was considered and rejected -- it would degrade the one field
+# whose job is to make a number's predicate legible. CONSUME THIS FILE WITH A REAL CSV PARSER.
+PN <- rbindlist(.PN, fill = TRUE)
+PN[, generated := format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")]
+stopifnot(!anyDuplicated(PN$key))
+# Every number must name the analysis that produced it. A missing `origin` means a pn() call
+# slipped through with .ORIGIN_CUR unset, which pn() is supposed to make impossible -- so this is
+# an assertion, not a warning.
+stopifnot(!any(is.na(PN$origin) | !nzchar(PN$origin)))
+out <- sprintf("processed_data/paper_numbers_%s.csv", tf)
+fwrite(PN, out)
+message(sprintf("paper_numbers: %d keys -> %s", nrow(PN), out))
+
+# Figure manifest: same provenance contract for the figures. Written beside the PDFs so the
+# manuscript's images directory is self-describing after sync_paper_figures copies it over.
+FIGS <- rbindlist(.FIG, fill = TRUE)
+if (nrow(FIGS)) {
+  fout <- file.path(fig_dir, sprintf("figure_provenance_%s.csv", tf))
+  fwrite(FIGS, fout)
+  message(sprintf("figure manifest: %d figures -> %s", nrow(FIGS), fout))
+  print(FIGS[, .(figure, shows)])
+}
+
+# How many numbers each analysis contributes -- the quickest read on whether an UNPROMOTED
+# analysis is load-bearing for the manuscript.
+print(PN[, .(keys = .N), by = origin][order(-keys)])
+print(PN[, .(key, value = signif(value, 6), unit, origin)])
+```
+
+```{r session}
+sessionInfo()
+```

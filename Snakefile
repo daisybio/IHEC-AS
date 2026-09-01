@@ -265,6 +265,10 @@ rule all:
         # Final analysis reports
         f"reports/09-2-ml-local-new_{PRIMARY}.html",
         f"reports/10-experimental-events_{PRIMARY}.html",
+        # Step 11: the ONLY source for anything the manuscript quotes (figures + numbers).
+        # A DAG leaf on purpose -- nothing downstream, so paper iteration costs nothing.
+        f"reports/11-paper-figures_{PRIMARY}.html",
+        f"processed_data/paper_numbers_{PRIMARY}.csv",
 
 
 # ── Step 01: gather data ──────────────────────────────────────────────────────
@@ -1519,4 +1523,94 @@ rule clean:
         rm -f processed_data/event_glmnet_ids_*.txt
         rm -rf reports/
         echo "Cleaned outputs. Upstream steps (01-04) preserved."
+        """
+
+
+# ── Step 11: paper figures, tables and numbers ────────────────────────────────
+# The sole source for anything the manuscript quotes. 09-2 and the splicing_ml HTML reports are
+# internal diagnostics and are never cited; if a figure exists in both, this rule wins.
+#
+# DELIBERATELY A LEAF. It declares only the AGGREGATE artifacts it reads -- never
+# aggregated_dt, the per-event feature tables or chip_matrix -- so it does not inherit the
+# cascade it exists to escape. Editing it re-runs only itself, which is the whole point:
+# paper-facing text and figures are the most-edited artifacts in the project and used to live
+# in the most expensive place to edit. See revision/file-changes/11-paper-figures.Rmd.md.
+rule paper_figures:
+    input:
+        rmd            = "11-paper-figures.Rmd",
+        screen_results = f"processed_data/event_models/{PRIMARY}/screen_results.csv.gz",
+        tier1_hits     = f"processed_data/event_models/{PRIMARY}/tier1_hits_{PRIMARY}.txt",
+        floor_results  = f"processed_data/event_models/{PRIMARY}/floor/floor_results.csv.gz",
+        session        = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
+        qc_summary     = "processed_data/qc_summary.csv",
+        # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
+        # must stay fast because it re-runs on every tweak.
+        cv_payloads = [
+            f"splicing_ml/output/{et}_{PRIMARY}_both_{gc}/reports/subset_report_{et}_{PRIMARY}_both_{gc}.json"
+            for et in ("RI", "SE") for gc in ("seqnames", "ontology")
+        ],
+        ablation_payloads = [
+            f"splicing_ml/output_ablation/{fg}/{et}_{PRIMARY}_both_seqnames/reports/subset_report_{et}_{PRIMARY}_both_seqnames.json"
+            for fg in ("sequence", "histone+dnam") for et in ("RI", "SE")
+        ],
+    output:
+        html    = f"reports/11-paper-figures_{PRIMARY}.html",
+        numbers = f"processed_data/paper_numbers_{PRIMARY}.csv",
+    log: f"logs/11_paper_figures_{PRIMARY}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        f"""
+        TRANSCRIPT_FILTER={PRIMARY} \\
+        Rscript -e "rmarkdown::render('11-paper-figures.Rmd',
+            output_file = normalizePath('{{output.html}}', mustWork = FALSE)
+        )" > {{log}} 2>&1
+        """
+
+
+# ── Step 11b: sync figures into the manuscript tree ───────────────────────────
+# DELIBERATELY OUT OF `rule all`: the target is an Overleaf-synced git repo, and it must not be
+# written to as a side effect of a pipeline run. Invoke explicitly:
+#     snakemake --profile profiles/slurm sync_paper_figures
+#
+# Writes into <manuscript_images_dir>/generated/ and NEVER into images/ directly. Every file
+# already in images/ dates from Jul-Aug 2024 and is the preprint's figure record -- the version
+# submitted to Genome Biology. Overwriting e.g. varImp.pdf would also destroy the before/after
+# the preprint-leak figure needs (PATH-FORWARD queue item 2).
+rule sync_paper_figures:
+    input:
+        html = f"reports/11-paper-figures_{PRIMARY}.html",
+    params:
+        src  = f"reports/paper_figures/{PRIMARY}",
+        # str, not a lambda: this rule has no wildcards, and the Snakefile does not import os.
+        # Empty config => empty dest, which the shell guard below rejects rather than writing
+        # to a relative "generated/" inside the repo by accident.
+        dest = (
+            config["manuscript_images_dir"].rstrip("/") + "/generated"
+            if config.get("manuscript_images_dir") else ""
+        ),
+    log: f"logs/11b_sync_paper_figures_{PRIMARY}.log"
+    localrule: True
+    shell:
+        """
+        set -euo pipefail
+        if [ -z "{params.dest}" ]; then
+          echo "manuscript_images_dir is not set in config/snakemake_config.yaml -- refusing" >&2
+          exit 1
+        fi
+        if [ ! -d "$(dirname "{params.dest}")" ]; then
+          echo "manuscript_images_dir does not exist: {params.dest} -- refusing" >&2
+          exit 1
+        fi
+        mkdir -p "{params.dest}"
+        # -u so unchanged figures are not re-touched (an Overleaf tree is git-tracked, and a
+        # no-op copy would still show up as churn). -v so the log records exactly what moved.
+        cp -uv "{params.src}"/* "{params.dest}"/ > {log} 2>&1
+        echo "synced to {params.dest}" >> {log}
         """

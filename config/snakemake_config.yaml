@@ -407,3 +407,12 @@ slurm_gpu_partition: "shared-gpu"
 slurm_gpu_gres: "gpu:a40:1"
 slurm_gpu_qos: "limitgpus"
 slurm_gpu_exclude: "compms-gpu-1.exbio.wzw.tum.de"
+
+# ── Manuscript figure sync (rule sync_paper_figures, step 11b) ────────────────
+# Target for publication figures produced by 11-paper-figures.Rmd. The rule writes into
+# <manuscript_images_dir>/generated/ and NEVER into images/ directly: everything already in
+# images/ dates from Jul-Aug 2024 and is the preprint's figure record (the version submitted to
+# Genome Biology). Overwriting e.g. varImp.pdf would also destroy the before/after that the
+# preprint-leak figure needs. The sync rule is deliberately OUTSIDE `rule all` -- this is an
+# Overleaf-synced git repo and must not be written to as a side effect of a pipeline run.
+manuscript_images_dir: "/nfs/proj/quirinmanz/65f465a3da21f80541769df9/images"
