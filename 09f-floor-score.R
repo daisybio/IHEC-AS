@@ -158,6 +158,11 @@ inj[, p_pooled_z := {
 # family's p-vector: its rank is 1 + #{real p < p_inj}, and m is the real family size.
 # Exact up to the one real p this event would have displaced (shifts rank by <= 1).
 QTHR <- 0.1
+# Largest rho whose response still carries noise in a meaningful amount. rho enters as
+# sqrt(rho)*signal + sqrt(1-rho)*noise, so rho = 1 is noiseless and destabilises the
+# matched null (see the long comment at the anchors block). Anchors and the power curve
+# are restricted to rho <= this; rho = 1 stays in the sweep as a diagnostic.
+RHO_MAX_VALID <- 0.4
 famp <- scr[is.finite(p_pooled_z), .(p = sort(p_pooled_z), m = .N),
   by = .(`Event Type`, feature_set)]
 inj[, detected := {
@@ -181,22 +186,90 @@ print(inj[feature_set == "local", .(
   det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
 ), by = .(`Event Type`, Variability, inject_rho)][order(`Event Type`, Variability, inject_rho)])
 
-cat("\n=== same, stratified by blow-up (power is NOT uniform) ===\n")
-inj[, blowup := abs(screen_R2) > 1]
+# Blow-up status must come from the REAL screen (floor_events.tsv), NOT be recomputed
+# from the injected R2. Recomputing it makes the strata drift across rho -- a strong
+# injection stabilises a fit that blows up on real PSI, so the event silently changes
+# stratum and the per-rho rows stop being comparable. Measured 2026-09-01: the post-hoc
+# flag gave n = 184/177/181/176/183/184/180/228 across the rho grid for one stratum
+# (it should be constant), and moved RI's rho=1 detection rate from 10.7% to 7.0%.
+.ev_file <- Sys.getenv("FLOOR_EVENTS",
+  file.path(event_dir, "floor", "floor_events.tsv"))
+if (file.exists(.ev_file)) {
+  .ev <- fread(.ev_file, select = c("ID", "blowup"))
+  inj[.ev[, .(ID, k_bl = blowup)], on = "ID", blowup := i.k_bl]
+} else {
+  warning("floor_events.tsv not found; falling back to post-hoc blow-up status, ",
+    "whose strata are NOT comparable across rho")
+  inj[, blowup := abs(screen_R2) > 1]
+}
+
+cat("\n=== same, stratified by REAL blow-up status (power is NOT uniform) ===\n")
+cat("blowup is the event's status in the REAL screen, fixed across rho.\n")
+cat("Blown-up events are unrecoverable at ANY effect size -- 0% at every rho.\n\n")
 print(inj[feature_set == "local", .(n = .N,
-  med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
+  med_R2  = round(median(screen_R2, na.rm = TRUE), 4),
+  med_nsd = round(median(null_R2_sd, na.rm = TRUE), 5),
+  med_z   = round(median(z_inj, na.rm = TRUE), 2),
   det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
 ), by = .(`Event Type`, blowup, inject_rho)][order(`Event Type`, blowup, inject_rho)])
 
-cat("\n=== ANCHORS (must hold or the harness is broken) ===\n")
-print(inj[feature_set == "local" & inject_rho %in% c(0, 1), .(
+cat("\n=== ANCHORS ===\n")
+print(inj[feature_set == "local" & inject_rho %in% c(0, RHO_MAX_VALID), .(
   n = .N, med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
   med_p = signif(median(p_pooled_z, na.rm = TRUE), 3),
   det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
 ), by = .(inject_rho)][order(inject_rho)])
-cat("rho=0 must give a calibrated null (low detection); rho=1 must be detected.\n")
+cat("rho=0 must give a calibrated null: detection at or below the nominal rate.\n")
+cat(sprintf(
+  "Detection must rise MONOTONICALLY over the noisy range rho <= %g.\n", RHO_MAX_VALID))
+cat("There is deliberately NO 'rho=1 must be detected' anchor -- see below.\n")
 
-cat("\n=== THE FLOOR: smallest achieved R2 detected at q_pooled_z < 0.1 ===\n")
+# WHY rho = 1 IS EXCLUDED (measured 2026-09-01, do not re-add it as an anchor).
+# The worker builds the latent response as sqrt(rho)*signal + sqrt(1-rho)*noise, so at
+# rho = 1 the noise coefficient is exactly 0: the target is a noiseless, deterministic
+# function of s=10 columns. Kernel ridge on the CONTROL features fails against such a
+# target wildly and erratically, which inflates the null's SPREAD without shifting its
+# mean (null_R2_mean stays ~0; frac(null_R2_mean > 0) stays flat at 0.33-0.43, so the
+# controls do not predict better -- they fail more variably). Since
+# z = (R2 - null_mean)/null_sd, that sinks z even as R2 rises:
+#   RI  rho 0.4 -> 1:  med R2 0.072 -> 0.718 (x10)  but med null_sd 0.056 -> 1.027 (x18)
+#                      => med z 0.86 -> 0.72, detection 20.7% -> 10.7%
+#   SE  rho 0.4 -> 1:  med null_sd 0.009 -> 0.238 (x26)
+# rho = 1 is therefore a DEGENERATE setting, not a strong-signal setting, and its low
+# detection rate says nothing about the screen's sensitivity. Keep it in the sweep as a
+# diagnostic; never treat it as the ceiling.
+cat("\n=== POWER CURVE: detection rate vs achieved R2 (clean stratum, valid rho) ===\n")
+.pc <- inj[feature_set == "local" & blowup %in% FALSE & inject_rho <= RHO_MAX_VALID,
+  .(n = .N,
+    med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
+    power_pct = round(100 * mean(detected, na.rm = TRUE), 1)),
+  by = .(`Event Type`, inject_rho)][order(`Event Type`, inject_rho)]
+print(.pc)
+
+# Report POWER at a stated effect size, not the smallest R2 that happened to be detected.
+# min(screen_R2 | detected) is an outlier statistic and reads as a floor when it is not:
+# detection is decided on z, so an event whose null variance has collapsed is detected at
+# a trivial R2 while the median event at 10x that R2 is not. Quoting it as "the floor"
+# would overstate the screen's sensitivity by an order of magnitude.
+cat("\n=== POWER AT A TARGET: is there any effect size with >= 50% power? ===\n")
+POWER_TARGET <- 0.5
+.pk <- .pc[, .(
+  peak_power_pct = max(power_pct),
+  med_R2_at_peak = med_R2[which.max(power_pct)],
+  rho_at_peak    = inject_rho[which.max(power_pct)],
+  reaches_target = any(power_pct >= 100 * POWER_TARGET)
+), by = .(`Event Type`)]
+print(.pk)
+if (!any(.pk$reaches_target)) {
+  cat(sprintf(paste0(
+    "\nNO effect size reaches %.0f%% power in any event type. The screen therefore has\n",
+    "no detection FLOOR to quote -- report the power curve above instead, and state that\n",
+    "blown-up events (~50%% of the real screen) have 0%% power at EVERY effect size.\n"),
+    100 * POWER_TARGET))
+}
+
+cat("\n=== for reference only: smallest achieved R2 that happened to be detected ===\n")
+cat("NOT a floor -- an outlier statistic. See the comment above. Do not quote it.\n")
 print(inj[detected == TRUE & feature_set == "local",
   .(min_detected_R2 = round(min(screen_R2, na.rm = TRUE), 4),
     n_detected = .N), by = .(`Event Type`, Variability)][order(`Event Type`, Variability)])

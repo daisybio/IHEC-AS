@@ -1767,44 +1767,71 @@ if (en_available) {
 
 A null result is only interpretable against a stated sensitivity. Section 1.3 establishes that the
 *exceedance* p is floored by the rotation count and therefore cannot reject a single event at FDR 0.1
-in either event type — that is a property of the test's resolution, not of the data. This section
-answers the complementary and harder question: **holding the resolution fixed, how large would a real
-epigenetic effect have had to be for this screen to see it?**
+in either event type — a property of the test's resolution, not of the data. This section answers the
+complementary question: **holding the resolution fixed, how large would a real epigenetic effect have
+had to be for this screen to see it?**
 
-**How the floor is measured.** The pipeline re-runs the *real* Tier-1 worker on a stratified sample of
-real events, with the response replaced by a synthetic one built from that event's own feature matrix:
+**The answer is not a floor.** The sweep was designed to report the smallest detectable effect size;
+it found instead that **no effect size this design can represent reaches 50% power**, and that for
+roughly half of all events the power is exactly zero at *every* effect size. Both statements are
+measured below, and both change what the 0-hit result of section 1.2 is allowed to mean.
 
-$$y_{\text{lat}} = \rho \cdot \text{(standardised linear combination of } s \text{ real feature columns)} + \sqrt{1-\rho^{2}}\cdot\varepsilon$$
+**How it is measured.** The pipeline re-runs the *real* Tier-1 worker on a stratified sample of real
+events (596 of a targeted 600, 8 strata of ~75) with the response replaced by a synthetic one built
+from that event's own feature matrix:
 
-Everything else — the confound set, the leave-one-ontology-supergroup-out folds, the λ rule, the matched
-control rotations — is untouched, because the injected run *is* the production worker (`09s-ridge-screen.R`
-under `EPIATLAS_AS_SCREEN_INJECT`), not a re-implementation. A separate implementation would drift from
-`prep_event()`'s fold logic with nothing to detect it.
+$$y_{\text{lat}} = \sqrt{\rho}\, \cdot z(X_S \beta) \;+\; \sqrt{1-\rho}\, \cdot \varepsilon,
+\qquad |S| = 10 \text{ columns drawn from the event's own } \texttt{local} \text{ features}$$
 
-Three things about this design decide how the numbers below should be read:
+so $\rho$ is the **variance fraction** carried by the injected signal, not a correlation. Everything
+else — the confound set, the leave-one-ontology-supergroup-out folds, the λ rule, the matched control
+rotations — is untouched, because the injected run *is* the production worker
+(`09s-ridge-screen.R` under `EPIATLAS_AS_SCREEN_INJECT`), not a re-implementation.
 
-- **ρ is a knob, not the reported quantity.** The map from ρ to achieved out-of-fold R² is strongly
-  nonlinear and mode-dependent (at ρ = 1: 1.000 under a raw Gaussian response, 0.809 after a logistic
-  squash, 0.518 after rank-mapping). **Always quote the achieved R², never ρ.**
+Three design points decide how the numbers read:
+
+- **ρ is a knob, not the reported quantity.** The ρ→R² map is nonlinear and mode-dependent (at ρ = 1:
+  1.000 under a raw Gaussian response, 0.809 after a logistic squash, 0.518 after rank-mapping).
+  **Always quote the achieved R², never ρ.**
 - **The response is rank-mapped onto the real PSI marginal.** The injected `PSI` is the event's own
-  observed PSI values re-ordered to follow $y_{\text{lat}}$, so the boundary atoms (39.3% of PSI values
-  are exactly 1.0) and the bounded support are preserved exactly. This costs real recoverable signal —
-  the ceiling is ≈ 0.52, not 1.0 — and that is the point: an unbounded Gaussian response would report a
-  floor for a response shape PSI never has.
-- **Detection is scored on `p_pooled_z`, not `p_emp`.** The exceedance p is floored, so at the sample
-  size the floor sweep can afford it would measure the rotation count rather than the signal. Each
-  injected event is standardised against the **real** screen's pooled-z reference — every real event's
-  leave-one-out standardised null z, within its own `(Event Type × feature_set)` family — and spliced
-  into that family's real p-vector to get a genuine BH rank.
+  observed values re-ordered to follow $y_{\text{lat}}$, so the boundary atoms (39.3% of PSI values are
+  exactly 1.0) and the bounded support are preserved exactly. This costs real recoverable signal, and
+  that is the point: an unbounded Gaussian response would report a sensitivity for a response shape
+  PSI never has.
+- **Detection is scored on `p_pooled_z`, not `p_emp`.** Each injected event is standardised against the
+  **real** screen's pooled-z reference — 23,725,212 leave-one-out standardised null z values within its
+  own `(Event Type × feature_set)` family — and spliced into that family's real p-vector for a genuine
+  BH rank. The reference reproduces `09s-aggregate.R` to 5.55e-16 on 400 real events, and the scorer
+  refuses to run if it does not.
 
 **Scope.** The sweep runs on `local` only. In the `long` space the injection fails to recover a signal
-that is by construction present in that space's own columns, so `long` has no measurable floor to
-report — see the anchor table. That is itself a finding: the screen's power lives in the
-event-overlapping features.
+that is by construction present in that space's own columns, so `long` has no measurable sensitivity to
+report. That is itself a finding: the screen's power lives in the event-overlapping features.
+
+### Why ρ = 1 is excluded from the anchors
+
+Because $\sqrt{1-\rho} = 0$ there, ρ = 1 produces a **noiseless** target — a deterministic function of
+10 columns. Kernel ridge on the *control* features fails against such a target erratically, which
+inflates the null's spread without shifting its mean. Since $z = (R^2 - \bar{R^2}_{\text{null}})/
+s_{\text{null}}$, that sinks z even as R² climbs:
+
+| | med R² | med `null_R2_sd` | med z | detection |
+| --- | --- | --- | --- | --- |
+| RI, ρ = 0.4 | 0.072 | 0.056 | 0.86 | **20.7%** |
+| RI, ρ = 1 | 0.718 (×10) | 1.027 (**×18**) | 0.72 | 10.7% |
+| SE, ρ = 0.4 | 0.022 | 0.009 | 1.04 | 10.0% |
+| SE, ρ = 1 | 0.423 (×19) | 0.238 (**×26**) | 1.85 | 18.0% |
+
+The fraction of control rotations with `null_R2_mean > 0` stays flat at 0.33–0.43 across the whole
+grid, so the controls are **not** predicting the injected response better — they are failing more
+variably. ρ = 1 is therefore a *degenerate* setting, not a strong-signal one, and its detection rate
+says nothing about sensitivity. The valid range is ρ ≤ 0.4; ρ = 1 is kept in the sweep as a diagnostic
+only.
 
 ```{r tier1-detection-floor, echo=FALSE, message=FALSE, warning=FALSE}
 .floor_file <- file.path(event_dir, "floor", "floor_results.csv.gz")
 floor_dt <- if (file.exists(.floor_file)) fread(.floor_file) else data.table()
+RHO_MAX_VALID <- 0.4   # see the section above: rho = 1 is noiseless and destabilises the null
 
 if (!nrow(floor_dt)) {
   cat("Detection floor not available: ", .floor_file, " is missing.\n",
@@ -1812,90 +1839,115 @@ if (!nrow(floor_dt)) {
 } else {
   # `local` only, and this is a hard filter, not a default view: at rho = 1 the injection
   # fails to recover a signal that is by construction present in `long`'s own columns, so
-  # `long` has no measurable floor to report. Pooling the spaces would average a real floor
-  # against an undefined one. See the "Scope" paragraph above.
+  # `long` has no measurable sensitivity. Pooling would average a real curve against an
+  # undefined one. See the "Scope" paragraph above.
   floor_dt <- floor_dt[feature_set == "local"]
   cat(sprintf("floor sweep: %d rows, %d events, rho in {%s}\n\n",
     nrow(floor_dt), uniqueN(floor_dt$ID),
     paste(sort(unique(floor_dt$inject_rho)), collapse = ", ")))
 
-  # ANCHORS FIRST. rho = 0 is a pure null: its detection rate must sit near the nominal
-  # 10%, or the pooled-z reference is miscalibrated and nothing below it is trustworthy.
-  # rho = 1 must be detected: if the strongest injectable signal is invisible, the sweep
-  # is measuring a broken harness, not the screen's sensitivity.
-  anch <- floor_dt[inject_rho %in% c(0, 1), .(
+  # ANCHOR. rho = 0 is a pure null: detection must sit at or below the nominal rate, or the
+  # pooled-z reference is miscalibrated and nothing below it is trustworthy. There is no
+  # rho = 1 anchor -- see the section above for why that criterion was wrong.
+  cat("=== anchor: rho = 0 must be a calibrated null ===\n")
+  print(floor_dt[inject_rho == 0, .(
     n = .N,
     med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
     med_p_pooled_z = signif(median(p_pooled_z, na.rm = TRUE), 3),
     det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
-  ), by = .(inject_rho)][order(inject_rho)]
-  cat("=== anchors (rho = 0 must be near-null; rho = 1 must be detected) ===\n")
-  print(anch)
+  ), by = .(`Event Type`)])
 
-  cat("\n=== detection rate vs achieved out-of-fold R2, by stratum ===\n")
-  print(floor_dt[, .(
+  # `blowup` is the event's status in the REAL screen (joined from floor_events.tsv by
+  # 09f-floor-score.R), NOT recomputed from the injected R2. Recomputing it lets an event
+  # change stratum when a strong injection stabilises a fit that blows up on real PSI,
+  # so the per-rho rows stop being comparable -- measured, it moved one stratum's n from
+  # 184 to 228 across the grid.
+  cat("\n=== power by REAL blow-up status: power is not uniform, and half the events have none ===\n")
+  print(floor_dt[inject_rho <= RHO_MAX_VALID, .(
     n = .N,
     med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
-    det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
-  ), by = .(`Event Type`, Variability, inject_rho)][order(`Event Type`, Variability, inject_rho)])
-
-  # Power is NOT uniform across events. A blown-up statistic (|R2| > 1, 50.1% of real
-  # rows) means the leave-one-group-out fit extrapolated catastrophically on at least one
-  # fold; such an event cannot be rescued by a stronger signal, so pooling it with the
-  # well-behaved events understates the floor for the events that actually have power.
-  cat("\n=== same, stratified by blow-up |R2| > 1 (power is not uniform) ===\n")
-  print(floor_dt[, .(
-    n = .N,
-    med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
-    det_rate_pct = round(100 * mean(detected, na.rm = TRUE), 1)
+    med_z = round(median(z_inj, na.rm = TRUE), 2),
+    power_pct = round(100 * mean(detected, na.rm = TRUE), 1)
   ), by = .(`Event Type`, blowup, inject_rho)][order(`Event Type`, blowup, inject_rho)])
 
-  cat("\n=== THE FLOOR: smallest achieved R2 detected at q_pooled_z < 0.1 ===\n")
-  print(floor_dt[detected == TRUE, .(
-    min_detected_R2 = round(min(screen_R2, na.rm = TRUE), 4),
-    med_detected_R2 = round(median(screen_R2, na.rm = TRUE), 4),
-    n_detected = .N
-  ), by = .(`Event Type`, Variability)][order(`Event Type`, Variability)])
+  cat("\n=== POWER CURVE (clean stratum, valid rho): detection vs achieved R2 ===\n")
+  .pc <- floor_dt[blowup %in% FALSE & inject_rho <= RHO_MAX_VALID, .(
+    n = .N,
+    med_R2 = round(median(screen_R2, na.rm = TRUE), 4),
+    power_pct = round(100 * mean(detected, na.rm = TRUE), 1)
+  ), by = .(`Event Type`, inject_rho)][order(`Event Type`, inject_rho)]
+  print(.pc)
+
+  cat("\n=== is there ANY effect size with >= 50% power? ===\n")
+  print(.pc[, .(
+    peak_power_pct = max(power_pct),
+    med_R2_at_peak = med_R2[which.max(power_pct)],
+    reaches_50 = any(power_pct >= 50)
+  ), by = .(`Event Type`)])
 }
 ```
 
 ```{r tier1-detection-floor-curve, echo=FALSE, message=FALSE, warning=FALSE, fig.height=4.2, fig.width=8}
 if (nrow(floor_dt)) {
-  # Bin on the ACHIEVED R2, not on rho -- rho is the knob and the rho -> R2 map is
-  # nonlinear, so a curve against rho would be a curve against an arbitrary parameter.
-  .fc <- floor_dt[is.finite(screen_R2) & !is.na(detected)]
-  .fc[, r2_bin := cut(screen_R2,
-    breaks = c(-Inf, 0, 0.05, 0.1, 0.2, 0.3, 0.5, Inf),
-    labels = c("<=0", "0-0.05", "0.05-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.5", ">0.5"))]
-  .fcs <- .fc[, .(det = mean(detected), n = .N), by = .(`Event Type`, r2_bin)][n >= 5L]
+  # Plot against the ACHIEVED R2, not rho -- rho is the knob and the rho -> R2 map is
+  # nonlinear, so a curve against rho would be a curve against an arbitrary parameter and
+  # would share no axis with the real events' R2, which is the whole point of the figure.
+  .fc <- floor_dt[is.finite(screen_R2) & !is.na(detected) & inject_rho <= RHO_MAX_VALID]
+  .fcs <- .fc[, .(power = 100 * mean(detected), med_R2 = median(screen_R2), n = .N),
+    by = .(`Event Type`, blowup, inject_rho)][n >= 5L]
   if (nrow(.fcs)) {
+    .fcs[, stratum := fifelse(blowup %in% TRUE,
+      "blown up in the real screen", "well-behaved")]
     print(
-      ggplot(.fcs, aes(x = r2_bin, y = 100 * det, group = `Event Type`, colour = `Event Type`)) +
+      ggplot(.fcs, aes(x = med_R2, y = power, colour = `Event Type`, linetype = stratum)) +
         geom_line() +
         geom_point(aes(size = n)) +
-        geom_hline(yintercept = 100 * screen_q_threshold, linetype = "dashed", colour = "grey40") +
+        geom_hline(yintercept = 50, linetype = "dotted", colour = "grey40") +
         scale_size_continuous(range = c(1, 4)) +
         labs(
-          x = "achieved out-of-fold R² (binned)", y = "detected at q_pooled_z < 0.1 (%)",
-          title = "Tier-1 detection floor (local features, rank-mapped response)",
-          subtitle = sprintf("dashed line = nominal %g; bins with n < 5 dropped", screen_q_threshold)
+          x = "achieved out-of-fold R² (median of the stratum)",
+          y = "detected at q_pooled_z < 0.1 (%)",
+          title = "Tier-1 power, not a detection floor (local features, rank-mapped response)",
+          subtitle = sprintf(
+            "dotted = 50%% power, never reached; rho <= %g only (rho = 1 is noiseless, see text)",
+            RHO_MAX_VALID)
         ) +
-        theme_bw() +
-        theme(axis.text.x = element_text(angle = 30, hjust = 1))
+        theme_bw()
     )
   } else {
-    cat("too few injected rows per bin to draw the detection curve\n")
+    cat("too few injected rows per stratum to draw the power curve\n")
   }
 }
 ```
 
-**How to state this in the manuscript.** The floor is the smallest achieved out-of-fold R² that this
-screen detects at FDR 0.1, per event type and variability tier, on the `local` feature space, under a
-response that preserves PSI's own marginal distribution. Real events fall *below* that floor. The
-correct claim is therefore: *no event's epigenetic signal exceeds the matched-locus null by more than
-R² ≈ (floor), which the screen would have detected*. It is **not** *epigenetics does not influence
-splicing* — a diffuse mechanism shared across loci cancels in a matched-locus null by construction
-(section 1.1), and effects below the floor remain entirely possible.
+### What this licenses the manuscript to say
+
+The sweep does **not** yield a detection floor, and reporting one would overstate the screen by an
+order of magnitude. `09f-floor-score.R` still prints the smallest achieved R² that happened to be
+detected (0.012–0.073) — **do not quote it.** It is an outlier statistic: detection is decided on z, so
+an event whose null variance has collapsed is detected at a trivial R² while the median event at ten
+times that R² is not.
+
+What the sweep does establish, and what should be stated instead:
+
+1. **The null is calibrated.** At ρ = 0, detection is 0.0% across all 596 events, and the pooled-z
+   reference reproduces the aggregator exactly. The 0-hit result is not an artifact of a broken test.
+2. **Power rises monotonically with effect size but peaks around 21% (RI) and 10% (SE)**, at median
+   achieved R² of 0.072 and 0.022. **No effect size reaches 50% power.**
+3. **For events whose statistic blows up — about half of the real screen — power is 0% at every
+   effect size tested**, including the largest. These events are not underpowered; they are
+   **unrecoverable by this statistic**, and the reason is null instability rather than signal
+   swamping: their median `null_R2_sd` is 57.9–112.3 against 0.003–0.056 for well-behaved events, so
+   the matched null is as unstable as the real fit and $z$ has no resolution. Median $z$ sits at
+   0.08–0.16 flat across every ρ, ρ = 1 included — which is why the zero is exact rather than marginal.
+
+So the correct reading of section 1.2 is: *no event beats its matched-locus null, in a screen that
+would have missed most locus-specific effects of any magnitude it can represent, and all of them in
+half the events*. That is a much weaker claim than "epigenetic control of splicing does not occur" —
+and weaker, too, than the "effects below δ are invisible" statement this section was built to make.
+The honest framing of the whole Tier-1 result is a **bound on what was testable**, not a negative
+finding about biology.
+
 
 # 2. Tier 2 — elastic net on the hits: which features, and how well?
 
