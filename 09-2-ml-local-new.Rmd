@@ -1,6 +1,10 @@
 ---
 title: "ML event models"
-output: pdf_document
+# html_document, like every other report in this pipeline. Was `pdf_document`, which made
+# rmarkdown::render go to LaTeX regardless of the .html path `rule ml_analysis` declares and
+# passes as output_file -- so the rule died at pdflatex on a missing bookmark.sty AFTER all 58
+# chunks had run. A format mismatch with the rule, not a TeX problem.
+output: html_document
 ---
 
 # Epigenetic Prediction of Alternative Splicing: Per-Event Models
