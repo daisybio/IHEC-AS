@@ -345,7 +345,23 @@ print(data.table(
 # This file must never read that tree directly.
 atlas <- fread(INPUTS$atlas)
 print(atlas)
-pn("atlas.uuids", atlas[["uuids"]][1], "count", INPUTS$atlas)
+# `uuids` is repeated on every class row (it is a property of the run set, not of the class), so
+# take one; `events` is per class, so sum.
+stopifnot(uniqueN(atlas$uuids) == 1L)
+# QUANTIFIED, measured from the data rather than taken from the command table's declaration. The two
+# agree at 1,522 -- but only because 02-3b reads the count columns with colClasses="character".
+# Without that, fread reads a two-sample value like "10,11" as the number 10.11 (comma as decimal
+# separator), three N=2 runs appear to have lost a sample, and this key reads 1,519. The measurement
+# is kept despite currently agreeing with the declaration: a real gap would silently mislabel every
+# sample after it, and this is the headline count of the resource leg.
+pn("atlas.uuids", atlas[["uuids"]][1], "count", INPUTS$atlas,
+  filter = "RNA-seq uuids actually QUANTIFIED by rMATS (MATS.JC.txt field counts)",
+  n = atlas[["runs"]][1])
+if ("uuids_declared" %in% names(atlas)) {
+  pn("atlas.uuids_declared", atlas[["uuids_declared"]][1], "count", INPUTS$atlas,
+    filter = "uuids named in the rMATS command table's uuid_string -- a CLAIM, not a measurement",
+    note = "currently equal to the quantified count; quote atlas.uuids, which is measured")
+}
 pn(
   "atlas.events",
   sum(atlas[["events"]]),
@@ -353,6 +369,17 @@ pn(
   INPUTS$atlas,
   filter = "all 5 rMATS classes"
 )
+pn("atlas.runs", atlas[["runs"]][1], "count", INPUTS$atlas,
+  filter = "rMATS invocations = library strata (paired/single x libtype x read length)")
+# Per class, because the manuscript contrasts what was quantified against what was modelled, and
+# that contrast is only legible per class: SE and MXE carry ~98% of the events while RI, the class
+# where the epigenetic contribution sits, has just 2,459.
+for (i in seq_len(nrow(atlas))) {
+  pn(sprintf("atlas.events.%s", tolower(atlas$event_type[i])),
+    atlas$events[i], "count", INPUTS$atlas,
+    filter = sprintf("fromGTF.%s.txt, identical across all %d strata",
+      atlas$event_type[i], atlas$n_runs_checked[i]))
+}
 ```
 
 ```{r atlas-missing, eval = !have[["atlas"]], results='asis'}
@@ -415,6 +442,20 @@ pn(
   filter = "modelled",
   note = "54.7%: worse than the 214/227 near-balance older notes imply"
 )
+# THE RESOURCE CLAIM: the analysis used a small slice of what rMATS quantified. Derived, not
+# retyped. Emitted HERE and not in section 1 because `co` is built in this chunk -- section 1 runs
+# first, so an `exists("co")` guard there would silently never fire.
+if (have[["atlas"]] && exists("atlas")) {
+  pn(
+    "atlas.modelled_uuid_frac",
+    co$uuids[1] / atlas[["uuids"]][1],
+    "fraction",
+    "derived",
+    filter = sprintf("modelled %d of %d atlas uuids", co$uuids[1], atlas[["uuids"]][1]),
+    origin = ORIGIN$atlas,
+    note = "the manuscript's '27% of the experiments'"
+  )
+}
 if (!is.null(qcs)) {
   # kept ADJACENT to the modelled counts on purpose -- split apart, the 405-vs-379 drift recurs
   pn(

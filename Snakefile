@@ -413,6 +413,105 @@ rule rmats_event_filtering:
 # 02-4-irfinder-concordance.Rmd.md. IRFinder data itself
 # (/nfs/data/IHEC/RNAseq/irfinder/) is external, pre-computed, not a Snakemake
 # input (thousands of per-sample files, static reference data - not tracked).
+# ── Step 02-3b: rMATS atlas summary (leg R) ───────────────────────────────────
+# The resource leg's two numbers -- how many RNA-seq experiments rMATS quantified and how many
+# splicing events it found -- WITHOUT reading the 136 GB tree. Both are structural: the sample set is
+# declared in the command table's `uuid_string`, and rMATS derives its events from the GTF, so
+# `fromGTF.<ET>.txt` row counts ARE the event counts (verified identical across all 14 strata, and
+# against full decompression of the aggregated tables for 4 of 5 classes).
+#
+# Counting the aggregated `<ET>.MATS.JC.txt.csv.gz` tables instead would take hours -- measured at
+# ~10 min/GB, with a first attempt killed at a 90-minute wall having finished 2 of 6 files.
+#
+# The rMATS tree lives outside the workspace (/nfs/data/IHEC/RNAseq/rmats), so it cannot be a
+# declared input; the script fails loudly if a run directory or fromGTF file is missing. Overridable
+# via RMATS_ATLAS_ROOT.
+#
+# NOT the data release: producing the full 1,522-sample long-format atlas is a separate job that must
+# re-derive per-sample counts from the raw <ET>.MATS.JC.txt files. See revision/deferred-cosmetic-edits.md.
+rule atlas_summary:
+    input:
+        script   = "02-3b-atlas-summary.R",
+        commands = "data/rmats_split_post_commands.tsv",
+    output:
+        summary = "processed_data/atlas_summary_{transcript_filter}.csv",
+    log: "logs/02-3b_atlas_summary_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} ATLAS_OUT={output.summary} \
+        Rscript 02-3b-atlas-summary.R > {log} 2>&1
+        """
+
+
+# ── Step 02-3c: full 1,522-sample atlas rebuild (leg R data release) ──────────
+# DELIBERATELY OUT OF `rule all`. This is the data-release artifact, not a pipeline input: nothing
+# downstream reads it, it costs hours, and it only needs rebuilding when the release is cut.
+# Invoke explicitly:
+#     snakemake --profile profiles/slurm processed_data/atlas/biotype_filtered/SE.csv.gz
+#
+# WHY IT EXISTS. The aggregated `<ET>.MATS.JC.txt.csv.gz` files in the rMATS tree are cohort-subset
+# (415 uuids): 02-3 applies `keep_idx <- which(uuids %in% rna_to_use)` when building them, which was
+# an OOM fix rather than a scientific choice. The full-cohort files that exist on disk
+# (`*.allsample.bak`, `all.SE`, `.SE`) are orphaned output of the pre-fix code and the current
+# pipeline cannot regenerate them.
+#
+# WHY A SEPARATE SCRIPT RATHER THAN A FLAG ON 02-3. Parameterising 02-3 would be the principled route
+# -- same transform, and this project's precedent (the injection hook living inside
+# 09s-ridge-screen.R) argues against re-implementation. But 02-3 is a declared input of
+# rule rmats_event_filtering, whose outputs feed prepare_aggregation and therefore everything, and
+# `--touch` is explicitly ruled out for a whole-pipeline cascade. Duplication is acceptable here
+# because the output is a frozen snapshot with nothing to drift into, and because it is CHECKED:
+# `Rscript 02-3c-atlas-build-full.R --verify` rebuilds the cohort subset and requires it to be
+# identical to 02-3's own output (RI: 1,020,485 rows, IDENTICAL). Run --verify before trusting a
+# release. If 02-3 ever re-runs for a substantive reason, fold the parameterisation in and drop this.
+#
+# The rMATS tree is outside the workspace and is not a declared input; the script fails loudly on a
+# missing run directory. Writes only under processed_data/atlas/, never into the rMATS tree.
+rule atlas_build_full:
+    input:
+        script   = "02-3c-atlas-build-full.R",
+        commands = "data/rmats_split_post_commands.tsv",
+        # only for --verify's cohort definition, but declared so the rule cannot run against a
+        # missing file table
+        files    = "processed_data/file_table.csv.gz",
+    output:
+        # One file per rMATS class, assembled from per-run parts under atlas/parts/ by raw gzip
+        # concatenation. The parts survive on purpose: they are the resumption unit.
+        classes = expand(
+            "processed_data/atlas/{{transcript_filter}}/{event_type}.csv.gz",
+            event_type=["SE", "RI", "A3SS", "A5SS", "MXE"],
+        ),
+    params:
+        # Peak memory is n_events x chunk x 3 measure vars. SE at 500 is ~6.7 GB, comfortable on a
+        # 200 GB reservation; the original OOM came from holding whole-run-wide tables across 4-8
+        # concurrent forks, so chunk width -- not fork count -- is the lever.
+        chunk = 500,
+    log: "logs/02-3c_atlas_build_full_{transcript_filter}.log"
+    threads: R("atlas_build", "threads")
+    resources:
+        mem_mb          = R("atlas_build", "mem_mb"),
+        runtime         = R("atlas_build", "runtime"),
+        # NOT _partition(): that is a cpu/gpu binary and this rule needs the big-memory partition.
+        slurm_partition = config["slurm_atlas_partition"],
+        slurm_extra     = _extra("atlas_build"),
+        qos             = _qos("atlas_build"),
+        gres            = _gres("atlas_build"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        ATLAS_SAMPLE_CHUNK={params.chunk} ATLAS_DT_THREADS={threads} \
+        Rscript 02-3c-atlas-build-full.R > {log} 2>&1
+        """
+
+
 rule irfinder_concordance:
     input:
         rmd = "02-4-irfinder-concordance.Rmd",
@@ -1665,6 +1764,7 @@ rule paper_figures:
         variance       = f"processed_data/psi_variance_decomposition_{PRIMARY}.csv",
         permuted       = f"processed_data/permuted_groups_control_{PRIMARY}.csv",
         cohort         = f"processed_data/cohort_counts_{PRIMARY}.csv",
+        atlas          = f"processed_data/atlas_summary_{PRIMARY}.csv",
         # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
         # must stay fast because it re-runs on every tweak.
         cv_payloads = [

@@ -400,9 +400,23 @@ resources:
     runtime: 240
     threads: 4
     gpu: 0
+  # Full-atlas rebuild (rule atlas_build_full, step 02-3c). Its own tier because it is the only rule
+  # that reads the raw rMATS tree and reassembles all 1,522 samples: SE alone is 559,157 events x
+  # 1,522 samples = ~851 M rows. Sized for `exbio-interactive` (160 CPUs / 1.5 TB / 1-day cap), which
+  # is why runtime is 1440 and not more -- the partition will not grant longer. The job is resumable
+  # per (event type, run), so hitting the cap costs only the run in flight.
+  atlas_build:
+    mem_mb: 200000
+    runtime: 1440
+    threads: 8
+    gpu: 0
 
 # ── SLURM partitions ──────────────────────────────────────────────────────────
 slurm_cpu_partition: "shared-cpu"
+# Big-memory partition for the full-atlas rebuild only. Set on that rule directly rather than through
+# _partition(), which is a cpu/gpu binary -- routing it through there would change the partition of
+# every other CPU rule.
+slurm_atlas_partition: "exbio-interactive"
 slurm_gpu_partition: "shared-gpu"
 slurm_gpu_gres: "gpu:a40:1"
 slurm_gpu_qos: "limitgpus"
