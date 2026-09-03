@@ -1807,6 +1807,15 @@ rule paper_figures:
         atlas          = f"processed_data/atlas_summary_{PRIMARY}.csv",
         protocol       = f"processed_data/paired_protocol_dPSI_summary_{PRIMARY}.csv.gz",
         protocol_pool  = f"processed_data/paired_protocol_pooled_summary_{PRIMARY}.csv.gz",
+        # IRFinder concordance supplement (section 8c). `ann`/`keep_rows` are stage-03 outputs, read
+        # ONLY to re-express the caller-level validation rate against the modelled denominator -- a
+        # join of small tables, not a re-analysis.
+        irf_tree       = f"qc/irfinder_tree_comparison_{PRIMARY}.csv.gz",
+        irf_strat      = f"qc/irfinder_stratified_metrics_{PRIMARY}.csv.gz",
+        irf_conc       = [f"qc/irfinder_concordance_{t}_{PRIMARY}.csv.gz"
+                          for t in ("annotation", "TSL12")],
+        ann            = f"processed_data/event_annotations_dt_{PRIMARY}.csv.gz",
+        keep_rows      = f"processed_data/keep_rows_manual_{PRIMARY}.rds",
         # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
         # must stay fast because it re-runs on every tweak.
         cv_payloads = [

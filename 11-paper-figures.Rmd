@@ -107,6 +107,7 @@ ORIGIN <- list(
   floor = "Detection-floor injection sweep: 09f-floor-sample.R -> 09s-ridge-screen.R under EPIATLAS_AS_SCREEN_INJECT -> 09f-floor-score.R (scored on p_pooled_z vs the real screen's 23.7 M null-z reference) [leg C]",
   permuted = "Permuted-groups negative control, paired per event: 09p-permute-groups.R (rule permuted_groups_control), supergroup LABELS permuted so fold count and sizes are preserved exactly [leg C]",
   protocol = "Paired-protocol effect on PSI: 06c-paired-protocol.R (rule paired_protocol), the 36 epirrs carrying BOTH an mRNA-Seq and a total-RNA-Seq uuid; effect estimated WITHIN sample [confound]",
+  irfinder = "IRFinder concordance supplement: 02-4-irfinder-concordance.Rmd (rule irfinder_concordance), both reference trees; rMATS stays the PRIMARY RI quantification [confound/validation]",
   candidates = "Adjudication of the floor-free pooled-z candidates: screen_results.csv.gz (Tier-1) cross-referenced against floor_results.csv.gz (the injection sweep) -- no refits, reshape only [leg C]",
   design = "fixed by experimental design; not measured"
 )
@@ -304,6 +305,12 @@ INPUTS <- list(
   protocol = sprintf("processed_data/paired_protocol_dPSI_summary_%s.csv.gz", tf),
   protocol_conc = sprintf("processed_data/paired_protocol_concordance_%s.csv.gz", tf),
   protocol_pool = sprintf("processed_data/paired_protocol_pooled_summary_%s.csv.gz", tf),
+  irf_tree = sprintf("qc/irfinder_tree_comparison_%s.csv.gz", tf),
+  irf_strat = sprintf("qc/irfinder_stratified_metrics_%s.csv.gz", tf),
+  irf_conc_annotation = sprintf("qc/irfinder_concordance_annotation_%s.csv.gz", tf),
+  irf_conc_tsl12 = sprintf("qc/irfinder_concordance_TSL12_%s.csv.gz", tf),
+  ann = sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf),
+  keep_rows = sprintf("processed_data/keep_rows_manual_%s.rds", tf),
   atlas = sprintf("processed_data/atlas_summary_%s.csv", tf)
 )
 have <- vapply(INPUTS, file.exists, logical(1))
@@ -1770,6 +1777,109 @@ composition above all, since protocol is not randomised across ontologies — wh
 holds donor, cell type and batch fixed by construction. **The paired estimate is the causal quantity;
 the pooled one is an upper bound that includes confounding**, and `protocol.pooled_over_paired.*` is
 the fraction of the naive coefficient that does not survive controlling for sample identity.
+
+## 8c. IRFinder concordance (RI validation supplement)
+
+**Origin:** `02-4-irfinder-concordance.Rmd` (rule `irfinder_concordance`), both reference trees.
+**rMATS stays the primary RI quantification; IRFinder is a supplement.** RI is the event class where
+the epigenetic contribution is largest and where the protocol confound lives (8b), so an independent
+caller agreeing on it is worth reporting — provided the scoping is stated honestly.
+
+```{r irfinder, eval = have[["irf_tree"]]}
+.ORIGIN_CUR <- ORIGIN$irfinder
+irf <- fread(INPUTS$irf_tree)
+print(irf[, .(tree, events_any_annotation, events_high_conf,
+  pct_high_conf = round(pct_high_conf, 1), n_matched_cells,
+  r = round(concordance_r, 3), r_unfiltered = round(concordance_r_no_conf_filter, 3))])
+
+for (i in seq_len(nrow(irf))) {
+  tr <- tolower(irf$tree[i])
+  pn(sprintf("irfinder.concordance_r.%s", tr), irf$concordance_r[i], "correlation",
+    INPUTS$irf_tree,
+    filter = "Pearson r, rMATS PSI vs IRFinder IRratio, high-confidence events only",
+    n = irf$n_matched_cells[i])
+  # The unfiltered r is emitted beside it because the gap between them IS the confidence gate's
+  # effect; quoting only the filtered number would overstate agreement.
+  pn(sprintf("irfinder.concordance_r_unfiltered.%s", tr),
+    irf$concordance_r_no_conf_filter[i], "correlation", INPUTS$irf_tree,
+    filter = "same, WITHOUT the high-confidence filter", n = irf$n_matched_cells[i])
+  pn(sprintf("irfinder.only_introns.%s", tr), irf$irfinder_only_introns[i], "count",
+    INPUTS$irf_tree,
+    filter = "recurring high-confidence IRFinder introns absent from rMATS",
+    note = "a SCOPE gap, not a disagreement -- see below")
+  pn(sprintf("irfinder.only_never_candidate.%s", tr),
+    irf$irfinder_only_never_suppa_candidate[i], "count", INPUTS$irf_tree,
+    filter = "of those, never an rMATS RI candidate at all")
+}
+```
+
+```{r irfinder-modelled, eval = have[["irf_tree"]] && have[["ann"]] && have[["keep_rows"]]}
+.ORIGIN_CUR <- ORIGIN$irfinder
+# THE DENOMINATOR THE PAPER NEEDS. `02-4` validates the CALLER, so it reports high-confidence events
+# as a fraction of the 2,085 RI events that survive 02-3's Procedure 2 -- correct for that question.
+# The manuscript's question is different: how much of the set we actually MODELLED is independently
+# supported. 2,085 -> 1,846 is a funnel, not a mismatch (03 drops -50 non-autosomal, -182
+# non-cluster-representative, -7 with NA sd_psi), and the modelled rate is the HIGHER of the two,
+# so quoting the caller-level figure would understate the supplement.
+#
+# This is a join of two small aggregates (899/1,080 rows against a 39,176-row annotation table), not
+# a re-analysis -- recomputing it inside 02-4 would mean re-running a 24 GB job for an intersection.
+ann_ri <- fread(INPUTS$ann, select = c("event_id", "ID", "Event Type"))
+krm <- readRDS(INPUTS$keep_rows)
+ri_modelled <- ann_ri[ID %in% krm & `Event Type` == "RI"]
+pn("irfinder.ri_modelled_events", nrow(ri_modelled), "count", INPUTS$ann,
+  filter = "RI events in the modelled set (keep_rows_manual)",
+  note = "2,085 at caller level -> 1,846 modelled: -50 non-autosomal, -182 non-cluster-representative, -7 NA sd_psi")
+
+.trees <- c(annotation = INPUTS$irf_conc_annotation, TSL12 = INPUTS$irf_conc_tsl12)
+for (nm in names(.trees)) {
+  if (!file.exists(.trees[[nm]])) next
+  cc <- fread(.trees[[nm]])
+  hit <- sum(cc$suppa_id %chin% ri_modelled$event_id)
+  cat(sprintf("%-11s high-confidence %d, of which %d are in the modelled set = %.1f%% of %d\n",
+    nm, nrow(cc), hit, 100 * hit / nrow(ri_modelled), nrow(ri_modelled)))
+  pn(sprintf("irfinder.validated_frac_modelled.%s", tolower(nm)),
+    hit / nrow(ri_modelled), "fraction", .trees[[nm]],
+    filter = sprintf("IRFinder high-confidence AND in the modelled RI set (%s tree)", nm),
+    n = nrow(ri_modelled),
+    note = "quote THIS, not the caller-level percentage of 2,085 -- it is the modelled denominator and the higher figure")
+}
+```
+
+```{r irfinder-scope, eval = have[["irf_strat"]]}
+.ORIGIN_CUR <- ORIGIN$irfinder
+# WHICH EVENTS IRFINDER MISSES IS NOT RANDOM, and the supplement is only honest if it says so.
+# rmats_only events are systematically longer, lower-coverage and much closer to constitutive
+# (mean PSI ~0.75-0.85 vs ~0.17 for high-confidence) -- which is IRFinder's own LowCover gate doing
+# what it is designed to do, not a failure. So "IRFinder validates X%" is a statement about a
+# BIASED subset, and the bias runs toward the events least likely to be alternatively spliced.
+strat <- fread(INPUTS$irf_strat)
+print(strat[, .(tree, category, mean_coverage = round(mean_coverage, 1),
+  intron_length, mean_psi = round(mean_psi, 3), n_samples)])
+for (i in seq_len(nrow(strat))) {
+  if (strat$category[i] != "rmats_only") next
+  pn(sprintf("irfinder.missed_mean_psi.%s", tolower(strat$tree[i])), strat$mean_psi[i], "psi",
+    INPUTS$irf_strat,
+    filter = "median of per-event mean PSI, events rMATS calls but IRFinder never confidently detects",
+    note = "near-constitutive; the missed set is biased, not a random sample")
+}
+```
+
+**How to state it.** Concordance where both callers have data is strong and consistent across trees,
+and `TSL12` both finds *more* events and agrees slightly better — the reverse of the original
+expectation. Quote the **modelled-set** validation fraction, not the caller-level percentage of 2,085.
+
+**State the scope gap as a scope gap.** IRFinder reports tens of thousands of recurring
+high-confidence introns that rMATS does not, but ~99.98% were never rMATS RI candidates at all: rMATS
+needs an annotated alternative isoform to call retained intron, while IRFinder scores every intron as
+an absolute ratio. **Do not report the headline count as disagreement.** The defensible content is the
+high-recurrence tail (EIF1 retained in 312 of 415 samples at IRratio ≈ 0.995; MCL1, KRT5, DCN) as real
+constitutively-retained introns, and a Methods limitation. They are deliberately **not** added to the
+modelled set — doing so would require re-deriving `03`'s entire window and feature pipeline for ~90k
+new coordinates.
+
+**One hypothesis was tested and refuted.** Validation is *not* enriched in the RI/High-variability
+stratum (Fisher p = 0.093 / 0.743); it is uniform across the split. Do not imply otherwise.
 
 ## 9. Statistics appendix
 
