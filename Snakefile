@@ -269,6 +269,10 @@ rule all:
         # A DAG leaf on purpose -- nothing downstream, so paper iteration costs nothing.
         f"reports/11-paper-figures_{PRIMARY}.html",
         f"processed_data/paper_numbers_{PRIMARY}.csv",
+        # Supplementary QC sheet. In `all` because it is a submission deliverable, and because it is
+        # the ONLY place the modelled-vs-QC cohort distinction is stated per sample -- `qc/...txt`'s
+        # header names the 441/405 QC superset, and that header is deliberately not being edited.
+        f"qc/supplementary_qc_table_{PRIMARY}.csv",
 
 
 # ── Step 01: gather data ──────────────────────────────────────────────────────
@@ -970,6 +974,10 @@ rule cohort_counts:
         qc         = "processed_data/qc_summary.csv",
     output:
         counts = "processed_data/cohort_counts_{transcript_filter}.csv",
+        # The modelled uuid roster, so 05d can ask "is this one of the 415?" without re-deriving the
+        # cohort from `aggregated_dt_filtered` itself. Two derivations of one cohort is how the
+        # 405-vs-379 confusion started.
+        roster = "processed_data/cohort_uuids_{transcript_filter}.csv",
     log: "logs/05c_cohort_counts_{transcript_filter}.log"
     threads: R("analysis", "threads")
     resources:
@@ -982,7 +990,43 @@ rule cohort_counts:
     shell:
         """
         TRANSCRIPT_FILTER={wildcards.transcript_filter} COHORT_OUT={output.counts} \
+        COHORT_UUIDS_OUT={output.roster} \
         Rscript 05c-cohort-counts.R > {log} 2>&1
+        """
+
+
+rule supplementary_qc_table:
+    """Per-sample QC sheet for the supplement, assembled from artifacts 01 and 05c already wrote.
+
+    Deliberately NOT a chunk inside 01-gather-data.Rmd. Everything it needs is on disk as 01 output,
+    so reading it downstream costs nothing; editing 01 would give its outputs new mtimes and cascade
+    through create_aggregated_dt, the 117 GB feature-table build and all 34,146 screen jobs.
+    """
+    input:
+        script    = "05d-supplementary-qc-table.R",
+        qc        = "processed_data/qc_summary.csv",
+        file_tab  = "processed_data/file_table.csv.gz",
+        roster    = "processed_data/cohort_uuids_{transcript_filter}.csv",
+        metadata  = "data/IHEC_sample_metadata_harmonization.v1.4_extended.csv",
+    output:
+        table      = "qc/supplementary_qc_table_{transcript_filter}.csv",
+        thresholds = "qc/supplementary_qc_thresholds_{transcript_filter}.csv",
+    log: "logs/05d_supplementary_qc_table_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        QC_SUMMARY={input.qc} FILE_TABLE={input.file_tab} COHORT_UUIDS={input.roster} \
+        HARMONIZATION_CSV={input.metadata} \
+        QC_TABLE_OUT={output.table} QC_THRESHOLDS_OUT={output.thresholds} \
+        Rscript 05d-supplementary-qc-table.R > {log} 2>&1
         """
 
 

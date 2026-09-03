@@ -22,6 +22,11 @@ setDTthreads(2L)
 
 tf <- Sys.getenv("TRANSCRIPT_FILTER", "biotype_filtered")
 out <- Sys.getenv("COHORT_OUT", sprintf("processed_data/cohort_counts_%s.csv", tf))
+# The modelled uuid ROSTER, not just its size. Emitted so that anything needing "is this sample one of
+# the 415?" -- 05d's supplementary QC table today -- joins against the same derivation that produced the
+# count above, instead of re-deriving it from `aggregated_dt_filtered` on its own. Two independent
+# derivations of one cohort is exactly how the 405-vs-379 drift got established in the first place.
+roster_out <- Sys.getenv("COHORT_UUIDS_OUT", sprintf("processed_data/cohort_uuids_%s.csv", tf))
 
 # 3 columns only -- the whole point is not to pay for the 9 M-row x 98-column table.
 a <- fread(
@@ -29,6 +34,7 @@ a <- fread(
   select = c("uuid", "IHEC", "protocol")
 )
 u <- unique(a, by = "uuid")
+roster <- u[order(IHEC, uuid), .(uuid, IHEC, protocol)]
 
 modelled <- data.table(
   scope          = "modelled",
@@ -70,4 +76,5 @@ if (!is.null(qc)) {
 
 dir.create(dirname(out), recursive = TRUE, showWarnings = FALSE)
 fwrite(res, out)
-cat(sprintf("\nwritten: %s\n", out))
+fwrite(roster, roster_out)
+cat(sprintf("\nwritten: %s\nwritten: %s (%d modelled uuids)\n", out, roster_out, nrow(roster)))
