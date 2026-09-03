@@ -106,6 +106,7 @@ ORIGIN <- list(
   tier1 = "Tier-1 ridge screen: 09s-ridge-screen.R per event -> 09s-aggregate.R FDR; SCREEN_STAT_VERSION 5, FEATURE_TABLE_VERSION 2 [leg C]",
   floor = "Detection-floor injection sweep: 09f-floor-sample.R -> 09s-ridge-screen.R under EPIATLAS_AS_SCREEN_INJECT -> 09f-floor-score.R (scored on p_pooled_z vs the real screen's 23.7 M null-z reference) [leg C]",
   permuted = "Permuted-groups negative control, paired per event: 09p-permute-groups.R (rule permuted_groups_control), supergroup LABELS permuted so fold count and sizes are preserved exactly [leg C]",
+  protocol = "Paired-protocol effect on PSI: 06c-paired-protocol.R (rule paired_protocol), the 36 epirrs carrying BOTH an mRNA-Seq and a total-RNA-Seq uuid; effect estimated WITHIN sample [confound]",
   candidates = "Adjudication of the floor-free pooled-z candidates: screen_results.csv.gz (Tier-1) cross-referenced against floor_results.csv.gz (the injection sweep) -- no refits, reshape only [leg C]",
   design = "fixed by experimental design; not measured"
 )
@@ -300,6 +301,9 @@ INPUTS <- list(
   permuted_alt = ".claude/scratch/permuted_groups_control_result.csv",
   qc = "processed_data/qc_summary.csv",
   cohort = sprintf("processed_data/cohort_counts_%s.csv", tf),
+  protocol = sprintf("processed_data/paired_protocol_dPSI_summary_%s.csv.gz", tf),
+  protocol_conc = sprintf("processed_data/paired_protocol_concordance_%s.csv.gz", tf),
+  protocol_pool = sprintf("processed_data/paired_protocol_pooled_summary_%s.csv.gz", tf),
   atlas = sprintf("processed_data/atlas_summary_%s.csv", tf)
 )
 have <- vapply(INPUTS, file.exists, logical(1))
@@ -657,6 +661,64 @@ if (nrow(grid)) {
   }
 }
 ```
+
+## 4b. The preprint's own split, and what survives it (leg B)
+
+**Origin:** the same `splicing_ml` runs as section 4, reassembled as the argument the manuscript has to
+make. No new computation.
+
+The preprint reports two test sets separately and describes the first in its own words
+(`sn-article.tex:411`): *"testing on **seen events but unknown cell/tissue types** leads to near-perfect
+performances … emphasizing distinct mechanisms per event over cell-type specificity."* That design is
+`ontology`-grouped CV. Held-out samples are new, but the **events are not** — an event's other samples
+are in training, so a high-capacity model can fingerprint the event itself rather than learn anything
+that transfers. The near-perfect number is the signature of that, and the conclusion drawn from it is
+backwards.
+
+This section walks the four steps, each a measured number, from the preprint's claim to what replaces it.
+
+```{r preprint-correction, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6.5, fig.height=3.4}
+.ORIGIN_CUR <- ORIGIN$ml
+if (!nrow(grid)) {
+  cat("splicing_ml payloads unavailable; section 4 did not load.\n")
+} else {
+  # STEP 1 + 2: the two splits side by side. `ontology` IS the preprint's "unknown cell/tissue types"
+  # test set; `seqnames` holds out whole chromosomes, so the events are genuinely unseen.
+  sm <- summarise_folds(grid, c("split", "et", "model"))[order(split, et, model)]
+  print(sm)
+
+  # STEP 3: THE LEAK SIGNATURE. Capacity gap = xgb - linear, PAIRED WITHIN OUTER FOLD -- both models
+  # share the same deterministic split, so fold k is the same held-out data and the sd of the paired
+  # difference is interpretable. A linear model cannot carve per-event islands out of feature space;
+  # a boosted ensemble can. So a LARGE gap under ontology CV and NO gap under seqnames CV is the
+  # fingerprint of event-identity memorisation, not of extra signal that only the tree can reach.
+  w <- dcast(grid, split + et + outer_fold ~ model, value.var = "value")
+  gap <- w[, .(folds = .N, mean = mean(xgb - linear), sd = stats::sd(xgb - linear)),
+    by = .(split, et)][order(et, split)]
+  print(gap)
+
+  p <- ggplot(gap, aes(x = factor(split, levels = c("ontology", "seqnames")), y = mean,
+      colour = `et`, group = et)) +
+    geom_hline(yintercept = 0, linetype = 2, linewidth = 0.3, colour = PAL[7]) +
+    geom_line(linewidth = 0.4) +
+    geom_pointrange(aes(ymin = mean - sd, ymax = mean + sd), size = 0.3, linewidth = 0.4) +
+    scale_colour_paper(name = NULL) +
+    labs(
+      x = NULL, y = "test AUROC, xgb − linear (paired within fold)",
+      title = "The capacity gap is the leak, and it disappears when events are held out",
+      subtitle = "ontology CV = the preprint's \"unknown cell/tissue types\"; seqnames CV = events genuinely unseen"
+    ) +
+    scale_x_discrete(labels = c(ontology = "seen events,\nunseen samples", seqnames = "unseen events"))
+  print(p)
+  save_fig(p, "fig3b_preprint_correction", 5.5, 3.0,
+    shows = "capacity gap (xgb − linear, paired within outer fold) under the preprint's split vs event-held-out CV",
+    source = cfgs$payload)
+}
+```
+
+The steps above use only the two CV runs. **The full argument — including what the epigenome adds over
+a sequence-only reference, and what the locus-matched null returns — is stated in section 7b**, which
+has to come after the sections that produce those numbers.
 
 ## 5. Tier-1 screen (leg C)
 
@@ -1465,6 +1527,75 @@ if (nrow(abl)) {
 }
 ```
 
+## 7b. The argument end to end (legs B + C)
+
+**Origin:** synthesis. Every figure below is read from `paper_numbers`, not recomputed.
+
+**Placed here, not beside the figure in 4b, because it cites sections 5, 6 and 7** — the screen, the
+power curve and the ablation. `pn()` keys exist only once their section has run, so stating this
+argument next to its figure would cite keys that do not exist yet. It failed exactly that way on the
+first attempt (`pnv()` errored on `ablation.baseline_prior`), which is what `pnv()` is for.
+
+```{r preprint-correction-numbers, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+.ORIGIN_CUR <- ORIGIN$ml
+# Every figure quoted in the prose below is read from paper_numbers, not retyped. `pnv()` errors on a
+# missing key rather than rendering a blank, so a renamed key breaks the build instead of the claim.
+.PNV <- rbindlist(.PN, fill = TRUE)
+pnv <- function(k, digits = 3) {
+  v <- .PNV[key == k, value]
+  if (!length(v)) stop("prose cites a key that was never emitted: ", k)
+  formatC(v[1], format = "f", digits = digits)
+}
+cat(sprintf("
+**1. Under the preprint's own design, the models are near-perfect.** Held-out cell types, seen events:
+xgb reaches AUROC **%s** (RI) and **%s** (SE). That reproduces the preprint's description.
+
+**2. But the capacity gap gives it away.** Paired within fold, xgb exceeds linear by **%s ± %s** (RI)
+and **%s ± %s** (SE). A linear model is bounded by one global hyperplane and cannot carve out per-event
+islands; a boosted ensemble can. A gap that large, that consistently, is the signature of event-identity
+memorisation rather than of signal only the tree can reach.
+
+**3. Hold the events out and it collapses.** Under `seqnames` CV the gap is **%s ± %s** for RI —
+*negative, and smaller than its own fold-to-fold spread, so not distinguishable from zero* — and
+**%s ± %s** for SE. The near-perfect performance does not survive; xgb drops to **%s** (RI) and **%s**
+(SE). **Generalisation to unseen events is therefore the better-founded result, the opposite of the
+preprint's reading.**
+
+**4. And what the epigenome adds, measured against sequence rather than against chance, is small.**
+Sequence-only is the honest reference; the `DummyClassifier` prior is **%s** by construction and is a
+sanity floor, not a baseline. Adding every epigenetic feature to sequence-only buys **%s ± %s** AUROC
+for RI and **%s ± %s** for SE, paired within fold.
+
+**5. The endpoint.** Asking the locus-specific question directly — can an event's PSI be predicted from
+its own epigenetic state beyond what a matched but unrelated locus predicts — gives **%s hits** over
+34,146 events at FDR 0.1 (minimum q **%s**), in a screen whose power never exceeds **%s%%** (section 6).
+",
+pnv("cv.ontology.ri.auroc.xgb.mean"), pnv("cv.ontology.se.auroc.xgb.mean"),
+pnv("cv.ontology.ri.xgb_minus_linear.mean"), pnv("cv.ontology.ri.xgb_minus_linear.sd"),
+pnv("cv.ontology.se.xgb_minus_linear.mean"), pnv("cv.ontology.se.xgb_minus_linear.sd"),
+pnv("cv.seqnames.ri.xgb_minus_linear.mean"), pnv("cv.seqnames.ri.xgb_minus_linear.sd"),
+pnv("cv.seqnames.se.xgb_minus_linear.mean"), pnv("cv.seqnames.se.xgb_minus_linear.sd"),
+pnv("cv.seqnames.ri.auroc.xgb.mean"), pnv("cv.seqnames.se.auroc.xgb.mean"),
+pnv("ablation.baseline_prior", 1),
+pnv("ablation.epi_gain.ri.xgb.mean"), pnv("ablation.epi_gain.ri.xgb.sd"),
+pnv("ablation.epi_gain.se.xgb.mean"), pnv("ablation.epi_gain.se.xgb.sd"),
+pnv("tier1.hits", 0), pnv("tier1.min_q"),
+formatC(100 * .PNV[key == "power.max_overall", value][1], format = "f", digits = 1)))
+```
+
+**What this must NOT say.** The exploited axis is **not** identified as cell-type identity, and the
+manuscript must not name it that. The data show a sample-level component shared across loci; its cause
+is open. Antagonistic marks correlate positively on the sample axis (H3K27ac vs H3K27me3, r ≈ 0.65)
+while the spatial window axis is negative as biology predicts — at least as consistent with a global
+signal-scaling component (ChIP efficiency, observed-vs-imputed provenance, depth, batch) as with
+biology. Naming it would repeat the preprint's error in the opposite direction.
+
+**Handle as an explicit self-correction.** The preprint is public and states the split itself; a
+reviewer can find this. The correspondence is one of *design*, not a byte-identical replication — the
+preprint used random forest at PSI ≤ ⅓ / ≥ ⅔ with a B/T-lymphocyte holdout, this uses the ablation
+battery's models and thresholds on the same cohort.
+
+
 ## 8. Supplementary: permuted-groups control
 
 **Origin:** permuted-groups negative control, paired per event. Pipeline stage **09p** (`09p-permute-groups.R`, rule `permuted_groups_control`), promoted out of `.claude/scratch/` on 2026-09-01. It sits beside `floor_sample` rather than at 03b because it samples its events *from* `screen_results.csv.gz` and reads the per-event feature tables.
@@ -1532,6 +1663,113 @@ pn(
   n = nrow(pg)
 )
 ```
+
+## 8b. The protocol confound (RI)
+
+**Origin:** `06c-paired-protocol.R` (rule `paired_protocol`). Absent from the preprint entirely, and it
+has to be stated: **total-RNA-Seq retains unspliced pre-mRNA, which inflates retained-intron PSI — and
+RI is precisely where the epigenetic contribution is largest.** That coincidence is the reviewer's
+first question, so the manuscript should raise it rather than be asked.
+
+**Estimated WITHIN sample.** 36 epirrs carry both an mRNA-Seq and a total-RNA-Seq uuid, so their PSI
+difference isolates protocol with cell type, donor, batch and every other per-sample factor held
+fixed. A mixed-pool regression across all samples cannot do that: there, protocol is partly confounded
+with whatever else differs between the two groups of samples.
+
+```{r protocol, eval = have[["protocol"]]}
+.ORIGIN_CUR <- ORIGIN$protocol
+prot <- fread(INPUTS$protocol)
+print(prot[, .(`Event Type`, n_obs, n_epirrs,
+  mixed = signif(mixed_model_estimate, 3), mixed_se = signif(mixed_model_se, 2),
+  mixed_p = signif(mixed_model_p_value, 3),
+  paired = signif(paired_ttest_estimate, 3),
+  ci = sprintf("[%.4f, %.4f]", paired_ttest_ci_low, paired_ttest_ci_high))])
+
+for (i in seq_len(nrow(prot))) {
+  et <- tolower(prot$`Event Type`[i])
+  pn(sprintf("protocol.dpsi_paired.%s", et), prot$paired_ttest_estimate[i], "dpsi",
+    INPUTS$protocol,
+    filter = "total-RNA-Seq minus mRNA-Seq, paired t-test within epirr",
+    n = prot$n_epirrs[i])
+  pn(sprintf("protocol.dpsi_paired_ci_low.%s", et), prot$paired_ttest_ci_low[i], "dpsi",
+    INPUTS$protocol, filter = "95% CI lower bound", n = prot$n_epirrs[i])
+  pn(sprintf("protocol.dpsi_paired_ci_high.%s", et), prot$paired_ttest_ci_high[i], "dpsi",
+    INPUTS$protocol, filter = "95% CI upper bound", n = prot$n_epirrs[i])
+  # The mixed model uses every paired OBSERVATION rather than one mean per epirr, so its n is the
+  # event x sample count; emitted beside the t-test because they answer the same question at
+  # different levels and the manuscript should not silently pick one.
+  pn(sprintf("protocol.dpsi_mixed.%s", et), prot$mixed_model_estimate[i], "dpsi",
+    INPUTS$protocol,
+    filter = "lme4 mixed model, random intercept per epirr; paired subset only",
+    n = prot$n_obs[i])
+  pn(sprintf("protocol.dpsi_mixed_p.%s", et), prot$mixed_model_p_value[i], "p",
+    INPUTS$protocol, filter = "mixed model, two-sided", n = prot$n_obs[i])
+}
+
+if (have[["protocol_conc"]]) {
+  conc <- fread(INPUTS$protocol_conc)
+  print(conc[, .(`Event Type`, n, pearson = signif(pearson_r, 3),
+    spearman = signif(spearman_r, 3))])
+  for (i in seq_len(nrow(conc))) {
+    pn(sprintf("protocol.concordance_r.%s", tolower(conc$`Event Type`[i])),
+      conc$pearson_r[i], "correlation", INPUTS$protocol_conc,
+      filter = "PSI of the same event in the same epirr, total-RNA-Seq vs mRNA-Seq",
+      n = conc$n[i])
+  }
+}
+
+# THE POOLED ESTIMATE, measured rather than quoted. Emitted so the manuscript compares two numbers
+# from the same data instead of the paired estimate against a figure remembered from the preprint.
+if (have[["protocol_pool"]]) {
+  pool <- fread(INPUTS$protocol_pool)
+  print(pool[, .(`Event Type`, n_events,
+    median = signif(beta_pooled_median, 3),
+    IQR = sprintf("[%.4f, %.4f]", beta_pooled_q25, beta_pooled_q75))])
+  for (i in seq_len(nrow(pool))) {
+    et <- tolower(pool$`Event Type`[i])
+    pn(sprintf("protocol.dpsi_pooled_median.%s", et), pool$beta_pooled_median[i], "dpsi",
+      INPUTS$protocol_pool,
+      filter = "median per-event (total-RNA-Seq - mRNA-Seq) mean PSI over ALL samples, >= 5 per protocol",
+      n = pool$n_events[i],
+      note = "UPPER BOUND: absorbs cell-type composition, since protocol is not randomised across ontologies")
+    # The ratio is the number the manuscript actually needs: it says how much of the naive protocol
+    # coefficient survives once donor and cell type are held fixed.
+    .pair <- prot[`Event Type` == pool$`Event Type`[i], paired_ttest_estimate]
+    if (length(.pair) && is.finite(.pair[1]) && .pair[1] != 0) {
+      pn(sprintf("protocol.pooled_over_paired.%s", et),
+        pool$beta_pooled_median[i] / .pair[1], "ratio", "derived",
+        filter = "pooled median / paired estimate; how much of the naive coefficient is confounding",
+        n = pool$n_events[i])
+    }
+  }
+}
+
+# The cohort is not balanced, and the imbalance runs the wrong way for RI.
+if (exists("co") && nrow(co)) {
+  pn("protocol.total_rna_frac", co$total_rna[1] / co$uuids[1], "fraction",
+    INPUTS$cohort, filter = "modelled uuids that are total-RNA-Seq",
+    origin = ORIGIN$cohort)
+}
+```
+
+```{r protocol-missing, eval = !have[["protocol"]], results='asis'}
+cat("> **Not available**: run `snakemake processed_data/paired_protocol_dPSI_summary_",
+  tf, ".csv.gz`.\n", sep = "")
+```
+
+**How to state it.** The within-sample effect is **small and positive for RI and near-zero for SE**,
+which is the direction unspliced pre-mRNA predicts. Quote the paired estimate with its CI, and give
+the mixed-model estimate beside it — they are the same question asked at different levels (one mean
+per epirr vs every paired observation), and picking whichever is more convenient is the error to avoid.
+
+**Do not quote a single "protocol effect" number as if the design were settled.** Both estimates are
+computed above, from the same `aggregated_dt`, so they can be compared as measurements rather than one
+measurement against a remembered figure. They answer different questions: the pooled per-event estimate
+absorbs everything else that differs between the mRNA-Seq and total-RNA-Seq sample groups — cell-type
+composition above all, since protocol is not randomised across ontologies — while the paired design
+holds donor, cell type and batch fixed by construction. **The paired estimate is the causal quantity;
+the pooled one is an upper bound that includes confounding**, and `protocol.pooled_over_paired.*` is
+the fraction of the naive coefficient that does not survive controlling for sample identity.
 
 ## 9. Statistics appendix
 

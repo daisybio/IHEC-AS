@@ -181,6 +181,68 @@ for (i in seq_len(nrow(concordance_dt))) {
   )
 }
 
+## 4b. The POOLED estimate, for comparison with the paired one -----------------
+# WHY THIS IS HERE. The manuscript quotes a protocol coefficient of ~0.05 for RI, roughly four times
+# the paired estimate above. Stating "the pooled estimate is larger" while only ever measuring the
+# paired one would be a comparison with one measured side and one quoted side -- exactly the drift
+# `11-paper-figures.Rmd` exists to prevent. So both are computed here, from the same aggregated_dt,
+# and the manuscript can compare two numbers rather than a number and a memory.
+#
+# WHAT MAKES THEM DIFFER, AND WHY THE PAIRED ONE IS THE CAUSAL QUANTITY. This fits PSI ~ protocol per
+# event across ALL samples, so the coefficient absorbs every other way the mRNA-Seq and
+# total-RNA-Seq sample groups differ -- cell type composition above all, since protocol is not
+# randomised across ontologies. The paired design holds donor, cell type and batch fixed by
+# construction. The pooled number is therefore an UPPER BOUND that includes confounding, not a
+# competing estimate of the same thing.
+#
+# Restricted to events with >= minimum_pooled_per_group samples in BOTH protocols: a coefficient from
+# an event seen in one protocol only is not an estimate of anything.
+minimum_pooled_per_group <- 5L
+pooled_input <- aggregated_dt[!is.na(PSI) & protocol %chin% c("mRNA-Seq", "total-RNA-Seq")]
+pooled_counts <- dcast(
+  pooled_input[, .N, by = .(ID, `Event Type`, protocol)],
+  ID + `Event Type` ~ protocol, value.var = "N", fill = 0L
+)
+setnames(pooled_counts, c("mRNA-Seq", "total-RNA-Seq"), c("n_mrna", "n_total"))
+pooled_ok <- pooled_counts[n_mrna >= minimum_pooled_per_group & n_total >= minimum_pooled_per_group]
+message(sprintf(
+  "Pooled per-event regression: %d events with >= %d samples in both protocols (of %d)",
+  nrow(pooled_ok), minimum_pooled_per_group, nrow(pooled_counts)
+))
+
+# Difference of per-event group means IS the OLS slope of PSI ~ protocol for a two-level factor, so
+# this is the per-event coefficient without fitting 34k separate models.
+pooled_means <- pooled_input[
+  pooled_ok[, .(ID, `Event Type`)], on = c("ID", "Event Type"),
+  .(mean_psi = mean(PSI)), by = .(ID, `Event Type`, protocol)
+]
+pooled_wide <- dcast(pooled_means, ID + `Event Type` ~ protocol, value.var = "mean_psi")
+setnames(pooled_wide, c("mRNA-Seq", "total-RNA-Seq"), c("psi_mrna", "psi_total"))
+pooled_wide[, beta_pooled := psi_total - psi_mrna]
+
+pooled_summary <- pooled_wide[!is.na(beta_pooled), .(
+  n_events        = .N,
+  beta_pooled_median = median(beta_pooled),
+  beta_pooled_mean   = mean(beta_pooled),
+  beta_pooled_q25    = stats::quantile(beta_pooled, 0.25),
+  beta_pooled_q75    = stats::quantile(beta_pooled, 0.75)
+), by = `Event Type`]
+print(pooled_summary)
+fwrite(
+  pooled_summary,
+  sprintf("processed_data/paired_protocol_pooled_summary_%s.csv.gz", this_transcript_filter),
+  compress = "gzip"
+)
+for (i in seq_len(nrow(pooled_summary))) {
+  append_sanity(
+    sprintf("paired_protocol_pooled_beta_%s_%s",
+      tolower(pooled_summary$`Event Type`[i]), this_transcript_filter),
+    "INFO",
+    round(pooled_summary$beta_pooled_median[i], 5), NA,
+    "median per-event (total-RNA-Seq - mRNA-Seq) PSI over ALL samples; UPPER BOUND, absorbs cell-type composition"
+  )
+}
+
 ## 5. Per-event concordance / protocol-sensitivity flag ------------------------
 minimum_paired_obs_per_event <- 5
 per_event_concordance <- paired_wide[, {

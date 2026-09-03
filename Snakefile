@@ -1073,6 +1073,46 @@ _ML_GLOBAL_COMPARISON_ABLATION_JSONS = [
     for fg, et, var in ABLATION_CONFIGS
 ]
 
+# ── Step 06c: paired-protocol effect on PSI ───────────────────────────────────
+# The protocol confound, estimated WITHIN sample. 36 epirrs carry both an mRNA-Seq and a
+# total-RNA-Seq uuid, so their PSI difference isolates the protocol effect with cell type, donor and
+# every other per-sample factor held fixed -- which a mixed-pool regression over all samples cannot do.
+# It matters because total-RNA-Seq retains unspliced pre-mRNA, which inflates retained-intron PSI, and
+# RI is precisely where the epigenetic contribution is largest. The manuscript has to state that
+# coincidence rather than let a reviewer find it.
+#
+# The script already existed and had run (2026-07-13) but had NO RULE: its three outputs were
+# untracked, so they silently went stale when `05` rebuilt aggregated_dt on 2026-08-04 and nothing
+# could notice. Wired in 2026-09-02 for that reason.
+#
+# Cheap: 6 columns of aggregated_dt, then lme4 on the paired subset.
+rule paired_protocol:
+    input:
+        script     = "06c-paired-protocol.R",
+        aggregated = "processed_data/aggregated_dt_filtered_{transcript_filter}.csv.gz",
+    output:
+        dpsi        = "processed_data/paired_protocol_dPSI_summary_{transcript_filter}.csv.gz",
+        concordance = "processed_data/paired_protocol_concordance_{transcript_filter}.csv.gz",
+        per_event   = "processed_data/paired_protocol_per_event_concordance_{transcript_filter}.csv.gz",
+        # The POOLED per-event estimate, emitted so the manuscript compares two measured numbers
+        # rather than the paired estimate against a figure quoted from the preprint.
+        pooled      = "processed_data/paired_protocol_pooled_summary_{transcript_filter}.csv.gz",
+    log: "logs/06c_paired_protocol_{transcript_filter}.log"
+    threads: R("analysis", "threads")
+    resources:
+        mem_mb          = R("analysis", "mem_mb"),
+        runtime         = R("analysis", "runtime"),
+        slurm_partition = _partition("analysis"),
+        slurm_extra     = _extra("analysis"),
+        qos             = _qos("analysis"),
+        gres            = _gres("analysis"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        Rscript 06c-paired-protocol.R > {log} 2>&1
+        """
+
+
 rule ml_global_comparison:
     input:
         rmd      = "07-2-ml-global-comparison.Rmd",
@@ -1765,6 +1805,8 @@ rule paper_figures:
         permuted       = f"processed_data/permuted_groups_control_{PRIMARY}.csv",
         cohort         = f"processed_data/cohort_counts_{PRIMARY}.csv",
         atlas          = f"processed_data/atlas_summary_{PRIMARY}.csv",
+        protocol       = f"processed_data/paired_protocol_dPSI_summary_{PRIMARY}.csv.gz",
+        protocol_pool  = f"processed_data/paired_protocol_pooled_summary_{PRIMARY}.csv.gz",
         # Small purpose-built report payloads, NOT the multi-GB results pickles: the figure file
         # must stay fast because it re-runs on every tweak.
         cv_payloads = [
