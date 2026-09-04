@@ -995,6 +995,44 @@ rule cohort_counts:
         """
 
 
+rule atlas_landscape:
+    """Small per-ontology / per-class summaries of the FULL atlas, for the resource figure.
+
+    Exists because stage 11 must stay fast: the atlas is 5.1 GB gzipped and 1,134,719,490 rows, and
+    a figure is not a reason to break that. Describes all 1,522 quantified samples, not the modelled
+    415 -- the contrast between them is the figure's point.
+    """
+    input:
+        script   = "02-3d-atlas-landscape.R",
+        atlas    = expand("processed_data/atlas/{{transcript_filter}}/{et}.csv.gz", et=EVENT_TYPES),
+        file_tab = "processed_data/file_table.csv.gz",
+        metadata = "data/IHEC_sample_metadata_harmonization.v1.4_extended.csv",
+        commands = "data/rmats_split_post_commands.tsv",
+        roster   = "processed_data/cohort_uuids_{transcript_filter}.csv",
+    output:
+        landscape = "processed_data/atlas_landscape_{transcript_filter}.csv",
+        psi_hist  = "processed_data/atlas_psi_hist_{transcript_filter}.csv",
+        strata    = "processed_data/atlas_strata_{transcript_filter}.csv",
+    log: "logs/02-3d_atlas_landscape_{transcript_filter}.log"
+    threads: R("atlas_landscape", "threads")
+    resources:
+        mem_mb          = R("atlas_landscape", "mem_mb"),
+        runtime         = R("atlas_landscape", "runtime"),
+        slurm_partition = _partition("atlas_landscape"),
+        slurm_extra     = _extra("atlas_landscape"),
+        qos             = _qos("atlas_landscape"),
+        gres            = _gres("atlas_landscape"),
+    shell:
+        """
+        TRANSCRIPT_FILTER={wildcards.transcript_filter} \
+        FILE_TABLE={input.file_tab} HARMONIZATION_CSV={input.metadata} \
+        RMATS_COMMANDS={input.commands} COHORT_UUIDS={input.roster} \
+        ATLAS_LANDSCAPE_OUT={output.landscape} ATLAS_PSI_HIST_OUT={output.psi_hist} \
+        ATLAS_STRATA_OUT={output.strata} \
+        Rscript 02-3d-atlas-landscape.R > {log} 2>&1
+        """
+
+
 rule supplementary_qc_table:
     """Per-sample QC sheet for the supplement, assembled from artifacts 01 and 05c already wrote.
 
@@ -1849,6 +1887,12 @@ rule paper_figures:
         permuted       = f"processed_data/permuted_groups_control_{PRIMARY}.csv",
         cohort         = f"processed_data/cohort_counts_{PRIMARY}.csv",
         atlas          = f"processed_data/atlas_summary_{PRIMARY}.csv",
+        # Landscape summaries for the resource figure (step 02-3d). Declared here rather than
+        # recomputed: the reduction from 1.13 bn rows belongs upstream, and `11` must stay a leaf
+        # that is cheap to re-run on every figure tweak.
+        atlas_land     = f"processed_data/atlas_landscape_{PRIMARY}.csv",
+        atlas_hist     = f"processed_data/atlas_psi_hist_{PRIMARY}.csv",
+        atlas_strata   = f"processed_data/atlas_strata_{PRIMARY}.csv",
         protocol       = f"processed_data/paired_protocol_dPSI_summary_{PRIMARY}.csv.gz",
         protocol_pool  = f"processed_data/paired_protocol_pooled_summary_{PRIMARY}.csv.gz",
         # IRFinder concordance supplement (section 8c). `ann`/`keep_rows` are stage-03 outputs, read

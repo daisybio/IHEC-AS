@@ -311,7 +311,12 @@ INPUTS <- list(
   irf_conc_tsl12 = sprintf("qc/irfinder_concordance_TSL12_%s.csv.gz", tf),
   ann = sprintf("processed_data/event_annotations_dt_%s.csv.gz", tf),
   keep_rows = sprintf("processed_data/keep_rows_manual_%s.rds", tf),
-  atlas = sprintf("processed_data/atlas_summary_%s.csv", tf)
+  atlas = sprintf("processed_data/atlas_summary_%s.csv", tf),
+  # Landscape summaries of the FULL atlas (step 02-3d, rule atlas_landscape). Small by construction:
+  # the reduction from 1,134,719,490 rows happens in that stage precisely so this one never has to.
+  atlas_land = sprintf("processed_data/atlas_landscape_%s.csv", tf),
+  atlas_hist = sprintf("processed_data/atlas_psi_hist_%s.csv", tf),
+  atlas_strata = sprintf("processed_data/atlas_strata_%s.csv", tf)
 )
 have <- vapply(INPUTS, file.exists, logical(1))
 # Both analyses were PROMOTED to pipeline stages on 2026-09-01 (rules `psi_variance_decomposition`
@@ -395,10 +400,140 @@ for (i in seq_len(nrow(atlas))) {
 
 ```{r atlas-missing, eval = !have[["atlas"]], results='asis'}
 cat(
-  "> **Not available.** Blocked on the atlas summary artifact (spec 6.2), which is itself blocked on",
-  "the provenance audit of `/nfs/data/IHEC/RNAseq/rmats/biotype_filtered/` (PATH-FORWARD R2):",
-  "three RI files disagree and the smallest is live.\n"
+  "> **Not available.** Run `snakemake processed_data/atlas_summary_", tf, ".csv`.",
+  "(The provenance audit this once waited on was completed 2026-09-01: the three RI files never",
+  "disagreed on content -- same 2,459 events, differing only in sample scope and schema.)\n"
 )
+```
+
+## 1b. The atlas as a resource — figure (leg R)
+
+**Origin:** the same rMATS quantification, reduced by `02-3d-atlas-landscape.R` (rule `atlas_landscape`). That stage streams all **1,134,719,490** PSI values once; this one reads three small CSVs. The figure's argument is the *contrast*: what was quantified against the corner of it this paper models.
+
+```{r atlas-figure, eval = have[["atlas"]] && have[["atlas_land"]] && have[["atlas_hist"]] && have[["atlas_strata"]]}
+.ORIGIN_CUR <- ORIGIN$atlas
+land   <- fread(INPUTS$atlas_land)
+hst    <- fread(INPUTS$atlas_hist)
+strata <- fread(INPUTS$atlas_strata)
+
+ET_ORDER <- c("SE", "MXE", "A3SS", "A5SS", "RI")
+
+# --- modelled events per class, for the scope contrast ---------------------------------------
+# Reuses the two small tables 8c already reads. Only SE and RI are modelled at all; the other three
+# classes are quantified and untouched, which is the single most legible statement of what the
+# release adds and is invisible if the classes are pooled.
+modelled_ct <- data.table(event_type = ET_ORDER, modelled = 0L)
+if (have[["ann"]] && have[["keep_rows"]]) {
+  .ann <- fread(INPUTS$ann, select = c("ID", "Event Type"))
+  .krm <- readRDS(INPUTS$keep_rows)
+  mc <- .ann[ID %in% .krm, .N, by = .(event_type = `Event Type`)]
+  modelled_ct[mc, on = "event_type", modelled := i.N]
+}
+
+# --- panel A: events per class, quantified vs modelled ----------------------------------------
+pA <- merge(atlas[, .(event_type, quantified = events)], modelled_ct, by = "event_type")
+pA <- melt(pA, id.vars = "event_type", variable.name = "scope", value.name = "n")
+pA[, panel := "A  events per class"]
+pA[, event_type := factor(event_type, levels = ET_ORDER)]
+
+# --- panel B: samples per library stratum -----------------------------------------------------
+# The batch axis of the resource, and it is severely unbalanced: one stratum holds 987 of 1,522
+# samples while five hold one or two. Anyone reusing this needs that stated, not averaged away.
+pB <- strata[, .(lab = run_name, n = n_uuids, panel = "B  samples per library stratum")]
+pB[, lab := factor(lab, levels = lab[order(n)])]
+
+# --- panel C: observed fraction, per class, across ontologies ----------------------------------
+# PSI is NA where a sample has no reads on either side of the junction, so this is real detectability
+# and it is NOT uniform: SE sits ~20 points below MXE. Spread is across the 42 ontologies.
+pC <- land[, .(event_type, frac_observed, panel = "C  observed fraction (by ontology)")]
+pC[, event_type := factor(event_type, levels = ET_ORDER)]
+
+# --- panel D: where the PSI mass sits ---------------------------------------------------------
+# The boundary atoms are the dominant distributional fact about PSI and the reason a logit transform
+# is unusable here, so they are drawn as their own category rather than buried in an end bin.
+pD <- hst[, .(count = sum(count)), by = .(event_type, cls = fifelse(
+  atom & bin_lo == 0, "exactly 0", fifelse(atom & bin_lo == 1, "exactly 1", "interior")))]
+pD[, frac := count / sum(count), by = event_type]
+pD[, panel := "D  PSI mass at the bounds"]
+pD[, event_type := factor(event_type, levels = ET_ORDER)]
+pD[, cls := factor(cls, levels = c("exactly 0", "interior", "exactly 1"))]
+
+p <- ggplot() +
+  geom_col(
+    data = pA, aes(x = event_type, y = n, fill = scope),
+    position = position_dodge(width = 0.75), width = 0.7
+  ) +
+  geom_col(data = pB, aes(x = lab, y = n), fill = PAL[1], width = 0.7) +
+  geom_boxplot(
+    data = pC, aes(x = event_type, y = frac_observed),
+    fill = PAL[1], linewidth = 0.25, outlier.size = 0.4, width = 0.6
+  ) +
+  geom_col(data = pD, aes(x = event_type, y = frac, fill = cls), width = 0.7) +
+  facet_wrap(~panel, scales = "free", nrow = 2) +
+  scale_fill_paper(name = NULL) +
+  scale_y_continuous(trans = "identity") +
+  labs(x = NULL, y = NULL,
+    title = sprintf("%s samples x %s events x 5 classes = %s PSI values",
+      format(atlas$uuids[1], big.mark = ","), format(sum(atlas$events), big.mark = ","),
+      format(sum(land$n_rows), big.mark = ","))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+print(p)
+save_fig(p, "fig1_atlas", 6.5, 5.0,
+  source = c(INPUTS$atlas, INPUTS$atlas_land, INPUTS$atlas_hist, INPUTS$atlas_strata),
+  shows = paste("A quantified vs modelled events per class; B samples per library stratum;",
+    "C observed PSI fraction by ontology; D share of PSI mass at the bounds"))
+
+# --- keys the prose needs ----------------------------------------------------------------------
+pn("atlas.psi_values", sum(land$n_rows), "count", INPUTS$atlas_land,
+  filter = "sample x event cells over all 5 classes (the full grid, observed or not)")
+pn("atlas.frac_observed", sum(land$n_observed) / sum(land$n_rows), "fraction", INPUTS$atlas_land,
+  filter = "PSI actually quantified; NA where incl + skip == 0",
+  note = "coverage varies by class (SE lowest, MXE highest) -- do not quote the pooled value alone")
+for (et in ET_ORDER) {
+  v <- land[event_type == et, sum(n_observed) / sum(n_rows)]
+  if (length(v) && is.finite(v)) {
+    pn(sprintf("atlas.frac_observed.%s", tolower(et)), v, "fraction", INPUTS$atlas_land,
+      filter = sprintf("%s only", et))
+  }
+}
+pn("atlas.ontologies", uniqueN(land$ontology), "count", INPUTS$atlas_land,
+  filter = "distinct ontology terms over all 1,522 quantified samples",
+  note = "larger than the 34 in the modelled cohort -- the release spans more cell types than the analysis")
+pn("atlas.largest_stratum_frac", max(strata$n_uuids) / sum(strata$n_uuids), "fraction",
+  INPUTS$atlas_strata,
+  filter = sprintf("largest of %d library strata (%s)", nrow(strata),
+    strata$run_name[which.max(strata$n_uuids)]),
+  n = nrow(strata),
+  note = "the library configuration is severely unbalanced; state it as a batch axis of the resource")
+# THE UNFILTERED ATLAS IS NOT THE MODELLED SET, and on this quantity they differ enormously --
+# 69.2% at the bounds here against the 40.5% documented for the modelled set. That is not a
+# discrepancy to reconcile, it is the FILTER doing its job: 02-3 applies Wang Procedure 2
+# (psi_q95 >= 0.05 & psi_q05 <= 0.95), a non-constitutive test, which removes precisely the events
+# pinned at a bound in every sample. Unfiltered SE is 92.8% at the bounds (92.1% at exactly 1);
+# MXE, at 13.1%, is the only class that is not bound-dominated and it is what pulls the pooled
+# figure down. Quote these against the atlas; quote 40.5% against the modelled set; never mix them.
+pn("atlas.psi_at_bounds", pD[cls != "interior", sum(count)] / pD[, sum(count)], "fraction",
+  INPUTS$atlas_hist,
+  filter = "observed PSI exactly 0 or 1, UNFILTERED, all 5 classes pooled",
+  note = "NOT the modelled set's 40.5% -- Wang Procedure 2 removes the constitutive events; and the pooled value hides a 93%/13% spread across classes")
+for (et in ET_ORDER) {
+  v <- pD[event_type == et]
+  if (nrow(v)) {
+    pn(sprintf("atlas.psi_at_bounds.%s", tolower(et)),
+      v[cls != "interior", sum(count)] / v[, sum(count)], "fraction", INPUTS$atlas_hist,
+      filter = sprintf("%s only, unfiltered", et))
+  }
+}
+# The scope contrast, as one number: what fraction of the resource this paper actually uses.
+pn("atlas.modelled_frac_events", sum(modelled_ct$modelled) / sum(atlas$events), "fraction",
+  INPUTS$atlas,
+  filter = "events in the modelled set / events quantified, all classes",
+  note = "three of five classes are quantified and never modelled")
+```
+
+```{r atlas-figure-missing, eval = !(have[["atlas_land"]] && have[["atlas_hist"]] && have[["atlas_strata"]]), results='asis'}
+cat("> **Atlas figure not available.** Run `snakemake processed_data/atlas_landscape_", tf, ".csv`",
+  "(rule `atlas_landscape`, step 02-3d). It streams the built atlas once, ~12 min at 60 GB.\n")
 ```
 
 ## 2. Cohort counts

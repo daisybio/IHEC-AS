@@ -410,6 +410,17 @@ resources:
     runtime: 1440
     threads: 8
     gpu: 0
+  # Atlas landscape summaries (rule atlas_landscape, step 02-3d). Reads the BUILT atlas rather than
+  # the raw tree, one class at a time, two columns only -- so it is far cheaper than atlas_build, but
+  # still an order of magnitude past `analysis`: SE's 851 M rows cost ~14 GB for the uuid pointers and
+  # psi doubles alone, before fread's own buffers and the by-ontology grouping. Measured throughput is
+  # ~3.7 M rows/s, so all 1.13 bn rows are a few minutes of work; the memory, not the time, is why
+  # this needs its own tier.
+  atlas_landscape:
+    mem_mb: 96000
+    runtime: 120
+    threads: 4
+    gpu: 0
 
 # ── SLURM partitions ──────────────────────────────────────────────────────────
 slurm_cpu_partition: "shared-cpu"
