@@ -2,7 +2,7 @@
 ## Verification for the PSI-independent Tier-1 control change
 ## (FEATURE_TABLE_VERSION 2 / SCREEN_STAT_VERSION 4).
 ##
-##   Rscript .claude/scratch/verify_psi_independent_controls.R [n_events]
+##   Rscript verification/verify_psi_independent_controls.R [n_events]
 ##
 ## Exercises the REAL assembly (09-ml-shared.R's build_full_event_rows) rather than
 ## a stand-in. Fit-free apart from one small closed-form ridge, so it is safe on the
@@ -323,7 +323,7 @@ if (!grid_is_current) {
     "  * CHECK 4 proper: read R_used / n_eligible_controls / n_rotations_requested\n",
     "    out of the real screen rows and confirm RI's R_used actually rose\n",
     "  * CHECK 5: two fresh runs of one event via\n",
-    "    bash .claude/scratch/run_screen_examples.sh fresh <id>\n",
+    "    bash verification/run_screen_examples.sh fresh <id>\n",
     "    must give byte-identical _screen.csv.gz and _screen_null.csv.gz\n"
   ))
 }

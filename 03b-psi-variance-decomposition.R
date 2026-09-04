@@ -19,7 +19,7 @@
 # so this runs BEFORE create_aggregated_dt and touches no epigenetic data at all. That is the
 # analysis's own claim -- the variance budget is a property of the RESPONSE, established before any
 # mark is considered -- so placing it downstream of the marks would undercut what it is for.
-# Promoted out of .claude/scratch/ 2026-09-01: 12 of paper_numbers' keys come from here (the whole
+# Promoted from an undeclared prototype 2026-09-01: 12 of paper_numbers' keys come from here (the whole
 # of leg A), and Nature requires the code behind a quoted number to be available at submission.
 
 suppressPackageStartupMessages(library(data.table))

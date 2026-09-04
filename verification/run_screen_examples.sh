@@ -2,7 +2,7 @@
 # Run the Tier-1 ridge screen on a few example events in a SANDBOX, leaving the
 # production screen/ directory untouched.
 #
-#   bash .claude/scratch/run_screen_examples.sh [reuse|fresh] [id ...]
+#   bash verification/run_screen_examples.sh [reuse|fresh] [id ...]
 #
 #   reuse  (default) copy each event's existing per-event screen output into the
 #          sandbox first, so the resume gate keeps `long` verbatim and only
@@ -13,10 +13,15 @@
 # Fit-free (closed-form ridge, no tuning), so this is fine on the login node.
 set -euo pipefail
 
-PROJ=/nfs/proj/quirinmanz/ihec_as_clean/IHEC-AS
-TF=biotype_filtered
-CORES=4
-SANDBOX="$PROJ/.claude/scratch/screen_examples"
+# Repo root is derived from this script's own location rather than hardcoded, so the check runs
+# from any clone. PROJ/TF/CORES stay overridable from the environment.
+PROJ="${PROJ:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+TF="${TRANSCRIPT_FILTER:-biotype_filtered}"
+CORES="${CORES:-4}"
+# A fresh temp directory per run. The sandbox is wiped and rebuilt on every invocation anyway, so
+# nothing is gained by a fixed path -- and `rm -rf` on a variable that could resolve somewhere
+# unintended is not worth the convenience. Override with SCREEN_SANDBOX to keep the output around.
+SANDBOX="${SCREEN_SANDBOX:-$(mktemp -d -t screen_examples.XXXXXXXX)}"
 
 MODE="${1:-reuse}"; shift || true
 IDS=("$@")
@@ -30,6 +35,10 @@ cd "$PROJ"
 module load r/4.2.1 2>/dev/null || true
 
 PROD_SCREEN="processed_data/event_models/$TF/screen"
+case "$SANDBOX" in
+  */screen_examples.*|*/screen_examples) ;;
+  *) echo "refusing to rm -rf a sandbox path that is not a screen_examples dir: $SANDBOX" >&2; exit 1 ;;
+esac
 rm -rf "$SANDBOX"; mkdir -p "$SANDBOX/screen"
 
 if [ "$MODE" = "reuse" ]; then

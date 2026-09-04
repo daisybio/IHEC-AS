@@ -230,7 +230,7 @@ dt[
 ## This is a SENSITIVITY analysis. `tier1_hits` and `sig` stay on the primary
 ## exceedance p, which assumes only that an event's own controls are exchangeable
 ## with it; this one additionally assumes a family-common deviation shape.
-## Validation: .claude/scratch/check_pooled_z_strata.R
+## Validation: verification/check_pooled_z_strata.R
 # Smallest usable reference (null z values left after removing the event's own).
 # 10,000 resolves p down to ~1e-4, below the BH bound of every real family here.
 min_ref_z <- getOption("EpiATLAS_AS_SCREEN_MIN_REF_Z", 10000L)

@@ -27,7 +27,7 @@
 # "promoted controls": it samples its events FROM screen_results.csv.gz and reads the per-event
 # feature tables, so it depends on screen_aggregate and build_feature_tables. Structurally it is
 # the twin of 09f-floor-sample.R, and it is placed beside it for that reason.
-# Promoted out of .claude/scratch/ 2026-09-01: 7 of paper_numbers' keys come from here, and Nature
+# Promoted from an undeclared prototype 2026-09-01: 7 of paper_numbers' keys come from here, and Nature
 # requires the code behind a quoted number to be available at submission.
 
 suppressPackageStartupMessages(library(data.table))

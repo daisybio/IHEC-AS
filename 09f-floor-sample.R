@@ -17,7 +17,9 @@
 # Blow-up status is taken from the `local` space: that is where the signal is injected
 # (fs=local) and, per the rho=1 anchor, the only space with any recovery power at all.
 #
-# Reads only screen_results.csv.gz + event_annotations_dt. Writes only to .claude/scratch/.
+# Reads only screen_results.csv.gz + event_annotations_dt. Writes ONE declared output,
+# processed_data/event_models/{tf}/floor/floor_events.tsv (FLOOR_OUT), and nothing else --
+# in particular it never touches the real screen/ directory.
 
 suppressPackageStartupMessages(library(data.table))
 setDTthreads(4L)

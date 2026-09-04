@@ -76,7 +76,9 @@ sig_old <- dt[, is.finite(q) & q < qthr & is.finite(effect) & effect > 0]
 chk("hits, q-only rule (09-2 now)", "0", sum(sig_new), sum(sig_new) == 0L)
 chk("hits, dropped effect>0 rule", "0 (same at 0 hits)", sum(sig_old), sum(sig_old) == 0L)
 # stat_version 5: the pooled-z sensitivity now disagrees with the primary rule -- 7
-# candidates, not 0 (see .claude/scratch/investigate_pooled_z_candidates_v5.R). This is
+# candidates, not 0 (adjudicated in 11-paper-figures.Rmd section 6b, which emits the verdict
+# as paper_numbers keys: 4 survive a same-n peer check, 1 is borderline, 2 are variance-collapse
+# artifacts). This is
 # a tracked, real, open finding, not a bug in this script -- assert the count exactly so
 # it is caught if the candidate set ever changes again.
 chk("hits, pooled-z sensitivity == 7 (v5 open finding)", "7", sum(dt$q_pooled_z < qthr, na.rm = TRUE),

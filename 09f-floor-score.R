@@ -21,7 +21,8 @@
 #   3. pool z within the FDR family (Event Type x feature_set)
 #   4. score any statistic as p = (1 + #{ref z >= z}) / (1 + N_ref)
 #
-# Reads production read-only. Writes only to .claude/scratch/.
+# Reads production read-only. Writes ONE declared output,
+# processed_data/event_models/{tf}/floor/floor_results.csv.gz.
 
 suppressPackageStartupMessages(library(data.table))
 setDTthreads(4L)
