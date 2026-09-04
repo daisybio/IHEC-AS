@@ -90,7 +90,7 @@ scale_colour_paper <- function(...) scale_colour_manual(values = PAL, ...)
 # paper_numbers and into the figure manifest, so a reviewer question ("where does 0.207 come from?")
 # is answered by the artifact instead of by grepping the repo.
 #
-# Anything reading from .claude/scratch/ is flagged UNPROMOTED here, not silently treated as
+# Anything read from outside the pipeline is flagged UNPROMOTED here, not silently treated as
 # pipeline output -- a completed analysis whose only copy is in scratch is not reproducible.
 # As of 2026-09-01 nothing is UNPROMOTED: the variance budget (12 keys) and the permuted-groups
 # control (7 keys) -- the 19 that had no stage behind them -- became rules `psi_variance_decomposition`
@@ -292,14 +292,9 @@ INPUTS <- list(
   floor = file.path(event_dir, "floor", "floor_results.csv.gz"),
   session = sprintf("processed_data/session_09_1_ml_local_%s.rds", tf),
   variance = sprintf("processed_data/psi_variance_decomposition_%s.csv", tf),
-  variance_alt = sprintf(
-    ".claude/scratch/psi_variance_decomposition_%s.csv",
-    tf
-  ),
   # per-transcript_filter, like everything from 02-2 on: event `ID` is a row position in that
   # filter's event_gr, so one shared path reads back as silently wrong events under matching IDs.
   permuted = sprintf("processed_data/permuted_groups_control_%s.csv", tf),
-  permuted_alt = ".claude/scratch/permuted_groups_control_result.csv",
   qc = "processed_data/qc_summary.csv",
   cohort = sprintf("processed_data/cohort_counts_%s.csv", tf),
   protocol = sprintf("processed_data/paired_protocol_dPSI_summary_%s.csv.gz", tf),
@@ -319,30 +314,12 @@ INPUTS <- list(
   atlas_strata = sprintf("processed_data/atlas_strata_%s.csv", tf)
 )
 have <- vapply(INPUTS, file.exists, logical(1))
-# Both analyses were PROMOTED to pipeline stages on 2026-09-01 (rules `psi_variance_decomposition`
-# and `permuted_groups_control`), and both are declared inputs of `rule paper_figures` -- so under
-# Snakemake these files are always present and neither branch below fires. The scratch fallbacks are
-# kept for STANDALONE runs of this Rmd only, and they warn loudly because a paper number sourced
-# from scratch is not reproducible from the pipeline: the scratch copy can predate the stage, can
-# have been produced at a different N_EVENTS, and has no declared provenance.
-if (!have[["variance"]] && have[["variance_alt"]]) {
-  INPUTS$variance <- INPUTS$variance_alt
-  have[["variance"]] <- TRUE
-  warning(
-    "variance decomposition read from .claude/scratch/, NOT the pipeline output -- ",
-    "run `snakemake processed_data/psi_variance_decomposition_", tf, ".csv`; ",
-    "numbers from this path must not be quoted"
-  )
-}
-if (!have[["permuted"]] && have[["permuted_alt"]]) {
-  INPUTS$permuted <- INPUTS$permuted_alt
-  have[["permuted"]] <- TRUE
-  warning(
-    "permuted-groups control read from .claude/scratch/, NOT the pipeline output -- ",
-    "run `snakemake processed_data/permuted_groups_control_", tf, ".csv`; ",
-    "the scratch copy was measured at n = 100 and carries no declared provenance"
-  )
-}
+# The variance budget and the permuted-groups control became pipeline stages on 2026-09-01 (rules
+# `psi_variance_decomposition` and `permuted_groups_control`) and are declared inputs of
+# `rule paper_figures`. Prototype fallbacks used to sit here for standalone runs; they were removed
+# once the stages existed, because a paper number whose only source is an undeclared prototype is
+# not reproducible -- it can predate the stage, can have been produced at a different N_EVENTS, and
+# carries no provenance. If an input is genuinely absent the section is simply skipped.
 print(data.table(
   input = names(have),
   path = unlist(INPUTS[names(have)]),
@@ -617,7 +594,7 @@ if (!is.null(qcs)) {
 
 ## 3. PSI variance budget (leg A)
 
-**Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). Pipeline stage **03b** (`03b-psi-variance-decomposition.R`, rule `psi_variance_decomposition`), promoted out of `.claude/scratch/` on 2026-09-01. It sits before `create_aggregated_dt` on purpose: every input stops at stage 03 plus sample metadata, so the budget is established **before any epigenetic feature is considered** — which is the claim it exists to support.
+**Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). Pipeline stage **03b** (`03b-psi-variance-decomposition.R`, rule `psi_variance_decomposition`), promoted from an undeclared prototype on 2026-09-01. It sits before `create_aggregated_dt` on purpose: every input stops at stage 03 plus sample metadata, so the budget is established **before any epigenetic feature is considered** — which is the claim it exists to support.
 
 ```{r variance, eval = have[["variance"]], fig.width=6, fig.height=3}
 .ORIGIN_CUR <- ORIGIN$variance
@@ -1740,7 +1717,7 @@ battery's models and thresholds on the same cohort.
 
 ## 8. Supplementary: permuted-groups control
 
-**Origin:** permuted-groups negative control, paired per event. Pipeline stage **09p** (`09p-permute-groups.R`, rule `permuted_groups_control`), promoted out of `.claude/scratch/` on 2026-09-01. It sits beside `floor_sample` rather than at 03b because it samples its events *from* `screen_results.csv.gz` and reads the per-event feature tables.
+**Origin:** permuted-groups negative control, paired per event. Pipeline stage **09p** (`09p-permute-groups.R`, rule `permuted_groups_control`), promoted from an undeclared prototype on 2026-09-01. It sits beside `floor_sample` rather than at 03b because it samples its events *from* `screen_results.csv.gz` and reads the per-event feature tables.
 
 ```{r permuted, eval = have[["permuted"]]}
 .ORIGIN_CUR <- ORIGIN$permuted

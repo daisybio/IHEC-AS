@@ -109,7 +109,7 @@ below:
 **Numbers below are `stat_version` 5** (re-screened 2026-08-21–25 after `09-ml-shared.R`'s ridge λ
 selection changed from GCV to exact LOOCV + a 1SE rule — see the version history at
 `SCREEN_STAT_VERSION` in that file). They supersede an earlier `stat_version` 4 pass whose figures
-this guide previously quoted; re-run `.claude/scratch/verify_09_2_reported_numbers.R` after any future
+this guide previously quoted; re-run `verification/verify_09_2_reported_numbers.R` after any future
 re-screen; every figure below is checked against it.
 
 If Tier 1 yields no significant events, sections 2–6 are empty by construction (`en_available` is
@@ -162,7 +162,7 @@ spaces for the same event), and persisted across the GCV→LOOCV+1SE change (q_p
 Survives every internal-consistency check run so far but is **not validated as a real hit** — that was
 one event examined after seeing the ranking, not a pre-registered test, and no biological look at what
 gene/exon it is has been done. Full write-up:
-`.claude/scratch/investigate_pooled_z_candidates_v5_findings.md`.
+section 6b of `11-paper-figures.Rmd`, which emits the adjudication as `paper_numbers` keys.
 
 That combination — a null calibrated in aggregate under both p constructions, no surviving event under
 the primary rule, a handful of pooled-z candidates still under investigation, and a fingerprint p

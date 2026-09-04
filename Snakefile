@@ -636,7 +636,7 @@ rule prepare_aggregation:
 # create_aggregated_dt and reads no epigenetic data at all. That is the analysis's own claim -- the
 # budget is a property of the RESPONSE -- so placing it downstream of the marks would undercut it.
 #
-# Promoted out of .claude/scratch/ 2026-09-01. It supplies 12 of paper_numbers' keys (all of leg A),
+# Promoted from an undeclared prototype 2026-09-01. Supplies 12 of paper_numbers' keys (all of leg A),
 # and Nature requires the code behind a quoted number to be available at submission, so a completed
 # analysis whose only copy is in scratch is a submission blocker, not housekeeping.
 rule psi_variance_decomposition:
@@ -1599,7 +1599,7 @@ FLOOR_RHOS = ["0", "0.01", "0.02", "0.05", "0.1", "0.2", "0.4", "1"]
 # its events FROM screen_results.csv.gz and reads the per-event feature tables, so it depends on
 # screen_aggregate and build_feature_tables. It is the structural twin of floor_sample below.
 #
-# Promoted out of .claude/scratch/ 2026-09-01; supplies 7 of paper_numbers' keys.
+# Promoted from an undeclared prototype 2026-09-01; supplies 7 of paper_numbers' keys.
 rule permuted_groups_control:
     input:
         script  = "09p-permute-groups.R",
@@ -1880,7 +1880,7 @@ rule paper_figures:
         floor_results  = f"processed_data/event_models/{PRIMARY}/floor/floor_results.csv.gz",
         session        = f"processed_data/session_09_1_ml_local_{PRIMARY}.rds",
         qc_summary     = "processed_data/qc_summary.csv",
-        # Promoted 2026-09-01 out of .claude/scratch/. Declaring them here is the point of the
+        # Promoted from undeclared prototypes 2026-09-01. Declaring them here is the point of the
         # promotion: 19 of paper_numbers' keys came from analyses with no pipeline stage behind
         # them, which Nature's code-at-submission requirement makes a blocker rather than tidying.
         variance       = f"processed_data/psi_variance_decomposition_{PRIMARY}.csv",
