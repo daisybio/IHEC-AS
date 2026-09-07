@@ -50,6 +50,33 @@ EVENT_TYPES <- strsplit(Sys.getenv("ATLAS_EVENT_TYPES", "SE,RI,A3SS,A5SS,MXE"), 
 
 MEASURES <- c(IJC_SAMPLE_1 = "incl_count", SJC_SAMPLE_1 = "skip_count", IncLevel1 = "psi")
 
+# ATLAS_TRANSFORM_VERSION -- the guard on the per-run PARTS CACHE below, and what makes this script
+# safe to edit at all.
+#
+# The parts loop resumes by EXISTENCE (`if (file.exists(of))`), which is what makes a killed job
+# cheap to restart: SE alone is hours and exbio-interactive caps at one day. But existence says
+# nothing about WHICH transform wrote the part. Unstamped, editing `build_run()` would re-run the
+# rule (Snakemake sees a new `input_checksums` for this file), skip every cached part, exit 0, and
+# republish the OLD transform's output as the data release -- a silent no-op, and exactly the hole
+# `FEATURE_TABLE_VERSION` and `SCREEN_STAT_VERSION` close for the two stages downstream.
+#
+# It matters HERE specifically: `atlas_build_full` reaches `rule all` through `atlas_landscape`, and
+# `ancient()` was considered and REJECTED on that edge so that a genuine change to this script would
+# rebuild. That intent only holds if the script itself honours it.
+#
+# BUMP IT whenever `build_run()` changes a part's rows, columns or values. Comment-only edits do not
+# count -- same rule as the two stamps above.
+#
+# v1 keeps the unsuffixed `parts/` directory, so an existing cache is grandfathered and adding this
+# mechanism costs a re-concatenation rather than a cold rebuild. v2+ get their own directory, so a
+# bump forces the real rebuild AND leaves the previous cache in place to diff against.
+ATLAS_TRANSFORM_VERSION <- 1L
+
+parts_dir_for <- function(root, et, version = ATLAS_TRANSFORM_VERSION) {
+  stem <- if (version <= 1L) "parts" else sprintf("parts_v%d", version)
+  file.path(root, stem, et)
+}
+
 # Runs where the command table's declared sample count exceeds the data's field count. Collected so
 # the discrepancy is reported once at the end rather than only as scattered warnings.
 .DROPPED <- list()
@@ -147,8 +174,9 @@ HEADER <- "ID,uuid,incl_count,skip_count,psi"
 
 for (et in EVENT_TYPES) {
   # Per-run parts are the unit of work AND of resumption: a killed job re-runs only the runs it had
-  # not finished, which matters because SE is hours and exbio-interactive caps at one day.
-  pdir <- file.path(out_root, "parts", et)
+  # not finished, which matters because SE is hours and exbio-interactive caps at one day. The
+  # directory is version-stamped, so resumption can never span two transforms.
+  pdir <- parts_dir_for(out_root, et)
   dir.create(pdir, recursive = TRUE, showWarnings = FALSE)
   final <- file.path(out_root, sprintf("%s.csv.gz", et))
   acc <- vector("list", nrow(runs))
@@ -156,6 +184,8 @@ for (et in EVENT_TYPES) {
   for (i in seq_len(nrow(runs))) {
     rn <- runs$run_name[i]
     of <- file.path(pdir, sprintf("%s.csv.gz", rn))
+    # Existence alone is a sufficient test only because `pdir` carries the version: a part sitting
+    # in THIS directory was necessarily written by THIS transform.
     if (file.exists(of) && !VERIFY) {
       cat(sprintf("  %s / %s: part exists, skipping\n", et, rn)); wrote <- c(wrote, of); next
     }
@@ -222,4 +252,5 @@ if (length(.DROPPED)) {
   cat("The rMATS command table declares more samples than the output contains for these runs.\n")
   cat("The atlas covers the QUANTIFIED samples, which is fewer than uuid_string implies.\n")
 }
-cat("\ndone\n")
+cat(sprintf("\ndone (transform version %d, parts under %s)\n",
+  ATLAS_TRANSFORM_VERSION, dirname(parts_dir_for(out_root, EVENT_TYPES[1]))))
