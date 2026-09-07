@@ -35,6 +35,7 @@ suppressPackageStartupMessages({
   library(data.table)
   library(ggplot2)
   library(jsonlite)
+  library(patchwork)
 })
 data.table::setDTthreads(2L)
 
@@ -51,12 +52,28 @@ dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 
 ```{r conventions}
 # ---- journal figure theme -------------------------------------------------------------------
-# Nature: 5-8 pt fonts at print size, one typeface, NO rainbow scale, NO red/green contrast.
+# Nature Communications, from its own formatting instructions (ncomms-formatting-instructions.pdf,
+# shipped with the manuscript): fonts 5-8 pt AT PRINT SIZE, typeface Arial or Helvetica, vector with
+# editable text, no rainbow scale, no red/green contrast, and "each figure should be no larger than
+# a single A4 page (260 x 179 mm)".
 # Defined once here and used nowhere else in the project -- the Plotly heatmaps in 09-2 and
-# splicing_ml violate all three and are diagnostics, not paper figures.
+# splicing_ml violate all of it and are diagnostics, not paper figures.
 PAPER_BASE_PT <- 7
+
+# "sans" resolved through fontconfig to DejaVu Sans, which is neither of the two faces Nature names.
+# "Helvetica" resolves to Nimbus Sans (URW's metrically identical clone) and embeds as a subset --
+# verified with pdffonts. Do not "fix" this to "Arial": that resolves to Arimo here, a different
+# clone, and mixing the two across figures is exactly the one-typeface rule this is here to keep.
+PAPER_FONT <- "Helvetica"
+
+# 177.8 mm, just inside the 179 mm ceiling. EVERY figure is authored at this width on purpose: a set
+# authored at mixed widths gets rescaled by different factors at typesetting, so a uniform 7 pt in
+# the source lands as a different effective size in each figure. At FIG_W the scale factor is ~1 and
+# 7 pt stays 7 pt. Height is per-figure and only has to stay under 260 mm (10.24 in).
+FIG_W <- 7.0
+
 theme_paper <- function(base_size = PAPER_BASE_PT) {
-  theme_bw(base_size = base_size, base_family = "sans") +
+  theme_bw(base_size = base_size, base_family = PAPER_FONT) +
     theme(
       panel.grid.minor = element_blank(),
       panel.border = element_rect(linewidth = 0.3),
@@ -65,7 +82,11 @@ theme_paper <- function(base_size = PAPER_BASE_PT) {
       strip.text = element_text(size = base_size, margin = margin(2, 2, 2, 2)),
       legend.key.size = unit(3, "mm"),
       legend.margin = margin(0, 0, 0, 0),
-      plot.title = element_text(size = base_size + 1, face = "bold")
+      plot.title = element_text(size = base_size + 1, face = "bold"),
+      # Nature sets panel labels as bold LOWERCASE letters ("a", "b", ...), not capitals -- see the
+      # specimen legend in the formatting instructions. `labs(tag = "a")` is native ggplot2, so a
+      # multi-panel figure needs no layout package to carry them.
+      plot.tag = element_text(size = base_size + 1, face = "bold")
     )
 }
 theme_set(theme_paper())
@@ -410,19 +431,19 @@ if (have[["ann"]] && have[["keep_rows"]]) {
 # --- panel A: events per class, quantified vs modelled ----------------------------------------
 pA <- merge(atlas[, .(event_type, quantified = events)], modelled_ct, by = "event_type")
 pA <- melt(pA, id.vars = "event_type", variable.name = "scope", value.name = "n")
-pA[, panel := "A  events per class"]
+pA[, panel := "a  events per class"]
 pA[, event_type := factor(event_type, levels = ET_ORDER)]
 
 # --- panel B: samples per library stratum -----------------------------------------------------
 # The batch axis of the resource, and it is severely unbalanced: one stratum holds 987 of 1,522
 # samples while five hold one or two. Anyone reusing this needs that stated, not averaged away.
-pB <- strata[, .(lab = run_name, n = n_uuids, panel = "B  samples per library stratum")]
+pB <- strata[, .(lab = run_name, n = n_uuids, panel = "b  samples per library stratum")]
 pB[, lab := factor(lab, levels = lab[order(n)])]
 
 # --- panel C: observed fraction, per class, across ontologies ----------------------------------
 # PSI is NA where a sample has no reads on either side of the junction, so this is real detectability
 # and it is NOT uniform: SE sits ~20 points below MXE. Spread is across the 42 ontologies.
-pC <- land[, .(event_type, frac_observed, panel = "C  observed fraction (by ontology)")]
+pC <- land[, .(event_type, frac_observed, panel = "c  observed fraction (by ontology)")]
 pC[, event_type := factor(event_type, levels = ET_ORDER)]
 
 # --- panel D: where the PSI mass sits ---------------------------------------------------------
@@ -431,7 +452,7 @@ pC[, event_type := factor(event_type, levels = ET_ORDER)]
 pD <- hst[, .(count = sum(count)), by = .(event_type, cls = fifelse(
   atom & bin_lo == 0, "exactly 0", fifelse(atom & bin_lo == 1, "exactly 1", "interior")))]
 pD[, frac := count / sum(count), by = event_type]
-pD[, panel := "D  PSI mass at the bounds"]
+pD[, panel := "d  PSI mass at the bounds"]
 pD[, event_type := factor(event_type, levels = ET_ORDER)]
 pD[, cls := factor(cls, levels = c("exactly 0", "interior", "exactly 1"))]
 
@@ -455,10 +476,10 @@ p <- ggplot() +
       format(sum(land$n_rows), big.mark = ","))) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
 print(p)
-save_fig(p, "fig1_atlas", 6.5, 5.0,
+save_fig(p, "fig2_atlas", FIG_W, 5.2,
   source = c(INPUTS$atlas, INPUTS$atlas_land, INPUTS$atlas_hist, INPUTS$atlas_strata),
-  shows = paste("A quantified vs modelled events per class; B samples per library stratum;",
-    "C observed PSI fraction by ontology; D share of PSI mass at the bounds"))
+  shows = paste("a quantified vs modelled events per class; b samples per library stratum;",
+    "c observed PSI fraction by ontology; d share of PSI mass at the bounds"))
 
 # --- keys the prose needs ----------------------------------------------------------------------
 pn("atlas.psi_values", sum(land$n_rows), "count", INPUTS$atlas_land,
@@ -596,7 +617,7 @@ if (!is.null(qcs)) {
 
 **Origin:** fit-free PSI variance decomposition, leave-one-out group means (DrEval-derived). Pipeline stage **03b** (`03b-psi-variance-decomposition.R`, rule `psi_variance_decomposition`), promoted from an undeclared prototype on 2026-09-01. It sits before `create_aggregated_dt` on purpose: every input stops at stage 03 plus sample metadata, so the budget is established **before any epigenetic feature is considered** — which is the claim it exists to support.
 
-```{r variance, eval = have[["variance"]], fig.width=6, fig.height=3}
+```{r variance, eval = have[["variance"]], fig.width=7, fig.height=2.9}
 .ORIGIN_CUR <- ORIGIN$variance
 vb <- fread(INPUTS$variance)
 vb[, c("event_type", "variability") := tstrsplit(stratum, " / ", fixed = TRUE)]
@@ -629,9 +650,9 @@ p <- ggplot(long, aes(share, stratum, fill = component)) +
 print(p)
 save_fig(
   p,
-  "fig2_variance_budget",
-  5.5,
-  2.6,
+  "fig3_variance_budget",
+  FIG_W,
+  2.9,
   shows = "between- vs within-event share of PSI variance, per Event Type x Variability stratum",
   source = INPUTS$variance
 )
@@ -661,7 +682,7 @@ for (i in seq_len(nrow(vb))) {
 
 **Origin:** `splicing_ml` nested-CV pipeline (`run_splicing_ml.py` -> `pipeline.py`), grouped outer CV with a per-fold inner hyperparameter search. Numbers are read from the small report payloads, never the multi-GB result pickles.
 
-```{r artifacts}
+```{r artifacts, fig.width=7, fig.height=2.7}
 .ORIGIN_CUR <- ORIGIN$ml
 # Uses fold_metric_of()/find_payload() from section 0. Reads the small purpose-built report payloads,
 # NOT the multi-GB splicing_ml_results pickles -- this file must stay fast enough to re-run on
@@ -721,14 +742,11 @@ if (nrow(grid)) {
       title = "Holding out cell types leaks event identity; holding out events does not"
     )
   print(p)
-  save_fig(
-    p,
-    "fig3_artifacts",
-    5.5,
-    2.8,
-    shows = "per-outer-fold test AUROC, seqnames- vs ontology-grouped CV (the event-identity leak)",
-    source = cfgs$payload
-  )
+  # PANEL a OF THE MERGED ARTIFACTS FIGURE -- deliberately not saved here. The leak and its
+  # correction are ONE claim (both reviewers who raised the split raised it once), so they ship as
+  # one figure, assembled in section 4b once the second panel exists. Keeping the two chunks apart
+  # keeps each section's prose next to the numbers it states.
+  p_leak <- p
   for (i in seq_len(nrow(cfgs))) {
     d <- grid[split == cfgs$split[i] & et == cfgs$et[i]]
     if (!nrow(d)) {
@@ -796,7 +814,7 @@ backwards.
 
 This section walks the four steps, each a measured number, from the preprint's claim to what replaces it.
 
-```{r preprint-correction, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6.5, fig.height=3.4}
+```{r preprint-correction, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=2.7}
 .ORIGIN_CUR <- ORIGIN$ml
 if (!nrow(grid)) {
   cat("splicing_ml payloads unavailable; section 4 did not load.\n")
@@ -829,8 +847,24 @@ if (!nrow(grid)) {
     ) +
     scale_x_discrete(labels = c(ontology = "seen events,\nunseen samples", seqnames = "unseen events"))
   print(p)
-  save_fig(p, "fig3b_preprint_correction", 5.5, 3.0,
-    shows = "capacity gap (xgb − linear, paired within outer fold) under the preprint's split vs event-held-out CV",
+
+  # --- assemble the merged artifacts figure ----------------------------------------------------
+  # The leak (section 4) above its correction (this section). `tag_levels = "a"` is what puts the
+  # bold lowercase letters Nature asks for on the panels; setting them by hand would drift the
+  # moment a panel is added or reordered. The `&` applies the tag theme THROUGH the composition to
+  # every subplot -- `+` would attach it to the patchwork object instead and silently do nothing.
+  if (!exists("p_leak")) {
+    stop("section 4 did not build p_leak -- the merged artifacts figure needs both panels")
+  }
+  fig_artifacts <- (p_leak / p) +
+    plot_annotation(tag_levels = "a") &
+    theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"))
+  save_fig(fig_artifacts, "fig4_artifacts", FIG_W, 5.4,
+    shows = paste(
+      "a per-outer-fold test AUROC, seqnames- vs ontology-grouped CV (the event-identity leak);",
+      "b capacity gap (xgb − linear, paired within outer fold) under the preprint's split vs",
+      "event-held-out CV"
+    ),
     source = cfgs$payload)
 }
 ```
@@ -843,7 +877,7 @@ has to come after the sections that produce those numbers.
 
 **Origin:** `09s-ridge-screen.R` (one job per event, 34,146 events) -> `09s-aggregate.R` (BH/Storey FDR per `transcript_filter` x `Event Type` x `feature_set`). `SCREEN_STAT_VERSION` **5**, `FEATURE_TABLE_VERSION` **2**.
 
-```{r tier1, eval = have[["screen"]], fig.width=6.5, fig.height=3.2}
+```{r tier1, eval = have[["screen"]], fig.width=7, fig.height=3.2}
 .ORIGIN_CUR <- ORIGIN$tier1
 scr <- fread(INPUTS$screen)
 qthr <- 0.1
@@ -935,9 +969,9 @@ p <- ggplot(ph, aes(p_emp)) +
 print(p)
 save_fig(
   p,
-  "fig4_tier1_pvalues",
-  6.5,
-  3.0,
+  "fig6_tier1_pvalues",
+  FIG_W,
+  3.2,
   shows = "empirical p histogram per (Event Type x feature_set) family vs the uniform expectation",
   source = INPUTS$screen
 )
@@ -1195,7 +1229,7 @@ if (all(c(0.4, 1) %in% fl$inject_rho)) {
 }
 ```
 
-```{r floor-power, eval = have[["floor"]], fig.width=6.5, fig.height=3.0}
+```{r floor-power, eval = have[["floor"]], fig.width=7, fig.height=3.2}
 .ORIGIN_CUR <- ORIGIN$floor
 # `blowup` is JOINED by the scorer from the REAL screen's status (floor_events.tsv), never
 # recomputed from the injected R2. Recomputing lets an event change stratum when a strong injection
@@ -1362,9 +1396,9 @@ p <- ggplot(pw, aes(med_R2, rate, colour = `Event Type`)) +
 print(p)
 save_fig(
   p,
-  "fig5_power_curve",
-  6.5,
-  3.0,
+  "fig7_power_curve",
+  FIG_W,
+  3.2,
   shows = "detection rate vs achieved injected R2, faceted by real-PSI numeric stability; rho <= 0.4",
   source = INPUTS$floor
 )
@@ -1500,7 +1534,7 @@ cat("\nMatch on n, not on R2. See the chunk comment above.\n")
 
 **Origin:** `splicing_ml --feature-groups` ablation runs, seqnames-grouped CV. The **all-features** arm is not an ablation output — it is the same seqnames config section 4 reads, reused as the reference, and is attributed to that analysis in the manifest.
 
-```{r ablation, fig.width=5.5, fig.height=2.6}
+```{r ablation, fig.width=7, fig.height=3.0}
 .ORIGIN_CUR <- ORIGIN$ablation
 acfg <- CJ(
   group = c("sequence", "histone+dnam"),
@@ -1636,9 +1670,9 @@ if (nrow(abl)) {
   print(p)
   save_fig(
     p,
-    "fig6_ablation",
-    5.5,
-    2.8,
+    "fig5_ablation",
+    FIG_W,
+    3.0,
     shows = "per-outer-fold test AUROC by feature group (histone+dnam / sequence / all features)",
     origin = paste(ORIGIN$ablation, "+ all-features arm from", ORIGIN$ml),
     source = c(acfg$payload, unique(full$payload))
