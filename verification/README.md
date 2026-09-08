@@ -13,6 +13,20 @@ any event `screen/` directory.
 | `check_pooled_z_strata.R` | the pooled-z stratification in `09s-aggregate.R` — that the reference is standardised within `(Event Type x feature_set)` and not pooled across them. Pooling reads as calibrated at ratio 1.01 while being 1.43x liberal for SE and 0.41x conservative for RI, because SE outnumbers RI ~18:1. | any change to `09s-aggregate.R`'s z construction. `p_pooled_z` is the floor-free statistic the candidate set rests on. |
 | `run_screen_examples.sh` | one event end-to-end through the **real** Tier-1 worker in a sandbox, e.g. `bash run_screen_examples.sh reuse 20541`. Production `screen/` is untouched — the worker hard-`stop()`s on a `normalizePath` comparison if an output path resolves inside it. | any edit to `09s-ridge-screen.R` or `09-ml-shared.R`, before committing to a full re-screen. |
 
+## If you followed a `.claude/scratch/<name>` path here
+
+These four moved from `.claude/scratch/` to `verification/` on 2026-09-03 (`a0a982b`), so they could
+be tracked and satisfy the code-at-submission requirement. Dated records under `revision/` still name
+the old path — correctly, as a record of where the script was when that check was run — and are
+deliberately not being rewritten. Known instances: `revision-status-code-verified.md`,
+`file-changes/09-confound-projection-instability.md`, `file-changes/09-psi-independent-controls.md`,
+`file-changes/11-paper-figures.Rmd.md`, `file-changes/09-2-restructure-at-zero-hits.md`. The scripts
+are here; the file names did not change.
+
+Scripts still under `.claude/scratch/` are a different case: they are untracked, do not ship, and are
+development scaffolding (`test_*` fixtures, one-off investigations). A path that resolves there today
+is not stale — it is simply not part of the release.
+
 ## A note on paths in the pipeline's comments
 
 Three files still refer to these scripts by their former location, `.claude/scratch/<name>`:
