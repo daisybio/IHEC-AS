@@ -414,8 +414,10 @@ resources:
   # the raw tree, one class at a time, two columns only -- so it is far cheaper than atlas_build, but
   # still an order of magnitude past `analysis`: SE's 851 M rows cost ~14 GB for the uuid pointers and
   # psi doubles alone, before fread's own buffers and the by-ontology grouping. Measured throughput is
-  # ~3.7 M rows/s, so all 1.13 bn rows are a few minutes of work; the memory, not the time, is why
-  # this needs its own tier.
+  # ~1.3 M rows/s against the built atlas, so all 1.13 bn rows run in 12-15 min (three real runs:
+  # 12:08, 14:12, 14:35) -- comfortably inside the 120 min, and the memory, not the time, is why this
+  # needs its own tier. An earlier comment here claimed ~3.7 M rows/s and "a few minutes", which was
+  # ~3x optimistic; do not shrink `runtime` toward that.
   atlas_landscape:
     mem_mb: 96000
     runtime: 120

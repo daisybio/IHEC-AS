@@ -1,25 +1,49 @@
 # IHEC-AS
 
-This is the code repository for [Revisiting Evidence for Epigenetic Control of Alternative Splicing](https://doi.org/10.1101/2024.08.30.610315). Since the code in this repository conducts genome-wide analyses of 405 reference epigenomes, there is no small demo dataset available, but after running the first script, a file with the respective paths on the EpiATLAS FTP server is written, which can be subsequently downloaded.
+This is the code repository for [Revisiting Evidence for Epigenetic Control of Alternative Splicing](https://doi.org/10.1101/2024.08.30.610315). Since the code in this repository conducts genome-wide analyses of 379 reference epigenomes (415 RNA-seq experiments), there is no small demo dataset available, but after running the first script, a file with the respective paths on the EpiATLAS FTP server is written, which can be subsequently downloaded.
 
 Most analyses are done in R using the .Rmd files in this repo. To keep track of R package versions, we use `renv`. To restore this project's versions, which are documented in the [renv.lock](renv.lock), use `renv::restore()`.
 Some analyses use other languages. For those, we have a mamba/conda environment with the documented versions in [env.yml](env.yml) that you can restore using `mamba env create -f env.yml`.
 
 ## Running the pipeline
 
-The full pipeline is managed by [Snakemake](https://snakemake.readthedocs.io/) (installed in the `ihec-as` mamba environment). Steps are numbered 01–10; `08-*` global ML models are replaced by the `splicing_ml` Python package.
+The full pipeline is managed by [Snakemake](https://snakemake.readthedocs.io/) (installed in the `ihec-as` mamba environment). Steps are numbered 01–11; `08-*` global ML models are replaced by the `splicing_ml` Python package.
+Lettered stages (`02-3b`, `03b`, `05c`, `09p`, …) are not appendices — they sit at their true position
+in the DAG, and the letter only records that they were added after the integer numbering was fixed.
+
+**Two cohort sizes appear in this repository and they are not interchangeable.** The **modelled** cohort
+is **379 reference epigenomes / 415 RNA-seq experiments** — quote this for anything about what was
+analysed. The **QC/metadata** cohort is **405 / 441**, a clean superset: 26 experiments have QC metadata
+but were never modelled (absent from the rMATS quantification). Some QC outputs name the 405/441 scope
+in their own headers, correctly for those files.
 
 Stage order (restructured 2026-07-06):
 
 ```
 01-gather-data
-  → 02-1-transcript-filters      (SUPPA2-derived event coordinates)
+  → 02-1-transcript-filters      (transcript filters; its SUPPA2 chunks are REFERENCE-ONLY --
+                                  rMATS-turbo is the PSI-quantification tool, at 02-3)
   → 02-2-rnaseq-normalisation    (GeTMM + DESeq2 vst gene expression)
   → 02-3-rmats-event-filtering   (Procedure-2 + VST gene-expression gate)
+      ├─ 02-3b-atlas-summary         (resource counts: 1,522 uuids / 745,545 events)
+      ├─ 02-3c-atlas-build-full      (the five-class data release)
+      │    → 02-3d-atlas-landscape   (small summaries the resource figure reads)
+      └─ 02-4-irfinder-concordance   (independent RI caller, supplement)
   → 03-prepare-aggregation
+      └─ 03b-psi-variance-decomposition  (fit-free PSI variance budget; reads no epigenetic data)
   → 04-*  (WGBS / ChIP / MaxEntScan / Pangolin)
   → 05-create-aggregated-dt
-  → 06-correlation / 07-2-ml-global-comparison / 09  (+ splicing_ml)
+      ├─ 05b-feature-pca-sanity
+      └─ 05c-cohort-counts  → 05d-supplementary-qc-table
+  → 06-correlation / 06c-paired-protocol / 07-2-ml-global-comparison  (+ splicing_ml)
+  → 09  event models, two tiers:
+      09-1 (feature tables) → 09s-ridge-screen (one job per event, ~34k)
+        → 09s-aggregate (FDR)
+             ├─ 09f-floor-sample → 09f-floor-score  (detection-power sweep)
+             ├─ 09p-permute-groups                  (negative control)
+             └─ 09zz (elastic net, hits only) → 09-2 (report)
+  → 10-experimental-events
+  → 11-paper-figures   TERMINAL: the sole source for every figure and number the manuscript quotes
 ```
 
 ### Per-transcript-filter architecture
