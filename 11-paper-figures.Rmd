@@ -129,6 +129,7 @@ ORIGIN <- list(
   permuted = "Permuted-groups negative control, paired per event: 09p-permute-groups.R (rule permuted_groups_control), supergroup LABELS permuted so fold count and sizes are preserved exactly [leg C]",
   protocol = "Paired-protocol effect on PSI: 06c-paired-protocol.R (rule paired_protocol), the 36 epirrs carrying BOTH an mRNA-Seq and a total-RNA-Seq uuid; effect estimated WITHIN sample [confound]",
   irfinder = "IRFinder concordance supplement: 02-4-irfinder-concordance.Rmd (rule irfinder_concordance), both reference trees; rMATS stays the PRIMARY RI quantification [confound/validation]",
+  worked = "One real event end to end: 09e-worked-example.R (rule worked_example) -- the event's own PSI, its 32 event-proximal mark windows, and its matched-locus null, all read from the SAME per-event artifacts the screen itself scored [leg C]",
   candidates = "Adjudication of the floor-free pooled-z candidates: screen_results.csv.gz (Tier-1) cross-referenced against floor_results.csv.gz (the injection sweep) -- no refits, reshape only [leg C]",
   design = "fixed by experimental design; not measured"
 )
@@ -332,7 +333,20 @@ INPUTS <- list(
   # the reduction from 1,134,719,490 rows happens in that stage precisely so this one never has to.
   atlas_land = sprintf("processed_data/atlas_landscape_%s.csv", tf),
   atlas_hist = sprintf("processed_data/atlas_psi_hist_%s.csv", tf),
-  atlas_strata = sprintf("processed_data/atlas_strata_%s.csv", tf)
+  atlas_strata = sprintf("processed_data/atlas_strata_%s.csv", tf),
+  # ONE real event's own artifacts, for the worked-example figure. These are per-event files out of
+  # trees of ~34k (feature tables) and ~68k (null sidecars), and reading exactly TWO of them by id
+  # is NOT the thing the "must stay fast" invariant forbids -- that is about SWEEPING those trees,
+  # loading `chip_matrix` (13.8 GB) or scanning the 9 M-row aggregated_dt. Measured cost here is a
+  # 3.4 MB gzipped read plus a 14 KB one, ~1 s, so this stays a cheap leaf and needs no upstream
+  # stage of its own.
+  # NEITHER IS A DECLARED RULE INPUT, and that is safe for the same transitive reason
+  # `floor_score`'s sidecars are: both are produced by the same `event_screen_one` invocation that
+  # produced the row in `screen_results.csv.gz`, which IS declared, so they cannot be stale while
+  # the aggregate is current. The chunk hard-errors on a `stat_version` mismatch rather than
+  # trusting that argument.
+  worked_ft_dir = sprintf("processed_data/event_feature_tables_%s_v2", tf),
+  worked_screen_dir = file.path(event_dir, "screen")
 )
 have <- vapply(INPUTS, file.exists, logical(1))
 # The variance budget and the permuted-groups control became pipeline stages on 2026-09-01 (rules
@@ -431,19 +445,46 @@ if (have[["ann"]] && have[["keep_rows"]]) {
 # --- panel A: events per class, quantified vs modelled ----------------------------------------
 pA <- merge(atlas[, .(event_type, quantified = events)], modelled_ct, by = "event_type")
 pA <- melt(pA, id.vars = "event_type", variable.name = "scope", value.name = "n")
-pA[, panel := "a  events per class"]
 pA[, event_type := factor(event_type, levels = ET_ORDER)]
+# LOG10, because the classes span 559,157 (SE) to 2,459 (RI) -- 228x. On a linear axis SE sets the
+# limit and the other four classes are indistinguishable from zero, which is what the first version
+# of this figure did: four of five classes were invisible bars and the `modelled` series showed only
+# for SE. A log axis is the honest encoding for a quantity that spans two and a half orders.
+# log10(0) is undefined, so the three never-modelled classes cannot be drawn as zero-height bars --
+# they are named in the subtitle instead. That is strictly better than an invisible bar: "quantified
+# and never modelled" is the point of the panel, and it now reads as text rather than as absence.
+never <- pA[scope == "modelled" & n == 0, as.character(event_type)]
+pA <- pA[n > 0]
 
 # --- panel B: samples per library stratum -----------------------------------------------------
 # The batch axis of the resource, and it is severely unbalanced: one stratum holds 987 of 1,522
 # samples while five hold one or two. Anyone reusing this needs that stated, not averaged away.
-pB <- strata[, .(lab = run_name, n = n_uuids, panel = "b  samples per library stratum")]
+pB <- strata[, .(lab = run_name, n = n_uuids)]
+# ABBREVIATED, and the abbreviation is load-bearing twice over.
+# (1) SIZE. The full names run to 24 characters (`paired_fr-firststrand_75`). Fourteen of those on a
+#     half-width facet forced `axis.text.x` down to 5 pt, which after this template's 0.735 scaling
+#     rendered at 3.68 pt -- under the 5-8 pt Nature calls optimum, and it penalised the other three
+#     panels too, since `axis.text.x` is not per-facet. Measured at 7 pt: 0.405 in per label against
+#     a 0.236 in slot, so even at 45 degrees (0.287 in) they collide. Hence 90 degrees below.
+# (2) `single` becomes `SR`, NOT `SE`. This figure's other three panels carry `SE` on the x axis as
+#     the skipped-exon class, so `SE` for single-end here would put two different meanings of the
+#     same token on one figure.
+# Full names stay in `atlas_strata_{tf}.csv`, which is the source-data sheet for this panel.
+pB[, lab := sub("fr-unstranded_", "un ", sub("fr-firststrand_", "fs ",
+                sub("^single_", "SR ", sub("^paired_", "PE ", lab))))]
+# HORIZONTAL bars (lab on y), which is what actually solves the label problem: names run along the
+# reading direction with a full panel height to share, so no rotation and no size override. The
+# abbreviation below is kept anyway -- it keeps the axis narrow and avoids the SE collision.
+# Injective or the panel silently merges two strata into one bar.
+if (uniqueN(pB$lab) != nrow(pB)) {
+  stop("stratum abbreviation collided: ", nrow(pB), " strata -> ", uniqueN(pB$lab), " labels")
+}
 pB[, lab := factor(lab, levels = lab[order(n)])]
 
 # --- panel C: observed fraction, per class, across ontologies ----------------------------------
 # PSI is NA where a sample has no reads on either side of the junction, so this is real detectability
 # and it is NOT uniform: SE sits ~20 points below MXE. Spread is across the 42 ontologies.
-pC <- land[, .(event_type, frac_observed, panel = "c  observed fraction (by ontology)")]
+pC <- land[, .(event_type, frac_observed)]
 pC[, event_type := factor(event_type, levels = ET_ORDER)]
 
 # --- panel D: where the PSI mass sits ---------------------------------------------------------
@@ -452,29 +493,54 @@ pC[, event_type := factor(event_type, levels = ET_ORDER)]
 pD <- hst[, .(count = sum(count)), by = .(event_type, cls = fifelse(
   atom & bin_lo == 0, "exactly 0", fifelse(atom & bin_lo == 1, "exactly 1", "interior")))]
 pD[, frac := count / sum(count), by = event_type]
-pD[, panel := "d  PSI mass at the bounds"]
 pD[, event_type := factor(event_type, levels = ET_ORDER)]
 pD[, cls := factor(cls, levels = c("exactly 0", "interior", "exactly 1"))]
 
-p <- ggplot() +
-  geom_col(
-    data = pA, aes(x = event_type, y = n, fill = scope),
-    position = position_dodge(width = 0.75), width = 0.7
+# FOUR REAL PANELS, not one faceted plot. The first version pushed four different geoms through a
+# single ggplot with `facet_wrap(~panel, scales = "free")`, which cost two things that matter: every
+# panel had to share ONE fill scale (so the legend stacked `quantified`/`modelled` on top of
+# `exactly 0`/`interior`/`exactly 1` as if they were one key) and ONE y transform (so panel a could
+# not be logged without logging the proportions in c and d). patchwork removes both constraints.
+pa <- ggplot(pA, aes(event_type, n, fill = scope)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_y_log10(
+    breaks = 10^(3:6),
+    labels = c("1K", "10K", "100K", "1M"),
+    minor_breaks = NULL
   ) +
-  geom_col(data = pB, aes(x = lab, y = n), fill = PAL[1], width = 0.7) +
-  geom_boxplot(
-    data = pC, aes(x = event_type, y = frac_observed),
-    fill = PAL[1], linewidth = 0.25, outlier.size = 0.4, width = 0.6
-  ) +
-  geom_col(data = pD, aes(x = event_type, y = frac, fill = cls), width = 0.7) +
-  facet_wrap(~panel, scales = "free", nrow = 2) +
   scale_fill_paper(name = NULL) +
-  scale_y_continuous(trans = "identity") +
-  labs(x = NULL, y = NULL,
+  labs(x = NULL, y = "events (log)", subtitle = if (length(never)) {
+    paste0("never modelled: ", paste(never, collapse = ", "))
+  } else NULL)
+
+pb <- ggplot(pB, aes(n, lab)) +
+  geom_col(fill = PAL[1], width = 0.7) +
+  geom_text(aes(label = n), hjust = -0.25, size = PAPER_BASE_PT / .pt, colour = PAL[7]) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.16))) +
+  labs(x = "samples", y = NULL,
+    subtitle = sprintf("%.0f%% of samples in one stratum",
+      100 * max(pB$n) / sum(pB$n)))
+
+pc <- ggplot(pC, aes(event_type, frac_observed)) +
+  geom_boxplot(fill = PAL[1], linewidth = 0.25, outlier.size = 0.4, width = 0.6) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = NULL, y = "PSI observed", subtitle = "spread is across 42 ontologies")
+
+pd <- ggplot(pD, aes(event_type, frac, fill = cls)) +
+  geom_col(width = 0.7) +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  scale_fill_paper(name = NULL) +
+  labs(x = NULL, y = "share of observed PSI", subtitle = "boundary atoms drawn separately")
+
+p <- (pa | pb) / (pc | pd) +
+  plot_annotation(
     title = sprintf("%s samples x %s events x 5 classes = %s PSI values",
       format(atlas$uuids[1], big.mark = ","), format(sum(atlas$events), big.mark = ","),
-      format(sum(land$n_rows), big.mark = ","))) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+      format(sum(land$n_rows), big.mark = ",")),
+    tag_levels = "a"
+  ) &
+  theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"),
+        plot.subtitle = element_text(size = PAPER_BASE_PT - 1))
 print(p)
 save_fig(p, "fig2_atlas", FIG_W, 5.2,
   source = c(INPUTS$atlas, INPUTS$atlas_land, INPUTS$atlas_hist, INPUTS$atlas_strata),
@@ -648,14 +714,14 @@ p <- ggplot(long, aes(share, stratum, fill = component)) +
     title = "Event identity dominates PSI variance"
   )
 print(p)
-save_fig(
-  p,
-  "fig3_variance_budget",
-  FIG_W,
-  2.9,
-  shows = "between- vs within-event share of PSI variance, per Event Type x Variability stratum",
-  source = INPUTS$variance
-)
+# PANEL a OF THE PREDICTION FIGURE -- held, not saved here. The variance budget and the ablation
+# answer one question between them and were two separate figures until 2026-09-08: event identity
+# is 83-96% of PSI variance, which is WHY a model that can memorise identity reaches AUROC 0.957
+# and why sequence-only nearly matches all-features. Apart they read as two observations; together
+# they read as the reframe. Composed in the ablation chunk, which comes later in the DAG order.
+p_var <- p
+.ORIGIN_VAR <- .ORIGIN_CUR
+.SOURCE_VAR <- INPUTS$variance
 
 for (i in seq_len(nrow(vb))) {
   k <- gsub("[^A-Za-z]+", "_", tolower(vb$stratum[i]))
@@ -841,7 +907,10 @@ if (!nrow(grid)) {
     geom_pointrange(aes(ymin = mean - sd, ymax = mean + sd), size = 0.3, linewidth = 0.4) +
     scale_colour_paper(name = NULL) +
     labs(
-      x = NULL, y = "test AUROC, xgb − linear (paired within fold)",
+      # SHORT. At 5.8 in of panel width the long form ("test AUROC, xgb - linear (paired within
+      # fold)") overflowed the y-axis gutter and was clipped mid-word. The pairing is stated in the
+      # legend text and the caption, so it does not need to be in the axis title too.
+      x = NULL, y = "Δ AUROC (xgb − linear)",
       title = "The capacity gap is the leak, and it disappears when events are held out",
       subtitle = "ontology CV = the preprint's \"unknown cell/tissue types\"; seqnames CV = events genuinely unseen"
     ) +
@@ -856,10 +925,14 @@ if (!nrow(grid)) {
   if (!exists("p_leak")) {
     stop("section 4 did not build p_leak -- the merged artifacts figure needs both panels")
   }
+  # heights 1.7:1. Panel a carries 4 model x event rows of per-fold points; panel b is two x
+  # positions and two lines, so at equal heights it was ~60% whitespace. The unequal split is not
+  # cosmetic -- b is a two-point contrast and reads better small than stretched.
   fig_artifacts <- (p_leak / p) +
+    plot_layout(heights = c(1.7, 1)) +
     plot_annotation(tag_levels = "a") &
     theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"))
-  save_fig(fig_artifacts, "fig4_artifacts", FIG_W, 5.4,
+  save_fig(fig_artifacts, "fig3_artifacts", FIG_W, 4.6,
     shows = paste(
       "a per-outer-fold test AUROC, seqnames- vs ontology-grouped CV (the event-identity leak);",
       "b capacity gap (xgb − linear, paired within outer fold) under the preprint's split vs",
@@ -945,6 +1018,35 @@ NBINS <- 20L
 # the uniform expectation, per facet: m / nbins. Drawn so "flat" is judged against a line rather
 # than by eye -- a p-histogram piled at 0 would mean an optimistic null and nothing concludable.
 expect <- ph[, .(y = .N / NBINS), by = .(`Event Type`, feature_set)]
+# --- panel a of the screen figure: all six families on one axis -------------------------------
+# Six uniform histograms is a CALIBRATION CHECK, not a result, and as a main-text figure it spends
+# six panels saying "nothing happened" six times over. The ECDF says it once: six families against
+# the diagonal, none departing from it anywhere near p = 0, which is simultaneously the calibration
+# statement and the absence-of-signal statement. The histograms are kept IN FULL as a supplementary
+# figure -- a calibration check belongs there, not in the main text.
+# FACETED by Event Type rather than encoding it as linetype. All six ECDFs hug the diagonal, so
+# six lines in one panel overlap almost everywhere and a colour x linetype double encoding is
+# unreadable at 7 pt -- three lines per panel is legible. Faceting is also the honest split: SE
+# outnumbers RI ~18:1, and anything pooled across event types is an SE diagnostic with RI invisible.
+p_pcal <- ggplot(ph, aes(p_emp, colour = feature_set)) +
+  stat_ecdf(geom = "step", linewidth = 0.4, pad = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.3, colour = PAL[7]) +
+  facet_wrap(~`Event Type`, nrow = 1) +
+  scale_colour_paper(name = NULL) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+  labs(
+    x = "empirical p (one-sided exceedance)",
+    y = "cumulative fraction of events",
+    # The minimum q over the six families IS the primary result. Not a summed test count: the six
+    # are separate FDR families and adding them invites exactly the pooling error the feature
+    # spaces are documented against.
+    title = sprintf(
+      "No event beats its matched-locus null: minimum q = %.3f across all six families",
+      min(fam$min_q)
+    )
+  )
+print(p_pcal)
+
 p <- ggplot(ph, aes(p_emp)) +
   geom_histogram(
     boundary = 0,
@@ -967,9 +1069,12 @@ p <- ggplot(ph, aes(p_emp)) +
     title = sprintf("Calibrated null in every family (stat_version %d)", SV)
   )
 print(p)
+# SUPPLEMENTARY. Demoted from the main text 2026-09-08: the per-family histograms are the evidence
+# that the null is calibrated, which a reviewer will want to see in full and a reader does not need
+# in the narrative. The main-text statement is `p_pcal` above.
 save_fig(
   p,
-  "fig6_tier1_pvalues",
+  "figS1_pvalue_families",
   FIG_W,
   3.2,
   shows = "empirical p histogram per (Event Type x feature_set) family vs the uniform expectation",
@@ -1092,6 +1197,189 @@ for (i in seq_len(nrow(bw))) {
 ```{r tier1-missing, eval = !have[["screen"]], results='asis'}
 cat(
   "> **Not available**: `screen_results.csv.gz` missing. Run the screen and `screen_aggregate`.\n"
+)
+```
+
+## 5b. One event, end to end (leg C)
+
+**Origin:** the same per-event artifacts the screen itself scored — the event's feature table and its matched-null sidecar. No refit, no new statistic; this section reads two files and reshapes them.
+
+**Why it exists.** Every other panel in this file is a summary statistic *of an analysis*: counts, variance shares, per-fold AUROC, a p distribution, a detection rate. None of them shows a PSI value or an epigenetic signal, in a paper about epigenetic control of splicing — so a referee cannot see what the Tier-1 test actually *does*, only what came out of it. That is the likeliest objection to a negative result.
+
+**The event is selected, never pinned.** `SCREEN_STAT_VERSION` changes move the candidate set (v4 had zero pooled-z candidates, v5 has seven), so a hardcoded id would eventually describe a different event than the prose claims and nothing would fail. The rule is: `local` space (the only one with measurable recovery power), note-free (a refused or rank-deficient event is not a showcase), minimum `q_pooled_z`.
+
+**It is deliberately the best case.** Showing that the *strongest* candidate still cannot be certified is a stronger and more honest statement than showing a median event — and this figure is where the reader can see exactly why the two tests disagree about it.
+
+```{r worked-example, eval = have[["screen"]] && have[["worked_ft_dir"]] && have[["worked_screen_dir"]], fig.width=7, fig.height=8.4}
+.ORIGIN_CUR <- ORIGIN$worked
+if (!exists("scr")) {
+  stop("section 5 did not load `scr`; this section reuses it rather than re-reading the aggregate")
+}
+
+wpool <- scr[
+  feature_set == "local" & (is.na(note) | note == "") & is.finite(q_pooled_z)
+][order(q_pooled_z)]
+stopifnot(nrow(wpool) > 0L)
+eid <- wpool$ID[1]
+wmeta <- scr[ID == eid][order(feature_set)]
+print(wmeta[, .(ID, `Event Type`, feature_set, n_samples, R_used,
+  screen_R2 = round(screen_R2, 4), null_R2_mean = signif(null_R2_mean, 3),
+  null_R2_sd = signif(null_R2_sd, 3), p_emp = signif(p_emp, 3),
+  p_pooled_z = signif(p_pooled_z, 3), q = signif(q, 4), q_pooled_z = signif(q_pooled_z, 4))])
+
+# TWO reads out of the per-event trees, by id. Not a sweep -- see the INPUTS note.
+wnull_f <- file.path(INPUTS$worked_screen_dir, sprintf("%d_screen_null.csv.gz", eid))
+wft_f <- file.path(INPUTS$worked_ft_dir, sprintf("feature_table_%d.csv.gz", eid))
+if (!file.exists(wnull_f)) stop("no null sidecar for event ", eid, ": ", wnull_f)
+if (!file.exists(wft_f)) stop("no feature table for event ", eid, ": ", wft_f)
+wnull <- fread(wnull_f)
+# The sidecar is not a declared rule input, so this is the check that replaces the DAG guarantee.
+if (any(wnull$stat_version != SV)) {
+  stop("null sidecar for event ", eid, " is stat_version ",
+    paste(unique(wnull$stat_version), collapse = "/"), " but the aggregate is ", SV,
+    " -- the sidecar predates the current screen")
+}
+wft <- fread(wft_f)
+
+# --- panel a: the response ---------------------------------------------------------------------
+# PSI across cell types, which is the variation the screen is trying to explain. Ordered by median
+# so the reader can see it is real structure and not noise -- flat here would mean the event was
+# never a candidate for cross-cell-type prediction in the first place.
+wp <- wft[!is.na(PSI), .(uuid, ontology, protocol, PSI)]
+# n >= WORKED_ONT_MIN. All 34 ontologies at 7 pt need ~3.6 in of panel height, and a five-number
+# summary over 1-2 samples is not a box plot, it is two points wearing one. The 20 surviving
+# ontologies still carry 384 of the 409 observed samples, so this trims presentation noise rather
+# than evidence -- and the counts it drops are stated in the subtitle rather than left implicit.
+WORKED_ONT_MIN <- 5L
+ocnt <- wp[, .N, by = ontology]
+keep_ont <- ocnt[N >= WORKED_ONT_MIN, ontology]
+wp_all_n <- nrow(wp)
+wp <- wp[ontology %in% keep_ont]
+ont_ord <- wp[, .(m = median(PSI)), by = ontology][order(m), ontology]
+wp[, ontology := factor(ontology, levels = ont_ord)]
+
+pa <- ggplot(wp, aes(PSI, ontology)) +
+  geom_boxplot(fill = PAL[1], linewidth = 0.25, outlier.size = 0.4, width = 0.6) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x = "PSI", y = NULL,
+    subtitle = sprintf(
+      "event %d (%s): %d of %d cohort samples observed; %d ontologies with n >= %d shown (%d samples)",
+      eid, wmeta$`Event Type`[1], wp_all_n, nrow(wft), uniqueN(wp$ontology),
+      WORKED_ONT_MIN, nrow(wp)))
+
+# --- panel b: the test -------------------------------------------------------------------------
+# THE PUNCHLINE, and the reason this figure is worth a slot: in `local` the observed partial R2
+# sits far outside its own matched null, yet the PRIMARY q is ~0.8. That is not a contradiction and
+# it is not a bug -- `p_emp` is an exceedance p floored at 1/(R_used+1) = 0.00498 at R = 200, and BH
+# admits a p at rank k only if p <= k*q/m, which for SE needs ~1,608 events tied at that floor
+# against the 199 there are. So the floor, not the effect, is what refuses this event. Drawn side by
+# side with `short`/`long`, where the null's own spread is four orders larger and the observed value
+# sits ordinarily inside it.
+wnull[wmeta, on = c("ID", "feature_set"), observed_R2 := i.screen_R2]
+stopifnot(!anyNA(wnull$observed_R2))
+# Strip label is the feature space ALONE. The q values were in it and got clipped mid-word at this
+# facet width ("cal: q = 0.796..."), which is worse than not showing them; they go under the panel
+# as their own annotation row instead.
+wnull[, lab := factor(feature_set, levels = c("local", "short", "long"))]
+# The q values go in a CAPTION, not in the panels. They were in the strip label first (clipped
+# mid-word at this facet width) and then as in-panel text at x = Inf (clipped at the right edge).
+# One caption line is immune to both and reads in one pass.
+wq_txt <- paste(wmeta[order(factor(feature_set, levels = c("local", "short", "long"))),
+  sprintf("%s q = %.3f (q_pooled_z = %.4f)", feature_set, q, q_pooled_z)], collapse = "   ")
+
+pb <- ggplot(wnull, aes(null_R2)) +
+  geom_histogram(bins = 40, fill = PAL[7], colour = "white", linewidth = 0.1) +
+  geom_vline(aes(xintercept = observed_R2), colour = PAL[6], linewidth = 0.5) +
+  # THE FIX THAT MATTERS. `scales = "free"` sizes each facet from the plotted DATA, which is
+  # null_R2 -- the `geom_vline` intercept does not enter the range calculation. In `local` the
+  # observed 0.349 sits outside the nulls' own span, so the line was computed, drawn, and clipped
+  # off the panel: the figure's entire punchline was invisible. `geom_blank` puts the observed value
+  # into the range so the axis has to contain it.
+  geom_blank(aes(x = observed_R2)) +
+  # Expansion on top of geom_blank: in `local` the observed value IS the range maximum, so with
+  # ggplot's default expansion the line lands on the panel border and reads as part of the frame.
+  scale_x_continuous(expand = expansion(mult = 0.08)) +
+  facet_wrap(~lab, scales = "free", nrow = 1) +
+  labs(x = "partial R² of a matched control locus", y = "control loci",
+    subtitle = sprintf(
+      "vertical line = the event's own R²; %d matched control loci per space",
+      wmeta$R_used[1]),
+    caption = wq_txt)
+
+# --- panel c: the predictors --------------------------------------------------------------------
+# The 32 EVENT-PROXIMAL windows -- 6 histone marks + DNAm + CpG count at the four splice-site
+# flanks. This is the `local` design the panel-b number was scored on; pairing it with `short`/`long`
+# columns would show a different model than the number describes. `H3K*_source` is excluded on
+# purpose: observed-vs-imputed provenance is a cell-type and batch proxy that Tier-1 blocks from the
+# design, so plotting it as signal would misrepresent what was fit.
+WMARKS <- c("H3K27ac", "H3K27me3", "H3K36me3", "H3K4me1", "H3K4me3", "H3K9me3", "DNAm", "CpGs")
+WWIN <- c("5up", "5down", "3up", "3down")
+wcols <- intersect(paste(rep(WMARKS, each = length(WWIN)), WWIN, sep = ";"), names(wft))
+wsub <- wft[!is.na(PSI), c("uuid", "PSI", wcols), with = FALSE]
+# CpGs is an integer count while the marks are doubles; cast before melt so the coercion is
+# deliberate rather than a warning nobody reads.
+wsub[, (wcols) := lapply(.SD, as.numeric), .SDcols = wcols]
+wm <- melt(wsub, id.vars = c("uuid", "PSI"), variable.name = "feature",
+  value.name = "value", variable.factor = FALSE)
+wm[, c("mark", "window") := tstrsplit(feature, ";", fixed = TRUE)]
+wm[, mark := factor(mark, levels = WMARKS)]
+wm[, window := factor(window, levels = WWIN)]
+
+pc <- ggplot(wm, aes(value, PSI, colour = window)) +
+  geom_point(size = 0.35, alpha = 0.5) +
+  facet_wrap(~mark, scales = "free_x", nrow = 2) +
+  scale_colour_paper(name = NULL) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "signal in the event-proximal window", y = "PSI",
+    subtitle = "the 32 local features the R² above was fit on")
+
+fig_worked <- (pa / pb / pc) +
+  plot_layout(heights = c(1.5, 0.9, 1.5)) +
+  plot_annotation(
+    title = sprintf(
+      "The strongest candidate event, and why the primary test still refuses it (q = %.3f)",
+      wmeta[feature_set == "local", q]
+    ),
+    tag_levels = "a"
+  ) &
+  theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"),
+    plot.subtitle = element_text(size = PAPER_BASE_PT - 1))
+print(fig_worked)
+save_fig(fig_worked, "fig6_worked_example", FIG_W, 8.4,
+  shows = paste(
+    "a PSI across ontologies for the strongest pooled-z candidate event;",
+    "b its partial R² against its own matched-locus null, per feature space, with the primary",
+    "and floor-free q values; c the 32 event-proximal mark windows the local R² was fit on"
+  ),
+  source = c(INPUTS$screen, wnull_f, wft_f)
+)
+
+# Keys the prose needs. The event id is itself a number the manuscript states, so it is recorded
+# like any other -- a figure that names an event in its caption while the id is derived at render
+# time is exactly the drift this registry exists to stop.
+pn("worked.event_id", eid, "event ID", INPUTS$screen,
+  filter = "local, note-free, minimum q_pooled_z", stat_version = SV,
+  note = "SELECTED by rule at render time, not pinned; re-derives if the screen is re-run")
+pn("worked.n_observed", nrow(wp), "count", wft_f,
+  filter = sprintf("samples with observed PSI, of %d in the cohort", nrow(wft)))
+pn("worked.n_ontologies", uniqueN(wp$ontology), "count", wft_f, filter = "ontologies represented")
+for (i in seq_len(nrow(wmeta))) {
+  fs <- wmeta$feature_set[i]
+  pn(sprintf("worked.screen_r2.%s", fs), wmeta$screen_R2[i], "R2", INPUTS$screen,
+    filter = "the event's own partial R2", stat_version = SV)
+  pn(sprintf("worked.null_sd.%s", fs), wmeta$null_R2_sd[i], "R2", INPUTS$screen,
+    filter = "sd of its matched-control null", stat_version = SV)
+  pn(sprintf("worked.q.%s", fs), wmeta$q[i], "q", INPUTS$screen,
+    filter = "primary exceedance FDR", stat_version = SV)
+  pn(sprintf("worked.q_pooled_z.%s", fs), wmeta$q_pooled_z[i], "q", INPUTS$screen,
+    filter = "floor-free pooled-z FDR", stat_version = SV)
+}
+```
+
+```{r worked-example-missing, eval = !(have[["worked_ft_dir"]] && have[["worked_screen_dir"]]), results='asis'}
+cat(
+  "> **Not available**: the per-event feature tables or the screen sidecars are missing.",
+  "Run `build_feature_tables` and the screen.\n"
 )
 ```
 
@@ -1259,6 +1547,16 @@ pw <- fv[,
   .(
     n = .N,
     med_R2 = median(screen_R2),
+    # BOUNDED is what gets PLOTTED, raw is kept for the printed table and the pn() keys.
+    # Injected `screen_R2` runs from -625,384 to 0.986 (median -1.98), because the blown-up half
+    # carries the same catastrophic leave-one-ontology-out failures as the real screen. A single
+    # raw-R2 x axis over both strata therefore spans -10 to 1 and squeezes the entire informative
+    # range -- 0 to 0.072, where the power actually rises -- into the last 3% of the panel. The
+    # first version of this figure did exactly that and the curve was unreadable.
+    # `R2/(1+|R2|)` is the project's documented remedy for this (see the v3 scoring note) and is
+    # STRICTLY INCREASING, so no ordering changes; over the range that matters it is also nearly
+    # the identity (0.072 -> 0.067), so the stable panel reads as raw R2 to two decimals.
+    med_R2b = median(screen_R2_bounded),
     det = sum(detected),
     rate = mean(detected)
   ),
@@ -1372,11 +1670,15 @@ pn(
   note = "never reaches 50%: the 0-hit screen is a BOUND ON WHAT WAS TESTABLE, not a null finding"
 )
 
-p <- ggplot(pw, aes(med_R2, rate, colour = `Event Type`)) +
+p <- ggplot(pw, aes(med_R2b, rate, colour = `Event Type`)) +
   geom_hline(yintercept = 0.5, linetype = 3, linewidth = 0.3, colour = PAL[7]) +
   geom_line(linewidth = 0.4) +
   geom_point(size = 0.9) +
-  facet_wrap(~blow_lab) +
+  # FREE x. The two strata do not share a meaningful range: the stable half rises over
+  # 0 to 0.07 while the blown half sits between -0.9 and -0.5 and never leaves zero detection.
+  # Forcing one axis makes the left panel unreadable to no benefit -- the right panel's claim is
+  # "flat at zero", which needs no shared scale to land.
+  facet_wrap(~blow_lab, scales = "free_x") +
   scale_colour_paper(name = NULL) +
   scale_y_continuous(
     labels = scales::percent,
@@ -1384,24 +1686,47 @@ p <- ggplot(pw, aes(med_R2, rate, colour = `Event Type`)) +
     expand = c(0, 0)
   ) +
   labs(
-    x = "median achieved out-of-fold partial R² (injected)",
+    x = "median achieved out-of-fold partial R², bounded as R²/(1+|R²|)",
     y = "detected",
-    title = "The screen never reaches 50% power, and none that is usable for blown-up events",
+    title = "The screen never reaches 50% power, and has none that is usable for blown-up events",
     caption = sprintf(
-      "%s space; rho <= %.1f (rho=1 is degenerate); detection at q_pooled_z < 0.1",
+      paste("%s space; rho <= %.1f (rho=1 is degenerate); detection at q_pooled_z < 0.1.",
+        "Bounded R2 is monotone in R2 and ~= R2 over the range plotted here; note the free x axes."),
       inj_fs,
       RHO_MAX_VALID
     )
   )
 print(p)
-save_fig(
-  p,
-  "fig7_power_curve",
-  FIG_W,
-  3.2,
-  shows = "detection rate vs achieved injected R2, faceted by real-PSI numeric stability; rho <= 0.4",
-  source = INPUTS$floor
-)
+
+# --- assemble the screen figure ---------------------------------------------------------------
+# The result above the bound on it. These were two figures until 2026-09-08 and separating them was
+# the worst of the ordering problems: "zero hits" read as a negative finding about biology when the
+# power curve, two figures later, says it is a bound on what was testable. Adjacent panels make the
+# qualification unavoidable rather than optional.
+# `origin` spans both legs, so it is stated rather than taken from the chunk default.
+if (exists("p_pcal")) {
+  fig_screen <- (p_pcal / p) +
+    plot_layout(heights = c(1, 1)) +
+    plot_annotation(tag_levels = "a") &
+    theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"))
+  save_fig(fig_screen, "fig5_screen", FIG_W, 5.6,
+    shows = paste(
+      "a cumulative distribution of the empirical exceedance p per (Event Type x feature set)",
+      "family against the uniform expectation, all six families;",
+      "b detection rate vs achieved injected R2 (bounded), faceted by real-PSI numeric",
+      "stability; rho <= 0.4"
+    ),
+    origin = paste(ORIGIN$tier1, "+", ORIGIN$floor),
+    source = c(INPUTS$screen, INPUTS$floor)
+  )
+} else {
+  # The screen chunk is input-gated; the power curve must still ship if it did not run.
+  warning("screen panel unavailable; shipping the power curve alone", call. = FALSE)
+  save_fig(p, "fig5_screen", FIG_W, 3.2,
+    shows = "detection rate vs achieved injected R2 (bounded), faceted by real-PSI numeric stability; rho <= 0.4",
+    source = INPUTS$floor
+  )
+}
 
 # NOT WRITTEN, DELIBERATELY: min(screen_R2 | detected). 09f-floor-score.R prints it under an
 # explicit "for reference only ... NOT a floor -- an outlier statistic ... Do not quote it" banner
@@ -1668,15 +1993,35 @@ if (nrow(abl)) {
       title = "Sequence carries it; marks add little"
     )
   print(p)
-  save_fig(
-    p,
-    "fig5_ablation",
-    FIG_W,
-    3.0,
-    shows = "per-outer-fold test AUROC by feature group (histone+dnam / sequence / all features)",
-    origin = paste(ORIGIN$ablation, "+ all-features arm from", ORIGIN$ml),
-    source = c(acfg$payload, unique(full$payload))
-  )
+  # --- assemble the prediction figure ---------------------------------------------------------
+  # The response first (what there is to predict), then the models (what prediction achieves).
+  # `origin` spans three analyses, so it is stated explicitly rather than left to the chunk
+  # default -- the variance budget is fit-free and reads no epigenetic data, the ablation arms are
+  # splicing_ml runs, and the all-features arm is a section-4 seqnames run reused as the reference.
+  if (exists("p_var")) {
+    fig_pred <- (p_var / p) +
+      plot_layout(heights = c(1, 1.15)) +
+      plot_annotation(tag_levels = "a") &
+      theme(plot.tag = element_text(size = PAPER_BASE_PT + 1, face = "bold"))
+    save_fig(fig_pred, "fig4_prediction", FIG_W, 5.8,
+      shows = paste(
+        "a between- vs within-event share of PSI variance, per Event Type x Variability stratum;",
+        "b per-outer-fold test AUROC by feature group (histone+dnam / sequence / all features)"
+      ),
+      origin = paste(.ORIGIN_VAR, "+", ORIGIN$ablation,
+        "+ all-features arm from", ORIGIN$ml),
+      source = c(.SOURCE_VAR, acfg$payload, unique(full$payload))
+    )
+  } else {
+    # The variance chunk is input-gated. If it did not run, the ablation still ships on its own
+    # rather than vanishing with it -- a missing input must not silently drop a second figure.
+    warning("variance panel unavailable; shipping the ablation alone", call. = FALSE)
+    save_fig(p, "fig4_prediction", FIG_W, 3.0,
+      shows = "per-outer-fold test AUROC by feature group (histone+dnam / sequence / all features)",
+      origin = paste(ORIGIN$ablation, "+ all-features arm from", ORIGIN$ml),
+      source = c(acfg$payload, unique(full$payload))
+    )
+  }
 }
 ```
 
